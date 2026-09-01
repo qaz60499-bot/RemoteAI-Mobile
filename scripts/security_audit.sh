@@ -107,7 +107,10 @@ grep -q '^    runs-on: macos-15$' "$WORKFLOW" || fail "release build must stay o
 if grep -nE 'runs-on: macos-latest|find /Applications.*Xcode_.*tail -1|brew install xcodegen' "$WORKFLOW"; then
   fail "mutable Xcode/XcodeGen toolchain selection detected"
 fi
-grep -q 'Corrupted IPA negative test' "$WORKFLOW" || fail "corrupted IPA negative test missing"
+grep -q 'IPA verifier negative tests' "$WORKFLOW" || fail "IPA verifier negative tests missing"
+grep -q 'path-traversal-negative.ipa' "$WORKFLOW" || fail "path traversal IPA negative test missing"
+grep -q 'duplicate-entry-negative.ipa' "$WORKFLOW" || fail "duplicate ZIP-entry IPA negative test missing"
+grep -q 'symlink-negative.ipa' "$WORKFLOW" || fail "symlink IPA negative test missing"
 grep -q 'Reproducible packaging check' "$WORKFLOW" || fail "deterministic IPA packaging check missing"
 grep -q 'build/build-provenance.txt' "$WORKFLOW" || fail "build provenance artifact missing"
 
@@ -172,6 +175,10 @@ for ref in uses:
 PY
 
 grep -q 'FORBIDDEN_PATH' scripts/verify_ipa.sh || fail "IPA test/fixture/VCS contamination scan missing"
+grep -q 'duplicate ZIP entry' scripts/verify_ipa.sh || fail "IPA duplicate ZIP-entry defense missing"
+grep -q 'symlink ZIP entry is not allowed' scripts/verify_ipa.sh || fail "IPA pre-extraction symlink defense missing"
+grep -q 'unsafe ZIP path segments' scripts/verify_ipa.sh || fail "IPA path traversal defense missing"
+grep -q 'Executable structure audit: PASS' scripts/verify_ipa.sh || fail "IPA extra executable/framework audit missing"
 grep -q 'Signature=adhoc' scripts/verify_ipa.sh || fail "IPA ad-hoc signature verification missing"
 grep -q 'unexpected entitlements in TrollStore build' scripts/verify_ipa.sh || fail "IPA entitlement audit missing"
 grep -q 'SECRET_PATTERN' scripts/verify_ipa.sh || fail "IPA secret scan missing"

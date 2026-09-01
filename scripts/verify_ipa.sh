@@ -14,16 +14,43 @@ fail() {
 [[ -s "$IPA" ]] || fail "IPA missing or empty: $IPA"
 unzip -t "$IPA" >/dev/null || fail "ZIP integrity check failed"
 
-BAD_ENTRY="$(unzip -Z1 "$IPA" | while IFS= read -r entry; do
-  case "$entry" in
-    Payload|Payload/|Payload/*) ;;
-    *) printf '%s\n' "$entry"; break ;;
-  esac
-  case "$entry" in
-    /*|*../*|../*|*\\*) printf '%s\n' "$entry"; break ;;
-  esac
-done | head -1)"
-[[ -z "$BAD_ENTRY" ]] || fail "unexpected or unsafe ZIP entry: $BAD_ENTRY"
+python3 - "$IPA" <<'PY' || fail "ZIP safety preflight failed"
+import stat
+import sys
+import zipfile
+
+path = sys.argv[1]
+max_entries = 2000
+max_uncompressed = 100 * 1024 * 1024
+seen = set()
+total = 0
+
+with zipfile.ZipFile(path) as archive:
+    infos = archive.infolist()
+    if not infos or len(infos) > max_entries:
+        raise SystemExit(f"unexpected ZIP entry count: {len(infos)}")
+    for info in infos:
+        name = info.filename
+        if not name or "\x00" in name or "\\" in name or name.startswith("/"):
+            raise SystemExit(f"unsafe ZIP entry name: {name!r}")
+        clean = name[:-1] if name.endswith("/") else name
+        parts = clean.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            raise SystemExit(f"unsafe ZIP path segments: {name}")
+        if clean != "Payload" and not clean.startswith("Payload/"):
+            raise SystemExit(f"entry outside Payload/: {name}")
+        if name in seen:
+            raise SystemExit(f"duplicate ZIP entry: {name}")
+        seen.add(name)
+        if info.flag_bits & 0x1:
+            raise SystemExit(f"encrypted ZIP entry is not allowed: {name}")
+        mode = info.external_attr >> 16
+        if mode and stat.S_ISLNK(mode):
+            raise SystemExit(f"symlink ZIP entry is not allowed: {name}")
+        total += info.file_size
+        if total > max_uncompressed:
+            raise SystemExit(f"ZIP expands beyond {max_uncompressed} bytes")
+PY
 
 unzip -q "$IPA" -d "$TMP"
 [[ -d "$TMP/Payload" ]] || fail "Payload directory missing"
@@ -49,6 +76,13 @@ SUPPORTED_PLATFORM=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatfor
 
 BIN="$APP/$EXEC"
 [[ -f "$BIN" && -x "$BIN" ]] || fail "executable missing: $BIN"
+UNEXPECTED_CODE_DIR=$(find "$APP" -type d \( -name Frameworks -o -name PlugIns -o -name AppClips -o -name Watch -o -name XPCServices -o -name '*.framework' -o -name '*.appex' \) -print -quit)
+[[ -z "$UNEXPECTED_CODE_DIR" ]] || fail "unexpected embedded code container: ${UNEXPECTED_CODE_DIR#$TMP/}"
+UNEXPECTED_DYLIB=$(find "$APP" -type f -name '*.dylib' -print -quit)
+[[ -z "$UNEXPECTED_DYLIB" ]] || fail "unexpected embedded dylib: ${UNEXPECTED_DYLIB#$TMP/}"
+EXTRA_EXEC=$(find "$APP" -type f -perm -111 ! -path "$BIN" -print -quit)
+[[ -z "$EXTRA_EXEC" ]] || fail "unexpected extra executable: ${EXTRA_EXEC#$TMP/}"
+echo "Executable structure audit: PASS"
 file "$BIN"
 ARCHS=$(lipo -archs "$BIN")
 echo "Architectures: $ARCHS"
@@ -68,7 +102,7 @@ BIN_BYTES=$(stat -f%z "$BIN")
 SIGNATURE_INFO="$(codesign -dv --verbose=4 "$APP" 2>&1)" || fail "codesign metadata unavailable"
 printf '%s\n' "$SIGNATURE_INFO" | grep -q '^Signature=adhoc$' || fail "app is not ad-hoc signed"
 printf '%s\n' "$SIGNATURE_INFO" | grep -q '^TeamIdentifier=not set$' || fail "unexpected signing team present"
-codesign --verify --deep --strict "$APP" || fail "codesign verification failed"
+codesign --verify --strict "$APP" || fail "codesign verification failed"
 
 ENTITLEMENTS="$TMP/entitlements.plist"
 codesign -d --entitlements :- "$APP" >"$ENTITLEMENTS" 2>/dev/null || true
@@ -94,26 +128,18 @@ FORBIDDEN_PATH="$(find "$APP" \( -type d \( -name '.git' -o -name '.github' -o -
 echo "Release content contamination scan: PASS"
 
 SECRET_PATTERN='(-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|A(KIA|SIA)[0-9A-Z]{16}|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{32,}|AIza[0-9A-Za-z_-]{35}|(CLOUDFLARE_API_TOKEN|CF_API_TOKEN|GITHUB_TOKEN|PROVIDER_API_KEY|PAIRING_SECRET)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}|GITHUB_(SHA|RUN_ID|RUN_NUMBER|WORKFLOW|REPOSITORY|TOKEN)[[:space:]]*[:=])'
-if grep -R -I -nE "$SECRET_PATTERN" "$APP" >/dev/null 2>&1; then
-  grep -R -I -nE "$SECRET_PATTERN" "$APP" >&2 || true
-  fail "secret-like material found in app resources"
-fi
-
 DEV_URL_PATTERN='((http|ws)://|(https|wss)://[^[:space:]]*(localhost|127\.0\.0\.1|0\.0\.0\.0|dev[-.]?relay|relay[-.]?dev|staging))'
-if grep -R -I -nE "$DEV_URL_PATTERN" "$APP" >/dev/null 2>&1; then
-  grep -R -I -nE "$DEV_URL_PATTERN" "$APP" >&2 || true
-  fail "development/local URL found in app resources"
+ALL_STRINGS="$TMP/app.strings"
+while IFS= read -r -d '' item; do
+  strings -a "$item" || true
+done < <(find "$APP" -type f -print0) > "$ALL_STRINGS"
+if grep -nE "$SECRET_PATTERN" "$ALL_STRINGS" >/dev/null 2>&1; then
+  grep -nE "$SECRET_PATTERN" "$ALL_STRINGS" >&2 || true
+  fail "secret-like material found in app content"
 fi
-
-BIN_STRINGS="$TMP/binary.strings"
-strings -a "$BIN" > "$BIN_STRINGS"
-if grep -nE "$SECRET_PATTERN" "$BIN_STRINGS" >/dev/null 2>&1; then
-  grep -nE "$SECRET_PATTERN" "$BIN_STRINGS" >&2 || true
-  fail "secret-like material found in executable strings"
-fi
-if grep -nE "$DEV_URL_PATTERN" "$BIN_STRINGS" >/dev/null 2>&1; then
-  grep -nE "$DEV_URL_PATTERN" "$BIN_STRINGS" >&2 || true
-  fail "development/local URL found in executable strings"
+if grep -nE "$DEV_URL_PATTERN" "$ALL_STRINGS" >/dev/null 2>&1; then
+  grep -nE "$DEV_URL_PATTERN" "$ALL_STRINGS" >&2 || true
+  fail "development/local URL found in app content"
 fi
 echo "Sensitive-content scan: PASS"
 

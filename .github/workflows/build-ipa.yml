@@ -185,8 +185,8 @@ jobs:
           file "$APP/$EXEC"
           test "$(lipo -archs "$APP/$EXEC")" = 'arm64'
           otool -l "$APP/$EXEC" | awk '/LC_BUILD_VERSION/{f=1;n=0} f{print;n++} n>8{f=0}' | grep -q 'platform 2'
-          codesign --force --deep --sign - --timestamp=none "$APP"
-          codesign --verify --deep --strict "$APP"
+          codesign --force --sign - --timestamp=none "$APP"
+          codesign --verify --strict "$APP"
           codesign -dv --verbose=4 "$APP" 2>&1 | grep -q '^Signature=adhoc$'
           echo "bundle=$BUNDLE"
           echo "version=$VERSION"
@@ -225,20 +225,48 @@ jobs:
           rm -f "$REPRO"
           echo "Deterministic IPA packaging PASS"
 
-      - name: Corrupted IPA negative test
+      - name: IPA verifier negative tests
         shell: bash
         run: |
           set -euo pipefail
           IPA="build/${{ steps.ipa.outputs.name }}"
           CORRUPT="build/corrupted-negative.ipa"
+          TRAVERSAL="build/path-traversal-negative.ipa"
+          DUPLICATE="build/duplicate-entry-negative.ipa"
+          SYMLINK="build/symlink-negative.ipa"
+
           SIZE=$(stat -f%z "$IPA")
           dd if="$IPA" of="$CORRUPT" bs=1 count=$((SIZE / 2)) status=none
-          if scripts/verify_ipa.sh "$CORRUPT" com.remoteai.mobile >/dev/null 2>&1; then
-            echo "Corrupted IPA unexpectedly passed verification" >&2
-            exit 1
-          fi
-          rm -f "$CORRUPT"
-          echo "Corrupted IPA rejected as expected"
+
+          python3 - "$TRAVERSAL" "$DUPLICATE" "$SYMLINK" <<'PY'
+          import stat
+          import sys
+          import warnings
+          import zipfile
+
+          traversal, duplicate, symlink = sys.argv[1:]
+          with zipfile.ZipFile(traversal, "w") as zf:
+              zf.writestr("Payload/../escape.txt", "blocked")
+          with warnings.catch_warnings():
+              warnings.simplefilter("ignore", UserWarning)
+              with zipfile.ZipFile(duplicate, "w") as zf:
+                  zf.writestr("Payload/RemoteAI.app/Info.plist", b"first")
+                  zf.writestr("Payload/RemoteAI.app/Info.plist", b"second")
+          with zipfile.ZipFile(symlink, "w") as zf:
+              info = zipfile.ZipInfo("Payload/RemoteAI.app/link")
+              info.create_system = 3
+              info.external_attr = (stat.S_IFLNK | 0o777) << 16
+              zf.writestr(info, "../../outside")
+          PY
+
+          for candidate in "$CORRUPT" "$TRAVERSAL" "$DUPLICATE" "$SYMLINK"; do
+            if scripts/verify_ipa.sh "$candidate" com.remoteai.mobile >/dev/null 2>&1; then
+              echo "Negative IPA unexpectedly passed verification: $candidate" >&2
+              exit 1
+            fi
+          done
+          rm -f "$CORRUPT" "$TRAVERSAL" "$DUPLICATE" "$SYMLINK"
+          echo "Corrupt/traversal/duplicate/symlink IPA cases rejected as expected"
 
       - name: Unzip structure test
         shell: bash
