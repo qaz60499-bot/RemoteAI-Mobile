@@ -109,7 +109,11 @@ struct ChatView: View {
                     LazyVStack(spacing: 12) {
                         Color.clear.frame(height: 1).id("top").onAppear { guard !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
                         if loadingOlder { ProgressView().padding(.vertical, 6) }
-                        ForEach(messages) { message in MessageRow(message: message, retry: message.kind == .error ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id) } } : nil).id(message.id) }
+                        ForEach(messages) { message in
+                            let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
+                            let retryable = message.kind == .error || commandState == .failed || commandState == .unknown
+                            MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id) } } : nil).id(message.id)
+                        }
                     }.padding(.horizontal, 12).padding(.vertical, 10)
                 }
                 .background(Color(.systemGroupedBackground))
@@ -142,6 +146,7 @@ struct Composer: View {
 
 struct MessageRow: View {
     let message: ChatMessage
+    let commandState: CommandState?
     let retry: (() -> Void)?
     var body: some View {
         if message.kind == .toolEvent {
@@ -155,6 +160,9 @@ struct MessageRow: View {
                     if message.text.contains("```") { ScrollView(.horizontal, showsIndicators: false) { Text(message.text.replacingOccurrences(of: "```", with: "")).font(.system(.body, design: .monospaced)).textSelection(.enabled) } }
                     else { Text(message.text).textSelection(.enabled) }
                     if message.toolStatus == "Streaming" { ProgressView().scaleEffect(0.7) }
+                    if message.role == .user, let commandState {
+                        Text(commandState.rawValue).font(.caption2).foregroundColor(commandState == .failed || commandState == .unknown ? .red : .secondary)
+                    }
                     if let retry { Button("Retry", action: retry).font(.caption) }
                 }
                 .padding(.horizontal, 12).padding(.vertical, 9)

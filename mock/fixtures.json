@@ -1,14 +1,15 @@
 {
+  "protocolVersion": 1,
   "machine": {"id":"my-pc","name":"My PC","state":"Online"},
   "runtimes": [
-    {"id":"web","name":"Web"},
-    {"id":"cloud","name":"Cloud Code"},
-    {"id":"codex","name":"Codex"}
+    {"id":"runtime.web","kind":"Web","name":"Web"},
+    {"id":"runtime.cloudcode","kind":"CloudCode","name":"Cloud Code"},
+    {"id":"runtime.codex","kind":"Codex","name":"Codex"}
   ],
   "instances": {
-    "web": ["ChatGPT","Photo SaaS","Excel SaaS"],
-    "cloud": ["Photo"],
-    "codex": ["Codex1","Codex2","Codex6","Codex11","Kali Codex","Linux Codex"]
+    "runtime.web": ["ChatGPT","Photo SaaS","Excel SaaS"],
+    "runtime.cloudcode": ["Photo"],
+    "runtime.codex": ["Codex1","Codex2","Codex6","Codex11","Kali Codex","Linux Codex"]
   },
   "sessions": {
     "Photo SaaS": ["上传性能优化","手机 APP"],
@@ -16,5 +17,7 @@
     "Photo": ["Session A"],
     "Codex6": ["Session A"]
   },
-  "scenarios": ["normal","streaming","tool-event","disconnect","reconnect","duplicate-event","sequence-gap","command-failure","offline","1200-message-history"]
+  "relayFrames": ["PAIR_REQUEST","PAIR_CHALLENGE","PAIR_PROOF","PAIR_ACCEPT","ENCRYPTED","ACK","PING","PONG"],
+  "eventTypes": ["MESSAGE_ADDED","MESSAGE_UPDATED","TOOL_STARTED","TOOL_FINISHED","GENERATION_STARTED","GENERATION_STOPPED","COMMAND_RESULT","COMMAND_REJECTED"],
+  "scenarios": ["normal","streaming","tool-event","disconnect","reconnect","duplicate-event","sequence-gap","command-failure","offline","1200-message-history","windows-crypto-vector"]
 }

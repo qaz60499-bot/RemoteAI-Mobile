@@ -339,9 +339,10 @@ final class WorkspaceStore: ObservableObject {
             let id = event.payload["messageId"]?.stringValue ?? streamingBuffers[sessionId]?.id ?? "stream-\(sessionId)"
             bufferStreaming(sessionId: sessionId, id: id, content: content, sequence: event.sequence)
         case "MESSAGE_ADDED":
-            flushStreaming(sessionId: sessionId)
             if let server = try? JSONValue.object(event.payload).decode(ServerMessage.self) {
                 let base = server.chatMessage
+                if base.role == .assistant { discardStreamingPlaceholder(sessionId: sessionId) }
+                if base.role == .user { await reconcileOptimisticUserEcho(base, sessionId: sessionId) }
                 let message = ChatMessage(id: base.id, sessionId: base.sessionId, sequence: event.sequence, role: base.role, kind: base.kind, text: base.text, toolName: nil, toolStatus: nil, detail: nil, createdAt: base.createdAt)
                 merge([message], into: sessionId)
                 try? await cache.upsertMessages([message])
@@ -398,6 +399,21 @@ final class WorkspaceStore: ObservableObject {
     private func flushAllStreaming() {
         for sessionId in Array(streamingBuffers.keys) { flushStreaming(sessionId: sessionId) }
         flushTask = nil
+    }
+
+    private func discardStreamingPlaceholder(sessionId: String) {
+        streamingBuffers.removeValue(forKey: sessionId)
+        var list = messagesBySession[sessionId, default: []]
+        list.removeAll { $0.role == .assistant && ($0.toolStatus == "Streaming" || $0.id == "stream-\(sessionId)") }
+        messagesBySession[sessionId] = list
+    }
+
+    private func reconcileOptimisticUserEcho(_ serverMessage: ChatMessage, sessionId: String) async {
+        guard let optimistic = messagesBySession[sessionId, default: []].last(where: {
+            $0.role == .user && $0.sequence == nil && UUID(uuidString: $0.id) != nil && $0.text == serverMessage.text && abs($0.createdAt.timeIntervalSince(serverMessage.createdAt)) < 180
+        }) else { return }
+        messagesBySession[sessionId]?.removeAll { $0.id == optimistic.id }
+        try? await cache.deleteMessage(id: optimistic.id)
     }
 
     private func merge(_ incoming: [ChatMessage], into sessionId: String) {

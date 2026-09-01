@@ -1,43 +1,149 @@
-# RemoteAI Protocol v1
+# RemoteAI Protocol v1 — iOS Client Contract
 
-RemoteAI Mobile is a control-plane client. Windows remains the execution plane. The hierarchy is fixed as **Machine → Runtime → Instance → Session/Conversation → Message**.
+This client follows the frozen Windows contract in `contracts/protocol-v1.json`. The file is byte-for-byte synchronized with the Windows Agent contract.
 
-## Transport
+Hierarchy is fixed:
 
-The production transport uses HTTPS for commands/history/delta sync and WSS for real-time events. `Transport` is abstracted so the same UI/store runs on `CloudflareTransport` or `MockTransport`. Future `LANDirectTransport` and `FallbackHTTPTransport` can conform without changing views.
+**Machine → Runtime → Instance → Session / Conversation → Message / Event**
+
+Runtime IDs:
+
+- `runtime.web`
+- `runtime.cloudcode`
+- `runtime.codex`
+
+## Relay
+
+The iPhone never connects directly to Windows.
+
+```text
+iPhone
+  -> HTTPS / WSS
+Cloudflare Worker + per-Machine Durable Object
+  -> WSS
+RemoteAI-Agent.exe
+```
+
+The configured base endpoint must be HTTPS. Device WebSocket:
+
+```text
+wss://<relay>/connect?machineId=<machineId>&role=device&deviceId=<stable-device-id>
+Sec-WebSocket-Protocol: remoteai.v1
+```
+
+Production code rejects plain `http://` relay configuration.
+
+## Pairing
+
+Windows displays a machine ID and an 8-digit rotating pairing code. iOS creates an X25519 private key locally and stores private/shared key material in `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` Keychain items.
+
+Pair flow:
+
+1. iOS sends `PAIR_REQUEST` with its X25519 DER-SPKI public key.
+2. Windows returns `PAIR_CHALLENGE` with a random challenge and machine public key.
+3. iOS sends `PAIR_PROOF`:
+
+```text
+HMAC-SHA256(
+  key = UTF8(pairingCode),
+  data = challenge + "|" + machineId + "|" + deviceId + "|" + devicePublicKeyB64
+)
+```
+
+4. After `PAIR_ACCEPT`, both endpoints derive the same 32-byte key:
+
+```text
+IKM  = X25519(devicePrivateKey, machinePublicKey)
+salt = UTF8("RemoteAI:" + machineId)
+info = UTF8("device:" + deviceId + ":protocol-v1")
+KDF  = HKDF-SHA256
+```
+
+The pairing code and private/shared keys are never written to UserDefaults, SQLite, source, or GitHub.
+
+## End-to-end encryption
+
+Commands, command responses, and events use AES-256-GCM before entering Cloudflare. Cloudflare only routes the encrypted relay frame and does not need the payload key.
+
+AAD:
+
+```text
+machineId + "|" + deviceId + "|" + messageId + "|v1"
+```
+
+Encrypted frame:
+
+```json
+{
+  "v": 1,
+  "kind": "ENCRYPTED",
+  "machineId": "...",
+  "deviceId": "...",
+  "messageId": "...",
+  "body": {
+    "alg": "A256GCM",
+    "nonce": "<base64url>",
+    "ciphertext": "<base64url>",
+    "tag": "<base64url>"
+  }
+}
+```
+
+Outbound frames are capped at 256 KiB and inbound frames at 512 KiB, matching the Windows Relay boundaries.
 
 ## Command idempotency
 
-Every command has a UUID `commandId`. A retry caused by reconnect must reuse the same ID. The relay/Windows Agent must persist or otherwise deduplicate IDs and return the prior lifecycle state rather than executing twice.
+`protocolVersion` is numeric `1`. Every command has a UUID `commandId`. If delivery becomes unknown after a socket drop, a retry reuses the same command ID. Windows persists command results and does not repeat side effects for an already completed ID.
 
-Lifecycle: `Pending → Acknowledged → Executing → Completed|Failed`; `Unknown` is used when the client cannot establish the final result.
+Lifecycle shown by the app: `Pending → Executing → Completed|Failed|Unknown`.
 
-## Event ordering and recovery
+## Event cursor / reconnect
 
-Each event has a monotonically increasing `sequence` for a machine stream. iOS persists `lastSequence` in SQLite.
+Events have a strictly increasing machine-local `sequence`. iOS stores the highest fully applied sequence in SQLite.
 
-- `sequence <= lastSequence`: duplicate, ignore.
-- `sequence == lastSequence + 1`: apply normally.
-- `sequence > lastSequence + 1`: gap, call `getChangesAfterCursor(lastSequence)`, sort, dedupe and apply recovered events.
-- foreground after background: reconnect WSS, then delta sync before relying on real-time state.
+- duplicate (`sequence <= lastSequence`): ignore;
+- next sequence: apply;
+- gap: call `getChangesAfterCursor`;
+- foreground/reconnect: reopen WSS, run delta sync, then resume normal event handling.
 
-## History
+Delta batches are applied in sequence order. The cursor is persisted only after local application, and repeated while `hasMore=true`.
 
-A session opens from the SQLite cache immediately, then refreshes the most recent 50 messages. Older history is loaded 40 messages at a time with `loadMessagesBefore(cursor)`. The UI uses `LazyVStack` and preserves the prior top anchor when older rows are inserted.
+## Message pagination
 
-## Security
+Recent history is fetched with `loadRecentMessages(limit=50)`; server maximum is 100.
 
-Pairing exchanges a one-time code for a trusted-device shared secret. The secret is stored only in Keychain. AES-GCM from CryptoKit is used for the optional encrypted command envelope. No provider API key is stored on iOS; Cloud Code accepts only `credentialProfileId`.
+Older messages use the oldest visible message cursor:
 
-## Windows integration endpoints
+```json
+{
+  "before": {
+    "createdAt": "<oldest-createdAt>",
+    "messageId": "<oldest-messageId>"
+  },
+  "limit": 40
+}
+```
 
-The client expects these relay paths relative to the configured HTTPS relay base URL:
+SQLite uses the same `(createdAt, messageId)` ordering, so cached and remote pagination have identical semantics.
 
-- `POST /v1/pair`
-- `POST /v1/command`
-- `GET /v1/sync?after=<sequence>`
-- `GET /v1/messages/recent?sessionId=<id>&limit=<n>`
-- `GET /v1/messages/before?sessionId=<id>&before=<sequence>&limit=<n>`
-- `WSS /v1/ws`
+## Supported actions
 
-The canonical machine-readable contract is `contracts/protocol-v1.json`.
+System: `getStatus`, `listRuntimes`, `listInstances`, `listSessions`.
+
+Session: `createSession`, `resumeSession`, `stopSession`, `getSessionStatus`.
+
+Chat: `sendMessage`, `stopGeneration`, `loadRecentMessages`, `loadMessagesBefore`.
+
+Sync: `getChangesAfterCursor`.
+
+Web: `registerCurrentPage`, `unregisterConversation`, `openConversation`, `focusConversation`, `createConversation`.
+
+The mobile client never exposes arbitrary shell/PowerShell execution.
+
+## Local cache
+
+SQLite is WAL-mode and uses bound SQL parameters. The application cache directory/database are marked with iOS data protection (`completeUntilFirstUserAuthentication`). Pairing secrets are not stored in SQLite.
+
+## Windows integration source of truth
+
+The Windows Agent's frozen integration document is `docs/IOS-INTEGRATION.md` in the Windows project. When it changes compatibly, update this client contract, interoperability vectors, and MockTransport in the same change.

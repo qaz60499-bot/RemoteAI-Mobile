@@ -50,6 +50,9 @@ actor SQLiteStore {
     func messageCount(sessionId: String) throws -> Int {
         var stmt: OpaquePointer?; guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM messages WHERE session_id=?", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }; defer { sqlite3_finalize(stmt) }; bindText(stmt, 1, sessionId); guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.stepFailed }; return Int(sqlite3_column_int64(stmt, 0))
     }
+    func deleteMessage(id: String) throws {
+        var stmt: OpaquePointer?; guard sqlite3_prepare_v2(db, "DELETE FROM messages WHERE id=?", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }; defer { sqlite3_finalize(stmt) }; bindText(stmt, 1, id); guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.stepFailed }
+    }
 
     private func queryMessages(sql: String, sessionId: String, cursor: MessageCursor?, limit: Int) throws -> [ChatMessage] {
         var stmt: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }; defer { sqlite3_finalize(stmt) }

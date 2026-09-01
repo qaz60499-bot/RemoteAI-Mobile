@@ -218,6 +218,22 @@ final class RemoteAIMobileTests: XCTestCase {
         reader.cancel()
     }
 
+    @MainActor
+    func testWorkspaceStoreReconcilesOptimisticAndStreamingMessages() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
+        let db = try SQLiteStore(url: url)
+        let mock = MockTransport(historyCount: 10)
+        let store = WorkspaceStore(transport: mock, cache: db)
+        await store.start()
+        await store.send(text: "dedupe-check", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload")
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        let messages = store.messagesBySession["photo-upload", default: []]
+        XCTAssertEqual(messages.filter { $0.role == .user && $0.text == "dedupe-check" }.count, 1)
+        XCTAssertEqual(messages.filter { $0.role == .assistant && $0.text == "Remote AI mock streaming response." }.count, 1)
+        XCTAssertFalse(messages.contains { $0.role == .assistant && $0.toolStatus == "Streaming" })
+        await store.suspend()
+    }
+
     func testSQLitePersistsMetadataAndCursor() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
         let db = try SQLiteStore(url: url)
