@@ -13,19 +13,23 @@ final class WorkspaceStore: ObservableObject {
     @Published var hasMoreBySession: [String: Bool] = [:]
     @Published var isPaired = false
 
-    let transport: Transport
+    var transport: Transport
     let cache: SQLiteStore
     private var tracker = SequenceTracker()
     private var eventTask: Task<Void, Never>?
-    private var deltaBuffers: [String: (id: String, text: String)] = [:]
+    private var connectionMonitorTask: Task<Void, Never>?
+    private var streamingBuffers: [String: (id: String, text: String, sequence: Int64)] = [:]
     private var flushTask: Task<Void, Never>?
 
-    init(transport: Transport, cache: SQLiteStore) { self.transport = transport; self.cache = cache }
+    init(transport: Transport, cache: SQLiteStore) {
+        self.transport = transport
+        self.cache = cache
+    }
 
     static func makeDefault() -> WorkspaceStore {
         let cache = (try? SQLiteStore.appStore()) ?? (try! SQLiteStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("remoteai-cache.sqlite3")))
         let config = RemoteAIConfig.loadMetadata()
-        let useMock = ProcessInfo.processInfo.arguments.contains("-UITestMockMode") || KeychainStore.shared.load(account: config.machineId) == nil
+        let useMock = ProcessInfo.processInfo.arguments.contains("-UITestMockMode") || !PairingKeyStore.isPaired(machineId: config.machineId)
         let transport: Transport = useMock ? MockTransport() : CloudflareTransport(config: config)
         let store = WorkspaceStore(transport: transport, cache: cache)
         store.machine = MachineMetadata(id: config.machineId, name: "My PC", state: .connecting)
@@ -34,130 +38,378 @@ final class WorkspaceStore: ObservableObject {
 
     func start() async {
         await loadCachedFirst()
-        isPaired = KeychainStore.shared.load(account: machine.id) != nil
+        isPaired = PairingKeyStore.isPaired(machineId: machine.id)
+        installEventConsumer()
         do {
-            try await transport.connect(); machine.state = .online
+            try await transport.connect()
+            machine.state = .online
+            errors["connection"] = nil
             await recoverDelta()
-            let stream = await transport.eventStream()
-            eventTask?.cancel(); eventTask = Task { [weak self] in
-                for await event in stream { guard !Task.isCancelled else { break }; await self?.ingest(event) }
-            }
-        } catch { machine.state = .offline; errors["connection"] = error.localizedDescription }
+            await refreshMetadata()
+            startConnectionMonitor()
+        } catch {
+            machine.state = .offline
+            errors["connection"] = error.localizedDescription
+            startConnectionMonitor()
+        }
     }
 
-    func suspend() async { await transport.disconnect(); machine.state = .offline }
-    func resumeFromForeground() async { machine.state = .connecting; await start() }
+    func suspend() async {
+        connectionMonitorTask?.cancel()
+        connectionMonitorTask = nil
+        await transport.disconnect()
+        machine.state = .offline
+    }
+
+    func resumeFromForeground() async {
+        machine.state = .connecting
+        await start()
+    }
 
     func loadSession(_ sessionId: String) async {
         if messagesBySession[sessionId] == nil {
             let local = (try? await cache.recentMessages(sessionId: sessionId, limit: 50)) ?? []
             messagesBySession[sessionId] = local
         }
-        guard machine.state == .online else { return }
+        guard machine.state == .online, let context = contextForSession(sessionId) else { return }
         do {
-            let page = try await transport.loadRecent(sessionId: sessionId, limit: 50)
+            let page = try await transport.loadRecent(machineId: machine.id, runtimeId: context.runtime.id, instanceId: context.instance.id, sessionId: sessionId, limit: 50)
             try? await cache.upsertMessages(page.items)
-            merge(page.items, into: sessionId); hasMoreBySession[sessionId] = page.hasMore
-        } catch { errors[sessionId] = error.localizedDescription }
+            merge(page.items, into: sessionId)
+            hasMoreBySession[sessionId] = page.hasMore
+        } catch {
+            errors[sessionId] = error.localizedDescription
+        }
     }
 
     func loadOlder(_ sessionId: String) async {
         guard let first = messagesBySession[sessionId]?.first, hasMoreBySession[sessionId] != false else { return }
         do {
             let page: Page<ChatMessage>
-            if machine.state == .online { page = try await transport.loadBefore(sessionId: sessionId, before: first.sequence, limit: 40) }
-            else { let local = try await cache.messagesBefore(sessionId: sessionId, before: first.sequence, limit: 40); page = Page(items: local, beforeCursor: local.first?.sequence, hasMore: local.count == 40) }
+            if machine.state == .online, let context = contextForSession(sessionId) {
+                page = try await transport.loadBefore(machineId: machine.id, runtimeId: context.runtime.id, instanceId: context.instance.id, sessionId: sessionId, before: first.cursor, limit: 40)
+            } else {
+                let local = try await cache.messagesBefore(sessionId: sessionId, before: first.cursor, limit: 40)
+                page = Page(items: local, beforeCursor: local.first?.cursor, hasMore: local.count == 40)
+            }
             try? await cache.upsertMessages(page.items)
-            merge(page.items, into: sessionId); hasMoreBySession[sessionId] = page.hasMore
-        } catch { errors[sessionId] = error.localizedDescription }
+            merge(page.items, into: sessionId)
+            hasMoreBySession[sessionId] = page.hasMore
+        } catch {
+            errors[sessionId] = error.localizedDescription
+        }
     }
 
-    func send(text: String, runtimeId: String, instanceId: String, sessionId: String) async {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines); guard !trimmed.isEmpty else { return }
-        guard machine.state == .online else { try? await cache.saveDraft(trimmed, sessionId: sessionId); errors[sessionId] = "PC Offline — draft saved. Tap Send after reconnecting."; return }
-        let commandId = UUID(); commandStates[commandId] = .pending
-        let optimistic = ChatMessage(id: commandId.uuidString, sessionId: sessionId, sequence: tracker.lastSequence + 1, role: .user, kind: .text, text: trimmed, toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
-        merge([optimistic], into: sessionId); try? await cache.upsertMessages([optimistic])
+    func send(text: String, runtimeId: String, instanceId: String, sessionId: String, commandId: UUID = UUID()) async {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard machine.state == .online else {
+            try? await cache.saveDraft(trimmed, sessionId: sessionId)
+            errors[sessionId] = "PC Offline — draft saved. Tap Send after reconnecting."
+            return
+        }
+
+        commandStates[commandId] = .pending
+        let optimistic = ChatMessage(id: commandId.uuidString, sessionId: sessionId, sequence: nil, role: .user, kind: .text, text: trimmed, toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
+        merge([optimistic], into: sessionId)
+        try? await cache.upsertMessages([optimistic])
         let command = RemoteCommand.make(machineId: machine.id, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "sendMessage", payload: ["text": .string(trimmed)], commandId: commandId)
-        do { commandStates[commandId] = try await transport.send(command) } catch { commandStates[commandId] = .failed; errors[sessionId] = error.localizedDescription }
+        commandStates[commandId] = .executing
+        do {
+            commandStates[commandId] = try await transport.send(command)
+            try? await cache.saveDraft("", sessionId: sessionId)
+        } catch TransportError.disconnected {
+            commandStates[commandId] = .unknown
+            errors[sessionId] = "Connection dropped after send. Delivery is unknown; retry reuses the same command ID."
+        } catch {
+            commandStates[commandId] = .failed
+            errors[sessionId] = error.localizedDescription
+        }
     }
 
-    func retry(message: ChatMessage, runtimeId: String, instanceId: String) async { await send(text: message.text, runtimeId: runtimeId, instanceId: instanceId, sessionId: message.sessionId) }
+    func retry(message: ChatMessage, runtimeId: String, instanceId: String) async {
+        let commandId = UUID(uuidString: message.id) ?? UUID()
+        await send(text: message.text, runtimeId: runtimeId, instanceId: instanceId, sessionId: message.sessionId, commandId: commandId)
+    }
+
     func stop(runtimeId: String, instanceId: String, sessionId: String) async {
         let command = RemoteCommand.make(machineId: machine.id, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "stopGeneration")
         commandStates[command.commandId] = .pending
-        do { commandStates[command.commandId] = try await transport.send(command) } catch { commandStates[command.commandId] = .failed }
+        do { commandStates[command.commandId] = try await transport.send(command) }
+        catch { commandStates[command.commandId] = .failed; errors[sessionId] = error.localizedDescription }
     }
 
     func createSession(runtime: RuntimeDescriptor, instance: InstanceDescriptor, title: String, provider: String = "", model: String = "", credentialProfileId: String = "") async {
-        let id = UUID().uuidString; let s = SessionDescriptor(id: id, instanceId: instance.id, title: title.isEmpty ? "New Session" : title, state: .idle, updatedAt: Date()); sessions.insert(s, at: 0); await persistMetadata()
-        let payload: [String: JSONValue] = ["provider": .string(provider), "model": .string(model), "credentialProfileId": .string(credentialProfileId)]
-        let c = RemoteCommand.make(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id, sessionId: id, action: "createSession", payload: payload)
-        if machine.state == .online { _ = try? await transport.send(c) }
+        let payload: [String: JSONValue] = [
+            "title": .string(title.isEmpty ? "New Session" : title),
+            "provider": .string(provider),
+            "model": .string(model),
+            "credentialProfileId": .string(credentialProfileId)
+        ]
+        guard machine.state == .online else {
+            errors[instance.id] = "PC Offline — new sessions are not queued automatically."
+            return
+        }
+        do {
+            if let created = try await transport.createSession(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id, payload: payload) {
+                sessions.removeAll { $0.id == created.id }
+                sessions.insert(created, at: 0)
+                await persistMetadata()
+            } else if transport is MockTransport {
+                let local = SessionDescriptor(id: UUID().uuidString, instanceId: instance.id, title: title.isEmpty ? (runtime.kind == .web ? "New Chat" : "New Session") : title, state: .idle, updatedAt: Date())
+                sessions.insert(local, at: 0)
+                await persistMetadata()
+            } else {
+                await refreshMetadata()
+            }
+        } catch {
+            errors[instance.id] = error.localizedDescription
+        }
     }
 
-    func savePairing(baseURL: URL, code: String) async throws {
-        let response = try await PairingClient().pair(baseURL: baseURL, code: code)
-        guard let data = Data(base64Encoded: response.sharedSecretBase64), data.count >= 16 else { throw TransportError.malformedData }
-        try KeychainStore.shared.save(data, account: response.machineId)
-        let config = RemoteAIConfig(relayBaseURL: baseURL, machineId: response.machineId)
+    func savePairing(baseURL: URL, machineId: String, code: String) async throws {
+        eventTask?.cancel()
+        connectionMonitorTask?.cancel()
+        await transport.disconnect()
+        let result = try await RelayPairingClient().pair(baseURL: baseURL, machineId: machineId, pairingCode: code)
+        let config = RemoteAIConfig(relayBaseURL: baseURL, machineId: result.machineId)
         config.saveMetadata()
-        machine = MachineMetadata(id: response.machineId, name: machine.name, state: machine.state)
+        transport = CloudflareTransport(config: config)
+        machine = MachineMetadata(id: result.machineId, name: machine.name, state: .connecting)
         isPaired = true
+        await start()
     }
 
     func draft(sessionId: String) async -> String { (try? await cache.draft(sessionId: sessionId)) ?? "" }
     func clearError(sessionId: String) { errors[sessionId] = nil }
 
+    private func installEventConsumer() {
+        eventTask?.cancel()
+        eventTask = Task { [weak self] in
+            guard let self else { return }
+            let stream = await self.transport.eventStream()
+            for await event in stream {
+                guard !Task.isCancelled else { break }
+                await self.ingest(event)
+            }
+        }
+    }
+
+    private func startConnectionMonitor() {
+        connectionMonitorTask?.cancel()
+        connectionMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard !Task.isCancelled, let self else { break }
+                if !(await self.transport.isConnected) {
+                    self.machine.state = .connecting
+                    do {
+                        try await self.transport.connect()
+                        self.machine.state = .online
+                        self.errors["connection"] = nil
+                        await self.recoverDelta()
+                        await self.refreshMetadata()
+                    } catch {
+                        self.machine.state = .offline
+                        self.errors["connection"] = error.localizedDescription
+                    }
+                }
+            }
+        }
+    }
+
+    private func refreshMetadata() async {
+        guard machine.state == .online else { return }
+        do {
+            let remoteRuntimes = try await transport.listRuntimes(machineId: machine.id)
+            var remoteInstances: [InstanceDescriptor] = []
+            var remoteSessions: [SessionDescriptor] = []
+            for runtime in remoteRuntimes {
+                let rows = try await transport.listInstances(machineId: machine.id, runtimeId: runtime.id)
+                remoteInstances.append(contentsOf: rows)
+                for instance in rows {
+                    let sessionRows = try await transport.listSessions(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id)
+                    remoteSessions.append(contentsOf: sessionRows)
+                }
+            }
+            if !remoteRuntimes.isEmpty { runtimes = remoteRuntimes }
+            if !remoteInstances.isEmpty { instances = remoteInstances }
+            sessions = remoteSessions.sorted { $0.updatedAt > $1.updatedAt }
+            await persistMetadata()
+        } catch {
+            errors["sync"] = error.localizedDescription
+        }
+    }
+
+    private func contextForSession(_ sessionId: String) -> (runtime: RuntimeDescriptor, instance: InstanceDescriptor)? {
+        guard let session = sessions.first(where: { $0.id == sessionId }),
+              let instance = instances.first(where: { $0.id == session.instanceId }),
+              let runtime = runtimes.first(where: { $0.id == instance.runtimeId }) else { return nil }
+        return (runtime, instance)
+    }
+
     private func loadCachedFirst() async {
-        if let m: MachineMetadata = try? await cache.get(MachineMetadata.self, key: "machine") { machine = m; machine.state = .connecting }
-        if let v: [RuntimeDescriptor] = try? await cache.get([RuntimeDescriptor].self, key: "runtimes") { runtimes = v }
-        if let v: [InstanceDescriptor] = try? await cache.get([InstanceDescriptor].self, key: "instances") { instances = v }
-        if let v: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") { sessions = v }
+        if let cached: MachineMetadata = try? await cache.get(MachineMetadata.self, key: "machine") {
+            machine = MachineMetadata(id: cached.id, name: cached.name, state: .connecting)
+        }
+        if let value: [RuntimeDescriptor] = try? await cache.get([RuntimeDescriptor].self, key: "runtimes") { runtimes = value }
+        if let value: [InstanceDescriptor] = try? await cache.get([InstanceDescriptor].self, key: "instances") { instances = value }
+        if let value: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") { sessions = value }
         tracker = SequenceTracker(lastSequence: (try? await cache.lastSequence()) ?? 0)
         if runtimes.isEmpty { seedFixtureMetadata(); await persistMetadata() }
     }
 
     private func seedFixtureMetadata() {
-        runtimes = [.init(id: "web", machineId: machine.id, kind: .web, name: "Web"), .init(id: "cloud", machineId: machine.id, kind: .cloudCode, name: "Cloud Code"), .init(id: "codex", machineId: machine.id, kind: .codex, name: "Codex")]
+        runtimes = [
+            RuntimeDescriptor(id: "runtime.web", machineId: machine.id, kind: .web, name: "Web"),
+            RuntimeDescriptor(id: "runtime.cloudcode", machineId: machine.id, kind: .cloudCode, name: "Cloud Code"),
+            RuntimeDescriptor(id: "runtime.codex", machineId: machine.id, kind: .codex, name: "Codex")
+        ]
         instances = [
-            .init(id: "chatgpt", runtimeId: "web", name: "ChatGPT", subtitle: "Web runtime"), .init(id: "photo", runtimeId: "web", name: "Photo SaaS", subtitle: "2 conversations"), .init(id: "excel", runtimeId: "web", name: "Excel SaaS", subtitle: "1 conversation"),
-            .init(id: "cloud-photo", runtimeId: "cloud", name: "Photo", subtitle: "Cloud Code"),
-            .init(id: "codex1", runtimeId: "codex", name: "Codex1", subtitle: nil), .init(id: "codex2", runtimeId: "codex", name: "Codex2", subtitle: nil), .init(id: "codex6", runtimeId: "codex", name: "Codex6", subtitle: "1 session"), .init(id: "codex11", runtimeId: "codex", name: "Codex11", subtitle: nil), .init(id: "kali-codex", runtimeId: "codex", name: "Kali Codex", subtitle: nil), .init(id: "linux-codex", runtimeId: "codex", name: "Linux Codex", subtitle: nil)]
-        sessions = [.init(id: "photo-upload", instanceId: "photo", title: "上传性能优化", state: .idle, updatedAt: Date()), .init(id: "photo-ios", instanceId: "photo", title: "手机 APP", state: .idle, updatedAt: Date()), .init(id: "excel-permission", instanceId: "excel", title: "权限测试", state: .idle, updatedAt: Date()), .init(id: "cloud-photo-a", instanceId: "cloud-photo", title: "Session A", state: .idle, updatedAt: Date()), .init(id: "codex6-a", instanceId: "codex6", title: "Session A", state: .idle, updatedAt: Date())]
+            InstanceDescriptor(id: "web.chatgpt", runtimeId: "runtime.web", name: "ChatGPT", subtitle: "Web runtime"),
+            InstanceDescriptor(id: "photo", runtimeId: "runtime.web", name: "Photo SaaS", subtitle: "2 conversations"),
+            InstanceDescriptor(id: "excel", runtimeId: "runtime.web", name: "Excel SaaS", subtitle: "1 conversation"),
+            InstanceDescriptor(id: "cloud-photo", runtimeId: "runtime.cloudcode", name: "Photo", subtitle: "Cloud Code"),
+            InstanceDescriptor(id: "codex1", runtimeId: "runtime.codex", name: "Codex1", subtitle: nil),
+            InstanceDescriptor(id: "codex2", runtimeId: "runtime.codex", name: "Codex2", subtitle: nil),
+            InstanceDescriptor(id: "codex6", runtimeId: "runtime.codex", name: "Codex6", subtitle: "1 session"),
+            InstanceDescriptor(id: "codex11", runtimeId: "runtime.codex", name: "Codex11", subtitle: nil),
+            InstanceDescriptor(id: "kali-codex", runtimeId: "runtime.codex", name: "Kali Codex", subtitle: nil),
+            InstanceDescriptor(id: "linux-codex", runtimeId: "runtime.codex", name: "Linux Codex", subtitle: nil)
+        ]
+        sessions = [
+            SessionDescriptor(id: "photo-upload", instanceId: "photo", title: "上传性能优化", state: .idle, updatedAt: Date()),
+            SessionDescriptor(id: "photo-ios", instanceId: "photo", title: "手机 APP", state: .idle, updatedAt: Date()),
+            SessionDescriptor(id: "excel-permission", instanceId: "excel", title: "权限测试", state: .idle, updatedAt: Date()),
+            SessionDescriptor(id: "cloud-photo-a", instanceId: "cloud-photo", title: "Session A", state: .idle, updatedAt: Date()),
+            SessionDescriptor(id: "codex6-a", instanceId: "codex6", title: "Session A", state: .idle, updatedAt: Date())
+        ]
     }
-    private func persistMetadata() async { try? await cache.put(machine, key: "machine"); try? await cache.put(runtimes, key: "runtimes"); try? await cache.put(instances, key: "instances"); try? await cache.put(sessions, key: "sessions") }
+
+    private func persistMetadata() async {
+        try? await cache.put(machine, key: "machine")
+        try? await cache.put(runtimes, key: "runtimes")
+        try? await cache.put(instances, key: "instances")
+        try? await cache.put(sessions, key: "sessions")
+    }
 
     private func ingest(_ event: RemoteEvent) async {
-        let decision = tracker.ingest(event.sequence); if decision.duplicate { return }; if decision.gap { await recoverDelta(); return }
-        try? await cache.setLastSequence(tracker.lastSequence)
-        guard let sessionId = event.sessionId else { return }
-        switch event.type {
-        case "message.delta": bufferDelta(sessionId: sessionId, id: event.payload["messageId"]?.stringValue ?? UUID().uuidString, delta: event.payload["delta"]?.stringValue ?? "")
-        case "message.completed":
-            flushDeltas(); let id = event.payload["messageId"]?.stringValue ?? UUID().uuidString; let text = event.payload["text"]?.stringValue ?? ""; let m = ChatMessage(id: id, sessionId: sessionId, sequence: event.sequence, role: .assistant, kind: .text, text: text, toolName: nil, toolStatus: nil, detail: nil, createdAt: event.createdAt); merge([m], into: sessionId); try? await cache.upsertMessages([m])
-        case "tool.event":
-            let name = event.payload["toolName"]?.stringValue ?? "Tool"; let status = event.payload["status"]?.stringValue ?? "Running"; let m = ChatMessage(id: event.eventId.uuidString, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: name, toolStatus: status, detail: event.payload["detail"]?.stringValue, createdAt: event.createdAt); merge([m], into: sessionId); try? await cache.upsertMessages([m])
-        default: break
+        let decision = tracker.ingest(event.sequence)
+        if decision.duplicate { return }
+        if decision.gap {
+            await recoverDelta()
+            return
         }
+        await applyEvent(event)
+        try? await cache.setLastSequence(event.sequence)
     }
 
     private func recoverDelta() async {
-        let base = (try? await cache.lastSequence()) ?? max(0, tracker.lastSequence - 1)
-        guard let result = try? await transport.delta(after: base) else { return }
-        var recovery = SequenceTracker(lastSequence: base)
-        for event in result.events.sorted(by: { $0.sequence < $1.sequence }) { let d = recovery.ingest(event.sequence); if !d.duplicate && !d.gap { await ingestRecovered(event) } }
-        tracker = SequenceTracker(lastSequence: max(recovery.lastSequence, result.latestSequence)); try? await cache.setLastSequence(tracker.lastSequence)
+        guard machine.state == .online else { return }
+        var cursor = (try? await cache.lastSequence()) ?? 0
+        do {
+            while true {
+                let result = try await transport.delta(machineId: machine.id, after: cursor)
+                for event in result.events.sorted(by: { $0.sequence < $1.sequence }) where event.sequence > cursor {
+                    await applyEvent(event)
+                    cursor = event.sequence
+                    try? await cache.setLastSequence(cursor)
+                }
+                cursor = max(cursor, result.nextCursor)
+                try? await cache.setLastSequence(cursor)
+                if !result.hasMore { break }
+            }
+            tracker = SequenceTracker(lastSequence: cursor)
+        } catch {
+            errors["sync"] = error.localizedDescription
+        }
     }
-    private func ingestRecovered(_ event: RemoteEvent) async { guard let sessionId = event.sessionId else { return }; if event.type == "message.completed" { let m = ChatMessage(id: event.payload["messageId"]?.stringValue ?? event.eventId.uuidString, sessionId: sessionId, sequence: event.sequence, role: .assistant, kind: .text, text: event.payload["text"]?.stringValue ?? "", toolName: nil, toolStatus: nil, detail: nil, createdAt: event.createdAt); merge([m], into: sessionId); try? await cache.upsertMessages([m]) } }
 
-    private func bufferDelta(sessionId: String, id: String, delta: String) {
-        var current = deltaBuffers[sessionId] ?? (id, ""); current.text += delta; deltaBuffers[sessionId] = current
-        if flushTask == nil { flushTask = Task { [weak self] in try? await Task.sleep(nanoseconds: 90_000_000); self?.flushDeltas() } }
+    private func applyEvent(_ event: RemoteEvent) async {
+        guard let sessionId = event.sessionId else {
+            if ["INSTANCE_UPDATED", "RUNTIME_STATUS", "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED"].contains(event.type) {
+                await refreshMetadata()
+            }
+            return
+        }
+
+        switch event.type {
+        case "MESSAGE_UPDATED":
+            let content = event.payload["content"]?.stringValue ?? ""
+            let id = event.payload["messageId"]?.stringValue ?? streamingBuffers[sessionId]?.id ?? "stream-\(sessionId)"
+            bufferStreaming(sessionId: sessionId, id: id, content: content, sequence: event.sequence)
+        case "MESSAGE_ADDED":
+            flushStreaming(sessionId: sessionId)
+            if let server = try? JSONValue.object(event.payload).decode(ServerMessage.self) {
+                let base = server.chatMessage
+                let message = ChatMessage(id: base.id, sessionId: base.sessionId, sequence: event.sequence, role: base.role, kind: base.kind, text: base.text, toolName: nil, toolStatus: nil, detail: nil, createdAt: base.createdAt)
+                merge([message], into: sessionId)
+                try? await cache.upsertMessages([message])
+            }
+        case "TOOL_STARTED", "TOOL_FINISHED":
+            let completed = event.type == "TOOL_FINISHED"
+            let toolValue = event.payload["tool"]
+            let toolName = toolValue?.stringValue ?? toolValue?.objectValue?["name"]?.stringValue ?? toolValue?.objectValue?["type"]?.stringValue ?? "Tool"
+            let detail = event.payload["summary"]?.stringValue ?? event.payload["provider"]?.stringValue
+            let message = ChatMessage(id: event.eventId.uuidString, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: detail, createdAt: event.createdAt)
+            merge([message], into: sessionId)
+            try? await cache.upsertMessages([message])
+        case "GENERATION_STARTED":
+            setSessionState(sessionId, .busy)
+        case "GENERATION_STOPPED":
+            flushStreaming(sessionId: sessionId)
+            setSessionState(sessionId, .idle)
+        case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED":
+            await refreshMetadata()
+        case "COMMAND_RESULT", "COMMAND_REJECTED":
+            if let raw = event.payload["commandId"]?.stringValue, let commandId = UUID(uuidString: raw) {
+                commandStates[commandId] = event.type == "COMMAND_RESULT" ? .completed : .failed
+            }
+        default:
+            break
+        }
     }
-    private func flushDeltas() {
-        for (sessionId, item) in deltaBuffers { var list = messagesBySession[sessionId, default: []]; if let i = list.firstIndex(where: { $0.id == item.id }) { list[i].text = item.text } else { list.append(ChatMessage(id: item.id, sessionId: sessionId, sequence: tracker.lastSequence, role: .assistant, kind: .text, text: item.text, toolName: nil, toolStatus: "Streaming", detail: nil, createdAt: Date())) }; messagesBySession[sessionId] = list }
-        deltaBuffers.removeAll(); flushTask = nil
+
+    private func setSessionState(_ sessionId: String, _ state: SessionState) {
+        if let index = sessions.firstIndex(where: { $0.id == sessionId }) { sessions[index].state = state }
     }
-    private func merge(_ incoming: [ChatMessage], into sessionId: String) { var map = Dictionary(uniqueKeysWithValues: messagesBySession[sessionId, default: []].map { ($0.id, $0) }); for m in incoming { map[m.id] = m }; messagesBySession[sessionId] = map.values.sorted { $0.sequence == $1.sequence ? $0.createdAt < $1.createdAt : $0.sequence < $1.sequence } }
+
+    private func bufferStreaming(sessionId: String, id: String, content: String, sequence: Int64) {
+        streamingBuffers[sessionId] = (id, content, sequence)
+        if flushTask == nil {
+            flushTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 90_000_000)
+                self?.flushAllStreaming()
+            }
+        }
+    }
+
+    private func flushStreaming(sessionId: String) {
+        guard let item = streamingBuffers.removeValue(forKey: sessionId) else { return }
+        var list = messagesBySession[sessionId, default: []]
+        if let index = list.firstIndex(where: { $0.id == item.id }) {
+            list[index].text = item.text
+        } else {
+            list.append(ChatMessage(id: item.id, sessionId: sessionId, sequence: item.sequence, role: .assistant, kind: .text, text: item.text, toolName: nil, toolStatus: "Streaming", detail: nil, createdAt: Date()))
+        }
+        messagesBySession[sessionId] = sortedMessages(list)
+    }
+
+    private func flushAllStreaming() {
+        for sessionId in Array(streamingBuffers.keys) { flushStreaming(sessionId: sessionId) }
+        flushTask = nil
+    }
+
+    private func merge(_ incoming: [ChatMessage], into sessionId: String) {
+        var map = Dictionary(uniqueKeysWithValues: messagesBySession[sessionId, default: []].map { ($0.id, $0) })
+        for message in incoming { map[message.id] = message }
+        messagesBySession[sessionId] = sortedMessages(Array(map.values))
+    }
+
+    private func sortedMessages(_ messages: [ChatMessage]) -> [ChatMessage] {
+        messages.sorted {
+            if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+            return $0.createdAt < $1.createdAt
+        }
+    }
 }

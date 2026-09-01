@@ -3,70 +3,177 @@ import Foundation
 actor CloudflareTransport: Transport {
     private let config: RemoteAIConfig
     private let session: URLSession
+    private let keychain: KeychainStore
+    private let maxInboundFrameBytes = 512 * 1024
+    private let maxOutboundFrameBytes = 256 * 1024
+    private let commandTimeoutNanoseconds: UInt64 = 30_000_000_000
+
     private var socket: URLSessionWebSocketTask?
     private var connected = false
     private var continuation: AsyncStream<RemoteEvent>.Continuation?
     private var stream: AsyncStream<RemoteEvent>?
-    private let keychain: KeychainStore
+    private var pending: [UUID: CheckedContinuation<CommandResponseEnvelope, Error>] = [:]
+    private var timeoutTasks: [UUID: Task<Void, Never>] = [:]
 
     init(config: RemoteAIConfig, session: URLSession = .shared, keychain: KeychainStore = .shared) {
-        self.config = config; self.session = session; self.keychain = keychain
+        self.config = config
+        self.session = session
+        self.keychain = keychain
     }
+
     var isConnected: Bool { connected }
 
     func connect() async throws {
         guard !connected else { return }
-        var request = URLRequest(url: config.webSocketURL)
-        if let secret = keychain.load(account: config.machineId) { request.setValue(secret.base64EncodedString(), forHTTPHeaderField: "X-RemoteAI-Device") }
-        let task = session.webSocketTask(with: request); task.resume(); socket = task; connected = true
-        Task { await receiveLoop() }
+        try RemoteAIConfig.validateSecureRelay(config.relayBaseURL)
+        guard PairingKeyStore.isPaired(machineId: config.machineId, keychain: keychain) else { throw TransportError.pairingRequired }
+        let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
+        let url = try RemoteAIConfig.deviceWebSocketURL(baseURL: config.relayBaseURL, machineId: config.machineId, deviceId: deviceId)
+        let task = session.webSocketTask(with: url, protocols: ["remoteai.v1"])
+        task.maximumMessageSize = maxInboundFrameBytes
+        task.resume()
+        do {
+            try await ping(task)
+            socket = task
+            connected = true
+            Task { [weak self, weak task] in
+                guard let self, let task else { return }
+                await self.receiveLoop(task)
+            }
+        } catch {
+            task.cancel(with: .goingAway, reason: nil)
+            throw error
+        }
     }
+
     func disconnect() async {
-        connected = false; socket?.cancel(with: .goingAway, reason: nil); socket = nil; continuation?.finish()
+        connected = false
+        let active = socket
+        socket = nil
+        active?.cancel(with: .goingAway, reason: nil)
+        failAllPending(with: TransportError.disconnected)
     }
+
     func eventStream() async -> AsyncStream<RemoteEvent> {
         if let stream { return stream }
         var captured: AsyncStream<RemoteEvent>.Continuation?
-        let s = AsyncStream<RemoteEvent> { captured = $0 }
+        let created = AsyncStream<RemoteEvent> { captured = $0 }
         continuation = captured
-        stream = s
-        return s
+        stream = created
+        return created
     }
-    private func receiveLoop() async {
-        while connected, let socket {
-            do {
-                let msg = try await socket.receive(); let data: Data
-                switch msg { case .data(let d): data = d; case .string(let s): data = Data(s.utf8); @unknown default: continue }
-                if let event = try? JSONDecoder.remoteAI.decode(RemoteEvent.self, from: data) { continuation?.yield(event) }
-            } catch { connected = false; continuation?.finish(); break }
+
+    func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
+        guard connected, socket != nil else { throw TransportError.offline }
+        guard command.protocolVersion == 1, command.machineId == config.machineId else { throw TransportError.malformedData }
+        let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
+        guard let key = PairingKeyStore.sharedKey(machineId: config.machineId, keychain: keychain) else { throw TransportError.pairingRequired }
+        let clear = try JSONEncoder.remoteAI.encode(command)
+        guard clear.count <= maxOutboundFrameBytes else { throw TransportError.frameTooLarge }
+        let messageId = UUID().uuidString
+        let encrypted = try PayloadCrypto.encrypt(clear, keyData: key, machineId: config.machineId, deviceId: deviceId, messageId: messageId)
+        guard let encryptedObject = try JSONValue.encode(encrypted).objectValue else { throw TransportError.malformedData }
+        let frame = RelayFrame(v: 1, kind: "ENCRYPTED", machineId: config.machineId, deviceId: deviceId, messageId: messageId, body: encryptedObject)
+
+        return try await withCheckedThrowingContinuation { continuation in
+            pending[command.commandId] = continuation
+            timeoutTasks[command.commandId]?.cancel()
+            timeoutTasks[command.commandId] = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: self?.commandTimeoutNanoseconds ?? 30_000_000_000)
+                guard !Task.isCancelled else { return }
+                await self?.failPending(command.commandId, error: TransportError.timeout)
+            }
+            Task { [weak self] in
+                do { try await self?.sendFrame(frame) }
+                catch { await self?.failPending(command.commandId, error: error) }
+            }
         }
     }
-    func send(_ command: RemoteCommand) async throws -> CommandState {
-        var request = URLRequest(url: config.relayBaseURL.appendingPathComponent("v1/command")); request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let clear = try JSONEncoder.remoteAI.encode(command)
-        if let key = keychain.load(account: config.machineId) {
-            request.setValue("aes-gcm-v1", forHTTPHeaderField: "X-RemoteAI-Payload")
-            request.httpBody = try JSONEncoder.remoteAI.encode(PayloadCrypto.encrypt(clear, keyData: key))
-        } else { request.httpBody = clear }
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw TransportError.malformedData }
-        guard (200..<300).contains(http.statusCode) else { throw TransportError.badResponse(http.statusCode) }
-        if let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let value = raw["state"] as? String, let state = CommandState(rawValue: value) { return state }
-        return .acknowledged
+
+    private func receiveLoop(_ activeSocket: URLSessionWebSocketTask) async {
+        while connected, socket === activeSocket {
+            do {
+                let message = try await activeSocket.receive()
+                let data: Data
+                switch message {
+                case .data(let value): data = value
+                case .string(let value): data = Data(value.utf8)
+                @unknown default: continue
+                }
+                guard data.count <= maxInboundFrameBytes else { throw TransportError.frameTooLarge }
+                let frame = try JSONDecoder.remoteAI.decode(RelayFrame.self, from: data)
+                try await handle(frame)
+            } catch {
+                if socket === activeSocket {
+                    connected = false
+                    socket = nil
+                    activeSocket.cancel(with: .goingAway, reason: nil)
+                    failAllPending(with: TransportError.disconnected)
+                }
+                break
+            }
+        }
     }
-    func delta(after sequence: Int64) async throws -> DeltaSyncResult {
-        try await get(path: "v1/sync", query: [URLQueryItem(name: "after", value: String(sequence))], as: DeltaSyncResult.self)
+
+    private func handle(_ frame: RelayFrame) async throws {
+        guard frame.v == 1, frame.machineId == config.machineId else { return }
+        let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
+        if let frameDevice = frame.deviceId, frameDevice != deviceId { return }
+        if frame.kind == "PING" {
+            try await sendFrame(RelayFrame(v: 1, kind: "PONG", machineId: config.machineId, deviceId: deviceId, messageId: UUID().uuidString, body: ["at": .number(Date().timeIntervalSince1970 * 1000)]))
+            return
+        }
+        guard frame.kind == "ENCRYPTED", let key = PairingKeyStore.sharedKey(machineId: config.machineId, keychain: keychain) else { return }
+        let encrypted = try JSONValue.object(frame.body).decode(EncryptedRelayBody.self)
+        let clear = try PayloadCrypto.decrypt(encrypted, keyData: key, machineId: config.machineId, deviceId: deviceId, messageId: frame.messageId)
+        guard clear.count <= maxInboundFrameBytes else { throw TransportError.frameTooLarge }
+        let payload = try JSONDecoder.remoteAI.decode(DecryptedRelayPayload.self, from: clear)
+
+        if payload.kind == "event", let event = payload.event {
+            continuation?.yield(event)
+            return
+        }
+        if payload.kind == "commandResponse", let rawId = payload.commandId, let id = UUID(uuidString: rawId), let response = payload.response {
+            if let event = payload.event { continuation?.yield(event) }
+            completePending(id, response: response)
+            return
+        }
+        if payload.kind == "error", let error = payload.error {
+            failAllPending(with: TransportError.remote(error.code, error.message))
+        }
     }
-    func loadRecent(sessionId: String, limit: Int) async throws -> Page<ChatMessage> {
-        try await get(path: "v1/messages/recent", query: [.init(name: "sessionId", value: sessionId), .init(name: "limit", value: String(limit))], as: Page<ChatMessage>.self)
+
+    private func sendFrame(_ frame: RelayFrame) async throws {
+        guard connected, let socket else { throw TransportError.disconnected }
+        let data = try JSONEncoder.remoteAI.encode(frame)
+        guard data.count <= maxOutboundFrameBytes else { throw TransportError.frameTooLarge }
+        try await socket.send(.data(data))
     }
-    func loadBefore(sessionId: String, before: Int64, limit: Int) async throws -> Page<ChatMessage> {
-        try await get(path: "v1/messages/before", query: [.init(name: "sessionId", value: sessionId), .init(name: "before", value: String(before)), .init(name: "limit", value: String(limit))], as: Page<ChatMessage>.self)
+
+    private func completePending(_ id: UUID, response: CommandResponseEnvelope) {
+        timeoutTasks.removeValue(forKey: id)?.cancel()
+        pending.removeValue(forKey: id)?.resume(returning: response)
     }
-    private func get<T: Decodable>(path: String, query: [URLQueryItem], as type: T.Type) async throws -> T {
-        var c = URLComponents(url: config.relayBaseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!; c.queryItems = query
-        var r = URLRequest(url: c.url!); if let secret = keychain.load(account: config.machineId) { r.setValue(secret.base64EncodedString(), forHTTPHeaderField: "X-RemoteAI-Device") }
-        let (data, response) = try await session.data(for: r); guard let http = response as? HTTPURLResponse else { throw TransportError.malformedData }; guard (200..<300).contains(http.statusCode) else { throw TransportError.badResponse(http.statusCode) }
-        return try JSONDecoder.remoteAI.decode(T.self, from: data)
+
+    private func failPending(_ id: UUID, error: Error) {
+        timeoutTasks.removeValue(forKey: id)?.cancel()
+        pending.removeValue(forKey: id)?.resume(throwing: error)
+    }
+
+    private func failAllPending(with error: Error) {
+        let continuations = pending
+        pending.removeAll()
+        for task in timeoutTasks.values { task.cancel() }
+        timeoutTasks.removeAll()
+        for continuation in continuations.values { continuation.resume(throwing: error) }
+    }
+
+    private func ping(_ socket: URLSessionWebSocketTask) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            socket.sendPing { error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume(returning: ()) }
+            }
+        }
     }
 }

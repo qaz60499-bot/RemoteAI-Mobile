@@ -1,28 +1,102 @@
 {
-  "protocolVersion": "1",
-  "command": {
-    "required": ["protocolVersion", "commandId", "machineId", "runtimeId", "instanceId", "action", "payload", "createdAt"],
-    "optional": ["sessionId"],
-    "actions": {
-      "SYSTEM": ["getStatus", "listRuntimes", "listInstances", "listSessions"],
-      "SESSION": ["createSession", "resumeSession", "stopSession", "getSessionStatus"],
-      "CHAT": ["sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore"],
-      "SYNC": ["getChangesAfterCursor"],
-      "WEB": ["registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation"]
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://remoteai.local/contracts/protocol-v1.json",
+  "title": "RemoteAI Protocol v1",
+  "type": "object",
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "runtimeKind": { "type": "string", "enum": ["Web", "CloudCode", "Codex"] },
+    "action": {
+      "type": "string",
+      "enum": [
+        "getStatus", "listRuntimes", "listInstances", "listSessions",
+        "createSession", "resumeSession", "stopSession", "getSessionStatus",
+        "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore",
+        "getChangesAfterCursor",
+        "registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation"
+      ]
+    },
+    "eventType": {
+      "type": "string",
+      "enum": [
+        "COMMAND_RESULT", "COMMAND_REJECTED", "SYSTEM_STATUS", "RUNTIME_STATUS",
+        "INSTANCE_UPDATED", "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS",
+        "MESSAGE_ADDED", "MESSAGE_UPDATED", "GENERATION_STARTED", "GENERATION_STOPPED",
+        "TOOL_STARTED", "TOOL_FINISHED", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED",
+        "WEB_BINDING_CHANGED", "WEB_SELECTOR_DEGRADED", "PAIRING_REQUESTED", "DEVICE_PAIRED",
+        "DEVICE_REJECTED", "TRANSPORT_STATUS"
+      ]
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "commandId", "machineId", "runtimeId", "instanceId", "action", "payload", "createdAt"],
+      "properties": {
+        "protocolVersion": { "const": 1 },
+        "commandId": { "$ref": "#/$defs/id" },
+        "machineId": { "$ref": "#/$defs/id" },
+        "runtimeId": { "$ref": "#/$defs/id" },
+        "instanceId": { "$ref": "#/$defs/id" },
+        "sessionId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "action": { "$ref": "#/$defs/action" },
+        "payload": { "type": "object" },
+        "createdAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "eventId", "sequence", "machineId", "runtimeId", "instanceId", "sessionId", "type", "payload", "createdAt"],
+      "properties": {
+        "protocolVersion": { "const": 1 },
+        "eventId": { "$ref": "#/$defs/id" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "machineId": { "$ref": "#/$defs/id" },
+        "runtimeId": { "$ref": "#/$defs/id" },
+        "instanceId": { "$ref": "#/$defs/id" },
+        "sessionId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "type": { "$ref": "#/$defs/eventType" },
+        "payload": { "type": "object" },
+        "createdAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "relayFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["v", "kind", "machineId", "deviceId", "messageId", "body"],
+      "properties": {
+        "v": { "const": 1 },
+        "kind": { "type": "string", "enum": ["PAIR_REQUEST", "PAIR_CHALLENGE", "PAIR_PROOF", "PAIR_ACCEPT", "ENCRYPTED", "ACK", "PING", "PONG"] },
+        "machineId": { "$ref": "#/$defs/id" },
+        "deviceId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "messageId": { "$ref": "#/$defs/id" },
+        "body": { "type": "object" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "INVALID_COMMAND", "UNAUTHORIZED_DEVICE", "UNKNOWN_RUNTIME", "UNKNOWN_INSTANCE", "UNKNOWN_SESSION",
+            "CAPABILITY_DENIED", "ALREADY_EXECUTED", "BROWSER_NOT_CONNECTED", "BROWSER_BINDING_MISSING",
+            "WEB_SELECTOR_FAILED", "PROVIDER_UNAVAILABLE", "SESSION_UNAVAILABLE", "PAGINATION_CURSOR_INVALID",
+            "TRANSPORT_OFFLINE", "INTERNAL_ERROR"
+          ]
+        },
+        "message": { "type": "string" },
+        "retryable": { "type": "boolean", "default": false },
+        "details": { "type": "object" }
+      }
     }
   },
-  "event": {
-    "required": ["protocolVersion", "eventId", "sequence", "machineId", "runtimeId", "instanceId", "type", "payload", "createdAt"],
-    "optional": ["sessionId"],
-    "ordering": "sequence is monotonically increasing per machine stream; clients dedupe sequence <= lastSequence and recover gaps with getChangesAfterCursor(lastSequence)"
-  },
-  "commandLifecycle": ["Pending", "Acknowledged", "Executing", "Completed", "Failed", "Unknown"],
-  "machineStates": ["Online", "Offline", "Connecting"],
-  "sessionStates": ["Idle", "Busy", "Waiting", "Sleeping", "Error"],
-  "webStates": ["Registered", "BrowserClosed", "Attached", "Unsupported"],
-  "security": {
-    "pairing": "Windows presents QR/pairing code; iOS stores returned shared secret in Keychain",
-    "payloadEncryption": "AES-256-GCM envelope when a pairing secret is available",
-    "credentialHandling": "iOS may send credentialProfileId only; provider keys never leave Windows"
-  }
+  "oneOf": [
+    { "$ref": "#/$defs/command" },
+    { "$ref": "#/$defs/event" },
+    { "$ref": "#/$defs/relayFrame" }
+  ]
 }

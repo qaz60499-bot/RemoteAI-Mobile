@@ -184,13 +184,62 @@ struct NewSessionView: View {
 struct PairingView: View {
     @EnvironmentObject var store: WorkspaceStore
     @Environment(\.dismiss) private var dismiss
-    @State private var relay = "https://relay.example.invalid"; @State private var code = ""; @State private var scanner = false; @State private var error: String?
+    @State private var relay = RemoteAIConfig.loadMetadata().relayBaseURL.absoluteString
+    @State private var machineId = RemoteAIConfig.loadMetadata().machineId
+    @State private var code = ""
+    @State private var scanner = false
+    @State private var error: String?
+
     var body: some View {
         NavigationView { Form {
-            Section("Windows Relay") { TextField("https://relay.example.com", text: $relay).textInputAutocapitalization(.never).autocorrectionDisabled(true); TextField("Pairing code", text: $code).textInputAutocapitalization(.never).autocorrectionDisabled(true); Button { scanner = true } label: { Label("Scan QR Code", systemImage: "qrcode.viewfinder") } }
-            Section { Text("The pairing secret is stored only in iOS Keychain. Relay URLs may be cached, but secrets are never written to UserDefaults or SQLite.").font(.caption).foregroundColor(.secondary) }
+            Section("Windows Relay") {
+                TextField("https://relay.example.com", text: $relay).textInputAutocapitalization(.never).autocorrectionDisabled(true)
+                TextField("Machine ID", text: $machineId).textInputAutocapitalization(.never).autocorrectionDisabled(true)
+                TextField("8-digit pairing code", text: $code).keyboardType(.numberPad).textInputAutocapitalization(.never).autocorrectionDisabled(true)
+                Button { scanner = true } label: { Label("Scan QR Code", systemImage: "qrcode.viewfinder") }
+            }
+            Section {
+                Text("Pairing uses X25519 + HKDF-SHA256. Device private/shared keys are ThisDeviceOnly Keychain items; Cloudflare only routes AES-256-GCM encrypted payloads.").font(.caption).foregroundColor(.secondary)
+            }
             if let error { Section { Text(error).foregroundColor(.red).font(.caption) } }
-        }.remoteAITopBreathingRoom().navigationTitle("Pair Device").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Pair") { Task { guard let url = URL(string: relay), !code.isEmpty else { error = "Enter a valid relay URL and code."; return }; do { try await store.savePairing(baseURL: url, code: code); dismiss() } catch { self.error = error.localizedDescription } } } } }.sheet(isPresented: $scanner) { QRScannerView { value in code = value; scanner = false } } }
+        }
+        .remoteAITopBreathingRoom()
+        .navigationTitle("Pair Device")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Pair") {
+                    Task {
+                        guard let url = URL(string: relay), !machineId.isEmpty, code.count == 8 else { error = "Enter an HTTPS relay URL, Machine ID, and 8-digit code."; return }
+                        do { try await store.savePairing(baseURL: url, machineId: machineId, code: code); dismiss() }
+                        catch { self.error = error.localizedDescription }
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $scanner) {
+            QRScannerView { value in
+                applyScannedPairing(value)
+                scanner = false
+            }
+        } }
+    }
+
+    private func applyScannedPairing(_ value: String) {
+        if value.count == 8, value.allSatisfy({ $0.isNumber }) { code = value; return }
+        if let data = value.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            if let v = object["relayBaseURL"] ?? object["relay"] { relay = v }
+            if let v = object["machineId"] { machineId = v }
+            if let v = object["pairingCode"] ?? object["code"] { code = v }
+            return
+        }
+        if let url = URL(string: value), let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            let values = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item in item.value.map { (item.name, $0) } })
+            if let v = values["relay"] { relay = v }
+            if let v = values["machineId"] { machineId = v }
+            if let v = values["code"] { code = v }
+        }
     }
 }
 

@@ -2,110 +2,185 @@ import XCTest
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
-    func testCommandRoundTripKeepsIdempotencyId() throws {
+    func testCommandRoundTripKeepsIdempotencyIdAndNumericProtocolVersion() throws {
         let id = UUID()
-        let c = RemoteCommand.make(machineId: "pc", runtimeId: "web", instanceId: "chatgpt", sessionId: "s", action: "sendMessage", payload: ["text": .string("hello")], commandId: id)
-        let data = try JSONEncoder.remoteAI.encode(c)
-        let decoded = try JSONDecoder.remoteAI.decode(RemoteCommand.self, from: data)
+        let command = RemoteCommand.make(machineId: "pc", runtimeId: "runtime.web", instanceId: "agent", sessionId: "s", action: "sendMessage", payload: ["text": .string("hello")], commandId: id)
+        let decoded = try JSONDecoder.remoteAI.decode(RemoteCommand.self, from: JSONEncoder.remoteAI.encode(command))
         XCTAssertEqual(decoded.commandId, id)
-        XCTAssertEqual(decoded.protocolVersion, "1")
+        XCTAssertEqual(decoded.protocolVersion, 1)
         XCTAssertEqual(decoded.payload["text"]?.stringValue, "hello")
     }
 
     func testEventRoundTripPreservesSequence() throws {
-        let e = RemoteEvent(protocolVersion: "1", eventId: UUID(), sequence: 42, machineId: "pc", runtimeId: "codex", instanceId: "codex6", sessionId: "s", type: "message.completed", payload: ["text": .string("ok")], createdAt: Date())
-        let decoded = try JSONDecoder.remoteAI.decode(RemoteEvent.self, from: JSONEncoder.remoteAI.encode(e))
+        let event = RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 42, machineId: "pc", runtimeId: "runtime.codex", instanceId: "codex6", sessionId: "s", type: "MESSAGE_ADDED", payload: ["content": .string("ok")], createdAt: Date())
+        let decoded = try JSONDecoder.remoteAI.decode(RemoteEvent.self, from: JSONEncoder.remoteAI.encode(event))
         XCTAssertEqual(decoded.sequence, 42)
-        XCTAssertEqual(decoded.type, "message.completed")
+        XCTAssertEqual(decoded.type, "MESSAGE_ADDED")
     }
 
     func testSequenceTrackerDropsDuplicate() {
-        var t = SequenceTracker(lastSequence: 10)
-        XCTAssertTrue(t.ingest(10).duplicate)
-        XCTAssertFalse(t.ingest(11).duplicate)
-        XCTAssertEqual(t.lastSequence, 11)
+        var tracker = SequenceTracker(lastSequence: 10)
+        XCTAssertTrue(tracker.ingest(10).duplicate)
+        XCTAssertFalse(tracker.ingest(11).duplicate)
+        XCTAssertEqual(tracker.lastSequence, 11)
     }
 
     func testSequenceTrackerDetectsGap() {
-        var t = SequenceTracker(lastSequence: 10)
-        let d = t.ingest(13)
-        XCTAssertTrue(d.gap)
-        XCTAssertFalse(d.duplicate)
+        var tracker = SequenceTracker(lastSequence: 10)
+        let decision = tracker.ingest(13)
+        XCTAssertTrue(decision.gap)
+        XCTAssertFalse(decision.duplicate)
     }
 
-    func testCryptoRoundTrip() throws {
-        let key = PayloadCrypto.mockPairingKey(code: "123456", machineId: "my-pc")
+    func testBase64URLRoundTrip() throws {
+        let data = Data([0xfb, 0xff, 0x00, 0x10, 0x7f])
+        let encoded = Base64URL.encode(data)
+        XCTAssertFalse(encoded.contains("+"))
+        XCTAssertFalse(encoded.contains("/"))
+        XCTAssertFalse(encoded.contains("="))
+        XCTAssertEqual(Base64URL.decode(encoded), data)
+    }
+
+    func testWindowsPairingProofVector() {
+        let proof = PayloadCrypto.pairingProof(
+            pairingCode: "12345678",
+            challenge: "challenge_test_123",
+            machineId: "machine-test-001",
+            deviceId: "ios-test-001",
+            devicePublicKeyB64: "MCowBQYDK2VuAyEAT14+n+/J0UNC2Z8kSyBbnt4dU2+P8xOCPKc14UHIF3g="
+        )
+        XCTAssertEqual(proof, "-aimXXz2Bt84NKf1cpt3YSeTSI6PhPrOP7PxTY6a7Fo")
+    }
+
+    func testWindowsX25519HKDFVector() throws {
+        let privatePKCS8 = Data(base64Encoded: "MC4CAQAwBQYDK2VuBCIEIDDswlYnNeavIx4tzsUq2sYCQc1nAZTUU80ahYByK/x4")!
+        let privateRaw = Data(privatePKCS8.suffix(32))
+        let key = try PayloadCrypto.deriveSharedKey(
+            privateKeyRaw: privateRaw,
+            machinePublicKeyB64: "MCowBQYDK2VuAyEAVr06jCbV51kSzd0v7tBO792LaFqWw1OmZ8FX5LdMhzY=",
+            machineId: "machine-test-001",
+            deviceId: "ios-test-001"
+        )
+        XCTAssertEqual(key.base64EncodedString(), "6zdQi/1ISlyQF1K/60BC1faFTOYa5Po/LUm7TUKdTAI=")
+    }
+
+    func testDecryptsWindowsAESGCMVector() throws {
+        let key = Data(base64Encoded: "6zdQi/1ISlyQF1K/60BC1faFTOYa5Po/LUm7TUKdTAI=")!
+        let body = EncryptedRelayBody(
+            alg: "A256GCM",
+            nonce: "7bbcpBwLpVmbPZzm",
+            ciphertext: "DZ543nZlttX-MuGry7Ssuj6f8H_aRqIfkDq2KiO-kjnRMP8mTPNydYEkKE5SOTIJ_AfpdcdovPWHyJuw1MXQ3o7G4qeW1pxa074SnqIjvPWIwLPMNGAOlOtnLYk7FXYqN3ypTnl8EbBUkyWwp9hudQ8QpeF3CgH_7afdZ7a6sQqEFy_7qmcmzJ0L1ExsFQWVsjh5fzwxMPV1BTzqpfvBK7sb_UrsuN64pU2jQM0GT_McofWgy0WhynqjRC1SAtI37DGcSMvoEnnL3bjEGJRZMTz3BHdURdTou_ezvzh_KxG_DcSZsJOxZUVoEk44rvNDOrAl",
+            tag: "FMq6uFeoyzsM0QB9326P2A"
+        )
+        let clear = try PayloadCrypto.decrypt(body, keyData: key, machineId: "machine-test-001", deviceId: "ios-test-001", messageId: "00000000-0000-0000-0000-000000000099")
+        let command = try JSONDecoder.remoteAI.decode(RemoteCommand.self, from: clear)
+        XCTAssertEqual(command.protocolVersion, 1)
+        XCTAssertEqual(command.action, "listRuntimes")
+        XCTAssertEqual(command.runtimeId, "runtime.web")
+    }
+
+    func testAESGCMRoundTripUsesAAD() throws {
+        let key = Data(repeating: 7, count: 32)
         let clear = Data("secret payload".utf8)
-        let encrypted = try PayloadCrypto.encrypt(clear, keyData: key)
-        XCTAssertNotEqual(encrypted.ciphertext, clear)
-        XCTAssertEqual(try PayloadCrypto.decrypt(encrypted, keyData: key), clear)
+        let body = try PayloadCrypto.encrypt(clear, keyData: key, machineId: "machine-a", deviceId: "device-a", messageId: "message-a")
+        XCTAssertEqual(try PayloadCrypto.decrypt(body, keyData: key, machineId: "machine-a", deviceId: "device-a", messageId: "message-a"), clear)
+        XCTAssertThrowsError(try PayloadCrypto.decrypt(body, keyData: key, machineId: "machine-a", deviceId: "device-a", messageId: "message-b"))
+    }
+
+    func testRelayRejectsPlainHTTP() {
+        XCTAssertThrowsError(try RemoteAIConfig.validateSecureRelay(URL(string: "http://example.com")!))
+        XCTAssertNoThrow(try RemoteAIConfig.validateSecureRelay(URL(string: "https://example.com")!))
+    }
+
+    func testRelayDeviceURLUsesFrozenConnectContract() throws {
+        let url = try RemoteAIConfig.deviceWebSocketURL(baseURL: URL(string: "https://relay.example.com/base")!, machineId: "machine-a", deviceId: "ios-a")
+        XCTAssertEqual(url.scheme, "wss")
+        XCTAssertEqual(url.path, "/connect")
+        let values = Dictionary(uniqueKeysWithValues: URLComponents(url: url, resolvingAgainstBaseURL: false)!.queryItems!.map { ($0.name, $0.value ?? "") })
+        XCTAssertEqual(values["machineId"], "machine-a")
+        XCTAssertEqual(values["role"], "device")
+        XCTAssertEqual(values["deviceId"], "ios-a")
+    }
+
+    func testMockListsFrozenRuntimeIds() async throws {
+        let mock = MockTransport(historyCount: 10)
+        try await mock.connect()
+        let runtimes = try await mock.listRuntimes(machineId: "my-pc")
+        XCTAssertEqual(Set(runtimes.map(\.id)), Set(["runtime.web", "runtime.cloudcode", "runtime.codex"]))
+        XCTAssertEqual(runtimes.first(where: { $0.id == "runtime.cloudcode" })?.kind, .cloudCode)
     }
 
     func testMockRecentIsPaginated() async throws {
         let mock = MockTransport(historyCount: 1200)
         try await mock.connect()
-        let page = try await mock.loadRecent(sessionId: "photo-upload", limit: 50)
+        let page = try await mock.loadRecent(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", limit: 50)
         XCTAssertEqual(page.items.count, 50)
         XCTAssertTrue(page.hasMore)
-        XCTAssertEqual(page.items.last?.sequence, 1200)
+        XCTAssertEqual(page.items.last?.id, "mock-1200")
     }
 
-    func testMockLoadBeforeReturnsOlderPage() async throws {
+    func testMockLoadBeforeUsesCreatedAtAndMessageIdCursor() async throws {
         let mock = MockTransport(historyCount: 1200)
-        let page = try await mock.loadBefore(sessionId: "photo-upload", before: 1151, limit: 40)
-        XCTAssertEqual(page.items.count, 40)
-        XCTAssertTrue(page.items.allSatisfy { $0.sequence < 1151 })
+        try await mock.connect()
+        let recent = try await mock.loadRecent(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", limit: 50)
+        let cursor = try XCTUnwrap(recent.items.first?.cursor)
+        let older = try await mock.loadBefore(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", before: cursor, limit: 40)
+        XCTAssertEqual(older.items.count, 40)
+        XCTAssertTrue(older.items.allSatisfy { $0.createdAt < cursor.createdAt || ($0.createdAt == cursor.createdAt && $0.id < cursor.messageId) })
     }
 
-    func testMockCommandIdempotency() async throws {
+    func testMockCommandIdempotencyReturnsReplay() async throws {
         let mock = MockTransport(historyCount: 10)
         try await mock.connect()
         let id = UUID()
-        let c = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage", payload: ["text": .string("once")], commandId: id)
-        let first = try await mock.send(c)
-        let second = try await mock.send(c)
-        XCTAssertEqual(first, .acknowledged)
-        XCTAssertEqual(second, .acknowledged)
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage", payload: ["text": .string("once")], commandId: id)
+        let first = try await mock.execute(command)
+        let second = try await mock.execute(command)
+        XCTAssertTrue(first.ok)
+        XCTAssertEqual(second.idempotentReplay, true)
     }
 
-    func testMockOfflineRejectsSend() async {
+    func testMockOfflineRejectsConnect() async {
         let mock = MockTransport(scenario: .offline, historyCount: 10)
-        do { try await mock.connect(); XCTFail("Expected offline") } catch { XCTAssertEqual(error as? TransportError, .offline) }
+        do { try await mock.connect(); XCTFail("Expected offline") }
+        catch { XCTAssertEqual(error as? TransportError, .offline) }
     }
 
     func testMockStreamingToolAndCompletionEvents() async throws {
         let mock = MockTransport(historyCount: 10)
         try await mock.connect()
-        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage", payload: ["text": .string("stream")])
-        _ = try await mock.send(command)
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage", payload: ["text": .string("stream")])
+        _ = try await mock.execute(command)
         try await Task.sleep(nanoseconds: 800_000_000)
-        let events = try await mock.delta(after: 0).events
-        let types = events.map(\.type)
-        XCTAssertTrue(types.contains("command.acknowledged"))
-        XCTAssertTrue(types.contains("command.executing"))
-        XCTAssertTrue(types.contains("message.delta"))
-        XCTAssertTrue(types.contains("message.completed"))
-        XCTAssertTrue(types.contains("tool.event"))
-        XCTAssertTrue(events.contains { $0.type == "tool.event" && $0.payload["status"]?.stringValue == "Completed" })
+        let events = try await mock.delta(machineId: "my-pc", after: 0).events
+        let types = Set(events.map(\.type))
+        XCTAssertTrue(types.contains("GENERATION_STARTED"))
+        XCTAssertTrue(types.contains("MESSAGE_UPDATED"))
+        XCTAssertTrue(types.contains("MESSAGE_ADDED"))
+        XCTAssertTrue(types.contains("TOOL_STARTED"))
+        XCTAssertTrue(types.contains("TOOL_FINISHED"))
+        XCTAssertTrue(types.contains("GENERATION_STOPPED"))
     }
 
     func testMockCommandFailureScenario() async throws {
         let mock = MockTransport(scenario: .commandFailure, historyCount: 10)
         try await mock.connect()
-        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
         do {
             _ = try await mock.send(command)
             XCTFail("Expected command failure")
         } catch {
-            XCTAssertEqual(error as? TransportError, .badResponse(503))
+            guard let transportError = error as? TransportError else { return XCTFail("Unexpected error: \(error)") }
+            guard case .remote(let code, _) = transportError else { return XCTFail("Unexpected transport error: \(transportError)") }
+            XCTAssertEqual(code, "PROVIDER_UNAVAILABLE")
         }
     }
 
     func testMockDisconnectThenReconnectScenario() async throws {
         let mock = MockTransport(scenario: .disconnect, historyCount: 10)
         try await mock.connect()
-        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
-        _ = try await mock.send(command)
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
+        _ = try await mock.execute(command)
         try await Task.sleep(nanoseconds: 800_000_000)
         let disconnected = await mock.isConnected
         XCTAssertFalse(disconnected)
@@ -118,10 +193,10 @@ final class RemoteAIMobileTests: XCTestCase {
     func testMockSequenceGapScenario() async throws {
         let mock = MockTransport(scenario: .sequenceGap, historyCount: 10)
         try await mock.connect()
-        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
-        _ = try await mock.send(command)
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
+        _ = try await mock.execute(command)
         try await Task.sleep(nanoseconds: 800_000_000)
-        let sequences = try await mock.delta(after: 0).events.map(\.sequence).sorted()
+        let sequences = try await mock.delta(machineId: "my-pc", after: 0).events.map(\.sequence).sorted()
         let hasGap = zip(sequences, sequences.dropFirst()).contains { pair in pair.1 > pair.0 + 1 }
         XCTAssertTrue(hasGap)
     }
@@ -134,14 +209,11 @@ final class RemoteAIMobileTests: XCTestCase {
         let reader = Task {
             var seen = Set<UUID>()
             for await event in stream {
-                if !seen.insert(event.eventId).inserted {
-                    duplicate.fulfill()
-                    break
-                }
+                if !seen.insert(event.eventId).inserted { duplicate.fulfill(); break }
             }
         }
-        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
-        _ = try await mock.send(command)
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
+        _ = try await mock.execute(command)
         await fulfillment(of: [duplicate], timeout: 3.0)
         reader.cancel()
     }
@@ -158,23 +230,27 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(restoredSequence, 99)
     }
 
-    func testSQLiteMessagePagination() async throws {
+    func testSQLiteMessagePaginationUsesStableCursor() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
         let db = try SQLiteStore(url: url)
-        let items = (1...100).map { ChatMessage(id: "m\($0)", sessionId: "s", sequence: Int64($0), role: .assistant, kind: .text, text: "\($0)", toolName: nil, toolStatus: nil, detail: nil, createdAt: Date()) }
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let items = (1...100).map { index in
+            ChatMessage(id: String(format: "m%03d", index), sessionId: "s", sequence: nil, role: .assistant, kind: .text, text: "\(index)", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(Double(index)))
+        }
         try await db.upsertMessages(items)
         let recent = try await db.recentMessages(sessionId: "s", limit: 30)
         XCTAssertEqual(recent.count, 30)
-        XCTAssertEqual(recent.first?.sequence, 71)
-        let older = try await db.messagesBefore(sessionId: "s", before: 71, limit: 20)
-        XCTAssertEqual(older.first?.sequence, 51)
+        XCTAssertEqual(recent.first?.id, "m071")
+        let cursor = try XCTUnwrap(recent.first?.cursor)
+        let older = try await db.messagesBefore(sessionId: "s", before: cursor, limit: 20)
+        XCTAssertEqual(older.first?.id, "m051")
         let count = try await db.messageCount(sessionId: "s")
         XCTAssertEqual(count, 100)
     }
 
     func testRuntimeHierarchyNamesAreDistinct() {
-        XCTAssertEqual(RuntimeKind.web.rawValue, "Web")
-        XCTAssertEqual(RuntimeKind.cloudCode.rawValue, "Cloud Code")
-        XCTAssertEqual(RuntimeKind.codex.rawValue, "Codex")
+        XCTAssertEqual(RuntimeKind.web.displayName, "Web")
+        XCTAssertEqual(RuntimeKind.cloudCode.displayName, "Cloud Code")
+        XCTAssertEqual(RuntimeKind.codex.displayName, "Codex")
     }
 }
