@@ -240,6 +240,34 @@ final class ProtocolSecurityTests: XCTestCase {
         run("strict Base64URL rejects padding") {
             if Base64URL.decode("-_8=") == nil { throw TransportError.malformedData }
         }
+        run("strict Base64URL rejects non-canonical trailing bits") {
+            if Base64URL.decode("AB") == nil { throw TransportError.malformedData }
+        }
+        run("decrypted event rejects branch-confusion field") {
+            var object: [String: Any] = ["kind": "event", "event": validEventObject()]
+            object["commandId"] = "00000000-0000-0000-0000-000000000101"
+            _ = try ProtocolSecurity.decodeDecryptedPayload(json(object), expectedMachineId: "my-pc")
+        }
+        run("decrypted commandResponse rejects nested unexpected field") {
+            let object: [String: Any] = [
+                "kind": "commandResponse",
+                "commandId": "00000000-0000-0000-0000-000000000101",
+                "response": ["ok": true, "debug": true]
+            ]
+            _ = try ProtocolSecurity.decodeDecryptedPayload(json(object), expectedMachineId: "my-pc")
+        }
+        run("decrypted error rejects unknown error code") {
+            let object: [String: Any] = ["kind": "error", "error": ["code": "UNKNOWN_SECURITY_CODE", "message": "no"]]
+            _ = try ProtocolSecurity.decodeDecryptedPayload(json(object), expectedMachineId: "my-pc")
+        }
+        run("decrypted error rejects unexpected nested field") {
+            let object: [String: Any] = ["kind": "error", "error": ["code": "INTERNAL_ERROR", "message": "no", "debug": true]]
+            _ = try ProtocolSecurity.decodeDecryptedPayload(json(object), expectedMachineId: "my-pc")
+        }
+        run("decrypted payload rejects unknown kind") {
+            let object: [String: Any] = ["kind": "commandPush", "event": validEventObject()]
+            _ = try ProtocolSecurity.decodeDecryptedPayload(json(object), expectedMachineId: "my-pc")
+        }
 
         var replay = BoundedReplayGuard(capacity: 4)
         XCTAssertTrue(replay.accept("message-1"))
@@ -248,7 +276,7 @@ final class ProtocolSecurityTests: XCTestCase {
             throw TransportError.replayDetected
         }
 
-        XCTAssertEqual(total, 34)
+        XCTAssertEqual(total, 40)
         XCTAssertEqual(passed, total)
         print("PROTOCOL_FUZZ_NEGATIVE cases=\(total) pass=\(passed) fail=\(total - passed)")
     }
@@ -409,7 +437,7 @@ final class ProtocolSecurityTests: XCTestCase {
     }
 
     func testProtocolFuzzManifestCount() {
-        let protocolNegative = 34
+        let protocolNegative = 40
         let cryptoNegative = 8
         let sizeAndOversize = 5
         let sequenceRecovery = 2
@@ -419,7 +447,7 @@ final class ProtocolSecurityTests: XCTestCase {
         let rapidReconnect = 1
         let duplicateReconnectRecovery = 1
         let total = protocolNegative + cryptoNegative + sizeAndOversize + sequenceRecovery + numericBoundary + commandReplay + disconnectAfterSend + rapidReconnect + duplicateReconnectRecovery
-        XCTAssertEqual(total, 56)
+        XCTAssertEqual(total, 62)
         print("PROTOCOL_FUZZ_TOTAL cases=\(total) vectors=5")
     }
 

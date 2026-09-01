@@ -10,6 +10,8 @@ actor CloudflareTransport: Transport {
 
     private var socket: URLSessionWebSocketTask?
     private var connected = false
+    private var connecting = false
+    private var connectionWaiters: [CheckedContinuation<Void, Error>] = []
     private var continuation: AsyncStream<RemoteEvent>.Continuation?
     private var stream: AsyncStream<RemoteEvent>?
     private var pending: [UUID: CheckedContinuation<CommandResponseEnvelope, Error>] = [:]
@@ -25,26 +27,44 @@ actor CloudflareTransport: Transport {
     var isConnected: Bool { connected }
 
     func connect() async throws {
-        guard !connected else { return }
-        try RemoteAIConfig.validateSecureRelay(config.relayBaseURL)
-        guard PairingKeyStore.isPaired(machineId: config.machineId, keychain: keychain) else { throw TransportError.pairingRequired }
-        try ProtocolSecurity.validateIdentifier(config.machineId)
-        let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
-        try ProtocolSecurity.validateIdentifier(deviceId)
-        let url = try RemoteAIConfig.deviceWebSocketURL(baseURL: config.relayBaseURL, machineId: config.machineId, deviceId: deviceId)
-        let task = session.webSocketTask(with: url, protocols: ["remoteai.v1"])
-        task.maximumMessageSize = maxInboundFrameBytes
-        task.resume()
+        if connected { return }
+        if connecting {
+            try await withCheckedThrowingContinuation { continuation in
+                connectionWaiters.append(continuation)
+            }
+            return
+        }
+
+        connecting = true
+        var attemptedSocket: URLSessionWebSocketTask?
         do {
-            try await ping(task)
+            try RemoteAIConfig.validateSecureRelay(config.relayBaseURL)
+            guard PairingKeyStore.isPaired(machineId: config.machineId, keychain: keychain) else { throw TransportError.pairingRequired }
+            try ProtocolSecurity.validateIdentifier(config.machineId)
+            let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
+            try ProtocolSecurity.validateIdentifier(deviceId)
+            let url = try RemoteAIConfig.deviceWebSocketURL(baseURL: config.relayBaseURL, machineId: config.machineId, deviceId: deviceId)
+            let task = session.webSocketTask(with: url, protocols: ["remoteai.v1"])
+            attemptedSocket = task
+            task.maximumMessageSize = maxInboundFrameBytes
             socket = task
+            task.resume()
+            try await ping(task)
+            guard socket === task else { throw TransportError.disconnected }
             connected = true
+            connecting = false
+            finishConnectionWaiters()
             Task { [weak self, weak task] in
                 guard let self, let task else { return }
                 await self.receiveLoop(task)
             }
         } catch {
-            task.cancel(with: .goingAway, reason: nil)
+            if let attemptedSocket, socket === attemptedSocket {
+                socket = nil
+                attemptedSocket.cancel(with: .goingAway, reason: nil)
+            }
+            connecting = false
+            finishConnectionWaiters(error: error)
             throw error
         }
     }
@@ -69,6 +89,7 @@ actor CloudflareTransport: Transport {
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
         guard connected, socket != nil else { throw TransportError.offline }
         try ProtocolSecurity.validate(command, expectedMachineId: config.machineId)
+        guard pending[command.commandId] == nil else { throw TransportError.replayDetected }
         let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
         guard let key = PairingKeyStore.sharedKey(machineId: config.machineId, keychain: keychain) else { throw TransportError.pairingRequired }
         let clear = try JSONEncoder.remoteAI.encode(command)
@@ -168,6 +189,15 @@ actor CloudflareTransport: Transport {
         for task in timeoutTasks.values { task.cancel() }
         timeoutTasks.removeAll()
         for continuation in continuations.values { continuation.resume(throwing: error) }
+    }
+
+    private func finishConnectionWaiters(error: Error? = nil) {
+        let waiters = connectionWaiters
+        connectionWaiters.removeAll()
+        for waiter in waiters {
+            if let error { waiter.resume(throwing: error) }
+            else { waiter.resume(returning: ()) }
+        }
     }
 
     private func ping(_ socket: URLSessionWebSocketTask) async throws {

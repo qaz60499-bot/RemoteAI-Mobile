@@ -99,9 +99,11 @@ The frozen JSON contract remains unchanged, but the iOS decoder applies a fail-c
 - relay kinds, command actions, and event types must be from the protocol-v1 allowlists;
 - identifiers are bounded to 160 UTF-8 bytes and the ASCII set `A-Z a-z 0-9 . _ : -`;
 - encrypted frame bodies must contain exactly `alg`, `nonce`, `ciphertext`, and `tag`;
-- Base64URL input is unpadded URL-safe alphabet only;
+- Base64URL input is unpadded URL-safe alphabet only and must be in canonical form;
 - encrypted `messageId` values are tracked in a bounded replay window and authenticated before being admitted to that window;
+- decrypted payload branches (`event`, `commandResponse`, `error`) reject cross-branch fields and unexpected nested response/error keys;
 - decrypted events are revalidated against the paired machine ID;
+- concurrent connection attempts are coalesced onto one WebSocket handshake, and a duplicate in-flight `commandId` is rejected instead of replacing its pending continuation;
 - delta batches must be strictly ordered, duplicate-free, cursor-consistent, and contiguous when recovering from a nonzero cursor.
 
 Pairing additionally rejects a `PAIR_ACCEPT` machine public key that differs from the key supplied in the corresponding `PAIR_CHALLENGE`.

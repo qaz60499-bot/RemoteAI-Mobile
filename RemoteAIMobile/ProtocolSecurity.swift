@@ -39,6 +39,14 @@ enum ProtocolSecurity {
     private static let relayFrameKeys: Set<String> = ["v", "kind", "machineId", "deviceId", "messageId", "body"]
     private static let encryptedBodyKeys: Set<String> = ["alg", "nonce", "ciphertext", "tag"]
     private static let decryptedPayloadKeys: Set<String> = ["kind", "commandId", "response", "event", "error"]
+    private static let commandResponseKeys: Set<String> = ["ok", "result", "error", "idempotentReplay"]
+    private static let errorKeys: Set<String> = ["code", "message", "retryable", "details"]
+    private static let errorCodes: Set<String> = [
+        "INVALID_COMMAND", "UNAUTHORIZED_DEVICE", "UNKNOWN_RUNTIME", "UNKNOWN_INSTANCE", "UNKNOWN_SESSION",
+        "CAPABILITY_DENIED", "ALREADY_EXECUTED", "BROWSER_NOT_CONNECTED", "BROWSER_BINDING_MISSING",
+        "WEB_SELECTOR_FAILED", "PROVIDER_UNAVAILABLE", "SESSION_UNAVAILABLE", "PAGINATION_CURSOR_INVALID",
+        "TRANSPORT_OFFLINE", "INTERNAL_ERROR"
+    ]
     private static let deltaKeys: Set<String> = ["events", "nextCursor", "hasMore"]
 
     static func isValidIdentifier(_ value: String) -> Bool {
@@ -150,28 +158,40 @@ enum ProtocolSecurity {
         let object = try objectDictionary(data)
         try requireKeys(object, allowed: decryptedPayloadKeys, required: ["kind"])
 
-        guard let kind = object["kind"] as? String,
-              ["event", "commandResponse", "error"].contains(kind) else {
-            throw TransportError.malformedData
-        }
+        guard let kind = object["kind"] as? String else { throw TransportError.malformedData }
 
         switch kind {
         case "event":
+            try requireKeys(object, allowed: ["kind", "event"], required: ["kind", "event"])
             guard let rawEvent = object["event"] as? [String: Any] else { throw TransportError.malformedData }
             try requireKeys(rawEvent, allowed: eventKeys, required: eventKeys)
         case "commandResponse":
-            guard object["commandId"] is String, object["response"] is [String: Any] else { throw TransportError.malformedData }
+            try requireKeys(object, allowed: ["kind", "commandId", "response", "event"], required: ["kind", "commandId", "response"])
+            guard let commandId = object["commandId"] as? String,
+                  UUID(uuidString: commandId) != nil,
+                  let response = object["response"] as? [String: Any] else { throw TransportError.malformedData }
+            try requireKeys(response, allowed: commandResponseKeys, required: ["ok"])
+            guard response["ok"] is Bool else { throw TransportError.malformedData }
+            if let rawError = response["error"] as? [String: Any] {
+                try validateErrorObject(rawError)
+            } else if let rawError = response["error"], !(rawError is NSNull) {
+                throw TransportError.malformedData
+            }
+            if let rawEvent = object["event"] as? [String: Any] {
+                try requireKeys(rawEvent, allowed: eventKeys, required: eventKeys)
+            } else if let rawEvent = object["event"], !(rawEvent is NSNull) {
+                throw TransportError.malformedData
+            }
         case "error":
-            guard object["error"] is [String: Any] else { throw TransportError.malformedData }
+            try requireKeys(object, allowed: ["kind", "error"], required: ["kind", "error"])
+            guard let rawError = object["error"] as? [String: Any] else { throw TransportError.malformedData }
+            try validateErrorObject(rawError)
         default:
             throw TransportError.malformedData
         }
 
         let payload = try JSONDecoder.remoteAI.decode(DecryptedRelayPayload.self, from: data)
         if let event = payload.event { try validate(event, expectedMachineId: expectedMachineId) }
-        if let commandId = payload.commandId {
-            guard UUID(uuidString: commandId) != nil else { throw TransportError.malformedData }
-        }
         return payload
     }
 
@@ -226,6 +246,15 @@ enum ProtocolSecurity {
     static func validateEncodedSize(_ data: Data, outbound: Bool) throws {
         let limit = outbound ? maxOutboundFrameBytes : maxInboundFrameBytes
         guard data.count <= limit else { throw TransportError.frameTooLarge }
+    }
+
+    private static func validateErrorObject(_ object: [String: Any]) throws {
+        try requireKeys(object, allowed: errorKeys, required: ["code", "message"])
+        guard let code = object["code"] as? String,
+              errorCodes.contains(code),
+              object["message"] is String else { throw TransportError.malformedData }
+        if let retryable = object["retryable"], !(retryable is Bool) { throw TransportError.malformedData }
+        if let details = object["details"], !(details is NSNull), !(details is [String: Any]) { throw TransportError.malformedData }
     }
 
     private static func objectDictionary(_ data: Data) throws -> [String: Any] {

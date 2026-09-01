@@ -97,7 +97,8 @@ enum Base64URL {
         let remainder = base64.count % 4
         if remainder == 1 { return nil }
         if remainder != 0 { base64 += String(repeating: "=", count: 4 - remainder) }
-        return Data(base64Encoded: base64)
+        guard let decoded = Data(base64Encoded: base64), encode(decoded) == value else { return nil }
+        return decoded
     }
 }
 
@@ -158,10 +159,14 @@ enum PayloadCrypto {
               let nonceData = Base64URL.decode(body.nonce), nonceData.count == 12,
               let ciphertext = Base64URL.decode(body.ciphertext),
               let tag = Base64URL.decode(body.tag), tag.count == 16 else { throw TransportError.malformedData }
-        let nonce = try AES.GCM.Nonce(data: nonceData)
-        let box = try AES.GCM.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag)
-        let aad = Data("\(machineId)|\(deviceId)|\(messageId)|v1".utf8)
-        return try AES.GCM.open(box, using: SymmetricKey(data: keyData), authenticating: aad)
+        do {
+            let nonce = try AES.GCM.Nonce(data: nonceData)
+            let box = try AES.GCM.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag)
+            let aad = Data("\(machineId)|\(deviceId)|\(messageId)|v1".utf8)
+            return try AES.GCM.open(box, using: SymmetricKey(data: keyData), authenticating: aad)
+        } catch {
+            throw TransportError.malformedData
+        }
     }
 }
 

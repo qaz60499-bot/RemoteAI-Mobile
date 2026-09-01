@@ -86,6 +86,11 @@ if grep -nE '^  (actions|checks|contents|deployments|id-token|issues|packages|pu
 fi
 grep -q 'persist-credentials: false' .github/workflows/build-ipa.yml || fail "checkout must not persist GITHUB_TOKEN credentials"
 grep -q 'Protocol Security / Fuzz' .github/workflows/build-ipa.yml || fail "protocol security fuzz step missing from macOS CI"
+grep -q 'commandResponseKeys' RemoteAIMobile/ProtocolSecurity.swift || fail "strict decrypted command-response key validation missing"
+grep -q 'errorCodes' RemoteAIMobile/ProtocolSecurity.swift || fail "protocol-v1 remote error allowlist missing"
+grep -q 'encode(decoded) == value' RemoteAIMobile/Security.swift || fail "canonical Base64URL validation missing"
+grep -q 'connectionWaiters' RemoteAIMobile/CloudflareTransport.swift || fail "concurrent WebSocket connect coalescing missing"
+grep -Fq 'pending[command.commandId] == nil' RemoteAIMobile/CloudflareTransport.swift || fail "duplicate in-flight commandId guard missing"
 grep -q 'fetch-depth: 0' .github/workflows/build-ipa.yml || fail "full Git history is required for secret scanning"
 if grep -nE '^\s*uses:\s*[^#[:space:]]+@(v[0-9]+|main|master|latest)\s*$' .github/workflows/build-ipa.yml; then
   fail "mutable GitHub Action tag detected; pin actions to full commit SHA"
