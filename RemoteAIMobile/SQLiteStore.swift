@@ -1,0 +1,68 @@
+import Foundation
+import SQLite3
+
+actor SQLiteStore {
+    private var db: OpaquePointer?
+    private let encoder = JSONEncoder.remoteAI
+    private let decoder = JSONDecoder.remoteAI
+    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+    init(url: URL) throws {
+        if sqlite3_open_v2(url.path, &db, SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) != SQLITE_OK { throw StoreError.openFailed }
+        try exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY,value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,sequence INTEGER NOT NULL,created_at REAL NOT NULL,json BLOB NOT NULL); CREATE INDEX IF NOT EXISTS idx_messages_session_sequence ON messages(session_id,sequence);")
+    }
+    deinit { sqlite3_close(db) }
+
+    static func appStore() throws -> SQLiteStore {
+        let fm = FileManager.default
+        let root = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("RemoteAI", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        return try SQLiteStore(url: root.appendingPathComponent("cache.sqlite3"))
+    }
+
+    func put<T: Encodable>(_ value: T, key: String) throws { try putData(encoder.encode(value), key: key) }
+    func get<T: Decodable>(_ type: T.Type, key: String) throws -> T? { guard let data = try getData(key: key) else { return nil }; return try decoder.decode(T.self, from: data) }
+    func setLastSequence(_ value: Int64) throws { try put(String(value), key: "sync.lastSequence") }
+    func lastSequence() throws -> Int64 { Int64(try get(String.self, key: "sync.lastSequence") ?? "0") ?? 0 }
+    func saveDraft(_ text: String, sessionId: String) throws { try put(text, key: "draft.\(sessionId)") }
+    func draft(sessionId: String) throws -> String { try get(String.self, key: "draft.\(sessionId)") ?? "" }
+    func saveUIState(_ value: String, key: String) throws { try put(value, key: "ui.\(key)") }
+
+    func upsertMessages(_ messages: [ChatMessage]) throws {
+        let sql = "INSERT OR REPLACE INTO messages(id,session_id,sequence,created_at,json) VALUES(?,?,?,?,?)"
+        var stmt: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }; defer { sqlite3_finalize(stmt) }
+        for message in messages {
+            sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+            bindText(stmt, 1, message.id); bindText(stmt, 2, message.sessionId); sqlite3_bind_int64(stmt, 3, message.sequence); sqlite3_bind_double(stmt, 4, message.createdAt.timeIntervalSince1970)
+            let data = try encoder.encode(message); data.withUnsafeBytes { ptr in _ = sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(data.count), transient) }
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.stepFailed }
+        }
+    }
+
+    func recentMessages(sessionId: String, limit: Int) throws -> [ChatMessage] { Array(try queryMessages(sql: "SELECT json FROM messages WHERE session_id=? ORDER BY sequence DESC LIMIT ?", sessionId: sessionId, cursor: nil, limit: limit).reversed()) }
+    func messagesBefore(sessionId: String, before: Int64, limit: Int) throws -> [ChatMessage] { Array(try queryMessages(sql: "SELECT json FROM messages WHERE session_id=? AND sequence<? ORDER BY sequence DESC LIMIT ?", sessionId: sessionId, cursor: before, limit: limit).reversed()) }
+    func messageCount(sessionId: String) throws -> Int {
+        var stmt: OpaquePointer?; guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM messages WHERE session_id=?", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }; defer { sqlite3_finalize(stmt) }; bindText(stmt, 1, sessionId); guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.stepFailed }; return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    private func queryMessages(sql: String, sessionId: String, cursor: Int64?, limit: Int) throws -> [ChatMessage] {
+        var stmt: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }; defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, sessionId); var idx: Int32 = 2; if let cursor { sqlite3_bind_int64(stmt, idx, cursor); idx += 1 }; sqlite3_bind_int(stmt, idx, Int32(limit))
+        var result: [ChatMessage] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let blob = sqlite3_column_blob(stmt, 0) else { continue }; let count = Int(sqlite3_column_bytes(stmt, 0)); let data = Data(bytes: blob, count: count); result.append(try decoder.decode(ChatMessage.self, from: data))
+        }
+        return result
+    }
+
+    private func putData(_ data: Data, key: String) throws {
+        var stmt: OpaquePointer?; guard sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }; defer { sqlite3_finalize(stmt) }; bindText(stmt, 1, key); data.withUnsafeBytes { ptr in _ = sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(data.count), transient) }; guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.stepFailed }
+    }
+    private func getData(key: String) throws -> Data? {
+        var stmt: OpaquePointer?; guard sqlite3_prepare_v2(db, "SELECT value FROM kv WHERE key=?", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }; defer { sqlite3_finalize(stmt) }; bindText(stmt, 1, key); guard sqlite3_step(stmt) == SQLITE_ROW, let blob = sqlite3_column_blob(stmt, 0) else { return nil }; return Data(bytes: blob, count: Int(sqlite3_column_bytes(stmt, 0)))
+    }
+    private func bindText(_ stmt: OpaquePointer?, _ index: Int32, _ value: String) { sqlite3_bind_text(stmt, index, (value as NSString).utf8String, -1, transient) }
+    private func exec(_ sql: String) throws { if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK { throw StoreError.stepFailed } }
+}
+
+enum StoreError: Error { case openFailed, prepareFailed, stepFailed }

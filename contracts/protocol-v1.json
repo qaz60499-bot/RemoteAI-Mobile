@@ -1,0 +1,28 @@
+{
+  "protocolVersion": "1",
+  "command": {
+    "required": ["protocolVersion", "commandId", "machineId", "runtimeId", "instanceId", "action", "payload", "createdAt"],
+    "optional": ["sessionId"],
+    "actions": {
+      "SYSTEM": ["getStatus", "listRuntimes", "listInstances", "listSessions"],
+      "SESSION": ["createSession", "resumeSession", "stopSession", "getSessionStatus"],
+      "CHAT": ["sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore"],
+      "SYNC": ["getChangesAfterCursor"],
+      "WEB": ["registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation"]
+    }
+  },
+  "event": {
+    "required": ["protocolVersion", "eventId", "sequence", "machineId", "runtimeId", "instanceId", "type", "payload", "createdAt"],
+    "optional": ["sessionId"],
+    "ordering": "sequence is monotonically increasing per machine stream; clients dedupe sequence <= lastSequence and recover gaps with getChangesAfterCursor(lastSequence)"
+  },
+  "commandLifecycle": ["Pending", "Acknowledged", "Executing", "Completed", "Failed", "Unknown"],
+  "machineStates": ["Online", "Offline", "Connecting"],
+  "sessionStates": ["Idle", "Busy", "Waiting", "Sleeping", "Error"],
+  "webStates": ["Registered", "BrowserClosed", "Attached", "Unsupported"],
+  "security": {
+    "pairing": "Windows presents QR/pairing code; iOS stores returned shared secret in Keychain",
+    "payloadEncryption": "AES-256-GCM envelope when a pairing secret is available",
+    "credentialHandling": "iOS may send credentialProfileId only; provider keys never leave Windows"
+  }
+}

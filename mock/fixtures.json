@@ -1,0 +1,20 @@
+{
+  "machine": {"id":"my-pc","name":"My PC","state":"Online"},
+  "runtimes": [
+    {"id":"web","name":"Web"},
+    {"id":"cloud","name":"Cloud Code"},
+    {"id":"codex","name":"Codex"}
+  ],
+  "instances": {
+    "web": ["ChatGPT","Photo SaaS","Excel SaaS"],
+    "cloud": ["Photo"],
+    "codex": ["Codex1","Codex2","Codex6","Codex11","Kali Codex","Linux Codex"]
+  },
+  "sessions": {
+    "Photo SaaS": ["上传性能优化","手机 APP"],
+    "Excel SaaS": ["权限测试"],
+    "Photo": ["Session A"],
+    "Codex6": ["Session A"]
+  },
+  "scenarios": ["normal","streaming","tool-event","disconnect","reconnect","duplicate-event","sequence-gap","command-failure","offline","1200-message-history"]
+}

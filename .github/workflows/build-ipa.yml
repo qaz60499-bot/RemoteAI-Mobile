@@ -1,0 +1,172 @@
+name: Build TrollStore IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remoteai-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test + Device IPA
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select stable Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_APP=$(find /Applications -maxdepth 1 -type d -name 'Xcode_*.app' | grep -v -i beta | sort -V | tail -1)
+          test -n "$XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          test -f RemoteAIMobile.xcodeproj/project.pbxproj
+          xcodebuild -project RemoteAIMobile.xcodeproj -list
+
+      - name: Create iPhone 13 Pro simulator
+        id: simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; r=json.load(sys.stdin)["runtimes"]; ids=[x["identifier"] for x in r if x.get("isAvailable") and "iOS" in x.get("name","")]; print(ids[-1])')
+          UDID=$(xcrun simctl create RemoteAI-iPhone13Pro com.apple.CoreSimulator.SimDeviceType.iPhone-13-Pro "$RUNTIME")
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl list devices | grep "$UDID"
+
+      - name: Unit and UI tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          set -o pipefail
+          xcodebuild test \
+            -project RemoteAIMobile.xcodeproj \
+            -scheme RemoteAIMobile \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            | tee build/tests.log
+          grep -E 'Executed [0-9]+ tests?, with 0 failures' build/tests.log | tail -1
+
+      - name: Build unsigned iphoneos arm64 app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project RemoteAIMobile.xcodeproj \
+            -scheme RemoteAIMobile \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Verify device app and ad-hoc sign
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' | head -1)
+          test -n "$APP" && test -d "$APP"
+          PLIST="$APP/Info.plist"
+          test -f "$PLIST"
+          BUNDLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")
+          EXEC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
+          MIN_OS=$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$PLIST")
+          test "$BUNDLE" = 'com.remoteai.mobile'
+          test -x "$APP/$EXEC"
+          file "$APP/$EXEC"
+          lipo -archs "$APP/$EXEC" | tr ' ' '\n' | grep -qx arm64
+          otool -l "$APP/$EXEC" | awk '/LC_BUILD_VERSION/{f=1;n=0} f{print;n++} n>8{f=0}' | grep -q 'platform 2'
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          echo "bundle=$BUNDLE"
+          echo "version=$VERSION"
+          echo "minimum_ios=$MIN_OS"
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Package TrollStore IPA
+        id: ipa
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          IPA_NAME="RemoteAI-${{ steps.package.outputs.version }}-${SHORT_SHA}.ipa"
+          rm -rf build/package
+          mkdir -p build/package/Payload
+          ditto "${{ steps.package.outputs.app }}" "build/package/Payload/RemoteAI.app"
+          (cd build/package && /usr/bin/zip -qry "../$IPA_NAME" Payload)
+          test -s "build/$IPA_NAME"
+          chmod +x scripts/verify_ipa.sh
+          scripts/verify_ipa.sh "build/$IPA_NAME" com.remoteai.mobile | tee build/ipa-verification.txt
+          shasum -a 256 "build/$IPA_NAME" | tee "build/$IPA_NAME.sha256"
+          echo "name=$IPA_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Unzip structure test
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build/unzip-check
+          mkdir -p build/unzip-check
+          unzip -q "build/${{ steps.ipa.outputs.name }}" -d build/unzip-check
+          test -d build/unzip-check/Payload/RemoteAI.app
+          test -f build/unzip-check/Payload/RemoteAI.app/Info.plist
+          test -x build/unzip-check/Payload/RemoteAI.app/RemoteAI
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RemoteAI-TrollStore-IPA
+          path: |
+            build/${{ steps.ipa.outputs.name }}
+            build/${{ steps.ipa.outputs.name }}.sha256
+            build/ipa-verification.txt
+            build/tests.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo '## RemoteAI Mobile build'
+            echo '- Workflow: GREEN if this step runs'
+            echo '- Bundle ID: `com.remoteai.mobile`'
+            echo '- Minimum iOS: `15.0`'
+            echo '- Device architecture: `arm64`'
+            echo '- IPA: `${{ steps.ipa.outputs.name }}`'
+            echo '- Packaging: ad-hoc signed, TrollStore-targeted, no Apple Developer certificate/provisioning profile'
+            echo '- SHA256:'
+            echo '```'
+            cat "build/${{ steps.ipa.outputs.name }}.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,23 @@
+# Xcode / generated
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.ipa
+*.dSYM
+
+# XcodeGen generates this deterministically in CI/local macOS
+RemoteAIMobile.xcodeproj/
+
+# Secrets / local runtime config
+.env
+.env.*
+!.env.example
+Secrets/
+*.mobileprovision
+*.p12
+*.cer
+pairing-secret*
+
+# macOS
+.DS_Store
