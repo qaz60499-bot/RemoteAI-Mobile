@@ -20,11 +20,16 @@ struct RemoteAIConfig: Codable, Equatable {
     }
 
     static func validateSecureRelay(_ baseURL: URL) throws {
-        guard baseURL.scheme?.lowercased() == "https", baseURL.host?.isEmpty == false else { throw TransportError.insecureRelay }
+        guard baseURL.scheme?.lowercased() == "https",
+              baseURL.host?.isEmpty == false,
+              baseURL.user == nil,
+              baseURL.password == nil else { throw TransportError.insecureRelay }
     }
 
     static func deviceWebSocketURL(baseURL: URL, machineId: String, deviceId: String) throws -> URL {
         try validateSecureRelay(baseURL)
+        try ProtocolSecurity.validateIdentifier(machineId)
+        try ProtocolSecurity.validateIdentifier(deviceId)
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
         components?.scheme = "wss"
         components?.path = "/connect"
@@ -55,6 +60,7 @@ enum TransportError: LocalizedError, Equatable {
     case timeout
     case insecureRelay
     case frameTooLarge
+    case replayDetected
     case remote(String, String)
 
     var errorDescription: String? {
@@ -67,6 +73,7 @@ enum TransportError: LocalizedError, Equatable {
         case .timeout: return "RemoteAI request timed out"
         case .insecureRelay: return "RemoteAI Relay must use HTTPS/WSS"
         case .frameTooLarge: return "RemoteAI relay frame exceeds the protocol size limit"
+        case .replayDetected: return "RemoteAI rejected a replayed relay message"
         case .remote(let code, let message): return "\(code): \(message)"
         }
     }
@@ -121,6 +128,7 @@ extension Transport {
 
     func loadBefore(machineId: String, runtimeId: String, instanceId: String, sessionId: String, before: MessageCursor, limit: Int) async throws -> Page<ChatMessage> {
         let safeLimit = max(1, min(limit, 100))
+        try ProtocolSecurity.validateCursor(before)
         let beforeValue = try JSONValue.encode(before)
         let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "loadMessagesBefore", payload: ["before": beforeValue, "limit": .number(Double(safeLimit))])
         let response = try await requireSuccess(execute(command))
@@ -130,12 +138,13 @@ extension Transport {
 
     func delta(machineId: String, after sequence: Int64, limit: Int = 500) async throws -> DeltaSyncResult {
         let safeLimit = max(1, min(limit, 1000))
+        let safeCursor = max(0, sequence)
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "getChangesAfterCursor", payload: [
-            "cursor": .number(Double(max(0, sequence))),
+            "cursor": .number(Double(safeCursor)),
             "limit": .number(Double(safeLimit))
         ])
         let response = try await requireSuccess(execute(command))
-        return try response.decode(DeltaSyncResult.self)
+        return try ProtocolSecurity.decodeDelta(response, after: safeCursor, expectedMachineId: machineId)
     }
 
     private func requireSuccess(_ response: CommandResponseEnvelope) throws -> JSONValue {

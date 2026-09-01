@@ -1,6 +1,6 @@
 import Foundation
 
-enum MockScenario: String, CaseIterable { case normal, commandFailure, disconnect, duplicateEvent, sequenceGap, offline }
+enum MockScenario: String, CaseIterable { case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend, duplicateEvent, sequenceGap, offline }
 
 actor MockTransport: Transport {
     private var connected = false
@@ -78,6 +78,7 @@ actor MockTransport: Transport {
     }
 
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
+        try ProtocolSecurity.validate(command, expectedMachineId: machineId)
         if let prior = processedCommands[command.commandId] {
             return CommandResponseEnvelope(ok: prior.ok, result: prior.result, error: prior.error, idempotentReplay: true)
         }
@@ -141,6 +142,10 @@ actor MockTransport: Transport {
             response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "INVALID_COMMAND", message: "Unsupported mock action", retryable: false, details: nil), idempotentReplay: nil)
         }
         processedCommands[command.commandId] = response
+        if scenario == .disconnectImmediatelyAfterSend {
+            connected = false
+            throw TransportError.disconnected
+        }
         return response
     }
 

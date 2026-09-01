@@ -68,7 +68,14 @@ enum JSONValue: Codable, Hashable {
 
     var stringValue: String? { if case .string(let v) = self { return v }; return nil }
     var boolValue: Bool? { if case .bool(let v) = self { return v }; return nil }
-    var intValue: Int64? { if case .number(let v) = self { return Int64(v) }; return nil }
+    var intValue: Int64? {
+        guard case .number(let value) = self,
+              value.isFinite,
+              value.rounded(.towardZero) == value,
+              value >= -9_223_372_036_854_775_808.0,
+              value < 9_223_372_036_854_775_808.0 else { return nil }
+        return Int64(value)
+    }
     var objectValue: [String: JSONValue]? { if case .object(let v) = self { return v }; return nil }
     var arrayValue: [JSONValue]? { if case .array(let v) = self { return v }; return nil }
 
@@ -125,12 +132,14 @@ struct Page<T: Codable>: Codable {
 struct SequenceDecision: Equatable { let duplicate: Bool; let gap: Bool }
 struct SequenceTracker {
     private(set) var lastSequence: Int64
-    init(lastSequence: Int64 = 0) { self.lastSequence = lastSequence }
+    init(lastSequence: Int64 = 0) { self.lastSequence = max(0, lastSequence) }
     mutating func ingest(_ sequence: Int64) -> SequenceDecision {
         if sequence <= lastSequence { return .init(duplicate: true, gap: false) }
-        let gap = lastSequence > 0 && sequence > lastSequence + 1
+        if lastSequence > 0 && sequence - lastSequence > 1 {
+            return .init(duplicate: false, gap: true)
+        }
         lastSequence = sequence
-        return .init(duplicate: false, gap: gap)
+        return .init(duplicate: false, gap: false)
     }
 }
 

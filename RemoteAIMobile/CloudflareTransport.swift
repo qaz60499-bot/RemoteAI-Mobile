@@ -4,8 +4,8 @@ actor CloudflareTransport: Transport {
     private let config: RemoteAIConfig
     private let session: URLSession
     private let keychain: KeychainStore
-    private let maxInboundFrameBytes = 512 * 1024
-    private let maxOutboundFrameBytes = 256 * 1024
+    private let maxInboundFrameBytes = ProtocolSecurity.maxInboundFrameBytes
+    private let maxOutboundFrameBytes = ProtocolSecurity.maxOutboundFrameBytes
     private let commandTimeoutNanoseconds: UInt64 = 30_000_000_000
 
     private var socket: URLSessionWebSocketTask?
@@ -14,6 +14,7 @@ actor CloudflareTransport: Transport {
     private var stream: AsyncStream<RemoteEvent>?
     private var pending: [UUID: CheckedContinuation<CommandResponseEnvelope, Error>] = [:]
     private var timeoutTasks: [UUID: Task<Void, Never>] = [:]
+    private var inboundReplayGuard = BoundedReplayGuard(capacity: 4096)
 
     init(config: RemoteAIConfig, session: URLSession = .shared, keychain: KeychainStore = .shared) {
         self.config = config
@@ -27,7 +28,9 @@ actor CloudflareTransport: Transport {
         guard !connected else { return }
         try RemoteAIConfig.validateSecureRelay(config.relayBaseURL)
         guard PairingKeyStore.isPaired(machineId: config.machineId, keychain: keychain) else { throw TransportError.pairingRequired }
+        try ProtocolSecurity.validateIdentifier(config.machineId)
         let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
+        try ProtocolSecurity.validateIdentifier(deviceId)
         let url = try RemoteAIConfig.deviceWebSocketURL(baseURL: config.relayBaseURL, machineId: config.machineId, deviceId: deviceId)
         let task = session.webSocketTask(with: url, protocols: ["remoteai.v1"])
         task.maximumMessageSize = maxInboundFrameBytes
@@ -65,7 +68,7 @@ actor CloudflareTransport: Transport {
 
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
         guard connected, socket != nil else { throw TransportError.offline }
-        guard command.protocolVersion == 1, command.machineId == config.machineId else { throw TransportError.malformedData }
+        try ProtocolSecurity.validate(command, expectedMachineId: config.machineId)
         let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
         guard let key = PairingKeyStore.sharedKey(machineId: config.machineId, keychain: keychain) else { throw TransportError.pairingRequired }
         let clear = try JSONEncoder.remoteAI.encode(command)
@@ -100,8 +103,7 @@ actor CloudflareTransport: Transport {
                 case .string(let value): data = Data(value.utf8)
                 @unknown default: continue
                 }
-                guard data.count <= maxInboundFrameBytes else { throw TransportError.frameTooLarge }
-                let frame = try JSONDecoder.remoteAI.decode(RelayFrame.self, from: data)
+                let frame = try ProtocolSecurity.decodeRelayFrame(data, maxBytes: maxInboundFrameBytes)
                 try await handle(frame)
             } catch {
                 if socket === activeSocket {
@@ -116,9 +118,8 @@ actor CloudflareTransport: Transport {
     }
 
     private func handle(_ frame: RelayFrame) async throws {
-        guard frame.v == 1, frame.machineId == config.machineId else { return }
         let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
-        if let frameDevice = frame.deviceId, frameDevice != deviceId { return }
+        try ProtocolSecurity.validate(frame, expectedMachineId: config.machineId, expectedDeviceId: deviceId)
         if frame.kind == "PING" {
             try await sendFrame(RelayFrame(v: 1, kind: "PONG", machineId: config.machineId, deviceId: deviceId, messageId: UUID().uuidString, body: ["at": .number(Date().timeIntervalSince1970 * 1000)]))
             return
@@ -127,7 +128,8 @@ actor CloudflareTransport: Transport {
         let encrypted = try JSONValue.object(frame.body).decode(EncryptedRelayBody.self)
         let clear = try PayloadCrypto.decrypt(encrypted, keyData: key, machineId: config.machineId, deviceId: deviceId, messageId: frame.messageId)
         guard clear.count <= maxInboundFrameBytes else { throw TransportError.frameTooLarge }
-        let payload = try JSONDecoder.remoteAI.decode(DecryptedRelayPayload.self, from: clear)
+        let payload = try ProtocolSecurity.decodeDecryptedPayload(clear, expectedMachineId: config.machineId)
+        guard inboundReplayGuard.accept(frame.messageId) else { throw TransportError.replayDetected }
 
         if payload.kind == "event", let event = payload.event {
             continuation?.yield(event)

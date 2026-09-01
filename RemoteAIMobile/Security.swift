@@ -85,8 +85,17 @@ enum Base64URL {
     }
 
     static func decode(_ value: String) -> Data? {
+        let bytes = Array(value.utf8)
+        guard !value.contains("="),
+              bytes.allSatisfy({ byte in
+                  switch byte {
+                  case 45, 48...57, 65...90, 95, 97...122: return true
+                  default: return false
+                  }
+              }) else { return nil }
         var base64 = value.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
         let remainder = base64.count % 4
+        if remainder == 1 { return nil }
         if remainder != 0 { base64 += String(repeating: "=", count: 4 - remainder) }
         return Data(base64Encoded: base64)
     }
@@ -173,10 +182,11 @@ final class RelayPairingClient {
 
     func pair(baseURL: URL, machineId: String, pairingCode: String, label: String = "iPhone") async throws -> PairingResult {
         try RemoteAIConfig.validateSecureRelay(baseURL)
-        guard !machineId.isEmpty, machineId.count <= 160,
-              pairingCode.count == 8, pairingCode.allSatisfy({ $0.isNumber }) else { throw TransportError.malformedData }
+        try ProtocolSecurity.validateIdentifier(machineId)
+        guard ProtocolSecurity.validatePairingCode(pairingCode) else { throw TransportError.malformedData }
 
         let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
+        try ProtocolSecurity.validateIdentifier(deviceId)
         let privateKeyRaw = PayloadCrypto.generateDevicePrivateKey()
         let publicKeyB64 = try PayloadCrypto.publicKeySPKIBase64(privateKeyRaw: privateKeyRaw)
         let socket = session.webSocketTask(with: try RemoteAIConfig.deviceWebSocketURL(baseURL: baseURL, machineId: machineId, deviceId: deviceId), protocols: ["remoteai.v1"])
@@ -188,14 +198,20 @@ final class RelayPairingClient {
                 "label": .string(String(label.prefix(80)))
             ]), socket: socket)
 
-            let challenge = try await receiveFrame(kind: "PAIR_CHALLENGE", deviceId: deviceId, socket: socket)
+            let challenge = try await receiveFrame(kind: "PAIR_CHALLENGE", machineId: machineId, deviceId: deviceId, socket: socket)
             guard let challengeValue = challenge.body["challenge"]?.stringValue,
+                  !challengeValue.isEmpty,
+                  challengeValue.utf8.count <= 512,
                   let challengeMachinePublic = challenge.body["machinePublicKeyB64"]?.stringValue else { throw TransportError.malformedData }
+            _ = try ProtocolSecurity.validatedPairingMachineKey(challengeKey: challengeMachinePublic, acceptedKey: nil)
             let proof = PayloadCrypto.pairingProof(pairingCode: pairingCode, challenge: challengeValue, machineId: machineId, deviceId: deviceId, devicePublicKeyB64: publicKeyB64)
             try await send(frame: RelayFrame(v: 1, kind: "PAIR_PROOF", machineId: machineId, deviceId: deviceId, messageId: UUID().uuidString, body: ["proof": .string(proof)]), socket: socket)
 
-            let accepted = try await receiveFrame(kind: "PAIR_ACCEPT", deviceId: deviceId, socket: socket)
-            let machinePublicKeyB64 = accepted.body["machinePublicKeyB64"]?.stringValue ?? challengeMachinePublic
+            let accepted = try await receiveFrame(kind: "PAIR_ACCEPT", machineId: machineId, deviceId: deviceId, socket: socket)
+            let machinePublicKeyB64 = try ProtocolSecurity.validatedPairingMachineKey(
+                challengeKey: challengeMachinePublic,
+                acceptedKey: accepted.body["machinePublicKeyB64"]?.stringValue
+            )
             let shared = try PayloadCrypto.deriveSharedKey(privateKeyRaw: privateKeyRaw, machinePublicKeyB64: machinePublicKeyB64, machineId: machineId, deviceId: deviceId)
             try PairingKeyStore.savePairing(machineId: machineId, sharedKey: shared, keychain: keychain)
             socket.cancel(with: .normalClosure, reason: nil)
@@ -212,7 +228,7 @@ final class RelayPairingClient {
         try await socket.send(.data(data))
     }
 
-    private func receiveFrame(kind: String, deviceId: String, socket: URLSessionWebSocketTask) async throws -> RelayFrame {
+    private func receiveFrame(kind: String, machineId: String, deviceId: String, socket: URLSessionWebSocketTask) async throws -> RelayFrame {
         for _ in 0..<12 {
             let message = try await socket.receive()
             let data: Data
@@ -221,10 +237,10 @@ final class RelayPairingClient {
             case .string(let value): data = Data(value.utf8)
             @unknown default: continue
             }
-            guard data.count <= maxFrameBytes else { throw TransportError.frameTooLarge }
-            let frame = try JSONDecoder.remoteAI.decode(RelayFrame.self, from: data)
+            let frame = try ProtocolSecurity.decodeRelayFrame(data, maxBytes: maxFrameBytes)
+            try ProtocolSecurity.validate(frame, expectedMachineId: machineId, expectedDeviceId: deviceId)
             if frame.kind == "ACK", frame.body["error"]?.stringValue != nil { throw TransportError.pairingRequired }
-            if frame.kind == kind, frame.deviceId == deviceId { return frame }
+            if frame.kind == kind { return frame }
         }
         throw TransportError.timeout
     }

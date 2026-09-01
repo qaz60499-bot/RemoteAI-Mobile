@@ -16,6 +16,7 @@ final class WorkspaceStore: ObservableObject {
     var transport: Transport
     let cache: SQLiteStore
     private var tracker = SequenceTracker()
+    private var eventReplayGuard = BoundedReplayGuard(capacity: 8192)
     private var eventTask: Task<Void, Never>?
     private var connectionMonitorTask: Task<Void, Never>?
     private var streamingBuffers: [String: (id: String, text: String, sequence: Int64)] = [:]
@@ -185,6 +186,7 @@ final class WorkspaceStore: ObservableObject {
             messagesBySession.removeAll()
             hasMoreBySession.removeAll()
             tracker = SequenceTracker()
+            eventReplayGuard = BoundedReplayGuard(capacity: 8192)
         }
 
         let config = RemoteAIConfig(relayBaseURL: baseURL, machineId: result.machineId)
@@ -309,10 +311,22 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func ingest(_ event: RemoteEvent) async {
+        do {
+            try ProtocolSecurity.validate(event, expectedMachineId: machine.id)
+        } catch {
+            errors["sync"] = error.localizedDescription
+            return
+        }
+        let priorSequence = tracker.lastSequence
         let decision = tracker.ingest(event.sequence)
         if decision.duplicate { return }
         if decision.gap {
             await recoverDelta()
+            return
+        }
+        guard eventReplayGuard.accept(event.eventId.uuidString.lowercased()) else {
+            tracker = SequenceTracker(lastSequence: priorSequence)
+            errors["sync"] = TransportError.replayDetected.localizedDescription
             return
         }
         await applyEvent(event)
@@ -325,7 +339,8 @@ final class WorkspaceStore: ObservableObject {
         do {
             while true {
                 let result = try await transport.delta(machineId: machine.id, after: cursor)
-                for event in result.events.sorted(by: { $0.sequence < $1.sequence }) where event.sequence > cursor {
+                for event in result.events where event.sequence > cursor {
+                    guard eventReplayGuard.accept(event.eventId.uuidString.lowercased()) else { throw TransportError.replayDetected }
                     await applyEvent(event)
                     cursor = event.sequence
                     try? await cache.setLastSequence(cursor)

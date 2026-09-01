@@ -46,6 +46,11 @@ PY
 grep -q 'kSecAttrAccessibleWhenUnlockedThisDeviceOnly' RemoteAIMobile/Security.swift || fail "Keychain accessibility is not ThisDeviceOnly"
 grep -q 'Curve25519.KeyAgreement.PrivateKey' RemoteAIMobile/Security.swift || fail "X25519 private-key generation missing"
 grep -q 'A256GCM' RemoteAIMobile/Security.swift || fail "AES-256-GCM envelope missing"
+grep -q 'ProtocolSecurity.decodeRelayFrame' RemoteAIMobile/CloudflareTransport.swift || fail "relay frames are not using strict protocol decoding"
+grep -q 'inboundReplayGuard.accept(frame.messageId)' RemoteAIMobile/CloudflareTransport.swift || fail "encrypted relay replay guard missing"
+grep -q 'ProtocolSecurity.decodeDecryptedPayload' RemoteAIMobile/CloudflareTransport.swift || fail "decrypted relay payload validation missing"
+grep -q 'ProtocolSecurity.decodeDelta' RemoteAIMobile/Transport.swift || fail "delta response validation missing"
+grep -q 'BoundedReplayGuard' RemoteAIMobile/ProtocolSecurity.swift || fail "bounded replay guard implementation missing"
 grep -q 'keychain.delete(account: legacyPrivateAccount(machineId))' RemoteAIMobile/Security.swift || fail "legacy private-key cleanup missing"
 if grep -nE 'keychain\.save\(privateKeyRaw|static func privateKey\(' RemoteAIMobile/Security.swift; then
   fail "ephemeral X25519 private key is persisted or exposed after pairing"
@@ -80,6 +85,7 @@ if grep -nE '^  (actions|checks|contents|deployments|id-token|issues|packages|pu
   fail "workflow write permission detected"
 fi
 grep -q 'persist-credentials: false' .github/workflows/build-ipa.yml || fail "checkout must not persist GITHUB_TOKEN credentials"
+grep -q 'Protocol Security / Fuzz' .github/workflows/build-ipa.yml || fail "protocol security fuzz step missing from macOS CI"
 grep -q 'fetch-depth: 0' .github/workflows/build-ipa.yml || fail "full Git history is required for secret scanning"
 if grep -nE '^\s*uses:\s*[^#[:space:]]+@(v[0-9]+|main|master|latest)\s*$' .github/workflows/build-ipa.yml; then
   fail "mutable GitHub Action tag detected; pin actions to full commit SHA"
