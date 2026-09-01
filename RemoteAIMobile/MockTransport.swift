@@ -19,7 +19,10 @@ actor MockTransport: Transport {
 
     init(scenario: MockScenario = .normal, historyCount: Int = 1200) {
         self.scenario = scenario
-        let now = Date()
+        // Protocol timestamps are serialized at millisecond precision. Build deterministic
+        // mock history on the same precision so `(createdAt, messageId)` cursor comparisons
+        // do not change after an encode/decode round-trip.
+        let now = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970 * 1_000) / 1_000)
         runtimes = [
             ServerRuntime(runtimeId: "runtime.web", kind: "Web", label: "Web", capabilities: ["list", "status", "sendMessage"], status: "ready", updatedAt: now),
             ServerRuntime(runtimeId: "runtime.cloudcode", kind: "CloudCode", label: "Cloud Code", capabilities: ["list", "status", "sendMessage"], status: "ready", updatedAt: now),
@@ -50,7 +53,7 @@ actor MockTransport: Transport {
                     role: assistant ? "assistant" : "user",
                     content: assistant ? "Mock assistant response \(i). This verifies long-history pagination without rendering everything at once." : "Mock user message \(i)",
                     externalId: nil,
-                    createdAt: Date(timeIntervalSinceNow: Double(i - historyCount) * 30)
+                    createdAt: now.addingTimeInterval(Double(i - historyCount) * 30)
                 ))
             }
         }
