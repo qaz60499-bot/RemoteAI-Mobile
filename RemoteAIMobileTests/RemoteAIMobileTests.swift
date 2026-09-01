@@ -81,7 +81,8 @@ final class RemoteAIMobileTests: XCTestCase {
         try await db.setLastSequence(99)
         let restored: MachineMetadata? = try await db.get(MachineMetadata.self, key: "machine")
         XCTAssertEqual(restored, machine)
-        XCTAssertEqual(try await db.lastSequence(), 99)
+        let restoredSequence = try await db.lastSequence()
+        XCTAssertEqual(restoredSequence, 99)
     }
 
     func testSQLiteMessagePagination() async throws {
@@ -94,7 +95,8 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(recent.first?.sequence, 71)
         let older = try await db.messagesBefore(sessionId: "s", before: 71, limit: 20)
         XCTAssertEqual(older.first?.sequence, 51)
-        XCTAssertEqual(try await db.messageCount(sessionId: "s"), 100)
+        let count = try await db.messageCount(sessionId: "s")
+        XCTAssertEqual(count, 100)
     }
 
     func testRuntimeHierarchyNamesAreDistinct() {
