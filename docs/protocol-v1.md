@@ -155,7 +155,7 @@ Chat: `sendMessage`, `stopGeneration`, `loadRecentMessages`, `loadMessagesBefore
 
 Sync: `getChangesAfterCursor`.
 
-Web: `registerCurrentPage`, `unregisterConversation`, `openConversation`, `focusConversation`, `createConversation`, `listProjects`, `listProjectConversations`, `openProject`.
+Web: `registerCurrentPage`, `unregisterConversation`, `openConversation`, `focusConversation`, `createConversation`, `listProjects`, `listProjectConversations`, `openProject`, `createProject`.
 
 The mobile client never exposes arbitrary shell/PowerShell execution.
 

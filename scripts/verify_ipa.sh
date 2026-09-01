@@ -137,8 +137,12 @@ if grep -nE "$SECRET_PATTERN" "$ALL_STRINGS" >/dev/null 2>&1; then
   grep -nE "$SECRET_PATTERN" "$ALL_STRINGS" >&2 || true
   fail "secret-like material found in app content"
 fi
-if grep -nE "$DEV_URL_PATTERN" "$ALL_STRINGS" >/dev/null 2>&1; then
-  grep -nE "$DEV_URL_PATTERN" "$ALL_STRINGS" >&2 || true
+DEV_URL_HITS="$TMP/dev-url-hits.txt"
+grep -nE "$DEV_URL_PATTERN" "$ALL_STRINGS" \
+  | grep -vF 'http://www.apple.com/DTDs/PropertyList-1.0.dtd' \
+  > "$DEV_URL_HITS" || true
+if [[ -s "$DEV_URL_HITS" ]]; then
+  cat "$DEV_URL_HITS" >&2
   fail "development/local URL found in app content"
 fi
 echo "Sensitive-content scan: PASS"
