@@ -25,6 +25,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.remoteai.mobile
         PRODUCT_NAME: RemoteAI
+        PRODUCT_MODULE_NAME: RemoteAIMobile
         INFOPLIST_FILE: RemoteAIMobile/Info.plist
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: NO
