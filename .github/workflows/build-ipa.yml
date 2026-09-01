@@ -51,8 +51,8 @@ jobs:
           set -euo pipefail
           RUNTIME=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; r=json.load(sys.stdin)["runtimes"]; ids=[x["identifier"] for x in r if x.get("isAvailable") and "iOS" in x.get("name","")]; print(ids[-1])')
           UDID=$(xcrun simctl create RemoteAI-iPhone13Pro com.apple.CoreSimulator.SimDeviceType.iPhone-13-Pro "$RUNTIME")
-          xcrun simctl boot "$UDID"
-          xcrun simctl bootstatus "$UDID" -b
+          # Do not block on simctl bootstatus on hosted runners. xcodebuild will boot
+          # the selected simulator as part of the test destination lifecycle.
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
           xcrun simctl list devices | grep "$UDID"
 
