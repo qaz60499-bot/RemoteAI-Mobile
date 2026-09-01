@@ -1,6 +1,8 @@
 name: RemoteAIMobile
 options:
   bundleIdPrefix: com.remoteai
+  minimumXcodeGenVersion: "2.46.0"
+  xcodeVersion: "16.4"
   deploymentTarget:
     iOS: "15.0"
   createIntermediateGroups: true

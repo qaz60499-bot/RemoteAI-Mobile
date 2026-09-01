@@ -81,7 +81,7 @@ fi
 
 grep -q '^permissions:' .github/workflows/build-ipa.yml || fail "workflow permissions block missing"
 grep -q '^  contents: read$' .github/workflows/build-ipa.yml || fail "workflow contents permission must be read-only"
-if grep -nE '^  (actions|checks|contents|deployments|id-token|issues|packages|pull-requests|security-events|statuses): write$' .github/workflows/build-ipa.yml; then
+if grep -nE '^  (actions|attestations|checks|contents|deployments|id-token|issues|packages|pages|pull-requests|security-events|statuses): write$' .github/workflows/build-ipa.yml; then
   fail "workflow write permission detected"
 fi
 grep -q 'persist-credentials: false' .github/workflows/build-ipa.yml || fail "checkout must not persist GITHUB_TOKEN credentials"
@@ -92,9 +92,91 @@ grep -q 'encode(decoded) == value' RemoteAIMobile/Security.swift || fail "canoni
 grep -q 'connectionWaiters' RemoteAIMobile/CloudflareTransport.swift || fail "concurrent WebSocket connect coalescing missing"
 grep -Fq 'pending[command.commandId] == nil' RemoteAIMobile/CloudflareTransport.swift || fail "duplicate in-flight commandId guard missing"
 grep -q 'fetch-depth: 0' .github/workflows/build-ipa.yml || fail "full Git history is required for secret scanning"
-if grep -nE '^\s*uses:\s*[^#[:space:]]+@(v[0-9]+|main|master|latest)\s*$' .github/workflows/build-ipa.yml; then
-  fail "mutable GitHub Action tag detected; pin actions to full commit SHA"
+WORKFLOW=.github/workflows/build-ipa.yml
+if grep -nE '^  (pull_request|pull_request_target|workflow_run):' "$WORKFLOW"; then
+  fail "untrusted PR/workflow_run events must not build release IPA artifacts"
 fi
+if grep -nF '${{ secrets.' "$WORKFLOW"; then
+  fail "release IPA workflow must not consume repository secrets"
+fi
+if grep -nE '^    inputs:' "$WORKFLOW"; then
+  fail "workflow_dispatch inputs are not allowed to influence release builds"
+fi
+grep -Fq "if: github.ref == 'refs/heads/main'" "$WORKFLOW" || fail "manual release build must be restricted to main"
+grep -q '^    runs-on: macos-15$' "$WORKFLOW" || fail "release build must stay on the explicit macos-15 runner label"
+if grep -nE 'runs-on: macos-latest|find /Applications.*Xcode_.*tail -1|brew install xcodegen' "$WORKFLOW"; then
+  fail "mutable Xcode/XcodeGen toolchain selection detected"
+fi
+grep -q 'Corrupted IPA negative test' "$WORKFLOW" || fail "corrupted IPA negative test missing"
+grep -q 'Reproducible packaging check' "$WORKFLOW" || fail "deterministic IPA packaging check missing"
+grep -q 'build/build-provenance.txt' "$WORKFLOW" || fail "build provenance artifact missing"
+
+"$PYTHON" - "$WORKFLOW" project.yml <<'PY'
+import re
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text(encoding="utf-8")
+project = Path(sys.argv[2]).read_text(encoding="utf-8")
+
+def env(name):
+    m = re.search(rf'^  {re.escape(name)}: "([^"]+)"$', workflow, flags=re.MULTILINE)
+    if not m:
+        raise SystemExit(f"workflow env pin missing: {name}")
+    return m.group(1)
+
+xcode = env("XCODE_VERSION")
+xcode_build = env("XCODE_BUILD")
+sdk = env("IPHONEOS_SDK_VERSION")
+sim_runtime = env("IOS_SIM_RUNTIME")
+xcodegen = env("XCODEGEN_VERSION")
+xcodegen_sha = env("XCODEGEN_SHA256")
+xcodegen_url = env("XCODEGEN_URL")
+if (xcode, xcode_build, sdk) != ("16.4", "16F6", "18.5"):
+    raise SystemExit(f"unapproved Xcode toolchain pin: {(xcode, xcode_build, sdk)}")
+if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", xcode):
+    raise SystemExit(f"invalid Xcode pin: {xcode}")
+if not re.fullmatch(r"[0-9A-Za-z]+", xcode_build):
+    raise SystemExit(f"invalid Xcode build pin: {xcode_build}")
+if not re.fullmatch(r"\d+\.\d+", sdk):
+    raise SystemExit(f"invalid iPhoneOS SDK pin: {sdk}")
+expected_runtime = "com.apple.CoreSimulator.SimRuntime.iOS-" + sdk.replace(".", "-")
+if sim_runtime != expected_runtime:
+    raise SystemExit(f"simulator runtime pin does not match SDK: {sim_runtime} vs {sdk}")
+if xcodegen != "2.46.0":
+    raise SystemExit(f"unexpected XcodeGen version pin: {xcodegen}")
+if xcodegen_sha != "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806":
+    raise SystemExit("XcodeGen archive SHA256 pin mismatch")
+if xcodegen_url != f"https://github.com/yonaskolb/XcodeGen/releases/download/{xcodegen}/xcodegen.zip":
+    raise SystemExit("XcodeGen download URL is not tied to the pinned release")
+px = re.search(r'^  xcodeVersion: "([^"]+)"$', project, flags=re.MULTILINE)
+pg = re.search(r'^  minimumXcodeGenVersion: "([^"]+)"$', project, flags=re.MULTILINE)
+if not px or px.group(1) != xcode:
+    raise SystemExit("project.yml xcodeVersion does not match workflow pin")
+if not pg or pg.group(1) != xcodegen:
+    raise SystemExit("project.yml minimumXcodeGenVersion does not match workflow pin")
+if f'/Applications/Xcode_${{XCODE_VERSION}}.app' not in workflow:
+    raise SystemExit("workflow does not select Xcode from the pinned XCODE_VERSION")
+if 'test "$ACTUAL_XCODE_VERSION" = "$XCODE_VERSION"' not in workflow or 'test "$ACTUAL_XCODE_BUILD" = "$XCODE_BUILD"' not in workflow:
+    raise SystemExit("workflow does not verify actual Xcode version/build")
+if 'test "$ACTUAL_SDK" = "$IPHONEOS_SDK_VERSION"' not in workflow:
+    raise SystemExit("workflow does not verify actual iPhoneOS SDK")
+uses = re.findall(r"^\s*uses:\s*([^\s#]+)", workflow, flags=re.MULTILINE)
+if not uses:
+    raise SystemExit("workflow contains no actions to audit")
+for ref in uses:
+    if ref.startswith("./"):
+        continue
+    if not re.fullmatch(r"[^@]+@[0-9a-fA-F]{40}", ref):
+        raise SystemExit(f"GitHub Action is not pinned to a full commit SHA: {ref}")
+PY
+
+grep -q 'FORBIDDEN_PATH' scripts/verify_ipa.sh || fail "IPA test/fixture/VCS contamination scan missing"
+grep -q 'Signature=adhoc' scripts/verify_ipa.sh || fail "IPA ad-hoc signature verification missing"
+grep -q 'unexpected entitlements in TrollStore build' scripts/verify_ipa.sh || fail "IPA entitlement audit missing"
+grep -q 'SECRET_PATTERN' scripts/verify_ipa.sh || fail "IPA secret scan missing"
+grep -q 'DEV_URL_PATTERN' scripts/verify_ipa.sh || fail "IPA development URL scan missing"
+grep -q 'Mach-O minimum iOS is not 15.0' scripts/verify_ipa.sh || fail "Mach-O deployment target verification missing"
 
 SECRET_PATTERN='(-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|A(KIA|SIA)[0-9A-Z]{16}|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{32,}|AIza[0-9A-Za-z_-]{35}|(CLOUDFLARE_API_TOKEN|CF_API_TOKEN|GITHUB_TOKEN|PROVIDER_API_KEY|PAIRING_SECRET)[[:space:]]*[:=][[:space:]]*["'"'][^"'"']{8,}["'"'])'
 TMP_MATCHES="$(mktemp)"
