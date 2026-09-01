@@ -133,9 +133,9 @@ struct Composer: View {
     let send: () -> Void
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            Button(action: {}) { Image(systemName: "plus.circle").font(.title2) }.accessibilityLabel("Attachments")
+            Button(action: {}) { Image(systemName: "plus.circle").font(.title2).frame(width: 44, height: 44) }.accessibilityLabel("Attachments")
             TextEditor(text: $text).frame(minHeight: 36, maxHeight: 92).padding(.horizontal, 7).padding(.vertical, 2).background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground))).overlay(RoundedRectangle(cornerRadius: 18).stroke(Color(.separator), lineWidth: 0.5)).accessibilityIdentifier("MessageComposer")
-            Button(action: send) { Image(systemName: "arrow.up.circle.fill").font(.title).foregroundColor(enabled && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .accentColor : .secondary) }.disabled(!enabled || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).accessibilityLabel("Send")
+            Button(action: send) { Image(systemName: "arrow.up.circle.fill").font(.title).frame(width: 44, height: 44).foregroundColor(enabled && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .accentColor : .secondary) }.disabled(!enabled || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).accessibilityLabel("Send")
         }.padding(.horizontal, 10).padding(.vertical, 8).background(.ultraThinMaterial)
     }
 }
