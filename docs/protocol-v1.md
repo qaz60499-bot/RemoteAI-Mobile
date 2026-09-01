@@ -35,7 +35,7 @@ Production code rejects plain `http://` relay configuration.
 
 ## Pairing
 
-Windows displays a machine ID and an 8-digit rotating pairing code. iOS creates an X25519 private key locally and stores private/shared key material in `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` Keychain items.
+Windows displays a machine ID and an 8-digit rotating pairing code. iOS creates an ephemeral X25519 private key locally. After `PAIR_ACCEPT`, only the stable device ID and derived 32-byte shared key are persisted in `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` Keychain items; the X25519 private key is discarded after derivation.
 
 Pair flow:
 
@@ -59,7 +59,7 @@ info = UTF8("device:" + deviceId + ":protocol-v1")
 KDF  = HKDF-SHA256
 ```
 
-The pairing code and private/shared keys are never written to UserDefaults, SQLite, source, or GitHub.
+The pairing code, ephemeral private key, and derived shared key are never written to UserDefaults, SQLite, source, or GitHub. Legacy protocol-v1 private-key Keychain entries are deleted during successful pairing migration. When the app pairs to a different machine, the previous machine's pairing key and cached SQLite data are deleted before the new workspace is loaded.
 
 ## End-to-end encryption
 
@@ -142,7 +142,7 @@ The mobile client never exposes arbitrary shell/PowerShell execution.
 
 ## Local cache
 
-SQLite is WAL-mode and uses bound SQL parameters. The application cache directory/database are marked with iOS data protection (`completeUntilFirstUserAuthentication`). Pairing secrets are not stored in SQLite.
+SQLite is WAL-mode and uses bound SQL parameters, `secure_delete=ON`, `trusted_schema=OFF`, bounded KV/message record sizes, and `PRAGMA quick_check` coverage. The application cache directory/database/WAL/SHM files are marked with iOS `NSFileProtectionComplete`. If protected Application Support storage cannot open, the app falls back to an in-memory SQLite cache rather than an unprotected temporary file. Pairing secrets are not stored in SQLite.
 
 ## Windows integration source of truth
 

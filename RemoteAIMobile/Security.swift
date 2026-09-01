@@ -44,7 +44,7 @@ final class KeychainStore {
 
 enum PairingKeyStore {
     private static let deviceIdAccount = "device-id-v1"
-    private static func privateAccount(_ machineId: String) -> String { "x25519-private-v1.\(machineId)" }
+    private static func legacyPrivateAccount(_ machineId: String) -> String { "x25519-private-v1.\(machineId)" }
     private static func sharedAccount(_ machineId: String) -> String { "shared-key-v1.\(machineId)" }
 
     static func deviceId(keychain: KeychainStore = .shared) throws -> String {
@@ -54,17 +54,21 @@ enum PairingKeyStore {
         return id
     }
 
-    static func savePairing(machineId: String, privateKeyRaw: Data, sharedKey: Data, keychain: KeychainStore = .shared) throws {
-        try keychain.save(privateKeyRaw, account: privateAccount(machineId))
+    static func savePairing(machineId: String, sharedKey: Data, keychain: KeychainStore = .shared) throws {
+        guard sharedKey.count == 32 else { throw TransportError.malformedData }
         try keychain.save(sharedKey, account: sharedAccount(machineId))
+        // Migration cleanup: protocol-v1 originally persisted the ephemeral X25519 private key.
+        // Transport only needs the derived shared key after pairing, so remove any legacy copy.
+        keychain.delete(account: legacyPrivateAccount(machineId))
     }
 
     static func sharedKey(machineId: String, keychain: KeychainStore = .shared) -> Data? {
         keychain.load(account: sharedAccount(machineId))
     }
 
-    static func privateKey(machineId: String, keychain: KeychainStore = .shared) -> Data? {
-        keychain.load(account: privateAccount(machineId))
+    static func deletePairing(machineId: String, keychain: KeychainStore = .shared) {
+        keychain.delete(account: sharedAccount(machineId))
+        keychain.delete(account: legacyPrivateAccount(machineId))
     }
 
     static func isPaired(machineId: String, keychain: KeychainStore = .shared) -> Bool {
@@ -193,7 +197,7 @@ final class RelayPairingClient {
             let accepted = try await receiveFrame(kind: "PAIR_ACCEPT", deviceId: deviceId, socket: socket)
             let machinePublicKeyB64 = accepted.body["machinePublicKeyB64"]?.stringValue ?? challengeMachinePublic
             let shared = try PayloadCrypto.deriveSharedKey(privateKeyRaw: privateKeyRaw, machinePublicKeyB64: machinePublicKeyB64, machineId: machineId, deviceId: deviceId)
-            try PairingKeyStore.savePairing(machineId: machineId, privateKeyRaw: privateKeyRaw, sharedKey: shared, keychain: keychain)
+            try PairingKeyStore.savePairing(machineId: machineId, sharedKey: shared, keychain: keychain)
             socket.cancel(with: .normalClosure, reason: nil)
             return PairingResult(machineId: machineId, deviceId: deviceId)
         } catch {

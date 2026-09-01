@@ -27,7 +27,9 @@ final class WorkspaceStore: ObservableObject {
     }
 
     static func makeDefault() -> WorkspaceStore {
-        let cache = (try? SQLiteStore.appStore()) ?? (try! SQLiteStore(url: FileManager.default.temporaryDirectory.appendingPathComponent("remoteai-cache.sqlite3")))
+        // Fail closed for persistence: if the protected Application Support store cannot open,
+        // keep cache data in memory instead of writing it to an unprotected temporary file.
+        let cache = (try? SQLiteStore.appStore()) ?? (try! SQLiteStore.inMemory())
         let config = RemoteAIConfig.loadMetadata()
         let useMock = ProcessInfo.processInfo.arguments.contains("-UITestMockMode") || !PairingKeyStore.isPaired(machineId: config.machineId)
         let transport: Transport = useMock ? MockTransport() : CloudflareTransport(config: config)
@@ -171,7 +173,20 @@ final class WorkspaceStore: ObservableObject {
         eventTask?.cancel()
         connectionMonitorTask?.cancel()
         await transport.disconnect()
+        let previousMachineId = machine.id
         let result = try await RelayPairingClient().pair(baseURL: baseURL, machineId: machineId, pairingCode: code)
+
+        if previousMachineId != result.machineId {
+            PairingKeyStore.deletePairing(machineId: previousMachineId)
+            try await cache.clearAll()
+            runtimes.removeAll()
+            instances.removeAll()
+            sessions.removeAll()
+            messagesBySession.removeAll()
+            hasMoreBySession.removeAll()
+            tracker = SequenceTracker()
+        }
+
         let config = RemoteAIConfig(relayBaseURL: baseURL, machineId: result.machineId)
         config.saveMetadata()
         transport = CloudflareTransport(config: config)

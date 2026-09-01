@@ -1,4 +1,5 @@
 import XCTest
+import Security
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
@@ -85,6 +86,37 @@ final class RemoteAIMobileTests: XCTestCase {
         let body = try PayloadCrypto.encrypt(clear, keyData: key, machineId: "machine-a", deviceId: "device-a", messageId: "message-a")
         XCTAssertEqual(try PayloadCrypto.decrypt(body, keyData: key, machineId: "machine-a", deviceId: "device-a", messageId: "message-a"), clear)
         XCTAssertThrowsError(try PayloadCrypto.decrypt(body, keyData: key, machineId: "machine-a", deviceId: "device-a", messageId: "message-b"))
+    }
+
+    func testKeychainUsesWhenUnlockedThisDeviceOnly() throws {
+        let account = "security-test.\(UUID().uuidString)"
+        defer { KeychainStore.shared.delete(account: account) }
+        try KeychainStore.shared.save(Data("not-a-real-secret".utf8), account: account)
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.remoteai.mobile.pairing",
+            kSecAttrAccount as String: account,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        XCTAssertEqual(SecItemCopyMatching(query as CFDictionary, &result), errSecSuccess)
+        let attributes = try XCTUnwrap(result as? [String: Any])
+        XCTAssertEqual(attributes[kSecAttrAccessible as String] as? String, kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String)
+    }
+
+    func testPairingStorePersistsOnlyDerivedSharedKeyAndCleansLegacyPrivateKey() throws {
+        let machineId = "security-test-\(UUID().uuidString)"
+        let legacyPrivateAccount = "x25519-private-v1.\(machineId)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try KeychainStore.shared.save(Data(repeating: 1, count: 32), account: legacyPrivateAccount)
+
+        let shared = Data(repeating: 7, count: 32)
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: shared)
+
+        XCTAssertEqual(PairingKeyStore.sharedKey(machineId: machineId), shared)
+        XCTAssertNil(KeychainStore.shared.load(account: legacyPrivateAccount))
     }
 
     func testRelayRejectsPlainHTTP() {
@@ -246,6 +278,48 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(restoredSequence, 99)
     }
 
+    func testSQLiteRejectsOversizedDraftAndKeepsIntegrity() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let db = try SQLiteStore(url: url)
+        do {
+            try await db.saveDraft(String(repeating: "x", count: SQLiteStore.maxKVBytes + 1), sessionId: "oversized")
+            XCTFail("Expected oversized draft to be rejected")
+        } catch {
+            XCTAssertEqual(error as? StoreError, .valueTooLarge)
+        }
+        let integrityOK = try await db.integrityCheck()
+        XCTAssertTrue(integrityOK)
+    }
+
+    func testSQLiteRejectsCorruptDatabaseFile() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try Data("not-a-sqlite-database".utf8).write(to: url, options: .atomic)
+        XCTAssertThrowsError(try SQLiteStore(url: url))
+    }
+
+    func testSQLiteClearAllRemovesMetadataMessagesAndDrafts() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let db = try SQLiteStore(url: url)
+        let message = ChatMessage(id: "m1", sessionId: "s", sequence: 1, role: .assistant, kind: .text, text: "cached", toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
+        try await db.put("machine-a", key: "machine-id")
+        try await db.saveDraft("draft", sessionId: "s")
+        try await db.upsertMessages([message])
+
+        try await db.clearAll()
+
+        let machineId: String? = try await db.get(String.self, key: "machine-id")
+        let draft = try await db.draft(sessionId: "s")
+        let count = try await db.messageCount(sessionId: "s")
+        let integrityOK = try await db.integrityCheck()
+        XCTAssertNil(machineId)
+        XCTAssertEqual(draft, "")
+        XCTAssertEqual(count, 0)
+        XCTAssertTrue(integrityOK)
+    }
+
     func testSQLiteMessagePaginationUsesStableCursor() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
         let db = try SQLiteStore(url: url)
@@ -261,7 +335,11 @@ final class RemoteAIMobileTests: XCTestCase {
         let older = try await db.messagesBefore(sessionId: "s", before: cursor, limit: 20)
         XCTAssertEqual(older.first?.id, "m051")
         let count = try await db.messageCount(sessionId: "s")
+        let minPage = try await db.recentMessages(sessionId: "s", limit: 0)
+        let maxPage = try await db.recentMessages(sessionId: "s", limit: 1_000)
         XCTAssertEqual(count, 100)
+        XCTAssertEqual(minPage.count, 1)
+        XCTAssertEqual(maxPage.count, 100)
     }
 
     func testRuntimeHierarchyNamesAreDistinct() {

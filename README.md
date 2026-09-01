@@ -14,11 +14,11 @@ Hierarchy is fixed:
 - Chat UI with user/assistant bubbles, Tool/Event cards, streaming text, command state, Retry, Stop Generation, older-message loading and scroll preservation.
 - iPhone-safe layout: native safe areas plus extra top breathing room; composer follows the keyboard and primary touch targets are at least 44×44 pt.
 - Recent 50-message window plus 40-message upward pagination over `LazyVStack`.
-- SQLite WAL cache for metadata, recent messages, sync cursor, drafts and UI state. Remote and cached history share the same `(createdAt, messageId)` pagination semantics.
+- SQLite WAL cache for metadata, recent messages, sync cursor, drafts and UI state. Cache files use iOS `NSFileProtectionComplete`, secure-delete, bounded record sizes, corruption checks, and an in-memory fail-closed fallback if protected persistence cannot open. Remote and cached history share the same `(createdAt, messageId)` pagination semantics.
 - Persisted event sequence cursor with duplicate filtering, gap recovery, reconnect and delta sync.
 - Stable command UUID idempotency. Unknown delivery keeps the original command ID for explicit Retry rather than silently executing twice.
 - Pairing by QR/manual code using X25519, HMAC-SHA256 proof and HKDF-SHA256.
-- Device private/shared key material stored in iOS Keychain with `WhenUnlockedThisDeviceOnly` accessibility.
+- Stable device ID and the derived 32-byte pairing shared key are stored in iOS Keychain with `WhenUnlockedThisDeviceOnly` accessibility. The ephemeral X25519 private key exists only during pairing and is not persisted after HKDF derivation.
 - End-to-end AES-256-GCM command/response/event payloads with authenticated AAD. Cloudflare routes encrypted relay frames and does not receive the payload key.
 - Cloud Code accepts `credentialProfileId`; provider API keys stay on Windows.
 - `MockTransport` covers normal, 1200-message history, streaming, tool event, offline, command failure, disconnect/reconnect, duplicate event and sequence-gap behavior.
@@ -91,7 +91,7 @@ Until a real Windows machine is paired, the app can run with `MockTransport`. UI
 `.github/workflows/build-ipa.yml` runs on push to `main` and `workflow_dispatch`:
 
 1. checkout
-2. security/config audit and protocol JSON validation
+2. security/config audit, full Git-history secret scan, Info.plist/ATS checks and protocol JSON validation
 3. select a stable non-beta Xcode
 4. install XcodeGen and generate the project
 5. create an iPhone 13 Pro simulator
@@ -104,7 +104,7 @@ Until a real Windows machine is paired, the app can run with `MockTransport`. UI
 12. calculate SHA256
 13. upload the `RemoteAI-TrollStore-IPA` artifact
 
-No API keys, Cloudflare secrets, Apple credentials, account cookies, browser sessions, pairing codes, device private keys or derived pairing secrets belong in this repository.
+No API keys, Cloudflare secrets, Apple credentials, account cookies, browser sessions, pairing codes, device private keys or derived pairing secrets belong in this repository. CI checkout uses read-only permissions, does not persist `GITHUB_TOKEN` credentials, and third-party GitHub Actions are pinned to full commit SHAs.
 
 ## Windows integration still requiring a live-device check
 

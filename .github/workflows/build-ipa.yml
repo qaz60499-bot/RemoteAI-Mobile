@@ -19,33 +19,14 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Security and protocol audit
         shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m json.tool contracts/protocol-v1.json >/dev/null
-          EXPECTED_CONTRACT_SHA="4ad8eb5e7f58e5e0179489e0a0c9abdd6c9b9f19c307a603897532dee6869947"
-          ACTUAL_CONTRACT_SHA=$(shasum -a 256 contracts/protocol-v1.json | awk '{print $1}')
-          test "$ACTUAL_CONTRACT_SHA" = "$EXPECTED_CONTRACT_SHA"
-          grep -q 'kSecAttrAccessibleWhenUnlockedThisDeviceOnly' RemoteAIMobile/Security.swift
-          grep -q 'Curve25519.KeyAgreement.PrivateKey' RemoteAIMobile/Security.swift
-          grep -q 'A256GCM' RemoteAIMobile/Security.swift
-          grep -q 'case insecureRelay' RemoteAIMobile/Transport.swift
-          if grep -R -nE 'X-RemoteAI-Device|sharedSecretBase64|/v1/(pair|command)|protocolVersion: "1"' RemoteAIMobile; then
-            echo 'Legacy or secret-bearing transport pattern detected' >&2
-            exit 1
-          fi
-          if grep -R -nE 'BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|gh[opusr]_[A-Za-z0-9_]{20,}' RemoteAIMobile contracts mock; then
-            echo 'Possible committed credential/private key detected' >&2
-            exit 1
-          fi
-          if grep -q 'NSAppTransportSecurity' RemoteAIMobile/Info.plist; then
-            echo 'ATS exception detected' >&2
-            exit 1
-          fi
-          echo "Security audit PASS; frozen protocol SHA256=$ACTUAL_CONTRACT_SHA"
+        run: bash scripts/security_audit.sh
 
       - name: Select stable Xcode
         shell: bash
@@ -169,7 +150,7 @@ jobs:
           test -x build/unzip-check/Payload/RemoteAI.app/RemoteAI
 
       - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: RemoteAI-TrollStore-IPA
           path: |
