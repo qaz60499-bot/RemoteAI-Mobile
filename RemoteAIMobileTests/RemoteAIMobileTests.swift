@@ -222,15 +222,18 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertTrue(reconnected)
     }
 
-    func testMockSequenceGapScenario() async throws {
+    func testMockSequenceGapScenarioIsRejectedByStrictDeltaValidation() async throws {
         let mock = MockTransport(scenario: .sequenceGap, historyCount: 10)
         try await mock.connect()
         let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
         _ = try await mock.execute(command)
         try await Task.sleep(nanoseconds: 800_000_000)
-        let sequences = try await mock.delta(machineId: "my-pc", after: 0).events.map(\.sequence).sorted()
-        let hasGap = zip(sequences, sequences.dropFirst()).contains { pair in pair.1 > pair.0 + 1 }
-        XCTAssertTrue(hasGap)
+        do {
+            _ = try await mock.delta(machineId: "my-pc", after: 0)
+            XCTFail("Expected a delta batch with a sequence gap to be rejected")
+        } catch {
+            XCTAssertEqual(error as? TransportError, .malformedData)
+        }
     }
 
     func testMockDuplicateEventScenario() async throws {
