@@ -2,6 +2,24 @@ import SwiftUI
 import AVFoundation
 import UIKit
 
+private enum MobileLayout {
+    static let extraTopBreathingRoom: CGFloat = 8
+}
+
+private extension View {
+    /// Native navigation already respects the notch/Dynamic Island. Keep a small
+    /// additional non-interactive gap below it so content never feels pinned to
+    /// the system chrome on compact iPhones.
+    func remoteAITopBreathingRoom() -> some View {
+        safeAreaInset(edge: .top, spacing: 0) {
+            Color.clear
+                .frame(height: MobileLayout.extraTopBreathingRoom)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+    }
+}
+
 struct RootView: View {
     @EnvironmentObject var store: WorkspaceStore
     @State private var showingPair = false
@@ -27,6 +45,7 @@ struct RootView: View {
                 }
             }
             .listStyle(.insetGrouped)
+            .remoteAITopBreathingRoom()
             .navigationTitle("Remote AI")
             .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button { showingPair = true } label: { Image(systemName: store.isPaired ? "checkmark.shield" : "qrcode.viewfinder") }.accessibilityLabel("Pair Device") } }
             .sheet(isPresented: $showingPair) { PairingView().environmentObject(store) }
@@ -46,7 +65,7 @@ struct RuntimeView: View {
                     .padding(.vertical, 5)
                 }
             }
-        }.navigationTitle(runtime.name).navigationBarTitleDisplayMode(.inline)
+        }.remoteAITopBreathingRoom().navigationTitle(runtime.name).navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -66,6 +85,7 @@ struct InstanceView: View {
             }
             Section { Button { newSession = true } label: { Label(runtime.kind == .web ? "New Chat" : "New Session", systemImage: "plus.circle.fill") } }
         }
+        .remoteAITopBreathingRoom()
         .navigationTitle(instance.name).navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $newSession) { NewSessionView(runtime: runtime, instance: instance).environmentObject(store) }
     }
@@ -96,6 +116,7 @@ struct ChatView: View {
                 .onChange(of: messages.last?.id) { _ in if !loadingOlder, let id = messages.last?.id { withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(id, anchor: .bottom) } } }
             }
         }
+        .remoteAITopBreathingRoom()
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) { VStack(spacing: 1) { Text(instance.name).font(.subheadline.weight(.semibold)); Text(session.title).font(.caption2).foregroundColor(.secondary); Text(store.machine.state.rawValue).font(.caption2).foregroundColor(store.machine.state == .online ? .green : .secondary) } }
@@ -113,7 +134,7 @@ struct Composer: View {
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
             Button(action: {}) { Image(systemName: "plus.circle").font(.title2) }.accessibilityLabel("Attachments")
-            TextEditor(text: $text).frame(minHeight: 36, maxHeight: 92).padding(.horizontal, 7).padding(.vertical, 2).background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground))).overlay(RoundedRectangle(cornerRadius: 18).stroke(Color(.separator), lineWidth: 0.5))
+            TextEditor(text: $text).frame(minHeight: 36, maxHeight: 92).padding(.horizontal, 7).padding(.vertical, 2).background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground))).overlay(RoundedRectangle(cornerRadius: 18).stroke(Color(.separator), lineWidth: 0.5)).accessibilityIdentifier("MessageComposer")
             Button(action: send) { Image(systemName: "arrow.up.circle.fill").font(.title).foregroundColor(enabled && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .accentColor : .secondary) }.disabled(!enabled || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).accessibilityLabel("Send")
         }.padding(.horizontal, 10).padding(.vertical, 8).background(.ultraThinMaterial)
     }
@@ -156,7 +177,7 @@ struct NewSessionView: View {
         NavigationView { Form {
             Section("Project") { Text(instance.name); TextField("Session title", text: $title) }
             if runtime.kind == .cloudCode { Section("Runtime") { TextField("Provider", text: $provider); TextField("Model", text: $model); TextField("Credential Profile ID", text: $credential).textInputAutocapitalization(.never).autocorrectionDisabled(true); Text("Only credentialProfileId is stored on the phone. Real API keys never leave Windows.").font(.caption).foregroundColor(.secondary) } }
-        }.navigationTitle(runtime.kind == .web ? "New Chat" : "New Session").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Create") { Task { await store.createSession(runtime: runtime, instance: instance, title: title, provider: provider, model: model, credentialProfileId: credential); dismiss() } } } } }
+        }.remoteAITopBreathingRoom().navigationTitle(runtime.kind == .web ? "New Chat" : "New Session").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Create") { Task { await store.createSession(runtime: runtime, instance: instance, title: title, provider: provider, model: model, credentialProfileId: credential); dismiss() } } } } }
     }
 }
 
@@ -169,7 +190,7 @@ struct PairingView: View {
             Section("Windows Relay") { TextField("https://relay.example.com", text: $relay).textInputAutocapitalization(.never).autocorrectionDisabled(true); TextField("Pairing code", text: $code).textInputAutocapitalization(.never).autocorrectionDisabled(true); Button { scanner = true } label: { Label("Scan QR Code", systemImage: "qrcode.viewfinder") } }
             Section { Text("The pairing secret is stored only in iOS Keychain. Relay URLs may be cached, but secrets are never written to UserDefaults or SQLite.").font(.caption).foregroundColor(.secondary) }
             if let error { Section { Text(error).foregroundColor(.red).font(.caption) } }
-        }.navigationTitle("Pair Device").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Pair") { Task { guard let url = URL(string: relay), !code.isEmpty else { error = "Enter a valid relay URL and code."; return }; do { try await store.savePairing(baseURL: url, code: code); dismiss() } catch { self.error = error.localizedDescription } } } } }.sheet(isPresented: $scanner) { QRScannerView { value in code = value; scanner = false } } }
+        }.remoteAITopBreathingRoom().navigationTitle("Pair Device").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Pair") { Task { guard let url = URL(string: relay), !code.isEmpty else { error = "Enter a valid relay URL and code."; return }; do { try await store.savePairing(baseURL: url, code: code); dismiss() } catch { self.error = error.localizedDescription } } } } }.sheet(isPresented: $scanner) { QRScannerView { value in code = value; scanner = false } } }
     }
 }
 
