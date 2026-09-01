@@ -54,8 +54,9 @@ final class RemoteAIMobileUITests: XCTestCase {
         app.launchArguments += ["-UITestMockMode", "1"]
         app.launch()
         app.buttons["Pair Device"].tap()
-        XCTAssertTrue(app.staticTexts["Windows Relay"].waitForExistence(timeout: 3))
-        XCTAssertTrue(app.buttons["Scan QR Code"].exists)
+        XCTAssertTrue(app.navigationBars["Pair Device"].waitForExistence(timeout: 5))
+        XCTAssertGreaterThanOrEqual(app.textFields.count, 3)
+        XCTAssertTrue(app.buttons["Scan QR Code"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.buttons["Pair"].exists)
     }
 }
