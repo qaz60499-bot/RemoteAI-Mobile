@@ -18,8 +18,83 @@ enum MessageKind: String, Codable { case text, toolEvent, error }
 
 struct MachineMetadata: Codable, Identifiable, Hashable { let id: String; var name: String; var state: MachineConnectionState }
 struct RuntimeDescriptor: Codable, Identifiable, Hashable { let id: String; let machineId: String; let kind: RuntimeKind; let name: String; var status: String? = nil }
-struct InstanceDescriptor: Codable, Identifiable, Hashable { let id: String; let runtimeId: String; let name: String; let subtitle: String?; var status: String? = nil }
-struct SessionDescriptor: Codable, Identifiable, Hashable { let id: String; let instanceId: String; var title: String; var state: SessionState; var updatedAt: Date }
+struct InstanceDescriptor: Codable, Identifiable, Hashable {
+    let id: String
+    let runtimeId: String
+    let name: String
+    let subtitle: String?
+    var status: String? = nil
+    var config: [String: JSONValue] = [:]
+}
+
+struct CloudCodeProviderOption: Codable, Identifiable, Hashable {
+    let id: String
+    let label: String
+    let models: [String]
+    let defaultModel: String?
+    let custom: Bool
+    let requiresApiKey: Bool
+}
+
+struct CloudCodeCredentialOption: Codable, Identifiable, Hashable {
+    let id: String
+    let label: String
+}
+
+struct CloudCodeCatalog: Codable, Hashable {
+    let providers: [CloudCodeProviderOption]
+    let credentialProfiles: [CloudCodeCredentialOption]
+    let defaultProviderId: String?
+    let defaultCredentialProfileId: String?
+    let supportsNewCredential: Bool
+}
+
+extension InstanceDescriptor {
+    var cloudCodeCatalog: CloudCodeCatalog? {
+        try? config["cloudCodeCatalog"]?.decode(CloudCodeCatalog.self)
+    }
+}
+struct SessionDescriptor: Codable, Identifiable, Hashable { let id: String; let instanceId: String; var title: String; var state: SessionState; var updatedAt: Date; var projectAlias: String? = nil; var canonicalUrl: String? = nil }
+
+struct WebProjectDescriptor: Codable, Identifiable, Hashable {
+    var id: String { projectAlias }
+    let projectAlias: String
+    let projectId: String?
+    let displayName: String
+    let canonicalUrl: String
+    let lastSeenAt: Date?
+    let lastOpenedAt: Date?
+}
+
+struct WebConversationDescriptor: Codable, Identifiable, Hashable {
+    var id: String { localConversationId }
+    let localConversationId: String
+    let canonicalUrl: String
+    let projectId: String?
+    let displayTitle: String
+    let projectAlias: String?
+    let conversationAlias: String?
+    let lastVisited: Date?
+    let updatedAt: Date
+
+    var session: SessionDescriptor {
+        SessionDescriptor(id: localConversationId, instanceId: "web.chatgpt", title: displayTitle, state: .idle, updatedAt: updatedAt, projectAlias: projectAlias, canonicalUrl: canonicalUrl)
+    }
+}
+
+struct WebProjectListResponse: Codable {
+    let items: [WebProjectDescriptor]
+    let observedAt: Date?
+}
+
+struct WebProjectConversationPage: Codable {
+    let project: WebProjectDescriptor
+    let items: [WebConversationDescriptor]
+    let cursor: String?
+    let nextCursor: String?
+    let hasMore: Bool
+    let observedAt: Date?
+}
 
 struct MessageCursor: Codable, Hashable {
     let createdAt: Date
@@ -244,13 +319,21 @@ extension ServerRuntime {
 
 extension ServerInstance {
     var descriptor: InstanceDescriptor {
-        InstanceDescriptor(id: instanceId, runtimeId: runtimeId, name: label, subtitle: kind, status: status)
+        InstanceDescriptor(id: instanceId, runtimeId: runtimeId, name: label, subtitle: kind, status: status, config: config)
     }
 }
 
 extension ServerSession {
     var descriptor: SessionDescriptor {
-        SessionDescriptor(id: sessionId, instanceId: instanceId, title: title, state: .server(status), updatedAt: updatedAt)
+        SessionDescriptor(
+            id: sessionId,
+            instanceId: instanceId,
+            title: title,
+            state: .server(status),
+            updatedAt: updatedAt,
+            projectAlias: metadata["projectAlias"]?.stringValue,
+            canonicalUrl: canonicalUrl
+        )
     }
 }
 

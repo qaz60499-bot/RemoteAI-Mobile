@@ -8,6 +8,10 @@ final class WorkspaceStore: ObservableObject {
     @Published var instances: [InstanceDescriptor] = []
     @Published var sessions: [SessionDescriptor] = []
     @Published var messagesBySession: [String: [ChatMessage]] = [:]
+    @Published var webProjects: [WebProjectDescriptor] = []
+    @Published var projectConversationsByAlias: [String: [WebConversationDescriptor]] = [:]
+    @Published var projectNextCursorByAlias: [String: String] = [:]
+    @Published var projectHasMoreByAlias: [String: Bool] = [:]
     @Published var commandStates: [UUID: CommandState] = [:]
     @Published var errors: [String: String] = [:]
     @Published var hasMoreBySession: [String: Bool] = [:]
@@ -67,6 +71,121 @@ final class WorkspaceStore: ObservableObject {
     func resumeFromForeground() async {
         machine.state = .connecting
         await start()
+    }
+
+    func refreshWebProjects() async {
+        if webProjects.isEmpty,
+           let cached: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
+            webProjects = cached
+        }
+        guard machine.state == .online else { return }
+        do {
+            let remote = try await transport.listProjects(machineId: machine.id)
+            webProjects = remote.sorted { ($0.lastOpenedAt ?? $0.lastSeenAt ?? .distantPast) > ($1.lastOpenedAt ?? $1.lastSeenAt ?? .distantPast) }
+            try? await cache.put(webProjects, key: "web.projects")
+            errors["web.projects"] = nil
+        } catch {
+            errors["web.projects"] = error.localizedDescription
+        }
+    }
+
+    func createWebProject(name: String) async -> WebProjectDescriptor? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard machine.state == .online else {
+            errors["web.projects"] = "PC Offline — new Projects require the Windows browser runtime."
+            return nil
+        }
+        do {
+            let created = try await transport.createWebProject(machineId: machine.id, projectName: trimmed)
+            webProjects.removeAll { $0.projectAlias == created.projectAlias }
+            webProjects.insert(created, at: 0)
+            try? await cache.put(webProjects, key: "web.projects")
+            errors["web.projects"] = nil
+            return created
+        } catch {
+            errors["web.projects"] = error.localizedDescription
+            return nil
+        }
+    }
+
+    func loadProjectConversations(projectAlias: String, refresh: Bool = true) async {
+        if projectConversationsByAlias[projectAlias] == nil,
+           let cached: [WebConversationDescriptor] = try? await cache.get([WebConversationDescriptor].self, key: "web.project.\(projectAlias).conversations") {
+            projectConversationsByAlias[projectAlias] = cached
+        }
+        guard refresh, machine.state == .online else { return }
+        do {
+            let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30)
+            projectConversationsByAlias[projectAlias] = page.items
+            if let cursor = page.nextCursor { projectNextCursorByAlias[projectAlias] = cursor }
+            else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
+            projectHasMoreByAlias[projectAlias] = page.hasMore
+            try? await cache.put(page.items, key: "web.project.\(projectAlias).conversations")
+            mergeProjectSessions(page.items)
+            errors["web.project.\(projectAlias)"] = nil
+        } catch {
+            errors["web.project.\(projectAlias)"] = error.localizedDescription
+        }
+    }
+
+    func loadMoreProjectConversations(projectAlias: String) async {
+        guard machine.state == .online,
+              projectHasMoreByAlias[projectAlias] == true,
+              let cursor = projectNextCursorByAlias[projectAlias] else { return }
+        do {
+            let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, cursor: cursor)
+            var merged = projectConversationsByAlias[projectAlias, default: []]
+            for item in page.items where !merged.contains(where: { $0.id == item.id }) { merged.append(item) }
+            merged.sort { $0.updatedAt > $1.updatedAt }
+            projectConversationsByAlias[projectAlias] = Array(merged.prefix(50))
+            if let next = page.nextCursor { projectNextCursorByAlias[projectAlias] = next }
+            else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
+            projectHasMoreByAlias[projectAlias] = page.hasMore
+            try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+            mergeProjectSessions(page.items)
+        } catch {
+            errors["web.project.\(projectAlias)"] = error.localizedDescription
+        }
+    }
+
+    func createWebConversation(projectAlias: String? = nil) async -> SessionDescriptor? {
+        guard machine.state == .online else {
+            errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = "PC Offline — new conversations require the Windows browser runtime."
+            return nil
+        }
+        do {
+            let created = try await transport.createWebConversation(machineId: machine.id, projectAlias: projectAlias)
+            let session = created.session
+            sessions.removeAll { $0.id == session.id }
+            sessions.insert(session, at: 0)
+            if let alias = projectAlias {
+                var rows = projectConversationsByAlias[alias, default: []]
+                rows.removeAll { $0.id == created.id }
+                rows.insert(created, at: 0)
+                projectConversationsByAlias[alias] = Array(rows.prefix(50))
+                try? await cache.put(projectConversationsByAlias[alias] ?? [], key: "web.project.\(alias).conversations")
+            }
+            await persistMetadata()
+            return session
+        } catch {
+            errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = error.localizedDescription
+            return nil
+        }
+    }
+
+    func refreshSessions(runtime: RuntimeDescriptor, instance: InstanceDescriptor) async {
+        guard machine.state == .online else { return }
+        do {
+            let remote = try await transport.listSessions(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id)
+            sessions.removeAll { $0.instanceId == instance.id }
+            sessions.append(contentsOf: remote)
+            sessions.sort { $0.updatedAt > $1.updatedAt }
+            await persistMetadata()
+            errors["instance.\(instance.id)"] = nil
+        } catch {
+            errors["instance.\(instance.id)"] = error.localizedDescription
+        }
     }
 
     func loadSession(_ sessionId: String) async {
@@ -142,13 +261,26 @@ final class WorkspaceStore: ObservableObject {
         catch { commandStates[command.commandId] = .failed; errors[sessionId] = error.localizedDescription }
     }
 
-    func createSession(runtime: RuntimeDescriptor, instance: InstanceDescriptor, title: String, provider: String = "", model: String = "", credentialProfileId: String = "") async {
-        let payload: [String: JSONValue] = [
+    func createSession(
+        runtime: RuntimeDescriptor,
+        instance: InstanceDescriptor,
+        title: String,
+        providerId: String = "current",
+        providerBaseURL: String = "",
+        model: String = "",
+        credentialProfileId: String = "",
+        newCredentialProfileId: String = "",
+        apiKey: String = ""
+    ) async {
+        var payload: [String: JSONValue] = [
             "title": .string(title.isEmpty ? "New Session" : title),
-            "provider": .string(provider),
+            "providerId": .string(providerId),
             "model": .string(model),
             "credentialProfileId": .string(credentialProfileId)
         ]
+        if !providerBaseURL.isEmpty { payload["providerBaseURL"] = .string(providerBaseURL) }
+        if !newCredentialProfileId.isEmpty { payload["newCredentialProfileId"] = .string(newCredentialProfileId) }
+        if !apiKey.isEmpty { payload["apiKey"] = .string(apiKey) }
         guard machine.state == .online else {
             errors[instance.id] = "PC Offline — new sessions are not queued automatically."
             return
@@ -184,6 +316,10 @@ final class WorkspaceStore: ObservableObject {
             instances.removeAll()
             sessions.removeAll()
             messagesBySession.removeAll()
+            webProjects.removeAll()
+            projectConversationsByAlias.removeAll()
+            projectNextCursorByAlias.removeAll()
+            projectHasMoreByAlias.removeAll()
             hasMoreBySession.removeAll()
             tracker = SequenceTracker()
             eventReplayGuard = BoundedReplayGuard(capacity: 8192)
@@ -235,24 +371,33 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    func refreshRuntime(_ runtime: RuntimeDescriptor) async {
+        guard machine.state == .online else { return }
+        do {
+            let rows = try await transport.listInstances(machineId: machine.id, runtimeId: runtime.id)
+            instances.removeAll { $0.runtimeId == runtime.id }
+            instances.append(contentsOf: rows)
+            instances.sort { lhs, rhs in
+                if lhs.runtimeId == rhs.runtimeId { return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending }
+                return lhs.runtimeId < rhs.runtimeId
+            }
+            // Instance discovery stays cheap. Session history is loaded only after the
+            // user opens one instance, otherwise Codex1...Codex11 would all scan their
+            // JSONL stores just to render this list.
+            errors["runtime.\(runtime.id)"] = nil
+            await persistMetadata()
+        } catch {
+            errors["runtime.\(runtime.id)"] = error.localizedDescription
+        }
+    }
+
     private func refreshMetadata() async {
         guard machine.state == .online else { return }
         do {
             let remoteRuntimes = try await transport.listRuntimes(machineId: machine.id)
-            var remoteInstances: [InstanceDescriptor] = []
-            var remoteSessions: [SessionDescriptor] = []
-            for runtime in remoteRuntimes {
-                let rows = try await transport.listInstances(machineId: machine.id, runtimeId: runtime.id)
-                remoteInstances.append(contentsOf: rows)
-                for instance in rows {
-                    let sessionRows = try await transport.listSessions(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id)
-                    remoteSessions.append(contentsOf: sessionRows)
-                }
-            }
             if !remoteRuntimes.isEmpty { runtimes = remoteRuntimes }
-            if !remoteInstances.isEmpty { instances = remoteInstances }
-            sessions = remoteSessions.sorted { $0.updatedAt > $1.updatedAt }
-            await persistMetadata()
+            for runtime in runtimes { await refreshRuntime(runtime) }
+            errors["sync"] = nil
         } catch {
             errors["sync"] = error.localizedDescription
         }
@@ -272,8 +417,9 @@ final class WorkspaceStore: ObservableObject {
         if let value: [RuntimeDescriptor] = try? await cache.get([RuntimeDescriptor].self, key: "runtimes") { runtimes = value }
         if let value: [InstanceDescriptor] = try? await cache.get([InstanceDescriptor].self, key: "instances") { instances = value }
         if let value: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") { sessions = value }
+        if let value: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") { webProjects = value }
         tracker = SequenceTracker(lastSequence: (try? await cache.lastSequence()) ?? 0)
-        if runtimes.isEmpty { seedFixtureMetadata(); await persistMetadata() }
+        if runtimes.isEmpty && ProcessInfo.processInfo.arguments.contains("-UITestMockMode") { seedFixtureMetadata(); await persistMetadata() }
     }
 
     private func seedFixtureMetadata() {
@@ -286,21 +432,29 @@ final class WorkspaceStore: ObservableObject {
             InstanceDescriptor(id: "web.chatgpt", runtimeId: "runtime.web", name: "ChatGPT", subtitle: "Web runtime"),
             InstanceDescriptor(id: "photo", runtimeId: "runtime.web", name: "Photo SaaS", subtitle: "2 conversations"),
             InstanceDescriptor(id: "excel", runtimeId: "runtime.web", name: "Excel SaaS", subtitle: "1 conversation"),
-            InstanceDescriptor(id: "cloud-photo", runtimeId: "runtime.cloudcode", name: "Photo", subtitle: "Cloud Code"),
-            InstanceDescriptor(id: "codex1", runtimeId: "runtime.codex", name: "Codex1", subtitle: nil),
-            InstanceDescriptor(id: "codex2", runtimeId: "runtime.codex", name: "Codex2", subtitle: nil),
-            InstanceDescriptor(id: "codex6", runtimeId: "runtime.codex", name: "Codex6", subtitle: "1 session"),
-            InstanceDescriptor(id: "codex11", runtimeId: "runtime.codex", name: "Codex11", subtitle: nil),
-            InstanceDescriptor(id: "kali-codex", runtimeId: "runtime.codex", name: "Kali Codex", subtitle: nil),
-            InstanceDescriptor(id: "linux-codex", runtimeId: "runtime.codex", name: "Linux Codex", subtitle: nil)
+            InstanceDescriptor(id: "cloud-photo", runtimeId: "runtime.cloudcode", name: "Photo", subtitle: "Cloud Code")
+        ] + (1...11).map {
+            InstanceDescriptor(id: "codex.\($0)", runtimeId: "runtime.codex", name: "Codex\($0)", subtitle: nil)
+        } + [
+            InstanceDescriptor(id: "codex.kali", runtimeId: "runtime.codex", name: "Kali Codex", subtitle: nil),
+            InstanceDescriptor(id: "codex.linux", runtimeId: "runtime.codex", name: "Linux Codex", subtitle: nil)
         ]
         sessions = [
             SessionDescriptor(id: "photo-upload", instanceId: "photo", title: "上传性能优化", state: .idle, updatedAt: Date()),
             SessionDescriptor(id: "photo-ios", instanceId: "photo", title: "手机 APP", state: .idle, updatedAt: Date()),
             SessionDescriptor(id: "excel-permission", instanceId: "excel", title: "权限测试", state: .idle, updatedAt: Date()),
             SessionDescriptor(id: "cloud-photo-a", instanceId: "cloud-photo", title: "Session A", state: .idle, updatedAt: Date()),
-            SessionDescriptor(id: "codex6-a", instanceId: "codex6", title: "Session A", state: .idle, updatedAt: Date())
+            SessionDescriptor(id: "codex6-a", instanceId: "codex.6", title: "Session A", state: .idle, updatedAt: Date())
         ]
+    }
+
+    private func mergeProjectSessions(_ items: [WebConversationDescriptor]) {
+        for item in items {
+            let session = item.session
+            sessions.removeAll { $0.id == session.id }
+            sessions.append(session)
+        }
+        sessions.sort { $0.updatedAt > $1.updatedAt }
     }
 
     private func persistMetadata() async {

@@ -14,7 +14,8 @@
         "createSession", "resumeSession", "stopSession", "getSessionStatus",
         "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore",
         "getChangesAfterCursor",
-        "registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation"
+        "registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation",
+        "listProjects", "listProjectConversations", "openProject", "createProject"
       ]
     },
     "eventType": {
@@ -23,7 +24,7 @@
         "COMMAND_RESULT", "COMMAND_REJECTED", "SYSTEM_STATUS", "RUNTIME_STATUS",
         "INSTANCE_UPDATED", "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS",
         "MESSAGE_ADDED", "MESSAGE_UPDATED", "GENERATION_STARTED", "GENERATION_STOPPED",
-        "TOOL_STARTED", "TOOL_FINISHED", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED",
+        "TOOL_STARTED", "TOOL_FINISHED", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_CONVERSATION_CREATED",
         "WEB_BINDING_CHANGED", "WEB_SELECTOR_DEGRADED", "PAIRING_REQUESTED", "DEVICE_PAIRED",
         "DEVICE_REJECTED", "TRANSPORT_STATUS"
       ]
@@ -84,7 +85,7 @@
           "enum": [
             "INVALID_COMMAND", "UNAUTHORIZED_DEVICE", "UNKNOWN_RUNTIME", "UNKNOWN_INSTANCE", "UNKNOWN_SESSION",
             "CAPABILITY_DENIED", "ALREADY_EXECUTED", "BROWSER_NOT_CONNECTED", "BROWSER_BINDING_MISSING",
-            "WEB_SELECTOR_FAILED", "PROVIDER_UNAVAILABLE", "SESSION_UNAVAILABLE", "PAGINATION_CURSOR_INVALID",
+            "WEB_SELECTOR_FAILED", "PROVIDER_RATE_LIMITED", "PROVIDER_UNAVAILABLE", "SESSION_UNAVAILABLE", "PAGINATION_CURSOR_INVALID",
             "TRANSPORT_OFFLINE", "INTERNAL_ERROR"
           ]
         },

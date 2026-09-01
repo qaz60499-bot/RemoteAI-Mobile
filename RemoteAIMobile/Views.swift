@@ -65,7 +65,12 @@ struct RuntimeView: View {
                     .padding(.vertical, 5)
                 }
             }
-        }.remoteAITopBreathingRoom().navigationTitle(runtime.name).navigationBarTitleDisplayMode(.inline)
+        }
+        .remoteAITopBreathingRoom()
+        .navigationTitle(runtime.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await store.refreshRuntime(runtime) }
+        .refreshable { await store.refreshRuntime(runtime) }
     }
 }
 
@@ -74,20 +79,107 @@ struct InstanceView: View {
     let runtime: RuntimeDescriptor
     let instance: InstanceDescriptor
     @State private var newSession = false
+    @State private var newProject = false
+    private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
+
     var body: some View {
         List {
-            Section("Sessions / Conversations") {
-                ForEach(store.sessions.filter { $0.instanceId == instance.id }.sorted { $0.updatedAt > $1.updatedAt }) { session in
-                    NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) {
-                        HStack { VStack(alignment: .leading, spacing: 4) { Text(session.title); Text(session.updatedAt, style: .relative).font(.caption).foregroundColor(.secondary) }; Spacer(); Text(session.state.rawValue).font(.caption).foregroundColor(session.state == .error ? .red : .secondary) }
+            if isChatGPTWeb {
+                Section("普通聊天") {
+                    ForEach(store.sessions.filter { $0.instanceId == instance.id && $0.projectAlias == nil }.sorted { $0.updatedAt > $1.updatedAt }) { session in
+                        NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
+                    }
+                    Button { Task { _ = await store.createWebConversation() } } label: { Label("新建普通对话", systemImage: "plus.circle.fill") }
+                }
+                Section("Projects") {
+                    Button { newProject = true } label: { Label("新建 Project", systemImage: "folder.badge.plus") }
+                    if store.webProjects.isEmpty { Text(store.machine.state == .online ? "正在读取 Projects…" : "离线 — 显示缓存 Project").font(.caption).foregroundColor(.secondary) }
+                    ForEach(store.webProjects) { project in
+                        NavigationLink(destination: WebProjectView(runtime: runtime, instance: instance, project: project)) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(project.displayName).font(.body.weight(.medium))
+                                if let date = project.lastOpenedAt ?? project.lastSeenAt { Text(date, style: .relative).font(.caption).foregroundColor(.secondary) }
+                            }.padding(.vertical, 4)
+                        }
                     }
                 }
+                if let error = store.errors["web.projects"] { Section { ErrorBanner(text: error) { store.clearError(sessionId: "web.projects") } } }
+            } else {
+                Section("Sessions / Conversations") {
+                    ForEach(store.sessions.filter { $0.instanceId == instance.id }.sorted { $0.updatedAt > $1.updatedAt }) { session in
+                        NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
+                    }
+                }
+                Section { Button { newSession = true } label: { Label(runtime.kind == .web ? "New Chat" : "New Session", systemImage: "plus.circle.fill") } }
             }
-            Section { Button { newSession = true } label: { Label(runtime.kind == .web ? "New Chat" : "New Session", systemImage: "plus.circle.fill") } }
         }
         .remoteAITopBreathingRoom()
         .navigationTitle(instance.name).navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $newSession) { NewSessionView(runtime: runtime, instance: instance).environmentObject(store) }
+        .sheet(isPresented: $newProject) { NewWebProjectView().environmentObject(store) }
+        .task {
+            if isChatGPTWeb {
+                await store.refreshSessions(runtime: runtime, instance: instance)
+                await store.refreshWebProjects()
+            } else {
+                await store.refreshSessions(runtime: runtime, instance: instance)
+            }
+        }
+        .refreshable {
+            if isChatGPTWeb {
+                await store.refreshSessions(runtime: runtime, instance: instance)
+                await store.refreshWebProjects()
+            } else {
+                await store.refreshSessions(runtime: runtime, instance: instance)
+            }
+        }
+    }
+}
+
+struct SessionRow: View {
+    let session: SessionDescriptor
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 4) { Text(session.title); Text(session.updatedAt, style: .relative).font(.caption).foregroundColor(.secondary) }
+            Spacer()
+            Text(session.state.rawValue).font(.caption).foregroundColor(session.state == .error ? .red : .secondary)
+        }
+    }
+}
+
+struct WebProjectView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    let runtime: RuntimeDescriptor
+    let instance: InstanceDescriptor
+    let project: WebProjectDescriptor
+    @State private var loadingMore = false
+
+    private var rows: [WebConversationDescriptor] { store.projectConversationsByAlias[project.projectAlias, default: []] }
+
+    var body: some View {
+        List {
+            Section("最近对话") {
+                ForEach(rows) { conversation in
+                    NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: conversation.session)) {
+                        SessionRow(session: conversation.session)
+                    }
+                }
+                if store.projectHasMoreByAlias[project.projectAlias] == true {
+                    Button(loadingMore ? "加载中…" : "加载更多") {
+                        guard !loadingMore else { return }
+                        loadingMore = true
+                        Task { await store.loadMoreProjectConversations(projectAlias: project.projectAlias); loadingMore = false }
+                    }.disabled(loadingMore)
+                }
+            }
+            Section { Button { Task { _ = await store.createWebConversation(projectAlias: project.projectAlias) } } label: { Label("在此 Project 新建对话", systemImage: "plus.circle.fill") } }
+            if let error = store.errors["web.project.\(project.projectAlias)"] { Section { ErrorBanner(text: error) { store.clearError(sessionId: "web.project.\(project.projectAlias)") } } }
+        }
+        .remoteAITopBreathingRoom()
+        .navigationTitle(project.displayName)
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await store.loadProjectConversations(projectAlias: project.projectAlias) }
+        .refreshable { await store.loadProjectConversations(projectAlias: project.projectAlias) }
     }
 }
 
@@ -176,16 +268,190 @@ struct MessageRow: View {
 struct ErrorBanner: View { let text: String; let dismiss: () -> Void; var body: some View { HStack { Image(systemName: "exclamationmark.triangle"); Text(text).font(.caption); Spacer(); Button(action: dismiss) { Image(systemName: "xmark") } }.padding(10).background(Color.red.opacity(0.12)) } }
 struct StatusLabel: View { let text: String; let active: Bool; var body: some View { HStack(spacing: 5) { Circle().fill(active ? Color.green : Color.secondary).frame(width: 7, height: 7); Text(text).font(.caption).foregroundColor(.secondary) } } }
 
+struct NewWebProjectView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var creating = false
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("ChatGPT Project") {
+                    TextField("Project 名称", text: $name)
+                    Text("Windows 会在你当前已登录的 ChatGPT 页面里真实创建 Project。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .remoteAITopBreathingRoom()
+            .navigationTitle("新建 Project")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(creating ? "Creating…" : "Create") {
+                        creating = true
+                        Task {
+                            let created = await store.createWebProject(name: name)
+                            creating = false
+                            if created != nil { dismiss() }
+                        }
+                    }
+                    .disabled(creating || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
+}
+
 struct NewSessionView: View {
     @EnvironmentObject var store: WorkspaceStore
     @Environment(\.dismiss) private var dismiss
-    let runtime: RuntimeDescriptor; let instance: InstanceDescriptor
-    @State private var title = ""; @State private var provider = ""; @State private var model = ""; @State private var credential = ""
+    let runtime: RuntimeDescriptor
+    let instance: InstanceDescriptor
+
+    @State private var title = ""
+    @State private var providerId = "current"
+    @State private var providerBaseURL = ""
+    @State private var model = "default"
+    @State private var customModel = ""
+    @State private var credentialProfileId = ""
+    @State private var newCredentialProfileId = ""
+    @State private var apiKey = ""
+    @State private var creating = false
+
+    private var catalog: CloudCodeCatalog {
+        instance.cloudCodeCatalog ?? CloudCodeCatalog(
+            providers: [
+                CloudCodeProviderOption(id: "current", label: "当前 Cloud Code 配置", models: ["default", "sonnet", "opus", "haiku"], defaultModel: "default", custom: false, requiresApiKey: false),
+                CloudCodeProviderOption(id: "anthropic", label: "Anthropic", models: ["sonnet", "opus", "haiku"], defaultModel: "sonnet", custom: false, requiresApiKey: true),
+                CloudCodeProviderOption(id: "custom", label: "自定义 Anthropic-compatible 厂商", models: [], defaultModel: nil, custom: true, requiresApiKey: true)
+            ],
+            credentialProfiles: [],
+            defaultProviderId: "current",
+            defaultCredentialProfileId: nil,
+            supportsNewCredential: true
+        )
+    }
+
+    private var selectedProvider: CloudCodeProviderOption? {
+        catalog.providers.first { $0.id == providerId }
+    }
+
+    private var modelOptions: [String] {
+        let models = selectedProvider?.models ?? []
+        return models.isEmpty ? ["__custom__"] : models + ["__custom__"]
+    }
+
+    private var finalModel: String {
+        model == "__custom__" ? customModel.trimmingCharacters(in: .whitespacesAndNewlines) : model
+    }
+
+    private var canCreate: Bool {
+        if runtime.kind != .cloudCode { return true }
+        if providerId == "custom" && providerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        if model == "__custom__" && customModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+        if credentialProfileId == "__new__" {
+            return !newCredentialProfileId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && apiKey.count >= 8
+        }
+        return true
+    }
+
     var body: some View {
-        NavigationView { Form {
-            Section("Project") { Text(instance.name); TextField("Session title", text: $title) }
-            if runtime.kind == .cloudCode { Section("Runtime") { TextField("Provider", text: $provider); TextField("Model", text: $model); TextField("Credential Profile ID", text: $credential).textInputAutocapitalization(.never).autocorrectionDisabled(true); Text("Only credentialProfileId is stored on the phone. Real API keys never leave Windows.").font(.caption).foregroundColor(.secondary) } }
-        }.remoteAITopBreathingRoom().navigationTitle(runtime.kind == .web ? "New Chat" : "New Session").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Create") { Task { await store.createSession(runtime: runtime, instance: instance, title: title, provider: provider, model: model, credentialProfileId: credential); dismiss() } } } } }
+        NavigationView {
+            Form {
+                Section("Project") {
+                    Text(instance.name)
+                    TextField("Session title", text: $title)
+                }
+
+                if runtime.kind == .cloudCode {
+                    Section("厂商") {
+                        Picker("Provider", selection: $providerId) {
+                            ForEach(catalog.providers) { option in Text(option.label).tag(option.id) }
+                        }
+                        if providerId == "custom" {
+                            TextField("https://api.example.com", text: $providerBaseURL)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled(true)
+                                .keyboardType(.URL)
+                        }
+                    }
+
+                    Section("Key") {
+                        Picker("Credential", selection: $credentialProfileId) {
+                            Text("使用 Cloud Code 当前登录 / 环境").tag("")
+                            ForEach(catalog.credentialProfiles) { option in Text(option.label).tag(option.id) }
+                            if catalog.supportsNewCredential { Text("新增 Key…").tag("__new__") }
+                        }
+                        if credentialProfileId == "__new__" {
+                            TextField("Key 名称", text: $newCredentialProfileId)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled(true)
+                            SecureField("API Key", text: $apiKey)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled(true)
+                        }
+                        Text("已有 Key 只显示 Windows 上的 Profile 名称；真实 Key 不会从 Windows 回传。新增 Key 通过已配对的加密通道提交一次并存入 Windows DPAPI。")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Section("模型") {
+                        Picker("Model", selection: $model) {
+                            ForEach(modelOptions, id: \.self) { value in
+                                Text(value == "__custom__" ? "自定义模型…" : (value == "default" ? "默认" : value)).tag(value)
+                            }
+                        }
+                        if model == "__custom__" {
+                            TextField("模型 ID", text: $customModel)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled(true)
+                        }
+                    }
+                }
+            }
+            .remoteAITopBreathingRoom()
+            .navigationTitle(runtime.kind == .web ? "New Chat" : "New Session")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear {
+                if let defaultProvider = catalog.defaultProviderId { providerId = defaultProvider }
+                if let defaultCredential = catalog.defaultCredentialProfileId { credentialProfileId = defaultCredential }
+                if let provider = catalog.providers.first(where: { $0.id == providerId }), let defaultModel = provider.defaultModel { model = defaultModel }
+            }
+            .onChange(of: providerId) { newValue in
+                if let provider = catalog.providers.first(where: { $0.id == newValue }) {
+                    model = provider.defaultModel ?? (provider.models.first ?? "__custom__")
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(creating ? "Creating…" : "Create") {
+                        creating = true
+                        let selectedCredential = credentialProfileId == "__new__" ? "" : credentialProfileId
+                        Task {
+                            await store.createSession(
+                                runtime: runtime,
+                                instance: instance,
+                                title: title,
+                                providerId: providerId,
+                                providerBaseURL: providerBaseURL,
+                                model: finalModel,
+                                credentialProfileId: selectedCredential,
+                                newCredentialProfileId: credentialProfileId == "__new__" ? newCredentialProfileId : "",
+                                apiKey: credentialProfileId == "__new__" ? apiKey : ""
+                            )
+                            apiKey = ""
+                            creating = false
+                            dismiss()
+                        }
+                    }
+                    .disabled(creating || !canCreate)
+                }
+            }
+        }
     }
 }
 

@@ -142,6 +142,40 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(runtimes.first(where: { $0.id == "runtime.cloudcode" })?.kind, .cloudCode)
     }
 
+    func testMockProjectsAreLazyAndProjectConversationCreationStaysScoped() async throws {
+        let mock = MockTransport(historyCount: 10)
+        try await mock.connect()
+        let projects = try await mock.listProjects(machineId: "my-pc")
+        XCTAssertEqual(projects.count, 2)
+        let project = try XCTUnwrap(projects.first(where: { $0.projectAlias == "g-p-remoteai" }))
+        XCTAssertEqual(project.displayName, "RemoteAI")
+
+        let before = try await mock.listProjectConversations(machineId: "my-pc", projectAlias: project.projectAlias, limit: 30)
+        XCTAssertEqual(before.items.count, 1)
+        XCTAssertTrue(before.items.allSatisfy { $0.projectAlias == project.projectAlias })
+
+        let created = try await mock.createWebConversation(machineId: "my-pc", projectAlias: project.projectAlias)
+        XCTAssertEqual(created.projectAlias, project.projectAlias)
+        XCTAssertTrue(created.canonicalUrl.contains(project.projectAlias))
+
+        let after = try await mock.listProjectConversations(machineId: "my-pc", projectAlias: project.projectAlias, limit: 30)
+        XCTAssertEqual(after.items.first?.id, created.id)
+        XCTAssertTrue(after.items.allSatisfy { $0.projectAlias == project.projectAlias })
+
+        let newProject = try await mock.createWebProject(machineId: "my-pc", projectName: "Created from iPhone")
+        XCTAssertEqual(newProject.displayName, "Created from iPhone")
+        let refreshed = try await mock.listProjects(machineId: "my-pc")
+        XCTAssertTrue(refreshed.contains(where: { $0.projectAlias == newProject.projectAlias }))
+    }
+
+    func testMockExposesAllElevenDesktopCodexInstances() async throws {
+        let mock = MockTransport(historyCount: 10)
+        try await mock.connect()
+        let instances = try await mock.listInstances(machineId: "my-pc", runtimeId: "runtime.codex")
+        XCTAssertEqual(instances.filter { $0.name.hasPrefix("Codex") }.count, 11)
+        XCTAssertEqual(Set(instances.map(\.name)), Set((1...11).map { "Codex\($0)" }))
+    }
+
     func testMockRecentIsPaginated() async throws {
         let mock = MockTransport(historyCount: 1200)
         try await mock.connect()

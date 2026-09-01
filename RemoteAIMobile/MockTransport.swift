@@ -12,6 +12,8 @@ actor MockTransport: Transport {
     private var history: [String: [ServerMessage]] = [:]
     private var eventLog: [RemoteEvent] = []
     private var sessions: [ServerSession] = []
+    private var webProjects: [WebProjectDescriptor] = []
+    private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
 
     private let machineId = "my-pc"
     private let runtimes: [ServerRuntime]
@@ -32,15 +34,24 @@ actor MockTransport: Transport {
             ServerInstance(instanceId: "web.chatgpt", runtimeId: "runtime.web", label: "ChatGPT", kind: "chatgpt-web", config: [:], status: "ready", updatedAt: now),
             ServerInstance(instanceId: "photo", runtimeId: "runtime.web", label: "Photo SaaS", kind: "cached-project", config: [:], status: "ready", updatedAt: now),
             ServerInstance(instanceId: "excel", runtimeId: "runtime.web", label: "Excel SaaS", kind: "cached-project", config: [:], status: "ready", updatedAt: now),
-            ServerInstance(instanceId: "cloud-photo", runtimeId: "runtime.cloudcode", label: "Photo", kind: "claude-code-cli", config: [:], status: "ready", updatedAt: now),
-            ServerInstance(instanceId: "codex6", runtimeId: "runtime.codex", label: "Codex6", kind: "codex-cli", config: [:], status: "ready", updatedAt: now)
+            ServerInstance(instanceId: "cloud-photo", runtimeId: "runtime.cloudcode", label: "Photo", kind: "claude-code-cli", config: [:], status: "ready", updatedAt: now)
+        ] + (1...11).map {
+            ServerInstance(instanceId: "codex.\($0)", runtimeId: "runtime.codex", label: "Codex\($0)", kind: "codex-cli", config: [:], status: "ready", updatedAt: now)
+        }
+        webProjects = [
+            WebProjectDescriptor(projectAlias: "g-p-remoteai", projectId: nil, displayName: "RemoteAI", canonicalUrl: "https://chatgpt.com/g/g-p-remoteai/project", lastSeenAt: now, lastOpenedAt: now),
+            WebProjectDescriptor(projectAlias: "g-p-photo", projectId: nil, displayName: "Photo SaaS", canonicalUrl: "https://chatgpt.com/g/g-p-photo/project", lastSeenAt: now.addingTimeInterval(-3600), lastOpenedAt: nil)
         ]
+        webProjectConversations["g-p-remoteai"] = [
+            WebConversationDescriptor(localConversationId: "webconv-project-1", canonicalUrl: "https://chatgpt.com/g/g-p-remoteai/c/mock-1", projectId: nil, displayTitle: "Project smoke", projectAlias: "g-p-remoteai", conversationAlias: "mock-1", lastVisited: now, updatedAt: now)
+        ]
+
         sessions = [
             ServerSession(sessionId: "photo-upload", runtimeId: "runtime.web", instanceId: "photo", externalId: nil, title: "上传性能优化", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
             ServerSession(sessionId: "photo-ios", runtimeId: "runtime.web", instanceId: "photo", externalId: nil, title: "手机 APP", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
             ServerSession(sessionId: "excel-permission", runtimeId: "runtime.web", instanceId: "excel", externalId: nil, title: "权限测试", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
             ServerSession(sessionId: "cloud-photo-a", runtimeId: "runtime.cloudcode", instanceId: "cloud-photo", externalId: nil, title: "Session A", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
-            ServerSession(sessionId: "codex6-a", runtimeId: "runtime.codex", instanceId: "codex6", externalId: nil, title: "Session A", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now)
+            ServerSession(sessionId: "codex6-a", runtimeId: "runtime.codex", instanceId: "codex.6", externalId: nil, title: "Session A", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now)
         ]
 
         var messages: [ServerMessage] = []
@@ -112,6 +123,31 @@ actor MockTransport: Transport {
                 return message.createdAt < beforeDate || (message.createdAt == beforeDate && message.messageId < beforeId)
             }
             response = try success(Array(eligible.suffix(max(1, min(limit, 100)))))
+        case "listProjects":
+            response = try success(WebProjectListResponse(items: webProjects, observedAt: Date()))
+        case "listProjectConversations":
+            let alias = command.payload["projectAlias"]?.stringValue ?? ""
+            guard let project = webProjects.first(where: { $0.projectAlias == alias }) else {
+                response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "UNKNOWN_SESSION", message: "Mock Project not found", retryable: false, details: nil), idempotentReplay: nil)
+                break
+            }
+            let limit = max(1, min(Int(command.payload["limit"]?.intValue ?? 30), 50))
+            let offset: Int = {
+                guard let cursor = command.payload["cursor"]?.stringValue, cursor.hasPrefix("offset:"), let value = Int(cursor.dropFirst(7)) else { return 0 }
+                return max(0, value)
+            }()
+            let all = webProjectConversations[alias, default: []]
+            let slice = Array(all.dropFirst(offset).prefix(limit))
+            let nextOffset = offset + slice.count
+            response = try success(WebProjectConversationPage(project: project, items: slice, cursor: command.payload["cursor"]?.stringValue, nextCursor: nextOffset < all.count ? "offset:\(nextOffset)" : nil, hasMore: nextOffset < all.count, observedAt: Date()))
+        case "openProject":
+            response = success(["focused": .bool(false)])
+        case "createProject":
+            let name = command.payload["projectName"]?.stringValue ?? "New Project"
+            let alias = "g-p-mock-\(UUID().uuidString.lowercased())"
+            let project = WebProjectDescriptor(projectAlias: alias, projectId: nil, displayName: name, canonicalUrl: "https://chatgpt.com/g/\(alias)/project", lastSeenAt: Date(), lastOpenedAt: Date())
+            webProjects.insert(project, at: 0)
+            response = try success(project)
         case "getChangesAfterCursor":
             let cursor = command.payload["cursor"]?.intValue ?? 0
             let limit = Int(command.payload["limit"]?.intValue ?? 500)
@@ -136,7 +172,25 @@ actor MockTransport: Transport {
         case "stopGeneration", "stopSession":
             await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: command.sessionId, type: "GENERATION_STOPPED", payload: ["ok": .bool(true)])
             response = success(["stopped": .bool(true)])
-        case "resumeSession", "getSessionStatus", "openConversation", "focusConversation", "registerCurrentPage", "unregisterConversation", "createConversation":
+        case "createConversation":
+            let alias = command.payload["projectAlias"]?.stringValue
+            let now = Date()
+            let id = "webconv-\(UUID().uuidString.lowercased())"
+            let conversationAlias = "mock-\(UUID().uuidString.lowercased())"
+            let created = WebConversationDescriptor(
+                localConversationId: id,
+                canonicalUrl: alias.map { "https://chatgpt.com/g/\($0)/c/\(conversationAlias)" } ?? "https://chatgpt.com/c/\(conversationAlias)",
+                projectId: nil,
+                displayTitle: alias == nil ? "New Chat" : "Project New Chat",
+                projectAlias: alias,
+                conversationAlias: conversationAlias,
+                lastVisited: now,
+                updatedAt: now
+            )
+            if let alias { webProjectConversations[alias, default: []].insert(created, at: 0) }
+            sessions.append(ServerSession(sessionId: id, runtimeId: "runtime.web", instanceId: "web.chatgpt", externalId: nil, title: created.displayTitle, canonicalUrl: created.canonicalUrl, status: "idle", metadata: alias.map { ["projectAlias": .string($0)] } ?? [:], createdAt: now, updatedAt: now, lastVisited: now))
+            response = try success(created)
+        case "resumeSession", "getSessionStatus", "openConversation", "focusConversation", "registerCurrentPage", "unregisterConversation":
             response = success(["ok": .bool(true)])
         default:
             response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "INVALID_COMMAND", message: "Unsupported mock action", retryable: false, details: nil), idempotentReplay: nil)

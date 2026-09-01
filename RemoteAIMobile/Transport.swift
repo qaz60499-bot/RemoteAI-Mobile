@@ -118,6 +118,49 @@ extension Transport {
         return try? response.decode(ServerSession.self).descriptor
     }
 
+    func listProjects(machineId: String) async throws -> [WebProjectDescriptor] {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "listProjects")
+        let response = try await requireSuccess(execute(command))
+        return try response.decode(WebProjectListResponse.self).items
+    }
+
+    func listProjectConversations(machineId: String, projectAlias: String, limit: Int = 30, cursor: String? = nil) async throws -> WebProjectConversationPage {
+        let safeLimit = max(1, min(limit, 50))
+        var payload: [String: JSONValue] = [
+            "projectAlias": .string(projectAlias),
+            "limit": .number(Double(safeLimit))
+        ]
+        if let cursor, !cursor.isEmpty { payload["cursor"] = .string(cursor) }
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "listProjectConversations", payload: payload)
+        let response = try await requireSuccess(execute(command))
+        return try response.decode(WebProjectConversationPage.self)
+    }
+
+    func createWebProject(machineId: String, projectName: String) async throws -> WebProjectDescriptor {
+        let command = RemoteCommand.make(
+            machineId: machineId,
+            runtimeId: "runtime.web",
+            instanceId: "web.chatgpt",
+            action: "createProject",
+            payload: ["projectName": .string(projectName)]
+        )
+        let response = try await requireSuccess(execute(command))
+        return try response.decode(WebProjectDescriptor.self)
+    }
+
+    func createWebConversation(machineId: String, projectAlias: String? = nil) async throws -> WebConversationDescriptor {
+        var payload: [String: JSONValue] = [:]
+        if let projectAlias { payload["projectAlias"] = .string(projectAlias) }
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "createConversation", payload: payload)
+        let response = try await requireSuccess(execute(command))
+        return try response.decode(WebConversationDescriptor.self)
+    }
+
+    func openProject(machineId: String, projectAlias: String) async throws {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "openProject", payload: ["projectAlias": .string(projectAlias)])
+        _ = try await requireSuccess(execute(command))
+    }
+
     func loadRecent(machineId: String, runtimeId: String, instanceId: String, sessionId: String, limit: Int) async throws -> Page<ChatMessage> {
         let safeLimit = max(1, min(limit, 100))
         let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "loadRecentMessages", payload: ["limit": .number(Double(safeLimit))])
