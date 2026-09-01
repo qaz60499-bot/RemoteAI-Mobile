@@ -73,6 +73,79 @@ final class RemoteAIMobileTests: XCTestCase {
         do { try await mock.connect(); XCTFail("Expected offline") } catch { XCTAssertEqual(error as? TransportError, .offline) }
     }
 
+    func testMockStreamingToolAndCompletionEvents() async throws {
+        let mock = MockTransport(historyCount: 10)
+        try await mock.connect()
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage", payload: ["text": .string("stream")])
+        _ = try await mock.send(command)
+        try await Task.sleep(nanoseconds: 800_000_000)
+        let events = try await mock.delta(after: 0).events
+        let types = events.map(\.type)
+        XCTAssertTrue(types.contains("command.acknowledged"))
+        XCTAssertTrue(types.contains("command.executing"))
+        XCTAssertTrue(types.contains("message.delta"))
+        XCTAssertTrue(types.contains("message.completed"))
+        XCTAssertTrue(types.contains("tool.event"))
+        XCTAssertTrue(events.contains { $0.type == "tool.event" && $0.payload["status"]?.stringValue == "Completed" })
+    }
+
+    func testMockCommandFailureScenario() async throws {
+        let mock = MockTransport(scenario: .commandFailure, historyCount: 10)
+        try await mock.connect()
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
+        do {
+            _ = try await mock.send(command)
+            XCTFail("Expected command failure")
+        } catch {
+            XCTAssertEqual(error as? TransportError, .badResponse(503))
+        }
+    }
+
+    func testMockDisconnectThenReconnectScenario() async throws {
+        let mock = MockTransport(scenario: .disconnect, historyCount: 10)
+        try await mock.connect()
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
+        _ = try await mock.send(command)
+        try await Task.sleep(nanoseconds: 800_000_000)
+        let disconnected = await mock.isConnected
+        XCTAssertFalse(disconnected)
+        await mock.setScenario(.normal)
+        try await mock.connect()
+        let reconnected = await mock.isConnected
+        XCTAssertTrue(reconnected)
+    }
+
+    func testMockSequenceGapScenario() async throws {
+        let mock = MockTransport(scenario: .sequenceGap, historyCount: 10)
+        try await mock.connect()
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
+        _ = try await mock.send(command)
+        try await Task.sleep(nanoseconds: 800_000_000)
+        let sequences = try await mock.delta(after: 0).events.map(\.sequence).sorted()
+        let hasGap = zip(sequences, sequences.dropFirst()).contains { pair in pair.1 > pair.0 + 1 }
+        XCTAssertTrue(hasGap)
+    }
+
+    func testMockDuplicateEventScenario() async throws {
+        let mock = MockTransport(scenario: .duplicateEvent, historyCount: 10)
+        try await mock.connect()
+        let stream = await mock.eventStream()
+        let duplicate = expectation(description: "duplicate event yielded")
+        let reader = Task {
+            var seen = Set<UUID>()
+            for await event in stream {
+                if !seen.insert(event.eventId).inserted {
+                    duplicate.fulfill()
+                    break
+                }
+            }
+        }
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "web", instanceId: "photo", sessionId: "photo-upload", action: "sendMessage")
+        _ = try await mock.send(command)
+        await fulfillment(of: [duplicate], timeout: 3.0)
+        reader.cancel()
+    }
+
     func testSQLitePersistsMetadataAndCursor() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
         let db = try SQLiteStore(url: url)
