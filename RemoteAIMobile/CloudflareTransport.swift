@@ -7,6 +7,8 @@ actor CloudflareTransport: Transport {
     private let maxInboundFrameBytes = ProtocolSecurity.maxInboundFrameBytes
     private let maxOutboundFrameBytes = ProtocolSecurity.maxOutboundFrameBytes
     private let commandTimeoutNanoseconds: UInt64 = 30_000_000_000
+    private let connectionTimeoutSeconds: TimeInterval = 8
+    private let sendTimeoutSeconds: TimeInterval = 10
 
     private var socket: URLSessionWebSocketTask?
     private var connected = false
@@ -49,7 +51,7 @@ actor CloudflareTransport: Transport {
             task.maximumMessageSize = maxInboundFrameBytes
             socket = task
             task.resume()
-            try await ping(task)
+            try await waitForRelayReady(task, deviceId: deviceId)
             guard socket === task else { throw TransportError.disconnected }
             connected = true
             connecting = false
@@ -140,6 +142,19 @@ actor CloudflareTransport: Transport {
 
     private func handle(_ frame: RelayFrame) async throws {
         let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
+        try ProtocolSecurity.validate(frame, expectedMachineId: config.machineId)
+        if frame.kind == "ACK" {
+            guard frame.deviceId == nil || frame.deviceId == deviceId else { throw TransportError.malformedData }
+            if let code = frame.body["error"]?.stringValue {
+                let message = frame.body["message"]?.stringValue ?? "Windows rejected this device."
+                if code == "UNAUTHORIZED_DEVICE" {
+                    PairingKeyStore.deletePairing(machineId: config.machineId, keychain: keychain)
+                    throw TransportError.pairingRequired
+                }
+                throw TransportError.remote(code, message)
+            }
+            return
+        }
         try ProtocolSecurity.validate(frame, expectedMachineId: config.machineId, expectedDeviceId: deviceId)
         if frame.kind == "PING" {
             try await sendFrame(RelayFrame(v: 1, kind: "PONG", machineId: config.machineId, deviceId: deviceId, messageId: UUID().uuidString, body: ["at": .number(Date().timeIntervalSince1970 * 1000)]))
@@ -170,7 +185,7 @@ actor CloudflareTransport: Transport {
         guard connected, let socket else { throw TransportError.disconnected }
         let data = try JSONEncoder.remoteAI.encode(frame)
         guard data.count <= maxOutboundFrameBytes else { throw TransportError.frameTooLarge }
-        try await socket.send(.data(data))
+        try await WebSocketIO.send(.data(data), on: socket, timeout: sendTimeoutSeconds, timeoutReason: "remoteai-send-timeout")
     }
 
     private func completePending(_ id: UUID, response: CommandResponseEnvelope) {
@@ -200,12 +215,26 @@ actor CloudflareTransport: Transport {
         }
     }
 
-    private func ping(_ socket: URLSessionWebSocketTask) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            socket.sendPing { error in
-                if let error { continuation.resume(throwing: error) }
-                else { continuation.resume(returning: ()) }
+    private func waitForRelayReady(_ socket: URLSessionWebSocketTask, deviceId: String) async throws {
+        for _ in 0..<4 {
+            let message = try await WebSocketIO.receive(from: socket, timeout: connectionTimeoutSeconds, timeoutReason: "remoteai-connect-timeout")
+            let data = WebSocketIO.data(from: message)
+            guard !data.isEmpty else { continue }
+            let frame = try ProtocolSecurity.decodeRelayFrame(data, maxBytes: maxInboundFrameBytes)
+            try ProtocolSecurity.validate(frame, expectedMachineId: config.machineId)
+            guard frame.deviceId == nil || frame.deviceId == deviceId else { throw TransportError.malformedData }
+            if frame.kind == "ACK", let code = frame.body["error"]?.stringValue {
+                if code == "UNAUTHORIZED_DEVICE" {
+                    PairingKeyStore.deletePairing(machineId: config.machineId, keychain: keychain)
+                    throw TransportError.pairingRequired
+                }
+                throw TransportError.remote(code, frame.body["message"]?.stringValue ?? "Relay rejected the connection.")
+            }
+            if frame.kind == "ACK", frame.body["relay"]?.stringValue == "device-connected" {
+                if frame.body["agentOnline"]?.boolValue == false { throw TransportError.offline }
+                return
             }
         }
+        throw TransportError.timeout
     }
 }

@@ -728,8 +728,8 @@ struct PairingView: View {
                     HStack(spacing: 10) {
                         ProgressView()
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Pairing with Windows…").font(.subheadline.weight(.medium))
-                            Text("Waiting for the encrypted Relay handshake. This should finish within about 15 seconds.").font(.caption).foregroundColor(.secondary)
+                            Text(store.pairingStage?.title ?? "Preparing secure pairing…").font(.subheadline.weight(.medium))
+                            Text(pairingDetail).font(.caption).foregroundColor(.secondary)
                         }
                     }
                 }
@@ -749,6 +749,7 @@ struct PairingView: View {
                         return
                     }
                     pairing = true
+                    store.pairingStage = .preparing
                     error = nil
                     Task {
                         do {
@@ -770,6 +771,22 @@ struct PairingView: View {
                 scanner = false
             }
         } }
+    }
+
+    private var pairingDetail: String {
+        switch store.pairingStage {
+        case .connectingRelay: return "Opening the secure Cloudflare Relay connection."
+        case .relayConnected: return "Relay accepted this iPhone and Windows is online."
+        case .sendingRequest: return "Sending this iPhone's ephemeral public key to Windows."
+        case .waitingChallenge: return "Waiting for the Windows pairing challenge."
+        case .challengeReceived, .verifyingWindowsKey: return "Validating the Windows X25519 identity before proving the code."
+        case .sendingProof, .waitingApproval: return "Completing the code proof with Windows."
+        case .secureKeySaved: return "The derived shared key is stored in ThisDeviceOnly Keychain."
+        case .connectingRemoteAI: return "Reconnecting with the newly paired key."
+        case .loadingRuntimes: return "Loading Web, Cloud Code, and Codex from Windows."
+        case .completed: return "Pairing completed successfully."
+        default: return "Every network step is time-limited; the Pair button will recover on failure."
+        }
     }
 
     private func applyScannedPairing(_ value: String) {

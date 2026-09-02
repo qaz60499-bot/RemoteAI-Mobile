@@ -16,6 +16,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var errors: [String: String] = [:]
     @Published var hasMoreBySession: [String: Bool] = [:]
     @Published var isPaired = false
+    @Published var pairingStage: PairingStage?
 
     var transport: Transport
     let cache: SQLiteStore
@@ -47,7 +48,7 @@ final class WorkspaceStore: ObservableObject {
         return store
     }
 
-    func start() async {
+    func start(pairingProgress: ((PairingStage) -> Void)? = nil) async {
         await loadCachedFirst()
         if !(transport is MockTransport) { await removeLegacyMockFixtures() }
         isPaired = PairingKeyStore.isPaired(machineId: machine.id)
@@ -71,14 +72,23 @@ final class WorkspaceStore: ObservableObject {
         }
         installEventConsumer()
         do {
+            pairingProgress?(.connectingRemoteAI)
             try await transport.connect()
             machine.state = .online
             errors["connection"] = nil
+            pairingProgress?(.loadingRuntimes)
             await recoverDelta()
             await refreshMetadata()
             startConnectionMonitor()
         } catch {
             machine.state = .offline
+            if (error as? TransportError) == .pairingRequired {
+                isPaired = false
+                errors["connection"] = "Pairing expired or was revoked — scan the current Windows pairing QR code to re-pair."
+                connectionMonitorTask?.cancel()
+                connectionMonitorTask = nil
+                return
+            }
             errors["connection"] = error.localizedDescription
             startConnectionMonitor()
         }
@@ -353,11 +363,14 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func savePairing(baseURL: URL, machineId: String, code: String) async throws {
+        pairingStage = .preparing
         eventTask?.cancel()
         connectionMonitorTask?.cancel()
         await transport.disconnect()
         let previousMachineId = machine.id
-        let result = try await RelayPairingClient().pair(baseURL: baseURL, machineId: machineId, pairingCode: code)
+        let result = try await RelayPairingClient().pair(baseURL: baseURL, machineId: machineId, pairingCode: code) { [weak self] stage in
+            self?.pairingStage = stage
+        }
 
         if previousMachineId != result.machineId {
             PairingKeyStore.deletePairing(machineId: previousMachineId)
@@ -385,10 +398,13 @@ final class WorkspaceStore: ObservableObject {
         machine = MachineMetadata(id: result.machineId, name: machine.name, state: .connecting)
         isPaired = true
         errors["connection"] = nil
-        await start()
+        await start { [weak self] stage in
+            self?.pairingStage = stage
+        }
         if machine.state != .online {
             throw TransportError.remote("PAIR_CONNECTED_BUT_OFFLINE", errors["connection"] ?? "Pairing succeeded, but the Windows service did not become reachable.")
         }
+        pairingStage = .completed
     }
 
     func draft(sessionId: String) async -> String { (try? await cache.draft(sessionId: sessionId)) ?? "" }
@@ -422,6 +438,11 @@ final class WorkspaceStore: ObservableObject {
                         await self.refreshMetadata()
                     } catch {
                         self.machine.state = .offline
+                        if (error as? TransportError) == .pairingRequired {
+                            self.isPaired = false
+                            self.errors["connection"] = "Pairing expired or was revoked — scan the current Windows pairing QR code to re-pair."
+                            break
+                        }
                         self.errors["connection"] = error.localizedDescription
                     }
                 }

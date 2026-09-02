@@ -132,6 +132,25 @@ jobs:
           grep -E 'PROTOCOL_FUZZ_(NEGATIVE|CRYPTO|SIZE|RECOVERY|TOTAL)' build/protocol-security.log
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/protocol-security.log | tail -1
 
+      - name: Live iOS Relay pairing challenge smoke
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          REMOTEAI_LIVE_RELAY_URL: "https://remoteai-relay.qaz60499.workers.dev"
+          REMOTEAI_LIVE_MACHINE_ID: "machine-60e5101d-d386-464b-ac41-3e546ca800a0"
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          set -o pipefail
+          xcodebuild test \
+            -project RemoteAIMobile.xcodeproj \
+            -scheme RemoteAIMobile \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
+            -only-testing:RemoteAIMobileTests/PairingTests/testLiveRelayChallengeFromIOSURLSession \
+            | tee build/live-pairing.log
+          grep -E 'Executed [0-9]+ tests?, with 0 failures' build/live-pairing.log | tail -1
+
       - name: Unit and UI tests
         shell: bash
         run: |
