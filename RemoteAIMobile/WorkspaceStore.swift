@@ -36,7 +36,11 @@ final class WorkspaceStore: ObservableObject {
         // keep cache data in memory instead of writing it to an unprotected temporary file.
         let cache = (try? SQLiteStore.appStore()) ?? (try! SQLiteStore.inMemory())
         let config = RemoteAIConfig.loadMetadata()
-        let useMock = ProcessInfo.processInfo.arguments.contains("-UITestMockMode") || !PairingKeyStore.isPaired(machineId: config.machineId)
+        // MockTransport is test-only. Require both an explicit UI-test argument and a
+        // UI-test-only environment marker so an installed IPA can never fall into Mock.
+        let process = ProcessInfo.processInfo
+        let useMock = process.arguments.contains("-UITestMockMode")
+            && process.environment["REMOTEAI_UI_TEST_MOCK"] == "1"
         let transport: Transport = useMock ? MockTransport() : CloudflareTransport(config: config)
         let store = WorkspaceStore(transport: transport, cache: cache)
         store.machine = MachineMetadata(id: config.machineId, name: "My PC", state: .connecting)
@@ -45,7 +49,26 @@ final class WorkspaceStore: ObservableObject {
 
     func start() async {
         await loadCachedFirst()
+        if !(transport is MockTransport) { await removeLegacyMockFixtures() }
         isPaired = PairingKeyStore.isPaired(machineId: machine.id)
+        if !isPaired && !(transport is MockTransport) {
+            // Older builds incorrectly used MockTransport whenever the phone was not
+            // paired, which could persist fake Photo/Excel workspaces in SQLite.
+            // Remove that stale workspace state and fail closed until real pairing.
+            try? await cache.clearAll()
+            runtimes.removeAll()
+            instances.removeAll()
+            sessions.removeAll()
+            messagesBySession.removeAll()
+            webProjects.removeAll()
+            projectConversationsByAlias.removeAll()
+            projectNextCursorByAlias.removeAll()
+            projectHasMoreByAlias.removeAll()
+            hasMoreBySession.removeAll()
+            machine.state = .offline
+            errors["connection"] = "Not paired — scan the Windows pairing code to load your real runtimes and ChatGPT Projects."
+            return
+        }
         installEventConsumer()
         do {
             try await transport.connect()
@@ -419,7 +442,38 @@ final class WorkspaceStore: ObservableObject {
         if let value: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") { sessions = value }
         if let value: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") { webProjects = value }
         tracker = SequenceTracker(lastSequence: (try? await cache.lastSequence()) ?? 0)
-        if runtimes.isEmpty && ProcessInfo.processInfo.arguments.contains("-UITestMockMode") { seedFixtureMetadata(); await persistMetadata() }
+        let process = ProcessInfo.processInfo
+        if runtimes.isEmpty,
+           process.arguments.contains("-UITestMockMode"),
+           process.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
+            seedFixtureMetadata()
+            await persistMetadata()
+        }
+    }
+
+    private func removeLegacyMockFixtures() async {
+        let fixtureInstanceIds: Set<String> = ["photo", "excel", "cloud-photo"]
+        let fixtureSessionIds: Set<String> = ["photo-upload", "photo-ios", "excel-permission", "cloud-photo-a", "codex6-a"]
+        let fixtureProjectAliases: Set<String> = ["g-p-remoteai", "g-p-photo"]
+        let hadFixture = instances.contains { fixtureInstanceIds.contains($0.id) }
+            || sessions.contains { fixtureSessionIds.contains($0.id) }
+            || webProjects.contains { fixtureProjectAliases.contains($0.projectAlias) }
+        guard hadFixture else { return }
+
+        instances.removeAll { fixtureInstanceIds.contains($0.id) }
+        sessions.removeAll { fixtureSessionIds.contains($0.id) || fixtureInstanceIds.contains($0.instanceId) }
+        webProjects.removeAll { fixtureProjectAliases.contains($0.projectAlias) }
+        for alias in fixtureProjectAliases {
+            projectConversationsByAlias.removeValue(forKey: alias)
+            projectNextCursorByAlias.removeValue(forKey: alias)
+            projectHasMoreByAlias.removeValue(forKey: alias)
+        }
+        for sessionId in fixtureSessionIds {
+            messagesBySession.removeValue(forKey: sessionId)
+            hasMoreBySession.removeValue(forKey: sessionId)
+        }
+        await persistMetadata()
+        try? await cache.put(webProjects, key: "web.projects")
     }
 
     private func seedFixtureMetadata() {

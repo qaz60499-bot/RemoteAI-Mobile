@@ -33,6 +33,16 @@ struct RootView: View {
                         Spacer()
                     }.padding(.vertical, 8)
                 }
+                if !store.isPaired {
+                    Section {
+                        Button { showingPair = true } label: {
+                            Label("Pair with Windows to load real Projects", systemImage: "qrcode.viewfinder")
+                        }
+                        if let error = store.errors["connection"] {
+                            Text(error).font(.footnote).foregroundColor(.secondary)
+                        }
+                    }
+                }
                 Section("Runtimes") {
                     ForEach(store.runtimes) { runtime in
                         NavigationLink(destination: RuntimeView(runtime: runtime)) {
@@ -40,7 +50,7 @@ struct RootView: View {
                         }
                     }
                 }
-                if store.machine.state == .offline {
+                if store.machine.state == .offline && store.isPaired {
                     Section { Label("Cached workspaces remain available while the PC is offline.", systemImage: "wifi.slash").font(.footnote).foregroundColor(.secondary) }
                 }
             }

@@ -3,9 +3,15 @@ import XCTest
 final class RemoteAIMobileUITests: XCTestCase {
     override func setUpWithError() throws { continueAfterFailure = false }
 
-    func testMachineRuntimeHierarchyOnIPhone() throws {
+    private func makeMockApp() -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments += ["-UITestMockMode", "1"]
+        app.launchEnvironment["REMOTEAI_UI_TEST_MOCK"] = "1"
+        return app
+    }
+
+    func testMachineRuntimeHierarchyOnIPhone() throws {
+        let app = makeMockApp()
         app.launch()
         XCTAssertTrue(app.staticTexts["My PC"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["Web"].exists)
@@ -17,8 +23,7 @@ final class RemoteAIMobileUITests: XCTestCase {
     }
 
     func testOpenCachedWebConversation() throws {
-        let app = XCUIApplication()
-        app.launchArguments += ["-UITestMockMode", "1"]
+        let app = makeMockApp()
         app.launch()
         app.staticTexts["Web"].tap()
         XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 3))
@@ -30,8 +35,7 @@ final class RemoteAIMobileUITests: XCTestCase {
     }
 
     func testComposerFloatsAboveKeyboard() throws {
-        let app = XCUIApplication()
-        app.launchArguments += ["-UITestMockMode", "1"]
+        let app = makeMockApp()
         app.launch()
         app.staticTexts["Web"].tap()
         XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 3))
@@ -50,8 +54,7 @@ final class RemoteAIMobileUITests: XCTestCase {
     }
 
     func testPairingScreenHasManualAndQRPaths() throws {
-        let app = XCUIApplication()
-        app.launchArguments += ["-UITestMockMode", "1"]
+        let app = makeMockApp()
         app.launch()
         app.buttons["Pair Device"].tap()
         XCTAssertTrue(app.navigationBars["Pair Device"].waitForExistence(timeout: 5))
