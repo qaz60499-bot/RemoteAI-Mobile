@@ -207,9 +207,10 @@ final class RemoteAIMobileTests: XCTestCase {
     func testCloudCodeInstanceCarriesWorkspaceAndProviderCredentialModelCatalog() throws {
         let catalog = CloudCodeCatalog(
             providers: [
-                CloudCodeProviderOption(id: "current", label: "Current", models: ["default"], defaultModel: "default", custom: false, requiresApiKey: false),
-                CloudCodeProviderOption(id: "seekai", label: "SeekAI", models: ["claude-sonnet-5"], defaultModel: "claude-sonnet-5", custom: false, requiresApiKey: true, credentialMode: "local-relay-slot"),
-                CloudCodeProviderOption(id: "tabitoken", label: "Tabitoken", models: ["claude-opus-5"], defaultModel: "claude-opus-5", custom: false, requiresApiKey: true, credentialMode: "local-relay-slot"),
+                CloudCodeProviderOption(id: "current", label: "Current", models: ["default"], defaultModel: "default", custom: false, requiresApiKey: false, configured: false),
+                CloudCodeProviderOption(id: "seekai", label: "SeekAI", models: ["claude-sonnet-5"], defaultModel: "claude-sonnet-5", custom: false, requiresApiKey: true, credentialMode: "local-relay-slot", configured: true, keyCount: 1),
+                CloudCodeProviderOption(id: "tabitoken", label: "Tabitoken", models: ["claude-opus-5"], defaultModel: "claude-opus-5", custom: false, requiresApiKey: true, credentialMode: "local-relay-slot", configured: true, keyCount: 1),
+                CloudCodeProviderOption(id: "chatapi", label: "ChatAPI", models: ["claude-opus-5"], defaultModel: "claude-opus-5", custom: false, requiresApiKey: true, credentialMode: "local-relay-slot", configured: false, keyCount: 0),
                 CloudCodeProviderOption(id: "anthropic", label: "Anthropic", models: ["sonnet", "opus"], defaultModel: "sonnet", custom: false, requiresApiKey: true),
                 CloudCodeProviderOption(id: "custom", label: "Custom", models: [], defaultModel: nil, custom: true, requiresApiKey: true)
             ],
@@ -237,14 +238,47 @@ final class RemoteAIMobileTests: XCTestCase {
         let descriptor = server.descriptor
         XCTAssertEqual(descriptor.subtitle, "D:\\wendangcodex\\RemoteAI")
         let decoded = try XCTUnwrap(descriptor.cloudCodeCatalog)
-        XCTAssertEqual(decoded.providers.map(\.id), ["current", "seekai", "tabitoken", "anthropic", "custom"])
+        XCTAssertEqual(decoded.providers.map(\.id), ["current", "seekai", "tabitoken", "chatapi", "anthropic", "custom"])
         XCTAssertEqual(decoded.credentialProfiles.map(\.id), ["seekai-slot-1", "tabitoken-slot-1", "work"])
         XCTAssertEqual(decoded.providers.first(where: { $0.id == "seekai" })?.credentialMode, "local-relay-slot")
+        XCTAssertEqual(decoded.providers.first(where: { $0.id == "seekai" })?.keyCount, 1)
+        XCTAssertTrue(decoded.providers.first(where: { $0.id == "current" })?.isSelectableOnMobile == true)
+        XCTAssertTrue(decoded.providers.first(where: { $0.id == "seekai" })?.isSelectableOnMobile == true)
+        XCTAssertTrue(decoded.providers.first(where: { $0.id == "chatapi" })?.isSelectableOnMobile == false)
+        XCTAssertTrue(decoded.credentialProfiles.allSatisfy { $0.secretExposed != true })
         XCTAssertEqual(decoded.credentialProfiles.first(where: { $0.id == "seekai-slot-1" })?.providerId, "seekai")
         XCTAssertEqual(decoded.credentialProfiles.first(where: { $0.id == "seekai-slot-1" })?.slot, 1)
         XCTAssertEqual(decoded.defaultProviderId, "anthropic")
         XCTAssertEqual(decoded.defaultCredentialProfileId, "work")
         XCTAssertTrue(decoded.supportsNewCredential)
+    }
+
+    func testCodexInstanceCarriesSafeSelectableModelCatalog() throws {
+        let catalog = CodexCatalog(
+            models: [
+                CodexModelOption(id: "gpt-5.6-sol", label: "GPT-5.6-Sol"),
+                CodexModelOption(id: "gpt-5.4-mini", label: "GPT-5.4-Mini")
+            ],
+            defaultModel: "gpt-5.6-sol"
+        )
+        let server = ServerInstance(
+            instanceId: "codex.1",
+            runtimeId: "runtime.codex",
+            label: "Codex1",
+            kind: "codex-cli",
+            config: [
+                "model": .string("gpt-5.6-sol"),
+                "codexCatalog": try JSONValue.encode(catalog)
+            ],
+            status: "ready",
+            updatedAt: Date()
+        )
+        let descriptor = server.descriptor
+        let decoded = try XCTUnwrap(descriptor.codexCatalog)
+        XCTAssertEqual(descriptor.configuredModel, "gpt-5.6-sol")
+        XCTAssertEqual(decoded.defaultModel, "gpt-5.6-sol")
+        XCTAssertEqual(decoded.models.map(\.id), ["gpt-5.6-sol", "gpt-5.4-mini"])
+        XCTAssertEqual(decoded.models.map(\.label), ["GPT-5.6-Sol", "GPT-5.4-Mini"])
     }
 
     func testMockExposesAllElevenDesktopCodexInstances() async throws {

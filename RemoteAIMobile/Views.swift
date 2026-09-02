@@ -133,7 +133,12 @@ struct InstanceView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled(true)
                     if store.webProjects.isEmpty {
-                        Text(store.machine.state == .online ? "正在读取 ChatGPT Projects…" : "离线 — 显示缓存 Projects")
+                        let projectStatus: String = {
+                            if store.errors["web.projects"] != nil { return "Projects 读取失败 — 下拉刷新重试" }
+                            if store.hasLoadedWebProjects { return "当前没有找到 ChatGPT Projects" }
+                            return store.machine.state == .online ? "正在读取 ChatGPT Projects…" : "离线 — 显示缓存 Projects"
+                        }()
+                        Text(projectStatus)
                             .font(.caption).foregroundColor(.secondary)
                     }
                     ForEach(filteredProjects) { project in
@@ -268,9 +273,12 @@ struct ChatView: View {
     @State private var showFilePicker = false
     @State private var attachmentError: String?
     @State private var sending = false
+    @State private var sendTask: Task<Void, Never>?
+    @State private var selectedCodexModel = ""
     @FocusState private var focused: Bool
 
     var messages: [ChatMessage] { store.messagesBySession[session.id, default: []] }
+    private var codexModels: [CodexModelOption] { instance.codexCatalog?.models ?? [] }
     var body: some View {
         VStack(spacing: 0) {
             if let error = store.errors[session.id] { ErrorBanner(text: error) { store.clearError(sessionId: session.id) } }
@@ -283,7 +291,7 @@ struct ChatView: View {
                         ForEach(messages) { message in
                             let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
                             let retryable = message.kind == .error || commandState == .failed || commandState == .unknown
-                            MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id) } } : nil).id(message.id)
+                            MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil).id(message.id)
                         }
                     }.padding(.horizontal, 12).padding(.vertical, 10)
                 }
@@ -298,29 +306,63 @@ struct ChatView: View {
             ToolbarItem(placement: .navigationBarTrailing) { if store.machine.state == .online { Button("Stop") { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } }.font(.caption) } }
         }
         .safeAreaInset(edge: .bottom) {
-            Composer(
-                text: $input,
-                attachments: $pendingAttachments,
-                enabled: store.machine.state == .online && !sending,
-                addPhoto: { showPhotoPicker = true },
-                addFile: { showFilePicker = true },
-                send: {
-                    let text = input
-                    let attachments = pendingAttachments
-                    focused = false
-                    sending = true
-                    Task {
-                        let sent = await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, attachments: attachments)
-                        await MainActor.run {
-                            sending = false
-                            if sent {
-                                input = ""
-                                pendingAttachments.removeAll()
+            VStack(spacing: 0) {
+                if runtime.kind == .codex, !codexModels.isEmpty {
+                    HStack(spacing: 8) {
+                        Label("Model", systemImage: "cpu")
+                            .font(.caption.weight(.medium))
+                        Spacer()
+                        Picker("Model", selection: $selectedCodexModel) {
+                            ForEach(codexModels) { option in Text(option.label).tag(option.id) }
+                        }
+                        .pickerStyle(.menu)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.ultraThinMaterial)
+                }
+                if let transfer = store.attachmentTransferBySession[session.id] {
+                    HStack(spacing: 10) {
+                        ProgressView(value: transfer.fraction)
+                            .frame(maxWidth: 110)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("上传附件 \(min(transfer.completed + 1, transfer.total))/\(transfer.total)")
+                                .font(.caption.weight(.medium))
+                            Text(transfer.name).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        Button("取消") { sendTask?.cancel() }
+                            .font(.caption)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(.ultraThinMaterial)
+                }
+                Composer(
+                    text: $input,
+                    attachments: $pendingAttachments,
+                    enabled: store.machine.state == .online && !sending,
+                    addPhoto: { showPhotoPicker = true },
+                    addFile: { showFilePicker = true },
+                    send: {
+                        let text = input
+                        let attachments = pendingAttachments
+                        focused = false
+                        sending = true
+                        sendTask = Task {
+                            let sent = await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, attachments: attachments, model: runtime.kind == .codex ? selectedCodexModel : "")
+                            await MainActor.run {
+                                sending = false
+                                sendTask = nil
+                                if sent {
+                                    input = ""
+                                    pendingAttachments.removeAll()
+                                }
                             }
                         }
                     }
-                }
-            ).focused($focused)
+                ).focused($focused)
+            }
         }
         .sheet(isPresented: $showPhotoPicker) {
             PhotoLibraryAttachmentPicker(maxSelection: max(1, 8 - pendingAttachments.count)) { result in
@@ -334,7 +376,16 @@ struct ChatView: View {
             case .failure(let error): attachmentError = error.localizedDescription
             }
         }
-        .task { await store.loadSession(session.id); if input.isEmpty { input = await store.draft(sessionId: session.id) } }
+        .task {
+            if runtime.kind == .codex, selectedCodexModel.isEmpty {
+                selectedCodexModel = instance.configuredModel
+                    ?? instance.codexCatalog?.defaultModel
+                    ?? codexModels.first?.id
+                    ?? ""
+            }
+            await store.loadSession(session.id)
+            if input.isEmpty { input = await store.draft(sessionId: session.id) }
+        }
     }
 
     private func appendAttachments(_ incoming: [PendingAttachment]) {
@@ -573,11 +624,9 @@ struct NewSessionView: View {
     @State private var title = ""
     @State private var providerId = "current"
     @State private var providerBaseURL = ""
-    @State private var model = "default"
+    @State private var model = ""
     @State private var customModel = ""
     @State private var credentialProfileId = ""
-    @State private var newCredentialProfileId = ""
-    @State private var apiKey = ""
     @State private var creating = false
 
     private var catalog: CloudCodeCatalog {
@@ -598,15 +647,15 @@ struct NewSessionView: View {
         catalog.providers.first { $0.id == providerId }
     }
 
+    private var codexCatalog: CodexCatalog {
+        instance.codexCatalog ?? CodexCatalog(models: [], defaultModel: instance.configuredModel)
+    }
+
     private var credentialOptions: [CloudCodeCredentialOption] {
         let exact = catalog.credentialProfiles.filter { $0.providerId == providerId }
         if !exact.isEmpty { return exact }
         if providerId == "current" { return [] }
         return catalog.credentialProfiles.filter { $0.providerId == nil }
-    }
-
-    private var allowsNewCredential: Bool {
-        catalog.supportsNewCredential && selectedProvider?.credentialMode != "local-relay-slot"
     }
 
     private var modelOptions: [String] {
@@ -619,11 +668,18 @@ struct NewSessionView: View {
     }
 
     private var canCreate: Bool {
+        if runtime.kind == .codex {
+            return !model.isEmpty && codexCatalog.models.contains(where: { $0.id == model })
+        }
         if runtime.kind != .cloudCode { return true }
+        guard let provider = selectedProvider, provider.isSelectableOnMobile else { return false }
         if providerId == "custom" && providerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
         if model == "__custom__" && customModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
-        if credentialProfileId == "__new__" {
-            return !newCredentialProfileId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && apiKey.count >= 8
+        if provider.credentialMode == "local-relay-slot" {
+            return !credentialProfileId.isEmpty && credentialOptions.contains(where: { $0.id == credentialProfileId })
+        }
+        if provider.requiresApiKey && providerId != "current" {
+            return !credentialProfileId.isEmpty && credentialOptions.contains(where: { $0.id == credentialProfileId })
         }
         return true
     }
@@ -646,7 +702,11 @@ struct NewSessionView: View {
                 if runtime.kind == .cloudCode {
                     Section("厂商") {
                         Picker("Provider", selection: $providerId) {
-                            ForEach(catalog.providers) { option in Text(option.label).tag(option.id) }
+                            ForEach(catalog.providers) { option in
+                                Text(option.label + (option.isSelectableOnMobile ? "" : " · 未配置"))
+                                    .tag(option.id)
+                                    .disabled(!option.isSelectableOnMobile)
+                            }
                         }
                         if providerId == "custom" {
                             TextField("https://api.example.com", text: $providerBaseURL)
@@ -658,19 +718,16 @@ struct NewSessionView: View {
 
                     Section("Key") {
                         Picker("Credential", selection: $credentialProfileId) {
-                            Text("使用 Cloud Code 当前登录 / 环境").tag("")
+                            if providerId == "current" {
+                                Text("使用 Windows 当前 Claude 配置").tag("")
+                            }
                             ForEach(credentialOptions) { option in Text(option.label).tag(option.id) }
-                            if allowsNewCredential { Text("新增 Key…").tag("__new__") }
                         }
-                        if credentialProfileId == "__new__" {
-                            TextField("Key 名称", text: $newCredentialProfileId)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled(true)
-                            SecureField("API Key", text: $apiKey)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled(true)
+                        if providerId != "current" && credentialOptions.isEmpty {
+                            Text("Windows 未配置此 Provider 的可用 Key；请先在 Windows 端配置。")
+                                .font(.caption).foregroundColor(.orange)
                         }
-                        Text("已有 Key 只显示 Windows 上的 Profile 名称；真实 Key 不会从 Windows 回传。新增 Key 通过已配对的加密通道提交一次并存入 Windows DPAPI。")
+                        Text("手机只接收 Provider、Key Slot/Profile 和 Model 元数据；真实 API Key 始终保留在 Windows，不在手机端显示或录入。")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -687,23 +744,47 @@ struct NewSessionView: View {
                                 .autocorrectionDisabled(true)
                         }
                     }
+                } else if runtime.kind == .codex {
+                    Section("模型") {
+                        if codexCatalog.models.isEmpty {
+                            Text("Windows 尚未提供此 Codex 实例的模型目录。")
+                                .font(.caption).foregroundColor(.orange)
+                        } else {
+                            Picker("Model", selection: $model) {
+                                ForEach(codexCatalog.models) { option in
+                                    Text(option.label).tag(option.id)
+                                }
+                            }
+                        }
+                    }
                 }
             }
             .remoteAITopBreathingRoom()
             .navigationTitle(runtime.kind == .web ? "New Chat" : "New Session")
             .navigationBarTitleDisplayMode(.inline)
             .onAppear {
-                if let defaultProvider = catalog.defaultProviderId { providerId = defaultProvider }
-                if let defaultCredential = catalog.defaultCredentialProfileId { credentialProfileId = defaultCredential }
-                if let provider = catalog.providers.first(where: { $0.id == providerId }), let defaultModel = provider.defaultModel { model = defaultModel }
+                if runtime.kind == .cloudCode {
+                    if let defaultProvider = catalog.defaultProviderId { providerId = defaultProvider }
+                    if let defaultCredential = catalog.defaultCredentialProfileId { credentialProfileId = defaultCredential }
+                    if let provider = catalog.providers.first(where: { $0.id == providerId }) {
+                        if let defaultModel = provider.defaultModel { model = defaultModel }
+                        if provider.credentialMode == "local-relay-slot" && credentialProfileId.isEmpty {
+                            credentialProfileId = credentialOptions.first?.id ?? ""
+                        }
+                    }
+                } else if runtime.kind == .codex {
+                    model = instance.configuredModel
+                        ?? codexCatalog.defaultModel
+                        ?? codexCatalog.models.first?.id
+                        ?? ""
+                }
             }
             .onChange(of: providerId) { newValue in
+                guard runtime.kind == .cloudCode else { return }
                 if let provider = catalog.providers.first(where: { $0.id == newValue }) {
                     model = provider.defaultModel ?? (provider.models.first ?? "__custom__")
-                }
-                if credentialProfileId == "__new__" && !allowsNewCredential {
-                    credentialProfileId = ""
-                } else if !credentialProfileId.isEmpty && credentialProfileId != "__new__" && !credentialOptions.contains(where: { $0.id == credentialProfileId }) {
+                    credentialProfileId = provider.credentialMode == "local-relay-slot" ? (credentialOptions.first?.id ?? "") : ""
+                } else {
                     credentialProfileId = ""
                 }
             }
@@ -712,7 +793,6 @@ struct NewSessionView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button(creating ? "Creating…" : "Create") {
                         creating = true
-                        let selectedCredential = credentialProfileId == "__new__" ? "" : credentialProfileId
                         Task {
                             let created = await store.createSession(
                                 runtime: runtime,
@@ -721,11 +801,8 @@ struct NewSessionView: View {
                                 providerId: providerId,
                                 providerBaseURL: providerBaseURL,
                                 model: finalModel,
-                                credentialProfileId: selectedCredential,
-                                newCredentialProfileId: credentialProfileId == "__new__" ? newCredentialProfileId : "",
-                                apiKey: credentialProfileId == "__new__" ? apiKey : ""
+                                credentialProfileId: credentialProfileId
                             )
-                            apiKey = ""
                             creating = false
                             if created { dismiss() }
                         }

@@ -12,6 +12,8 @@ final class WorkspaceStore: ObservableObject {
     @Published var projectConversationsByAlias: [String: [WebConversationDescriptor]] = [:]
     @Published var projectNextCursorByAlias: [String: String] = [:]
     @Published var projectHasMoreByAlias: [String: Bool] = [:]
+    @Published var hasLoadedWebProjects = false
+    @Published var attachmentTransferBySession: [String: AttachmentTransferProgress] = [:]
     @Published var commandStates: [UUID: CommandState] = [:]
     @Published var errors: [String: String] = [:]
     @Published var hasMoreBySession: [String: Bool] = [:]
@@ -50,6 +52,7 @@ final class WorkspaceStore: ObservableObject {
 
     func start(pairingProgress: ((PairingStage) -> Void)? = nil) async {
         await loadCachedFirst()
+        await normalizeCachedTransientState()
         if !(transport is MockTransport) { await removeLegacyMockFixtures() }
         isPaired = PairingKeyStore.isPaired(machineId: machine.id)
         if !isPaired && !(transport is MockTransport) {
@@ -65,6 +68,8 @@ final class WorkspaceStore: ObservableObject {
             projectConversationsByAlias.removeAll()
             projectNextCursorByAlias.removeAll()
             projectHasMoreByAlias.removeAll()
+            hasLoadedWebProjects = false
+            attachmentTransferBySession.removeAll()
             hasMoreBySession.removeAll()
             machine.state = .offline
             errors["connection"] = "Not paired — scan the Windows pairing code to load your real runtimes and ChatGPT Projects."
@@ -114,7 +119,10 @@ final class WorkspaceStore: ObservableObject {
         guard machine.state == .online else { return }
         do {
             let remote = try await transport.listProjects(machineId: machine.id)
-            webProjects = remote.sorted { ($0.lastOpenedAt ?? $0.lastSeenAt ?? .distantPast) > ($1.lastOpenedAt ?? $1.lastSeenAt ?? .distantPast) }
+            // Preserve the authoritative DOM order from Windows. Sorting by cached
+            // timestamps can make a complete Project list look random or incomplete.
+            webProjects = remote
+            hasLoadedWebProjects = true
             try? await cache.put(webProjects, key: "web.projects")
             errors["web.projects"] = nil
         } catch {
@@ -133,6 +141,7 @@ final class WorkspaceStore: ObservableObject {
             let created = try await transport.createWebProject(machineId: machine.id, projectName: trimmed)
             webProjects.removeAll { $0.projectAlias == created.projectAlias }
             webProjects.insert(created, at: 0)
+            hasLoadedWebProjects = true
             try? await cache.put(webProjects, key: "web.projects")
             errors["web.projects"] = nil
             return created
@@ -223,7 +232,16 @@ final class WorkspaceStore: ObservableObject {
 
     func loadSession(_ sessionId: String) async {
         if messagesBySession[sessionId] == nil {
-            let local = (try? await cache.recentMessages(sessionId: sessionId, limit: 50)) ?? []
+            var local = (try? await cache.recentMessages(sessionId: sessionId, limit: 50)) ?? []
+            if sessions.first(where: { $0.id == sessionId })?.state != .busy {
+                var changed = false
+                for index in local.indices where local[index].kind == .toolEvent && local[index].toolStatus == "Running" {
+                    local[index].toolStatus = "Interrupted"
+                    if local[index].detail == nil { local[index].detail = "Previous app/connection lifecycle ended before a terminal tool event." }
+                    changed = true
+                }
+                if changed { try? await cache.upsertMessages(local) }
+            }
             messagesBySession[sessionId] = local
         }
         guard machine.state == .online, let context = contextForSession(sessionId) else { return }
@@ -256,7 +274,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     @discardableResult
-    func send(text: String, runtimeId: String, instanceId: String, sessionId: String, attachments: [PendingAttachment] = [], commandId: UUID = UUID()) async -> Bool {
+    func send(text: String, runtimeId: String, instanceId: String, sessionId: String, attachments: [PendingAttachment] = [], model: String = "", commandId: UUID = UUID()) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
         guard attachments.count <= 8, attachments.allSatisfy({ $0.sizeBytes > 0 && $0.sizeBytes <= 20 * 1024 * 1024 }) else {
@@ -274,7 +292,12 @@ final class WorkspaceStore: ObservableObject {
         commandStates[commandId] = .pending
         do {
             var remoteAttachments: [RemoteAttachmentDescriptor] = []
-            for attachment in attachments {
+            if !attachments.isEmpty {
+                attachmentTransferBySession[sessionId] = AttachmentTransferProgress(completed: 0, total: attachments.count, name: attachments[0].name)
+            }
+            for (index, attachment) in attachments.enumerated() {
+                try Task.checkCancellation()
+                attachmentTransferBySession[sessionId] = AttachmentTransferProgress(completed: index, total: attachments.count, name: attachment.name)
                 let remote = try await transport.uploadAttachment(
                     machineId: machine.id,
                     runtimeId: runtimeId,
@@ -283,7 +306,10 @@ final class WorkspaceStore: ObservableObject {
                     attachment: attachment
                 )
                 remoteAttachments.append(remote)
+                attachmentTransferBySession[sessionId] = AttachmentTransferProgress(completed: index + 1, total: attachments.count, name: attachment.name)
             }
+            try Task.checkCancellation()
+            attachmentTransferBySession.removeValue(forKey: sessionId)
 
             let names = remoteAttachments.map(\.name).joined(separator: ", ")
             let displayText = "\(trimmed)\(!names.isEmpty ? "\(trimmed.isEmpty ? "" : "\n\n")[Attachments: \(names)]" : "")"
@@ -292,26 +318,34 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.upsertMessages([optimistic])
 
             var payload: [String: JSONValue] = ["text": .string(trimmed)]
+            if !model.isEmpty { payload["model"] = .string(model) }
             if !remoteAttachments.isEmpty { payload["attachmentIds"] = .array(remoteAttachments.map { .string($0.attachmentId) }) }
             let command = RemoteCommand.make(machineId: machine.id, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "sendMessage", payload: payload, commandId: commandId)
             commandStates[commandId] = .executing
             commandStates[commandId] = try await transport.send(command)
             try? await cache.saveDraft("", sessionId: sessionId)
             return true
+        } catch is CancellationError {
+            attachmentTransferBySession.removeValue(forKey: sessionId)
+            commandStates[commandId] = .failed
+            errors[sessionId] = "Attachment upload cancelled. The message was not sent; you can retry without reselecting the files."
+            return false
         } catch TransportError.disconnected {
+            attachmentTransferBySession.removeValue(forKey: sessionId)
             commandStates[commandId] = .unknown
             errors[sessionId] = "Connection dropped after send. Delivery is unknown; retry reuses the same command ID."
             return false
         } catch {
+            attachmentTransferBySession.removeValue(forKey: sessionId)
             commandStates[commandId] = .failed
             errors[sessionId] = error.localizedDescription
             return false
         }
     }
 
-    func retry(message: ChatMessage, runtimeId: String, instanceId: String) async {
+    func retry(message: ChatMessage, runtimeId: String, instanceId: String, model: String = "") async {
         let commandId = UUID(uuidString: message.id) ?? UUID()
-        await send(text: message.text, runtimeId: runtimeId, instanceId: instanceId, sessionId: message.sessionId, commandId: commandId)
+        await send(text: message.text, runtimeId: runtimeId, instanceId: instanceId, sessionId: message.sessionId, model: model, commandId: commandId)
     }
 
     func stop(runtimeId: String, instanceId: String, sessionId: String) async {
@@ -333,14 +367,18 @@ final class WorkspaceStore: ObservableObject {
         apiKey: String = ""
     ) async -> Bool {
         var payload: [String: JSONValue] = [
-            "title": .string(title.isEmpty ? "New Session" : title),
-            "providerId": .string(providerId),
-            "model": .string(model),
-            "credentialProfileId": .string(credentialProfileId)
+            "title": .string(title.isEmpty ? "New Session" : title)
         ]
-        if !providerBaseURL.isEmpty { payload["providerBaseURL"] = .string(providerBaseURL) }
-        if !newCredentialProfileId.isEmpty { payload["newCredentialProfileId"] = .string(newCredentialProfileId) }
-        if !apiKey.isEmpty { payload["apiKey"] = .string(apiKey) }
+        if runtime.kind == .cloudCode {
+            payload["providerId"] = .string(providerId)
+            payload["model"] = .string(model)
+            payload["credentialProfileId"] = .string(credentialProfileId)
+            if !providerBaseURL.isEmpty { payload["providerBaseURL"] = .string(providerBaseURL) }
+            if !newCredentialProfileId.isEmpty { payload["newCredentialProfileId"] = .string(newCredentialProfileId) }
+            if !apiKey.isEmpty { payload["apiKey"] = .string(apiKey) }
+        } else if runtime.kind == .codex, !model.isEmpty {
+            payload["model"] = .string(model)
+        }
         guard machine.state == .online else {
             errors[instance.id] = "PC Offline — new sessions are not queued automatically."
             return false
@@ -395,6 +433,8 @@ final class WorkspaceStore: ObservableObject {
         projectConversationsByAlias.removeAll()
         projectNextCursorByAlias.removeAll()
         projectHasMoreByAlias.removeAll()
+        hasLoadedWebProjects = false
+        attachmentTransferBySession.removeAll()
         hasMoreBySession.removeAll()
         tracker = SequenceTracker()
         eventReplayGuard = BoundedReplayGuard(capacity: 8192)
@@ -503,7 +543,10 @@ final class WorkspaceStore: ObservableObject {
         if let value: [RuntimeDescriptor] = try? await cache.get([RuntimeDescriptor].self, key: "runtimes") { runtimes = value }
         if let value: [InstanceDescriptor] = try? await cache.get([InstanceDescriptor].self, key: "instances") { instances = value }
         if let value: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") { sessions = value }
-        if let value: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") { webProjects = value }
+        if let value: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
+            webProjects = value
+            hasLoadedWebProjects = !value.isEmpty
+        }
         tracker = SequenceTracker(lastSequence: (try? await cache.lastSequence()) ?? 0)
         let process = ProcessInfo.processInfo
         if runtimes.isEmpty,
@@ -512,6 +555,17 @@ final class WorkspaceStore: ObservableObject {
             seedFixtureMetadata()
             await persistMetadata()
         }
+    }
+
+    private func normalizeCachedTransientState() async {
+        var changed = false
+        for index in sessions.indices where sessions[index].state == .busy || sessions[index].state == .waiting {
+            let sessionId = sessions[index].id
+            sessions[index].state = .idle
+            errors[sessionId] = "Previous generation did not reach a terminal event before the app/connection ended. Its stale RUNNING state was reset."
+            changed = true
+        }
+        if changed { try? await cache.put(sessions, key: "sessions") }
     }
 
     private func removeLegacyMockFixtures() async {

@@ -180,6 +180,7 @@ extension Transport {
         var offset = 0
         do {
             while offset < attachment.data.count {
+                try Task.checkCancellation()
                 let end = min(attachment.data.count, offset + chunkSize)
                 let chunk = attachment.data.subdata(in: offset..<end)
                 let command = RemoteCommand.make(

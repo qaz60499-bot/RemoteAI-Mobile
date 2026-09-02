@@ -35,6 +35,15 @@ struct CloudCodeProviderOption: Codable, Identifiable, Hashable {
     let custom: Bool
     let requiresApiKey: Bool
     var credentialMode: String? = nil
+    var configured: Bool? = nil
+    var keyCount: Int? = nil
+    var credentialProfileIds: [String]? = nil
+    var usesWindowsClaudeSettings: Bool? = nil
+    var secretExposed: Bool? = nil
+
+    var isSelectableOnMobile: Bool {
+        id == "current" || configured != false
+    }
 }
 
 struct CloudCodeCredentialOption: Codable, Identifiable, Hashable {
@@ -54,12 +63,41 @@ struct CloudCodeCatalog: Codable, Hashable {
     let supportsNewCredential: Bool
 }
 
+struct CodexModelOption: Codable, Identifiable, Hashable {
+    let id: String
+    let label: String
+}
+
+struct CodexCatalog: Codable, Hashable {
+    let models: [CodexModelOption]
+    let defaultModel: String?
+}
+
 extension InstanceDescriptor {
     var cloudCodeCatalog: CloudCodeCatalog? {
         try? config["cloudCodeCatalog"]?.decode(CloudCodeCatalog.self)
     }
+
+    var codexCatalog: CodexCatalog? {
+        try? config["codexCatalog"]?.decode(CodexCatalog.self)
+    }
+
+    var configuredModel: String? {
+        config["model"]?.stringValue
+    }
 }
 struct SessionDescriptor: Codable, Identifiable, Hashable { let id: String; let instanceId: String; var title: String; var state: SessionState; var updatedAt: Date; var projectAlias: String? = nil; var canonicalUrl: String? = nil }
+
+struct AttachmentTransferProgress: Equatable {
+    let completed: Int
+    let total: Int
+    let name: String
+
+    var fraction: Double {
+        guard total > 0 else { return 0 }
+        return min(1, max(0, Double(completed) / Double(total)))
+    }
+}
 
 struct PendingAttachment: Identifiable, Hashable {
     let id: UUID
