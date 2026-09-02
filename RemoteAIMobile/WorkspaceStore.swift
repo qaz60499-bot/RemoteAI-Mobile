@@ -1075,7 +1075,11 @@ final class WorkspaceStore: ObservableObject {
                 // A fresh install has no local state to reconcile. Reuse the authenticated
                 // getStatus sequence when startup/reconnect already fetched it, so one
                 // initialization never issues a duplicate status request.
-                cursor = freshLatestSequence ?? (try await transport.latestSequence(machineId: machine.id))
+                if let freshLatestSequence {
+                    cursor = freshLatestSequence
+                } else {
+                    cursor = try await transport.latestSequence(machineId: machine.id)
+                }
                 try? await cache.setLastSequence(cursor)
                 tracker = SequenceTracker(lastSequence: cursor)
                 return
