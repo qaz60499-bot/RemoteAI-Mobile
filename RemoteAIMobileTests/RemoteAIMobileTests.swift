@@ -176,6 +176,18 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(Set(instances.map(\.name)), Set((1...11).map { "Codex\($0)" }))
     }
 
+    func testMockAttachmentUploadIsChunkedAndReturnsDescriptor() async throws {
+        let mock = MockTransport(historyCount: 1)
+        try await mock.connect()
+        let payload = Data(repeating: 0x41, count: 220_000)
+        let local = PendingAttachment(name: "photo.jpg", contentType: "image/jpeg", data: payload)
+        let uploaded = try await mock.uploadAttachment(machineId: "my-pc", runtimeId: "runtime.codex", instanceId: "codex.1", sessionId: "codex6-a", attachment: local)
+        XCTAssertEqual(uploaded.name, "photo.jpg")
+        XCTAssertEqual(uploaded.contentType, "image/jpeg")
+        XCTAssertEqual(uploaded.sizeBytes, payload.count)
+        XCTAssertFalse(uploaded.attachmentId.isEmpty)
+    }
+
     func testMockRecentIsPaginated() async throws {
         let mock = MockTransport(historyCount: 1200)
         try await mock.connect()

@@ -1,5 +1,7 @@
 import SwiftUI
 import AVFoundation
+import PhotosUI
+import UniformTypeIdentifiers
 import UIKit
 
 private enum MobileLayout {
@@ -90,37 +92,73 @@ struct InstanceView: View {
     let instance: InstanceDescriptor
     @State private var newSession = false
     @State private var newProject = false
+    @State private var projectSearch = ""
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
+    private var filteredProjects: [WebProjectDescriptor] {
+        let query = projectSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return store.webProjects }
+        return store.webProjects.filter { $0.displayName.localizedCaseInsensitiveContains(query) || $0.projectAlias.localizedCaseInsensitiveContains(query) }
+    }
 
     var body: some View {
         List {
             if isChatGPTWeb {
+                Section {
+                    Button { Task { _ = await store.createWebConversation() } } label: {
+                        Label("新建普通 ChatGPT 对话", systemImage: "plus.circle.fill")
+                    }
+                } footer: {
+                    Text("普通对话与 Projects 分开显示，不会混在一起。")
+                }
                 Section("普通聊天") {
                     ForEach(store.sessions.filter { $0.instanceId == instance.id && $0.projectAlias == nil }.sorted { $0.updatedAt > $1.updatedAt }) { session in
                         NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
                     }
-                    Button { Task { _ = await store.createWebConversation() } } label: { Label("新建普通对话", systemImage: "plus.circle.fill") }
                 }
-                Section("Projects") {
-                    Button { newProject = true } label: { Label("新建 Project", systemImage: "folder.badge.plus") }
-                    if store.webProjects.isEmpty { Text(store.machine.state == .online ? "正在读取 Projects…" : "离线 — 显示缓存 Project").font(.caption).foregroundColor(.secondary) }
-                    ForEach(store.webProjects) { project in
+                Section {
+                    Button { newProject = true } label: { Label("新建 ChatGPT Project", systemImage: "folder.badge.plus") }
+                    TextField("搜索 Project", text: $projectSearch)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+                    if store.webProjects.isEmpty {
+                        Text(store.machine.state == .online ? "正在读取 ChatGPT Projects…" : "离线 — 显示缓存 Projects")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    ForEach(filteredProjects) { project in
                         NavigationLink(destination: WebProjectView(runtime: runtime, instance: instance, project: project)) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(project.displayName).font(.body.weight(.medium))
-                                if let date = project.lastOpenedAt ?? project.lastSeenAt { Text(date, style: .relative).font(.caption).foregroundColor(.secondary) }
+                            HStack(spacing: 10) {
+                                Image(systemName: "folder.fill").foregroundColor(.accentColor)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(project.displayName).font(.body.weight(.medium))
+                                    HStack(spacing: 5) {
+                                        Text("Project").font(.caption2.weight(.semibold))
+                                        if let date = project.lastOpenedAt ?? project.lastSeenAt { FixedTimestamp(date: date, prefix: "最近访问") }
+                                    }
+                                }
                             }.padding(.vertical, 4)
                         }
                     }
+                } header: {
+                    Text("ChatGPT Projects")
+                } footer: {
+                    Text("点进某个 Project 后才加载该 Project 的历史对话；不会启动时遍历全部历史。")
                 }
                 if let error = store.errors["web.projects"] { Section { ErrorBanner(text: error) { store.clearError(sessionId: "web.projects") } } }
             } else {
-                Section("Sessions / Conversations") {
+                Section {
+                    Button { newSession = true } label: {
+                        Label(runtime.kind == .cloudCode ? "新建 Cloud Code 会话" : "新建会话", systemImage: "plus.circle.fill")
+                    }
+                    if runtime.kind == .cloudCode {
+                        Text("新建时可选择厂商、Key Profile 和模型。")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                }
+                Section("历史会话") {
                     ForEach(store.sessions.filter { $0.instanceId == instance.id }.sorted { $0.updatedAt > $1.updatedAt }) { session in
                         NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
                     }
                 }
-                Section { Button { newSession = true } label: { Label(runtime.kind == .web ? "New Chat" : "New Session", systemImage: "plus.circle.fill") } }
             }
         }
         .remoteAITopBreathingRoom()
@@ -146,11 +184,24 @@ struct InstanceView: View {
     }
 }
 
+struct FixedTimestamp: View {
+    let date: Date
+    var prefix: String = "最后更新"
+    var body: some View {
+        Text("\(prefix) \(date.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()))")
+            .font(.caption2)
+            .foregroundColor(.secondary)
+    }
+}
+
 struct SessionRow: View {
     let session: SessionDescriptor
     var body: some View {
         HStack {
-            VStack(alignment: .leading, spacing: 4) { Text(session.title); Text(session.updatedAt, style: .relative).font(.caption).foregroundColor(.secondary) }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(session.title)
+                FixedTimestamp(date: session.updatedAt)
+            }
             Spacer()
             Text(session.state.rawValue).font(.caption).foregroundColor(session.state == .error ? .red : .secondary)
         }
@@ -200,12 +251,18 @@ struct ChatView: View {
     let session: SessionDescriptor
     @State private var input = ""
     @State private var loadingOlder = false
+    @State private var pendingAttachments: [PendingAttachment] = []
+    @State private var showPhotoPicker = false
+    @State private var showFilePicker = false
+    @State private var attachmentError: String?
+    @State private var sending = false
     @FocusState private var focused: Bool
 
     var messages: [ChatMessage] { store.messagesBySession[session.id, default: []] }
     var body: some View {
         VStack(spacing: 0) {
             if let error = store.errors[session.id] { ErrorBanner(text: error) { store.clearError(sessionId: session.id) } }
+            if let attachmentError { ErrorBanner(text: attachmentError) { self.attachmentError = nil } }
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 12) {
@@ -228,21 +285,201 @@ struct ChatView: View {
             ToolbarItem(placement: .principal) { VStack(spacing: 1) { Text(instance.name).font(.subheadline.weight(.semibold)); Text(session.title).font(.caption2).foregroundColor(.secondary); Text(store.machine.state.rawValue).font(.caption2).foregroundColor(store.machine.state == .online ? .green : .secondary) } }
             ToolbarItem(placement: .navigationBarTrailing) { if store.machine.state == .online { Button("Stop") { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } }.font(.caption) } }
         }
-        .safeAreaInset(edge: .bottom) { Composer(text: $input, enabled: store.machine.state == .online) { let text = input; input = ""; focused = false; Task { await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } }.focused($focused) }
+        .safeAreaInset(edge: .bottom) {
+            Composer(
+                text: $input,
+                attachments: $pendingAttachments,
+                enabled: store.machine.state == .online && !sending,
+                addPhoto: { showPhotoPicker = true },
+                addFile: { showFilePicker = true },
+                send: {
+                    let text = input
+                    let attachments = pendingAttachments
+                    focused = false
+                    sending = true
+                    Task {
+                        let sent = await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, attachments: attachments)
+                        await MainActor.run {
+                            sending = false
+                            if sent {
+                                input = ""
+                                pendingAttachments.removeAll()
+                            }
+                        }
+                    }
+                }
+            ).focused($focused)
+        }
+        .sheet(isPresented: $showPhotoPicker) {
+            PhotoLibraryAttachmentPicker(maxSelection: max(1, 8 - pendingAttachments.count)) { result in
+                appendAttachments(result)
+                showPhotoPicker = false
+            }
+        }
+        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls): appendFileURLs(urls)
+            case .failure(let error): attachmentError = error.localizedDescription
+            }
+        }
         .task { await store.loadSession(session.id); if input.isEmpty { input = await store.draft(sessionId: session.id) } }
+    }
+
+    private func appendAttachments(_ incoming: [PendingAttachment]) {
+        var merged = pendingAttachments
+        for attachment in incoming {
+            guard merged.count < 8 else { attachmentError = "一次最多添加 8 个附件。"; break }
+            guard attachment.sizeBytes > 0 && attachment.sizeBytes <= 20 * 1024 * 1024 else {
+                attachmentError = "附件 \(attachment.name) 超过 20MB，未添加。"
+                continue
+            }
+            merged.append(attachment)
+        }
+        pendingAttachments = merged
+    }
+
+    private func appendFileURLs(_ urls: [URL]) {
+        var loaded: [PendingAttachment] = []
+        for url in urls.prefix(max(0, 8 - pendingAttachments.count)) {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let values = try url.resourceValues(forKeys: [.fileSizeKey, .nameKey, .contentTypeKey])
+                if let size = values.fileSize, size > 20 * 1024 * 1024 {
+                    attachmentError = "附件 \(values.name ?? url.lastPathComponent) 超过 20MB，未添加。"
+                    continue
+                }
+                let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+                let type = values.contentType?.preferredMIMEType
+                    ?? UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+                    ?? "application/octet-stream"
+                loaded.append(PendingAttachment(name: values.name ?? url.lastPathComponent, contentType: type, data: data))
+            } catch {
+                attachmentError = "读取文件失败：\(url.lastPathComponent)"
+            }
+        }
+        appendAttachments(loaded)
     }
 }
 
 struct Composer: View {
     @Binding var text: String
+    @Binding var attachments: [PendingAttachment]
     let enabled: Bool
+    let addPhoto: () -> Void
+    let addFile: () -> Void
     let send: () -> Void
+
+    private var canSend: Bool {
+        enabled && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
+    }
+
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            Button(action: {}) { Image(systemName: "plus.circle").font(.title2).frame(width: 44, height: 44) }.accessibilityLabel("Attachments")
-            TextEditor(text: $text).frame(minHeight: 36, maxHeight: 92).padding(.horizontal, 7).padding(.vertical, 2).background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground))).overlay(RoundedRectangle(cornerRadius: 18).stroke(Color(.separator), lineWidth: 0.5)).accessibilityIdentifier("MessageComposer")
-            Button(action: send) { Image(systemName: "arrow.up.circle.fill").font(.title).frame(width: 44, height: 44).foregroundColor(enabled && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .accentColor : .secondary) }.disabled(!enabled || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).accessibilityLabel("Send")
-        }.padding(.horizontal, 10).padding(.vertical, 8).background(.ultraThinMaterial)
+        VStack(spacing: 6) {
+            if !attachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(attachments) { attachment in
+                            HStack(spacing: 5) {
+                                Image(systemName: attachment.contentType.hasPrefix("image/") ? "photo" : "doc")
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(attachment.name).font(.caption).lineLimit(1)
+                                    Text(ByteCountFormatter.string(fromByteCount: Int64(attachment.sizeBytes), countStyle: .file))
+                                        .font(.caption2).foregroundColor(.secondary)
+                                }
+                                Button {
+                                    attachments.removeAll { $0.id == attachment.id }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Remove \(attachment.name)")
+                            }
+                            .padding(.horizontal, 9).padding(.vertical, 6)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Color(.secondarySystemBackground)))
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                }
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                Menu {
+                    Button(action: addPhoto) { Label("从照片选择", systemImage: "photo.on.rectangle") }
+                    Button(action: addFile) { Label("选择文件", systemImage: "folder") }
+                } label: {
+                    Image(systemName: "plus.circle").font(.title2).frame(width: 44, height: 44)
+                }
+                .disabled(attachments.count >= 8)
+                .accessibilityLabel("Attachments")
+
+                TextEditor(text: $text)
+                    .frame(minHeight: 36, maxHeight: 92)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground)))
+                    .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color(.separator), lineWidth: 0.5))
+                    .accessibilityIdentifier("MessageComposer")
+
+                Button(action: send) {
+                    Image(systemName: "arrow.up.circle.fill").font(.title).frame(width: 44, height: 44)
+                        .foregroundColor(canSend ? .accentColor : .secondary)
+                }
+                .disabled(!canSend)
+                .accessibilityLabel("Send")
+            }
+            .padding(.horizontal, 10)
+        }
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial)
+    }
+}
+
+struct PhotoLibraryAttachmentPicker: UIViewControllerRepresentable {
+    let maxSelection: Int
+    let onComplete: ([PendingAttachment]) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onComplete: onComplete) }
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var configuration = PHPickerConfiguration(photoLibrary: .shared())
+        configuration.filter = .images
+        configuration.selectionLimit = max(1, min(maxSelection, 8))
+        let controller = PHPickerViewController(configuration: configuration)
+        controller.delegate = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let onComplete: ([PendingAttachment]) -> Void
+        init(onComplete: @escaping ([PendingAttachment]) -> Void) { self.onComplete = onComplete }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            guard !results.isEmpty else { onComplete([]); return }
+            let group = DispatchGroup()
+            let lock = NSLock()
+            var attachments: [PendingAttachment] = []
+            for result in results.prefix(8) {
+                let provider = result.itemProvider
+                let typeIdentifier = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true })
+                    ?? UTType.image.identifier
+                group.enter()
+                provider.loadDataRepresentation(forTypeIdentifier: typeIdentifier) { data, _ in
+                    defer { group.leave() }
+                    guard let data, !data.isEmpty else { return }
+                    let type = UTType(typeIdentifier)
+                    let name = provider.suggestedName
+                        ?? "Photo-\(UUID().uuidString.prefix(8)).\(type?.preferredFilenameExtension ?? "jpg")"
+                    let attachment = PendingAttachment(
+                        name: name,
+                        contentType: type?.preferredMIMEType ?? "image/jpeg",
+                        data: data
+                    )
+                    lock.lock(); attachments.append(attachment); lock.unlock()
+                }
+            }
+            group.notify(queue: .main) { self.onComplete(attachments) }
+        }
     }
 }
 

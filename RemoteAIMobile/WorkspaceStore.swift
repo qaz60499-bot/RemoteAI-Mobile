@@ -245,30 +245,57 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func send(text: String, runtimeId: String, instanceId: String, sessionId: String, commandId: UUID = UUID()) async {
+    @discardableResult
+    func send(text: String, runtimeId: String, instanceId: String, sessionId: String, attachments: [PendingAttachment] = [], commandId: UUID = UUID()) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
+        guard attachments.count <= 8, attachments.allSatisfy({ $0.sizeBytes > 0 && $0.sizeBytes <= 20 * 1024 * 1024 }) else {
+            errors[sessionId] = "最多一次发送 8 个附件，每个附件不能超过 20MB。"
+            return false
+        }
         guard machine.state == .online else {
-            try? await cache.saveDraft(trimmed, sessionId: sessionId)
-            errors[sessionId] = "PC Offline — draft saved. Tap Send after reconnecting."
-            return
+            if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
+            errors[sessionId] = attachments.isEmpty
+                ? "PC Offline — draft saved. Tap Send after reconnecting."
+                : "PC Offline — 附件需要连接 Windows 后才能上传。"
+            return false
         }
 
         commandStates[commandId] = .pending
-        let optimistic = ChatMessage(id: commandId.uuidString, sessionId: sessionId, sequence: nil, role: .user, kind: .text, text: trimmed, toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
-        merge([optimistic], into: sessionId)
-        try? await cache.upsertMessages([optimistic])
-        let command = RemoteCommand.make(machineId: machine.id, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "sendMessage", payload: ["text": .string(trimmed)], commandId: commandId)
-        commandStates[commandId] = .executing
         do {
+            var remoteAttachments: [RemoteAttachmentDescriptor] = []
+            for attachment in attachments {
+                let remote = try await transport.uploadAttachment(
+                    machineId: machine.id,
+                    runtimeId: runtimeId,
+                    instanceId: instanceId,
+                    sessionId: sessionId,
+                    attachment: attachment
+                )
+                remoteAttachments.append(remote)
+            }
+
+            let names = remoteAttachments.map(\.name).joined(separator: ", ")
+            let displayText = "\(trimmed)\(!names.isEmpty ? "\(trimmed.isEmpty ? "" : "\n\n")[Attachments: \(names)]" : "")"
+            let optimistic = ChatMessage(id: commandId.uuidString, sessionId: sessionId, sequence: nil, role: .user, kind: .text, text: displayText, toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
+            merge([optimistic], into: sessionId)
+            try? await cache.upsertMessages([optimistic])
+
+            var payload: [String: JSONValue] = ["text": .string(trimmed)]
+            if !remoteAttachments.isEmpty { payload["attachmentIds"] = .array(remoteAttachments.map { .string($0.attachmentId) }) }
+            let command = RemoteCommand.make(machineId: machine.id, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "sendMessage", payload: payload, commandId: commandId)
+            commandStates[commandId] = .executing
             commandStates[commandId] = try await transport.send(command)
             try? await cache.saveDraft("", sessionId: sessionId)
+            return true
         } catch TransportError.disconnected {
             commandStates[commandId] = .unknown
             errors[sessionId] = "Connection dropped after send. Delivery is unknown; retry reuses the same command ID."
+            return false
         } catch {
             commandStates[commandId] = .failed
             errors[sessionId] = error.localizedDescription
+            return false
         }
     }
 

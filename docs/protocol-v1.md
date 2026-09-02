@@ -157,6 +157,8 @@ Sync: `getChangesAfterCursor`.
 
 Web: `registerCurrentPage`, `unregisterConversation`, `openConversation`, `focusConversation`, `createConversation`, `listProjects`, `listProjectConversations`, `openProject`, `createProject`.
 
+Attachments: `beginAttachmentUpload`, `uploadAttachmentChunk`, `finishAttachmentUpload`, `discardAttachmentUpload`. Attachment payloads are chunked over the already-paired encrypted Relay. The current client limit is 20 MB per file, 8 files per message, with chunks capped at 96 KiB before base64 encoding.
+
 The mobile client never exposes arbitrary shell/PowerShell execution.
 
 ## Local cache

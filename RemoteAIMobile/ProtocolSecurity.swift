@@ -25,7 +25,8 @@ enum ProtocolSecurity {
         "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore",
         "getChangesAfterCursor",
         "registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation",
-        "listProjects", "listProjectConversations", "openProject", "createProject"
+        "listProjects", "listProjectConversations", "openProject", "createProject",
+        "beginAttachmentUpload", "uploadAttachmentChunk", "finishAttachmentUpload", "discardAttachmentUpload"
     ]
 
     private static let commandKeys: Set<String> = [

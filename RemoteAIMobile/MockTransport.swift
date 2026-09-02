@@ -14,6 +14,7 @@ actor MockTransport: Transport {
     private var sessions: [ServerSession] = []
     private var webProjects: [WebProjectDescriptor] = []
     private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
+    private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
 
     private let machineId = "my-pc"
     private let runtimes: [ServerRuntime]
@@ -148,6 +149,37 @@ actor MockTransport: Transport {
             let project = WebProjectDescriptor(projectAlias: alias, projectId: nil, displayName: name, canonicalUrl: "https://chatgpt.com/g/\(alias)/project", lastSeenAt: Date(), lastOpenedAt: Date())
             webProjects.insert(project, at: 0)
             response = try success(project)
+        case "beginAttachmentUpload":
+            let uploadId = "upload-\(UUID().uuidString.lowercased())"
+            let name = command.payload["name"]?.stringValue ?? "attachment.bin"
+            let type = command.payload["contentType"]?.stringValue ?? "application/octet-stream"
+            let size = Int(command.payload["sizeBytes"]?.intValue ?? 0)
+            attachmentUploads[uploadId] = (name, type, size, Data(), 0)
+            response = try success(AttachmentUploadTicket(uploadId: uploadId, chunkBytes: 96 * 1024, maxAttachmentBytes: 20 * 1024 * 1024))
+        case "uploadAttachmentChunk":
+            let uploadId = command.payload["uploadId"]?.stringValue ?? ""
+            guard var upload = attachmentUploads[uploadId], let encoded = command.payload["dataBase64"]?.stringValue, let chunk = Data(base64Encoded: encoded) else {
+                response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "INVALID_COMMAND", message: "Invalid mock attachment chunk", retryable: false, details: nil), idempotentReplay: nil)
+                break
+            }
+            let index = Int(command.payload["index"]?.intValue ?? -1)
+            guard index == upload.nextIndex else {
+                response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "PAGINATION_CURSOR_INVALID", message: "Invalid mock attachment chunk index", retryable: false, details: nil), idempotentReplay: nil)
+                break
+            }
+            upload.data.append(chunk); upload.nextIndex += 1; attachmentUploads[uploadId] = upload
+            response = success(["nextIndex": .number(Double(upload.nextIndex)), "receivedBytes": .number(Double(upload.data.count))])
+        case "finishAttachmentUpload":
+            let uploadId = command.payload["uploadId"]?.stringValue ?? ""
+            guard let upload = attachmentUploads.removeValue(forKey: uploadId), upload.data.count == upload.sizeBytes else {
+                response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "INVALID_COMMAND", message: "Incomplete mock attachment", retryable: false, details: nil), idempotentReplay: nil)
+                break
+            }
+            let descriptor = RemoteAttachmentDescriptor(attachmentId: "attachment-\(UUID().uuidString.lowercased())", name: upload.name, contentType: upload.contentType, sizeBytes: upload.sizeBytes, sha256: String(repeating: "0", count: 64))
+            response = try success(descriptor)
+        case "discardAttachmentUpload":
+            if let uploadId = command.payload["uploadId"]?.stringValue { attachmentUploads.removeValue(forKey: uploadId) }
+            response = success(["discarded": .bool(true)])
         case "getChangesAfterCursor":
             let cursor = command.payload["cursor"]?.intValue ?? 0
             let limit = Int(command.payload["limit"]?.intValue ?? 500)

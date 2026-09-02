@@ -56,6 +56,37 @@ extension InstanceDescriptor {
 }
 struct SessionDescriptor: Codable, Identifiable, Hashable { let id: String; let instanceId: String; var title: String; var state: SessionState; var updatedAt: Date; var projectAlias: String? = nil; var canonicalUrl: String? = nil }
 
+struct PendingAttachment: Identifiable, Hashable {
+    let id: UUID
+    let name: String
+    let contentType: String
+    let data: Data
+
+    init(id: UUID = UUID(), name: String, contentType: String, data: Data) {
+        self.id = id
+        self.name = name
+        self.contentType = contentType
+        self.data = data
+    }
+
+    var sizeBytes: Int { data.count }
+}
+
+struct AttachmentUploadTicket: Codable, Hashable {
+    let uploadId: String
+    let chunkBytes: Int
+    let maxAttachmentBytes: Int
+}
+
+struct RemoteAttachmentDescriptor: Codable, Identifiable, Hashable {
+    var id: String { attachmentId }
+    let attachmentId: String
+    let name: String
+    let contentType: String
+    let sizeBytes: Int
+    let sha256: String
+}
+
 struct WebProjectDescriptor: Codable, Identifiable, Hashable {
     var id: String { projectAlias }
     let projectAlias: String

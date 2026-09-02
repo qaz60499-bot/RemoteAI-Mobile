@@ -161,6 +161,66 @@ extension Transport {
         _ = try await requireSuccess(execute(command))
     }
 
+    func uploadAttachment(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachment: PendingAttachment) async throws -> RemoteAttachmentDescriptor {
+        let begin = RemoteCommand.make(
+            machineId: machineId,
+            runtimeId: runtimeId,
+            instanceId: instanceId,
+            sessionId: sessionId,
+            action: "beginAttachmentUpload",
+            payload: [
+                "name": .string(attachment.name),
+                "contentType": .string(attachment.contentType),
+                "sizeBytes": .number(Double(attachment.sizeBytes))
+            ]
+        )
+        let ticket = try requireSuccess(execute(begin)).decode(AttachmentUploadTicket.self)
+        let chunkSize = max(16 * 1024, min(ticket.chunkBytes, 96 * 1024))
+        var index = 0
+        var offset = 0
+        do {
+            while offset < attachment.data.count {
+                let end = min(attachment.data.count, offset + chunkSize)
+                let chunk = attachment.data.subdata(in: offset..<end)
+                let command = RemoteCommand.make(
+                    machineId: machineId,
+                    runtimeId: runtimeId,
+                    instanceId: instanceId,
+                    sessionId: sessionId,
+                    action: "uploadAttachmentChunk",
+                    payload: [
+                        "uploadId": .string(ticket.uploadId),
+                        "index": .number(Double(index)),
+                        "dataBase64": .string(chunk.base64EncodedString())
+                    ]
+                )
+                _ = try await requireSuccess(execute(command))
+                index += 1
+                offset = end
+            }
+            let finish = RemoteCommand.make(
+                machineId: machineId,
+                runtimeId: runtimeId,
+                instanceId: instanceId,
+                sessionId: sessionId,
+                action: "finishAttachmentUpload",
+                payload: ["uploadId": .string(ticket.uploadId)]
+            )
+            return try requireSuccess(execute(finish)).decode(RemoteAttachmentDescriptor.self)
+        } catch {
+            let discard = RemoteCommand.make(
+                machineId: machineId,
+                runtimeId: runtimeId,
+                instanceId: instanceId,
+                sessionId: sessionId,
+                action: "discardAttachmentUpload",
+                payload: ["uploadId": .string(ticket.uploadId)]
+            )
+            _ = try? await execute(discard)
+            throw error
+        }
+    }
+
     func loadRecent(machineId: String, runtimeId: String, instanceId: String, sessionId: String, limit: Int) async throws -> Page<ChatMessage> {
         let safeLimit = max(1, min(limit, 100))
         let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "loadRecentMessages", payload: ["limit": .number(Double(safeLimit))])
