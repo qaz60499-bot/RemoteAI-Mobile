@@ -348,16 +348,17 @@ struct ChatView: View {
                         let text = input
                         let attachments = pendingAttachments
                         focused = false
+                        input = ""
+                        pendingAttachments.removeAll()
                         sending = true
                         sendTask = Task {
                             let sent = await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, attachments: attachments, model: runtime.kind == .codex ? selectedCodexModel : "")
                             await MainActor.run {
                                 sending = false
                                 sendTask = nil
-                                if sent {
-                                    input = ""
-                                    pendingAttachments.removeAll()
-                                }
+                                guard !sent else { return }
+                                if input.isEmpty { input = text }
+                                if pendingAttachments.isEmpty { pendingAttachments = attachments }
                             }
                         }
                     }

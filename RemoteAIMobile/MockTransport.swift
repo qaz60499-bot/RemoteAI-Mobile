@@ -155,7 +155,7 @@ actor MockTransport: Transport {
             let type = command.payload["contentType"]?.stringValue ?? "application/octet-stream"
             let size = Int(command.payload["sizeBytes"]?.intValue ?? 0)
             attachmentUploads[uploadId] = (name, type, size, Data(), 0)
-            response = try success(AttachmentUploadTicket(uploadId: uploadId, chunkBytes: 96 * 1024, maxAttachmentBytes: 20 * 1024 * 1024))
+            response = try success(AttachmentUploadTicket(uploadId: uploadId, chunkBytes: 128 * 1024, maxAttachmentBytes: 20 * 1024 * 1024))
         case "uploadAttachmentChunk":
             let uploadId = command.payload["uploadId"]?.stringValue ?? ""
             guard var upload = attachmentUploads[uploadId], let encoded = command.payload["dataBase64"]?.stringValue, let chunk = Data(base64Encoded: encoded) else {

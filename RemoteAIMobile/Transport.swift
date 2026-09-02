@@ -93,6 +93,13 @@ extension Transport {
         return .failed
     }
 
+    func latestSequence(machineId: String) async throws -> Int64 {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "getStatus")
+        let response = try await requireSuccess(execute(command))
+        guard let sequence = response.objectValue?["latestSequence"]?.intValue else { throw TransportError.malformedData }
+        return max(0, sequence)
+    }
+
     func listRuntimes(machineId: String) async throws -> [RuntimeDescriptor] {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "listRuntimes")
         let response = try await requireSuccess(execute(command))
@@ -175,7 +182,7 @@ extension Transport {
             ]
         )
         let ticket = try await requireSuccess(execute(begin)).decode(AttachmentUploadTicket.self)
-        let chunkSize = max(16 * 1024, min(ticket.chunkBytes, 96 * 1024))
+        let chunkSize = max(16 * 1024, min(ticket.chunkBytes, 128 * 1024))
         var index = 0
         var offset = 0
         do {
@@ -240,7 +247,7 @@ extension Transport {
         return Page(items: items, beforeCursor: items.first?.cursor, hasMore: items.count == safeLimit)
     }
 
-    func delta(machineId: String, after sequence: Int64, limit: Int = 500) async throws -> DeltaSyncResult {
+    func delta(machineId: String, after sequence: Int64, limit: Int = 100) async throws -> DeltaSyncResult {
         let safeLimit = max(1, min(limit, 1000))
         let safeCursor = max(0, sequence)
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "getChangesAfterCursor", payload: [

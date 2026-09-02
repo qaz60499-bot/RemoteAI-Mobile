@@ -500,7 +500,15 @@ final class WorkspaceStore: ObservableObject {
     func refreshRuntime(_ runtime: RuntimeDescriptor) async {
         guard machine.state == .online else { return }
         do {
-            let rows = try await transport.listInstances(machineId: machine.id, runtimeId: runtime.id)
+            var rows = try await transport.listInstances(machineId: machine.id, runtimeId: runtime.id)
+            if runtime.kind == .cloudCode,
+               let sharedCatalog = rows.compactMap({ $0.config["cloudCodeCatalog"] }).first {
+                rows = rows.map { descriptor in
+                    var copy = descriptor
+                    if copy.config["cloudCodeCatalog"] == nil { copy.config["cloudCodeCatalog"] = sharedCatalog }
+                    return copy
+                }
+            }
             instances.removeAll { $0.runtimeId == runtime.id }
             instances.append(contentsOf: rows)
             instances.sort { lhs, rhs in
@@ -522,8 +530,11 @@ final class WorkspaceStore: ObservableObject {
         do {
             let remoteRuntimes = try await transport.listRuntimes(machineId: machine.id)
             if !remoteRuntimes.isEmpty { runtimes = remoteRuntimes }
-            for runtime in runtimes { await refreshRuntime(runtime) }
+            // Runtime instance discovery is intentionally lazy. Each RuntimeView
+            // refreshes only the selected runtime, which keeps app launch and
+            // reconnects from scanning every Cloud Code/Codex workspace.
             errors["sync"] = nil
+            await persistMetadata()
         } catch {
             errors["sync"] = error.localizedDescription
         }
@@ -662,6 +673,15 @@ final class WorkspaceStore: ObservableObject {
         guard machine.state == .online else { return }
         var cursor = (try? await cache.lastSequence()) ?? 0
         do {
+            if cursor == 0 && instances.isEmpty && sessions.isEmpty && webProjects.isEmpty {
+                // A fresh install has no local state to reconcile, so replaying the
+                // entire historical event log only delays startup. Current state is
+                // loaded lazily from the authoritative runtime/project/session APIs.
+                cursor = try await transport.latestSequence(machineId: machine.id)
+                try? await cache.setLastSequence(cursor)
+                tracker = SequenceTracker(lastSequence: cursor)
+                return
+            }
             while true {
                 let result = try await transport.delta(machineId: machine.id, after: cursor)
                 for event in result.events where event.sequence > cursor {
