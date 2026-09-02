@@ -130,6 +130,9 @@ final class WorkspaceStore: ObservableObject {
     func refreshWebProjects() async {
         if webProjects.isEmpty,
            let cached: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
+            // Keep cache available for offline use, but do not mark it authoritative.
+            // The live Web view hides this stale snapshot until Windows returns the
+            // current ChatGPT DOM list, preventing the old/wrong Project flash.
             webProjects = cached
         }
         guard machine.state == .online else { return }
@@ -168,7 +171,10 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func loadProjectConversations(projectAlias: String, refresh: Bool = true) async {
-        if projectConversationsByAlias[projectAlias] == nil,
+        // Online Project pages should never flash cached placeholder/UUID titles before
+        // the authoritative browser DOM has loaded. Cache is still useful offline.
+        if (!refresh || machine.state != .online),
+           projectConversationsByAlias[projectAlias] == nil,
            let cached: [WebConversationDescriptor] = try? await cache.get([WebConversationDescriptor].self, key: "web.project.\(projectAlias).conversations") {
             projectConversationsByAlias[projectAlias] = cached
         }
@@ -195,13 +201,15 @@ final class WorkspaceStore: ObservableObject {
             let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, cursor: cursor)
             var merged = projectConversationsByAlias[projectAlias, default: []]
             for item in page.items where !merged.contains(where: { $0.id == item.id }) { merged.append(item) }
-            merged.sort { $0.updatedAt > $1.updatedAt }
+            // Preserve the authoritative newest-first order supplied by ChatGPT.
+            // Registry update timestamps reflect our scan time, not conversation age.
             projectConversationsByAlias[projectAlias] = Array(merged.prefix(50))
             if let next = page.nextCursor { projectNextCursorByAlias[projectAlias] = next }
             else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
             projectHasMoreByAlias[projectAlias] = page.hasMore
             try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
             mergeProjectSessions(page.items)
+            errors["web.project.\(projectAlias)"] = nil
         } catch {
             errors["web.project.\(projectAlias)"] = error.localizedDescription
         }
@@ -225,6 +233,7 @@ final class WorkspaceStore: ObservableObject {
                 try? await cache.put(projectConversationsByAlias[alias] ?? [], key: "web.project.\(alias).conversations")
             }
             await persistMetadata()
+            errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = nil
             return session
         } catch {
             errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = error.localizedDescription
@@ -266,6 +275,7 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.upsertMessages(page.items)
             merge(page.items, into: sessionId)
             hasMoreBySession[sessionId] = page.hasMore
+            errors[sessionId] = nil
         } catch {
             errors[sessionId] = error.localizedDescription
         }
@@ -284,6 +294,7 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.upsertMessages(page.items)
             merge(page.items, into: sessionId)
             hasMoreBySession[sessionId] = page.hasMore
+            errors[sessionId] = nil
         } catch {
             errors[sessionId] = error.localizedDescription
         }
@@ -340,6 +351,7 @@ final class WorkspaceStore: ObservableObject {
             commandStates[commandId] = .executing
             commandStates[commandId] = try await transport.send(command)
             try? await cache.saveDraft("", sessionId: sessionId)
+            errors[sessionId] = nil
             return true
         } catch is CancellationError {
             attachmentTransferBySession.removeValue(forKey: sessionId)
@@ -367,8 +379,13 @@ final class WorkspaceStore: ObservableObject {
     func stop(runtimeId: String, instanceId: String, sessionId: String) async {
         let command = RemoteCommand.make(machineId: machine.id, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "stopGeneration")
         commandStates[command.commandId] = .pending
-        do { commandStates[command.commandId] = try await transport.send(command) }
-        catch { commandStates[command.commandId] = .failed; errors[sessionId] = error.localizedDescription }
+        do {
+            commandStates[command.commandId] = try await transport.send(command)
+            errors[sessionId] = nil
+        } catch {
+            commandStates[command.commandId] = .failed
+            errors[sessionId] = error.localizedDescription
+        }
     }
 
     func createSession(
@@ -575,9 +592,11 @@ final class WorkspaceStore: ObservableObject {
         if let value: [RuntimeDescriptor] = try? await cache.get([RuntimeDescriptor].self, key: "runtimes") { runtimes = value }
         if let value: [InstanceDescriptor] = try? await cache.get([InstanceDescriptor].self, key: "instances") { instances = value }
         if let value: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") { sessions = value }
-        if let value: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
+        if webProjects.isEmpty,
+           let value: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
             webProjects = value
-            hasLoadedWebProjects = !value.isEmpty
+            // Cached Projects are an offline snapshot. Only refreshWebProjects() may
+            // mark the list as live/current for this store lifetime.
         }
         tracker = SequenceTracker(lastSequence: (try? await cache.lastSequence()) ?? 0)
         let process = ProcessInfo.processInfo

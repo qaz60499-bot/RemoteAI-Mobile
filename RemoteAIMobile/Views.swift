@@ -108,10 +108,17 @@ struct InstanceView: View {
     @State private var newProject = false
     @State private var projectSearch = ""
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
+    private var visibleProjects: [WebProjectDescriptor] {
+        // While connected, only show a Project list after the current live DOM refresh
+        // has completed. Cached rows remain available offline but never flash as if
+        // they were the current ChatGPT sidebar.
+        if store.machine.state != .offline && !store.hasLoadedWebProjects { return [] }
+        return store.webProjects
+    }
     private var filteredProjects: [WebProjectDescriptor] {
         let query = projectSearch.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return store.webProjects }
-        return store.webProjects.filter { $0.displayName.localizedCaseInsensitiveContains(query) || $0.projectAlias.localizedCaseInsensitiveContains(query) }
+        guard !query.isEmpty else { return visibleProjects }
+        return visibleProjects.filter { $0.displayName.localizedCaseInsensitiveContains(query) || $0.projectAlias.localizedCaseInsensitiveContains(query) }
     }
 
     var body: some View {
@@ -134,11 +141,13 @@ struct InstanceView: View {
                     TextField("搜索 Project", text: $projectSearch)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled(true)
-                    if store.webProjects.isEmpty {
+                    if filteredProjects.isEmpty {
+                        let query = projectSearch.trimmingCharacters(in: .whitespacesAndNewlines)
                         let projectStatus: String = {
                             if store.errors["web.projects"] != nil { return "Projects 读取失败 — 下拉刷新重试" }
+                            if !query.isEmpty, store.hasLoadedWebProjects { return "没有匹配的 ChatGPT Project" }
                             if store.hasLoadedWebProjects { return "当前没有找到 ChatGPT Projects" }
-                            return store.machine.state == .online ? "正在读取 ChatGPT Projects…" : "离线 — 显示缓存 Projects"
+                            return store.machine.state == .online ? "正在读取当前 ChatGPT Projects…" : "离线 — 显示缓存 Projects"
                         }()
                         Text(projectStatus)
                             .font(.caption).foregroundColor(.secondary)
@@ -182,16 +191,18 @@ struct InstanceView: View {
         .sheet(isPresented: $newProject) { NewWebProjectView().environmentObject(store) }
         .task {
             if isChatGPTWeb {
-                await store.refreshSessions(runtime: runtime, instance: instance)
+                // Projects are the primary navigation surface here. Refresh them first
+                // instead of waiting for the ordinary-chat history request to finish.
                 await store.refreshWebProjects()
+                await store.refreshSessions(runtime: runtime, instance: instance)
             } else {
                 await store.refreshSessions(runtime: runtime, instance: instance)
             }
         }
         .refreshable {
             if isChatGPTWeb {
-                await store.refreshSessions(runtime: runtime, instance: instance)
                 await store.refreshWebProjects()
+                await store.refreshSessions(runtime: runtime, instance: instance)
             } else {
                 await store.refreshSessions(runtime: runtime, instance: instance)
             }
