@@ -61,7 +61,10 @@ final class WorkspaceStore: ObservableObject {
 
         await loadCachedFirst()
         await normalizeCachedTransientState()
-        if !(transport is MockTransport) { await removeLegacyMockFixtures() }
+        if !(transport is MockTransport) {
+            await removeLegacyMockFixtures()
+            await removeCloudCodeFromMobileCache()
+        }
         isPaired = PairingKeyStore.isPaired(machineId: machine.id)
         if !isPaired && !(transport is MockTransport) {
             try? await cache.clearAll()
@@ -372,24 +375,12 @@ final class WorkspaceStore: ObservableObject {
         runtime: RuntimeDescriptor,
         instance: InstanceDescriptor,
         title: String,
-        providerId: String = "current",
-        providerBaseURL: String = "",
-        model: String = "",
-        credentialProfileId: String = "",
-        newCredentialProfileId: String = "",
-        apiKey: String = ""
+        model: String = ""
     ) async -> Bool {
         var payload: [String: JSONValue] = [
             "title": .string(title.isEmpty ? "New Session" : title)
         ]
-        if runtime.kind == .cloudCode {
-            payload["providerId"] = .string(providerId)
-            payload["model"] = .string(model)
-            payload["credentialProfileId"] = .string(credentialProfileId)
-            if !providerBaseURL.isEmpty { payload["providerBaseURL"] = .string(providerBaseURL) }
-            if !newCredentialProfileId.isEmpty { payload["newCredentialProfileId"] = .string(newCredentialProfileId) }
-            if !apiKey.isEmpty { payload["apiKey"] = .string(apiKey) }
-        } else if runtime.kind == .codex, !model.isEmpty {
+        if runtime.kind == .codex, !model.isEmpty {
             payload["model"] = .string(model)
         }
         guard machine.state == .online else {
@@ -538,15 +529,7 @@ final class WorkspaceStore: ObservableObject {
     func refreshRuntime(_ runtime: RuntimeDescriptor) async {
         guard machine.state == .online else { return }
         do {
-            var rows = try await transport.listInstances(machineId: machine.id, runtimeId: runtime.id)
-            if runtime.kind == .cloudCode,
-               let sharedCatalog = rows.compactMap({ $0.config["cloudCodeCatalog"] }).first {
-                rows = rows.map { descriptor in
-                    var copy = descriptor
-                    if copy.config["cloudCodeCatalog"] == nil { copy.config["cloudCodeCatalog"] = sharedCatalog }
-                    return copy
-                }
-            }
+            let rows = try await transport.listInstances(machineId: machine.id, runtimeId: runtime.id)
             instances.removeAll { $0.runtimeId == runtime.id }
             instances.append(contentsOf: rows)
             instances.sort { lhs, rhs in
@@ -570,7 +553,7 @@ final class WorkspaceStore: ObservableObject {
             if !remoteRuntimes.isEmpty { runtimes = remoteRuntimes }
             // Runtime instance discovery is intentionally lazy. Each RuntimeView
             // refreshes only the selected runtime, which keeps app launch and
-            // reconnects from scanning every Cloud Code/Codex workspace.
+            // reconnects from scanning every Codex workspace.
             errors["sync"] = nil
             await persistMetadata()
         } catch {
@@ -617,6 +600,24 @@ final class WorkspaceStore: ObservableObject {
         if changed { try? await cache.put(sessions, key: "sessions") }
     }
 
+    private func removeCloudCodeFromMobileCache() async {
+        let cloudInstanceIds = Set(instances.filter { $0.runtimeId == "runtime.cloudcode" }.map(\.id))
+        let cloudSessionIds = Set(sessions.filter { cloudInstanceIds.contains($0.instanceId) }.map(\.id))
+        let changed = runtimes.contains { $0.id == "runtime.cloudcode" }
+            || !cloudInstanceIds.isEmpty
+            || !cloudSessionIds.isEmpty
+        guard changed else { return }
+
+        runtimes.removeAll { $0.id == "runtime.cloudcode" }
+        instances.removeAll { $0.runtimeId == "runtime.cloudcode" }
+        sessions.removeAll { cloudInstanceIds.contains($0.instanceId) }
+        for sessionId in cloudSessionIds {
+            messagesBySession.removeValue(forKey: sessionId)
+            hasMoreBySession.removeValue(forKey: sessionId)
+        }
+        await persistMetadata()
+    }
+
     private func removeLegacyMockFixtures() async {
         let fixtureInstanceIds: Set<String> = ["photo", "excel", "cloud-photo"]
         let fixtureSessionIds: Set<String> = ["photo-upload", "photo-ios", "excel-permission", "cloud-photo-a", "codex6-a"]
@@ -645,14 +646,12 @@ final class WorkspaceStore: ObservableObject {
     private func seedFixtureMetadata() {
         runtimes = [
             RuntimeDescriptor(id: "runtime.web", machineId: machine.id, kind: .web, name: "Web"),
-            RuntimeDescriptor(id: "runtime.cloudcode", machineId: machine.id, kind: .cloudCode, name: "Cloud Code"),
             RuntimeDescriptor(id: "runtime.codex", machineId: machine.id, kind: .codex, name: "Codex")
         ]
         instances = [
             InstanceDescriptor(id: "web.chatgpt", runtimeId: "runtime.web", name: "ChatGPT", subtitle: "Web runtime"),
             InstanceDescriptor(id: "photo", runtimeId: "runtime.web", name: "Photo SaaS", subtitle: "2 conversations"),
-            InstanceDescriptor(id: "excel", runtimeId: "runtime.web", name: "Excel SaaS", subtitle: "1 conversation"),
-            InstanceDescriptor(id: "cloud-photo", runtimeId: "runtime.cloudcode", name: "Photo", subtitle: "Cloud Code")
+            InstanceDescriptor(id: "excel", runtimeId: "runtime.web", name: "Excel SaaS", subtitle: "1 conversation")
         ] + (1...11).map {
             InstanceDescriptor(id: "codex.\($0)", runtimeId: "runtime.codex", name: "Codex\($0)", subtitle: nil)
         } + [
@@ -663,7 +662,6 @@ final class WorkspaceStore: ObservableObject {
             SessionDescriptor(id: "photo-upload", instanceId: "photo", title: "上传性能优化", state: .idle, updatedAt: Date()),
             SessionDescriptor(id: "photo-ios", instanceId: "photo", title: "手机 APP", state: .idle, updatedAt: Date()),
             SessionDescriptor(id: "excel-permission", instanceId: "excel", title: "权限测试", state: .idle, updatedAt: Date()),
-            SessionDescriptor(id: "cloud-photo-a", instanceId: "cloud-photo", title: "Session A", state: .idle, updatedAt: Date()),
             SessionDescriptor(id: "codex6-a", instanceId: "codex.6", title: "Session A", state: .idle, updatedAt: Date())
         ]
     }

@@ -138,8 +138,8 @@ final class RemoteAIMobileTests: XCTestCase {
         let mock = MockTransport(historyCount: 10)
         try await mock.connect()
         let runtimes = try await mock.listRuntimes(machineId: "my-pc")
-        XCTAssertEqual(Set(runtimes.map(\.id)), Set(["runtime.web", "runtime.cloudcode", "runtime.codex"]))
-        XCTAssertEqual(runtimes.first(where: { $0.id == "runtime.cloudcode" })?.kind, .cloudCode)
+        XCTAssertEqual(Set(runtimes.map(\.id)), Set(["runtime.web", "runtime.codex"]))
+        XCTAssertFalse(runtimes.contains(where: { $0.id == "runtime.cloudcode" }))
     }
 
     func testMockProjectsAreLazyAndProjectConversationCreationStaysScoped() async throws {
@@ -202,55 +202,6 @@ final class RemoteAIMobileTests: XCTestCase {
             XCTAssertEqual(projects.first?.displayName, "Stress Project 99")
         }
         print("PROJECT_REFRESH_STRESS_TOTAL=2500")
-    }
-
-    func testCloudCodeInstanceCarriesWorkspaceAndProviderCredentialModelCatalog() throws {
-        let catalog = CloudCodeCatalog(
-            providers: [
-                CloudCodeProviderOption(id: "current", label: "Current", models: ["default"], defaultModel: "default", custom: false, requiresApiKey: false, configured: false),
-                CloudCodeProviderOption(id: "seekai", label: "SeekAI", models: ["claude-sonnet-5"], defaultModel: "claude-sonnet-5", custom: false, requiresApiKey: true, credentialMode: "local-relay-slot", configured: true, keyCount: 1),
-                CloudCodeProviderOption(id: "tabitoken", label: "Tabitoken", models: ["claude-opus-5"], defaultModel: "claude-opus-5", custom: false, requiresApiKey: true, credentialMode: "local-relay-slot", configured: true, keyCount: 1),
-                CloudCodeProviderOption(id: "chatapi", label: "ChatAPI", models: ["claude-opus-5"], defaultModel: "claude-opus-5", custom: false, requiresApiKey: true, credentialMode: "local-relay-slot", configured: false, keyCount: 0),
-                CloudCodeProviderOption(id: "anthropic", label: "Anthropic", models: ["sonnet", "opus"], defaultModel: "sonnet", custom: false, requiresApiKey: true),
-                CloudCodeProviderOption(id: "custom", label: "Custom", models: [], defaultModel: nil, custom: true, requiresApiKey: true)
-            ],
-            credentialProfiles: [
-                CloudCodeCredentialOption(id: "seekai-slot-1", label: "Key 1", providerId: "seekai", slot: 1, managedBy: "windows-local-relay", secretExposed: false),
-                CloudCodeCredentialOption(id: "tabitoken-slot-1", label: "Key 1", providerId: "tabitoken", slot: 1, managedBy: "windows-local-relay", secretExposed: false),
-                CloudCodeCredentialOption(id: "work", label: "work")
-            ],
-            defaultProviderId: "anthropic",
-            defaultCredentialProfileId: "work",
-            supportsNewCredential: true
-        )
-        let server = ServerInstance(
-            instanceId: "cloudcode.workspace",
-            runtimeId: "runtime.cloudcode",
-            label: "RemoteAI",
-            kind: "claude-code-cli",
-            config: [
-                "projectPath": .string("D:\\wendangcodex\\RemoteAI"),
-                "cloudCodeCatalog": try JSONValue.encode(catalog)
-            ],
-            status: "ready",
-            updatedAt: Date()
-        )
-        let descriptor = server.descriptor
-        XCTAssertEqual(descriptor.subtitle, "D:\\wendangcodex\\RemoteAI")
-        let decoded = try XCTUnwrap(descriptor.cloudCodeCatalog)
-        XCTAssertEqual(decoded.providers.map(\.id), ["current", "seekai", "tabitoken", "chatapi", "anthropic", "custom"])
-        XCTAssertEqual(decoded.credentialProfiles.map(\.id), ["seekai-slot-1", "tabitoken-slot-1", "work"])
-        XCTAssertEqual(decoded.providers.first(where: { $0.id == "seekai" })?.credentialMode, "local-relay-slot")
-        XCTAssertEqual(decoded.providers.first(where: { $0.id == "seekai" })?.keyCount, 1)
-        XCTAssertTrue(decoded.providers.first(where: { $0.id == "current" })?.isSelectableOnMobile == true)
-        XCTAssertTrue(decoded.providers.first(where: { $0.id == "seekai" })?.isSelectableOnMobile == true)
-        XCTAssertTrue(decoded.providers.first(where: { $0.id == "chatapi" })?.isSelectableOnMobile == false)
-        XCTAssertTrue(decoded.credentialProfiles.allSatisfy { $0.secretExposed != true })
-        XCTAssertEqual(decoded.credentialProfiles.first(where: { $0.id == "seekai-slot-1" })?.providerId, "seekai")
-        XCTAssertEqual(decoded.credentialProfiles.first(where: { $0.id == "seekai-slot-1" })?.slot, 1)
-        XCTAssertEqual(decoded.defaultProviderId, "anthropic")
-        XCTAssertEqual(decoded.defaultCredentialProfileId, "work")
-        XCTAssertTrue(decoded.supportsNewCredential)
     }
 
     func testCodexInstanceCarriesSafeSelectableModelCatalog() throws {
@@ -506,7 +457,6 @@ final class RemoteAIMobileTests: XCTestCase {
 
     func testRuntimeHierarchyNamesAreDistinct() {
         XCTAssertEqual(RuntimeKind.web.displayName, "Web")
-        XCTAssertEqual(RuntimeKind.cloudCode.displayName, "Cloud Code")
         XCTAssertEqual(RuntimeKind.codex.displayName, "Codex")
     }
 }

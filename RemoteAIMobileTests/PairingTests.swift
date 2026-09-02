@@ -106,7 +106,6 @@ final class PairingTests: XCTestCase {
             case "listRuntimes":
                 result = try JSONValue.encode([
                     ServerRuntime(runtimeId: "runtime.web", kind: RuntimeKind.web.rawValue, label: "Web", capabilities: [], status: "READY", updatedAt: now),
-                    ServerRuntime(runtimeId: "runtime.cloudcode", kind: RuntimeKind.cloudCode.rawValue, label: "Cloud Code", capabilities: [], status: "READY", updatedAt: now),
                     ServerRuntime(runtimeId: "runtime.codex", kind: RuntimeKind.codex.rawValue, label: "Codex", capabilities: [], status: "READY", updatedAt: now)
                 ])
             case "listInstances":
@@ -556,14 +555,10 @@ final class PairingTests: XCTestCase {
         await store.start { stages.append($0) }
 
         XCTAssertEqual(store.machine.state, .online)
-        XCTAssertEqual(Set(store.runtimes.map(\.id)), Set(["runtime.web", "runtime.cloudcode", "runtime.codex"]))
+        XCTAssertEqual(Set(store.runtimes.map(\.id)), Set(["runtime.web", "runtime.codex"]))
+        XCTAssertFalse(store.runtimes.contains(where: { $0.id == "runtime.cloudcode" }))
         XCTAssertTrue(store.instances.isEmpty, "Pairing/reconnect should not eagerly scan every runtime instance")
         XCTAssertEqual(stages, [.connectingRemoteAI, .loadingRuntimes])
-
-        let cloudRuntime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.cloudcode" }))
-        await store.refreshRuntime(cloudRuntime)
-        XCTAssertEqual(store.instances.map(\.runtimeId), ["runtime.cloudcode"])
-        XCTAssertEqual(store.instances.map(\.id), ["runtime.cloudcode.primary"])
         await store.suspend()
     }
 

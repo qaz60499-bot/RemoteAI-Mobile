@@ -28,14 +28,12 @@ actor MockTransport: Transport {
         let now = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970 * 1_000) / 1_000)
         runtimes = [
             ServerRuntime(runtimeId: "runtime.web", kind: "Web", label: "Web", capabilities: ["list", "status", "sendMessage"], status: "ready", updatedAt: now),
-            ServerRuntime(runtimeId: "runtime.cloudcode", kind: "CloudCode", label: "Cloud Code", capabilities: ["list", "status", "sendMessage"], status: "ready", updatedAt: now),
             ServerRuntime(runtimeId: "runtime.codex", kind: "Codex", label: "Codex", capabilities: ["list", "status", "sendMessage"], status: "ready", updatedAt: now)
         ]
         instances = [
             ServerInstance(instanceId: "web.chatgpt", runtimeId: "runtime.web", label: "ChatGPT", kind: "chatgpt-web", config: [:], status: "ready", updatedAt: now),
             ServerInstance(instanceId: "photo", runtimeId: "runtime.web", label: "Photo SaaS", kind: "cached-project", config: [:], status: "ready", updatedAt: now),
-            ServerInstance(instanceId: "excel", runtimeId: "runtime.web", label: "Excel SaaS", kind: "cached-project", config: [:], status: "ready", updatedAt: now),
-            ServerInstance(instanceId: "cloud-photo", runtimeId: "runtime.cloudcode", label: "Photo", kind: "claude-code-cli", config: [:], status: "ready", updatedAt: now)
+            ServerInstance(instanceId: "excel", runtimeId: "runtime.web", label: "Excel SaaS", kind: "cached-project", config: [:], status: "ready", updatedAt: now)
         ] + (1...11).map {
             ServerInstance(instanceId: "codex.\($0)", runtimeId: "runtime.codex", label: "Codex\($0)", kind: "codex-cli", config: [:], status: "ready", updatedAt: now)
         }
@@ -51,7 +49,6 @@ actor MockTransport: Transport {
             ServerSession(sessionId: "photo-upload", runtimeId: "runtime.web", instanceId: "photo", externalId: nil, title: "上传性能优化", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
             ServerSession(sessionId: "photo-ios", runtimeId: "runtime.web", instanceId: "photo", externalId: nil, title: "手机 APP", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
             ServerSession(sessionId: "excel-permission", runtimeId: "runtime.web", instanceId: "excel", externalId: nil, title: "权限测试", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
-            ServerSession(sessionId: "cloud-photo-a", runtimeId: "runtime.cloudcode", instanceId: "cloud-photo", externalId: nil, title: "Session A", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
             ServerSession(sessionId: "codex6-a", runtimeId: "runtime.codex", instanceId: "codex.6", externalId: nil, title: "Session A", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now)
         ]
 
@@ -71,7 +68,6 @@ actor MockTransport: Transport {
         }
         history["photo-upload"] = messages
         history["photo-ios"] = Array(messages.suffix(80)).map { ServerMessage(messageId: "ios-\($0.messageId)", sessionId: "photo-ios", role: $0.role, content: $0.content, externalId: nil, createdAt: $0.createdAt) }
-        history["cloud-photo-a"] = Array(messages.suffix(60)).map { ServerMessage(messageId: "cloud-\($0.messageId)", sessionId: "cloud-photo-a", role: $0.role, content: $0.content, externalId: nil, createdAt: $0.createdAt) }
         history["codex6-a"] = Array(messages.suffix(60)).map { ServerMessage(messageId: "codex-\($0.messageId)", sessionId: "codex6-a", role: $0.role, content: $0.content, externalId: nil, createdAt: $0.createdAt) }
     }
 

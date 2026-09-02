@@ -2,11 +2,10 @@ import Foundation
 
 enum RuntimeKind: String, Codable, CaseIterable, Identifiable {
     case web = "Web"
-    case cloudCode = "CloudCode"
     case codex = "Codex"
 
     var id: String { rawValue }
-    var displayName: String { self == .cloudCode ? "Cloud Code" : rawValue }
+    var displayName: String { rawValue }
 }
 
 enum MachineConnectionState: String, Codable { case online = "Online", offline = "Offline", connecting = "Connecting" }
@@ -57,42 +56,6 @@ struct InstanceDescriptor: Codable, Identifiable, Hashable {
     var config: [String: JSONValue] = [:]
 }
 
-struct CloudCodeProviderOption: Codable, Identifiable, Hashable {
-    let id: String
-    let label: String
-    let models: [String]
-    let defaultModel: String?
-    let custom: Bool
-    let requiresApiKey: Bool
-    var credentialMode: String? = nil
-    var configured: Bool? = nil
-    var keyCount: Int? = nil
-    var credentialProfileIds: [String]? = nil
-    var usesWindowsClaudeSettings: Bool? = nil
-    var secretExposed: Bool? = nil
-
-    var isSelectableOnMobile: Bool {
-        id == "current" || configured != false
-    }
-}
-
-struct CloudCodeCredentialOption: Codable, Identifiable, Hashable {
-    let id: String
-    let label: String
-    var providerId: String? = nil
-    var slot: Int? = nil
-    var managedBy: String? = nil
-    var secretExposed: Bool? = nil
-}
-
-struct CloudCodeCatalog: Codable, Hashable {
-    let providers: [CloudCodeProviderOption]
-    let credentialProfiles: [CloudCodeCredentialOption]
-    let defaultProviderId: String?
-    let defaultCredentialProfileId: String?
-    let supportsNewCredential: Bool
-}
-
 struct CodexModelOption: Codable, Identifiable, Hashable {
     let id: String
     let label: String
@@ -104,10 +67,6 @@ struct CodexCatalog: Codable, Hashable {
 }
 
 extension InstanceDescriptor {
-    var cloudCodeCatalog: CloudCodeCatalog? {
-        try? config["cloudCodeCatalog"]?.decode(CloudCodeCatalog.self)
-    }
-
     var codexCatalog: CodexCatalog? {
         try? config["codexCatalog"]?.decode(CodexCatalog.self)
     }
@@ -423,14 +382,7 @@ extension ServerRuntime {
 
 extension ServerInstance {
     var descriptor: InstanceDescriptor {
-        let projectPath = config["projectPath"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let subtitle: String
-        if runtimeId == "runtime.cloudcode", let projectPath, !projectPath.isEmpty {
-            subtitle = projectPath
-        } else {
-            subtitle = kind
-        }
-        return InstanceDescriptor(id: instanceId, runtimeId: runtimeId, name: label, subtitle: subtitle, status: status, config: config)
+        InstanceDescriptor(id: instanceId, runtimeId: runtimeId, name: label, subtitle: kind, status: status, config: config)
     }
 }
 

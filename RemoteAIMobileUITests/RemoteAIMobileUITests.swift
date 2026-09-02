@@ -15,7 +15,7 @@ final class RemoteAIMobileUITests: XCTestCase {
         app.launch()
         XCTAssertTrue(app.staticTexts["My PC"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["Web"].exists)
-        XCTAssertTrue(app.staticTexts["Cloud Code"].exists)
+        XCTAssertFalse(app.staticTexts["Cloud Code"].exists)
         XCTAssertTrue(app.staticTexts["Codex"].exists)
         // iPhone content must stay below system chrome; this catches accidental
         // ignoresSafeArea/negative-offset regressions on notched devices.

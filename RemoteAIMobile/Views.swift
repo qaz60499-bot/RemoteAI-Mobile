@@ -72,7 +72,7 @@ struct RootView: View {
             .sheet(isPresented: $showingPair) { PairingView().environmentObject(store) }
         }.navigationViewStyle(.stack)
     }
-    private func runtimeIcon(_ kind: RuntimeKind) -> String { switch kind { case .web: return "globe"; case .cloudCode: return "cloud"; case .codex: return "terminal" } }
+    private func runtimeIcon(_ kind: RuntimeKind) -> String { switch kind { case .web: return "globe"; case .codex: return "terminal" } }
 }
 
 struct RuntimeView: View {
@@ -80,13 +80,6 @@ struct RuntimeView: View {
     let runtime: RuntimeDescriptor
     var body: some View {
         List {
-            if runtime.kind == .cloudCode {
-                Section {
-                    Text("先选择 Windows 工作区；进入后点“新建 Cloud Code 会话”，可选择厂商、Key Profile 和模型。历史会话只作为次要入口。")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
-            }
             ForEach(store.instances.filter { $0.runtimeId == runtime.id }) { instance in
                 NavigationLink(destination: InstanceView(runtime: runtime, instance: instance)) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -173,11 +166,7 @@ struct InstanceView: View {
             } else {
                 Section {
                     Button { newSession = true } label: {
-                        Label(runtime.kind == .cloudCode ? "新建 Cloud Code 会话" : "新建会话", systemImage: "plus.circle.fill")
-                    }
-                    if runtime.kind == .cloudCode {
-                        Text("新建时可选择厂商、Key Profile 和模型。")
-                            .font(.caption).foregroundColor(.secondary)
+                        Label("新建会话", systemImage: "plus.circle.fill")
                     }
                 }
                 Section("历史会话") {
@@ -632,64 +621,16 @@ struct NewSessionView: View {
     let instance: InstanceDescriptor
 
     @State private var title = ""
-    @State private var providerId = "current"
-    @State private var providerBaseURL = ""
     @State private var model = ""
-    @State private var customModel = ""
-    @State private var credentialProfileId = ""
     @State private var creating = false
-
-    private var catalog: CloudCodeCatalog {
-        instance.cloudCodeCatalog ?? CloudCodeCatalog(
-            providers: [
-                CloudCodeProviderOption(id: "current", label: "当前 Cloud Code 配置", models: ["default", "sonnet", "opus", "haiku"], defaultModel: "default", custom: false, requiresApiKey: false),
-                CloudCodeProviderOption(id: "anthropic", label: "Anthropic", models: ["sonnet", "opus", "haiku"], defaultModel: "sonnet", custom: false, requiresApiKey: true),
-                CloudCodeProviderOption(id: "custom", label: "自定义 Anthropic-compatible 厂商", models: [], defaultModel: nil, custom: true, requiresApiKey: true)
-            ],
-            credentialProfiles: [],
-            defaultProviderId: "current",
-            defaultCredentialProfileId: nil,
-            supportsNewCredential: true
-        )
-    }
-
-    private var selectedProvider: CloudCodeProviderOption? {
-        catalog.providers.first { $0.id == providerId }
-    }
 
     private var codexCatalog: CodexCatalog {
         instance.codexCatalog ?? CodexCatalog(models: [], defaultModel: instance.configuredModel)
     }
 
-    private var credentialOptions: [CloudCodeCredentialOption] {
-        let exact = catalog.credentialProfiles.filter { $0.providerId == providerId }
-        if !exact.isEmpty { return exact }
-        if providerId == "current" { return [] }
-        return catalog.credentialProfiles.filter { $0.providerId == nil }
-    }
-
-    private var modelOptions: [String] {
-        let models = selectedProvider?.models ?? []
-        return models.isEmpty ? ["__custom__"] : models + ["__custom__"]
-    }
-
-    private var finalModel: String {
-        model == "__custom__" ? customModel.trimmingCharacters(in: .whitespacesAndNewlines) : model
-    }
-
     private var canCreate: Bool {
         if runtime.kind == .codex {
             return !model.isEmpty && codexCatalog.models.contains(where: { $0.id == model })
-        }
-        if runtime.kind != .cloudCode { return true }
-        guard let provider = selectedProvider, provider.isSelectableOnMobile else { return false }
-        if providerId == "custom" && providerBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
-        if model == "__custom__" && customModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
-        if provider.credentialMode == "local-relay-slot" {
-            return !credentialProfileId.isEmpty && credentialOptions.contains(where: { $0.id == credentialProfileId })
-        }
-        if provider.requiresApiKey && providerId != "current" {
-            return !credentialProfileId.isEmpty && credentialOptions.contains(where: { $0.id == credentialProfileId })
         }
         return true
     }
@@ -709,52 +650,7 @@ struct NewSessionView: View {
                     Section { ErrorBanner(text: error) { store.clearError(sessionId: instance.id) } }
                 }
 
-                if runtime.kind == .cloudCode {
-                    Section("厂商") {
-                        Picker("Provider", selection: $providerId) {
-                            ForEach(catalog.providers) { option in
-                                Text(option.label + (option.isSelectableOnMobile ? "" : " · 未配置"))
-                                    .tag(option.id)
-                                    .disabled(!option.isSelectableOnMobile)
-                            }
-                        }
-                        if providerId == "custom" {
-                            TextField("https://api.example.com", text: $providerBaseURL)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled(true)
-                                .keyboardType(.URL)
-                        }
-                    }
-
-                    Section("Key") {
-                        Picker("Credential", selection: $credentialProfileId) {
-                            if providerId == "current" {
-                                Text("使用 Windows 当前 Claude 配置").tag("")
-                            }
-                            ForEach(credentialOptions) { option in Text(option.label).tag(option.id) }
-                        }
-                        if providerId != "current" && credentialOptions.isEmpty {
-                            Text("Windows 未配置此 Provider 的可用 Key；请先在 Windows 端配置。")
-                                .font(.caption).foregroundColor(.orange)
-                        }
-                        Text("手机只接收 Provider、Key Slot/Profile 和 Model 元数据；真实 API Key 始终保留在 Windows，不在手机端显示或录入。")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-
-                    Section("模型") {
-                        Picker("Model", selection: $model) {
-                            ForEach(modelOptions, id: \.self) { value in
-                                Text(value == "__custom__" ? "自定义模型…" : (value == "default" ? "默认" : value)).tag(value)
-                            }
-                        }
-                        if model == "__custom__" {
-                            TextField("模型 ID", text: $customModel)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled(true)
-                        }
-                    }
-                } else if runtime.kind == .codex {
+                if runtime.kind == .codex {
                     Section("模型") {
                         if codexCatalog.models.isEmpty {
                             Text("Windows 尚未提供此 Codex 实例的模型目录。")
@@ -773,29 +669,11 @@ struct NewSessionView: View {
             .navigationTitle(runtime.kind == .web ? "New Chat" : "New Session")
             .navigationBarTitleDisplayMode(.inline)
             .onAppear {
-                if runtime.kind == .cloudCode {
-                    if let defaultProvider = catalog.defaultProviderId { providerId = defaultProvider }
-                    if let defaultCredential = catalog.defaultCredentialProfileId { credentialProfileId = defaultCredential }
-                    if let provider = catalog.providers.first(where: { $0.id == providerId }) {
-                        if let defaultModel = provider.defaultModel { model = defaultModel }
-                        if provider.credentialMode == "local-relay-slot" && credentialProfileId.isEmpty {
-                            credentialProfileId = credentialOptions.first?.id ?? ""
-                        }
-                    }
-                } else if runtime.kind == .codex {
+                if runtime.kind == .codex {
                     model = instance.configuredModel
                         ?? codexCatalog.defaultModel
                         ?? codexCatalog.models.first?.id
                         ?? ""
-                }
-            }
-            .onChange(of: providerId) { newValue in
-                guard runtime.kind == .cloudCode else { return }
-                if let provider = catalog.providers.first(where: { $0.id == newValue }) {
-                    model = provider.defaultModel ?? (provider.models.first ?? "__custom__")
-                    credentialProfileId = provider.credentialMode == "local-relay-slot" ? (credentialOptions.first?.id ?? "") : ""
-                } else {
-                    credentialProfileId = ""
                 }
             }
             .toolbar {
@@ -808,10 +686,7 @@ struct NewSessionView: View {
                                 runtime: runtime,
                                 instance: instance,
                                 title: title,
-                                providerId: providerId,
-                                providerBaseURL: providerBaseURL,
-                                model: finalModel,
-                                credentialProfileId: credentialProfileId
+                                model: model
                             )
                             creating = false
                             if created { dismiss() }
@@ -889,7 +764,7 @@ struct PairingView: View {
         case .sendingProof, .waitingApproval: return "Completing the code proof with Windows."
         case .secureKeySaved: return "The derived shared key is stored in ThisDeviceOnly Keychain."
         case .connectingRemoteAI: return "Reconnecting with the newly paired key."
-        case .loadingRuntimes: return "Loading Web, Cloud Code, and Codex from Windows."
+        case .loadingRuntimes: return "Loading Web and Codex from Windows."
         case .completed: return "Pairing completed successfully."
         default: return "Every network step is time-limited; the Pair button will recover on failure."
         }

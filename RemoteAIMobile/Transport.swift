@@ -104,7 +104,9 @@ extension Transport {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "listRuntimes")
         let response = try await requireSuccess(execute(command))
         let rows = try response.decode([ServerRuntime].self)
-        return rows.compactMap { $0.descriptor(machineId: machineId) }
+        return rows
+            .filter { $0.runtimeId != "runtime.cloudcode" }
+            .compactMap { $0.descriptor(machineId: machineId) }
     }
 
     func listInstances(machineId: String, runtimeId: String) async throws -> [InstanceDescriptor] {
