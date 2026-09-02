@@ -379,7 +379,7 @@ final class PairingTests: XCTestCase {
         }
     }
 
-    func testSuccessfulPairingAutomaticallyLoadsRuntimesAfterReconnect() async throws {
+    func testSuccessfulPairingLoadsRuntimeCatalogAndDefersInstanceDiscovery() async throws {
         let machineId = "machine-load-runtimes-\(UUID().uuidString)"
         defer { PairingKeyStore.deletePairing(machineId: machineId) }
         try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x33, count: 32))
@@ -393,8 +393,13 @@ final class PairingTests: XCTestCase {
 
         XCTAssertEqual(store.machine.state, .online)
         XCTAssertEqual(Set(store.runtimes.map(\.id)), Set(["runtime.web", "runtime.cloudcode", "runtime.codex"]))
-        XCTAssertEqual(store.instances.count, 3)
+        XCTAssertTrue(store.instances.isEmpty, "Pairing/reconnect should not eagerly scan every runtime instance")
         XCTAssertEqual(stages, [.connectingRemoteAI, .loadingRuntimes])
+
+        let cloudRuntime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.cloudcode" }))
+        await store.refreshRuntime(cloudRuntime)
+        XCTAssertEqual(store.instances.map(\.runtimeId), ["runtime.cloudcode"])
+        XCTAssertEqual(store.instances.map(\.id), ["runtime.cloudcode.primary"])
         await store.suspend()
     }
 
