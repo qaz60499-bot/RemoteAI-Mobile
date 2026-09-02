@@ -71,9 +71,21 @@ struct RuntimeView: View {
     let runtime: RuntimeDescriptor
     var body: some View {
         List {
+            if runtime.kind == .cloudCode {
+                Section {
+                    Text("先选择 Windows 工作区；进入后点“新建 Cloud Code 会话”，可选择厂商、Key Profile 和模型。历史会话只作为次要入口。")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+            }
             ForEach(store.instances.filter { $0.runtimeId == runtime.id }) { instance in
                 NavigationLink(destination: InstanceView(runtime: runtime, instance: instance)) {
-                    VStack(alignment: .leading, spacing: 4) { Text(instance.name).font(.body.weight(.medium)); if let subtitle = instance.subtitle { Text(subtitle).font(.caption).foregroundColor(.secondary) } }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(instance.name).font(.body.weight(.medium))
+                        if let subtitle = instance.subtitle, !subtitle.isEmpty {
+                            Text(subtitle).font(.caption).foregroundColor(.secondary).lineLimit(2)
+                        }
+                    }
                     .padding(.vertical, 5)
                 }
             }
@@ -608,9 +620,16 @@ struct NewSessionView: View {
     var body: some View {
         NavigationView {
             Form {
-                Section("Project") {
-                    Text(instance.name)
-                    TextField("Session title", text: $title)
+                Section("工作区") {
+                    Text(instance.name).font(.headline)
+                    if let subtitle = instance.subtitle, !subtitle.isEmpty {
+                        Text(subtitle).font(.caption).foregroundColor(.secondary).textSelection(.enabled)
+                    }
+                    TextField("会话名称", text: $title)
+                }
+
+                if let error = store.errors[instance.id] {
+                    Section { ErrorBanner(text: error) { store.clearError(sessionId: instance.id) } }
                 }
 
                 if runtime.kind == .cloudCode {
@@ -679,7 +698,7 @@ struct NewSessionView: View {
                         creating = true
                         let selectedCredential = credentialProfileId == "__new__" ? "" : credentialProfileId
                         Task {
-                            await store.createSession(
+                            let created = await store.createSession(
                                 runtime: runtime,
                                 instance: instance,
                                 title: title,
@@ -692,7 +711,7 @@ struct NewSessionView: View {
                             )
                             apiKey = ""
                             creating = false
-                            dismiss()
+                            if created { dismiss() }
                         }
                     }
                     .disabled(creating || !canCreate)

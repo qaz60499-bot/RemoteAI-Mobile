@@ -163,6 +163,8 @@ jobs:
             -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
             -skip-testing:RemoteAIMobileTests/ProtocolSecurityTests \
             | tee build/tests.log
+          grep -E 'PROJECT_ORDER_STRESS_TOTAL=25000' build/tests.log
+          grep -E 'PROJECT_REFRESH_STRESS_TOTAL=2500' build/tests.log
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/tests.log | tail -1
 
       - name: Build unsigned iphoneos arm64 app

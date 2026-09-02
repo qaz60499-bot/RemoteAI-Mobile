@@ -331,7 +331,7 @@ final class WorkspaceStore: ObservableObject {
         credentialProfileId: String = "",
         newCredentialProfileId: String = "",
         apiKey: String = ""
-    ) async {
+    ) async -> Bool {
         var payload: [String: JSONValue] = [
             "title": .string(title.isEmpty ? "New Session" : title),
             "providerId": .string(providerId),
@@ -343,22 +343,29 @@ final class WorkspaceStore: ObservableObject {
         if !apiKey.isEmpty { payload["apiKey"] = .string(apiKey) }
         guard machine.state == .online else {
             errors[instance.id] = "PC Offline — new sessions are not queued automatically."
-            return
+            return false
         }
         do {
             if let created = try await transport.createSession(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id, payload: payload) {
                 sessions.removeAll { $0.id == created.id }
                 sessions.insert(created, at: 0)
+                errors[instance.id] = nil
                 await persistMetadata()
+                return true
             } else if transport is MockTransport {
                 let local = SessionDescriptor(id: UUID().uuidString, instanceId: instance.id, title: title.isEmpty ? (runtime.kind == .web ? "New Chat" : "New Session") : title, state: .idle, updatedAt: Date())
                 sessions.insert(local, at: 0)
+                errors[instance.id] = nil
                 await persistMetadata()
+                return true
             } else {
                 await refreshMetadata()
+                errors[instance.id] = nil
+                return true
             }
         } catch {
             errors[instance.id] = error.localizedDescription
+            return false
         }
     }
 

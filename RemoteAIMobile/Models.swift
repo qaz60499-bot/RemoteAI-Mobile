@@ -350,7 +350,14 @@ extension ServerRuntime {
 
 extension ServerInstance {
     var descriptor: InstanceDescriptor {
-        InstanceDescriptor(id: instanceId, runtimeId: runtimeId, name: label, subtitle: kind, status: status, config: config)
+        let projectPath = config["projectPath"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subtitle: String
+        if runtimeId == "runtime.cloudcode", let projectPath, !projectPath.isEmpty {
+            subtitle = projectPath
+        } else {
+            subtitle = kind
+        }
+        return InstanceDescriptor(id: instanceId, runtimeId: runtimeId, name: label, subtitle: subtitle, status: status, config: config)
     }
 }
 

@@ -168,6 +168,79 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertTrue(refreshed.contains(where: { $0.projectAlias == newProject.projectAlias }))
     }
 
+    func testProjectOrderStressPreservesAuthoritativeServerOrder() throws {
+        let projects = (0..<250).map { index in
+            WebProjectDescriptor(
+                projectAlias: "g-p-order-\(index)",
+                projectId: "id-\(index)",
+                displayName: index.isMultiple(of: 3) ? "项目 \(index)" : "Project \(index)",
+                canonicalUrl: "https://chatgpt.com/g/g-p-order-\(index)/project",
+                lastSeenAt: Date(timeIntervalSince1970: TimeInterval(1_700_000_000 + index)),
+                lastOpenedAt: nil
+            )
+        }
+        let response = WebProjectListResponse(items: projects, observedAt: Date(timeIntervalSince1970: 1_700_100_000))
+        let encoded = try JSONEncoder.remoteAI.encode(response)
+        let expected = projects.map(\.projectAlias)
+        for _ in 0..<100 {
+            let decoded = try JSONDecoder.remoteAI.decode(WebProjectListResponse.self, from: encoded)
+            XCTAssertEqual(decoded.items.map(\.projectAlias), expected)
+        }
+        print("PROJECT_ORDER_STRESS_TOTAL=25000")
+    }
+
+    func testMockProjectCreateRefreshStressDoesNotDropOrDuplicateProjects() async throws {
+        let mock = MockTransport(historyCount: 1)
+        try await mock.connect()
+        for index in 0..<100 {
+            _ = try await mock.createWebProject(machineId: "my-pc", projectName: "Stress Project \(index)")
+        }
+        for _ in 0..<25 {
+            let projects = try await mock.listProjects(machineId: "my-pc")
+            XCTAssertEqual(projects.count, 102)
+            XCTAssertEqual(Set(projects.map(\.projectAlias)).count, 102)
+            XCTAssertEqual(projects.first?.displayName, "Stress Project 99")
+        }
+        print("PROJECT_REFRESH_STRESS_TOTAL=2500")
+    }
+
+    func testCloudCodeInstanceCarriesWorkspaceAndProviderCredentialModelCatalog() throws {
+        let catalog = CloudCodeCatalog(
+            providers: [
+                CloudCodeProviderOption(id: "current", label: "Current", models: ["default"], defaultModel: "default", custom: false, requiresApiKey: false),
+                CloudCodeProviderOption(id: "anthropic", label: "Anthropic", models: ["sonnet", "opus"], defaultModel: "sonnet", custom: false, requiresApiKey: true),
+                CloudCodeProviderOption(id: "custom", label: "Custom", models: [], defaultModel: nil, custom: true, requiresApiKey: true)
+            ],
+            credentialProfiles: [
+                CloudCodeCredentialOption(id: "work", label: "work"),
+                CloudCodeCredentialOption(id: "backup", label: "backup")
+            ],
+            defaultProviderId: "anthropic",
+            defaultCredentialProfileId: "work",
+            supportsNewCredential: true
+        )
+        let server = ServerInstance(
+            instanceId: "cloudcode.workspace",
+            runtimeId: "runtime.cloudcode",
+            label: "RemoteAI",
+            kind: "claude-code-cli",
+            config: [
+                "projectPath": .string("D:\\wendangcodex\\RemoteAI"),
+                "cloudCodeCatalog": try JSONValue.encode(catalog)
+            ],
+            status: "ready",
+            updatedAt: Date()
+        )
+        let descriptor = server.descriptor
+        XCTAssertEqual(descriptor.subtitle, "D:\\wendangcodex\\RemoteAI")
+        let decoded = try XCTUnwrap(descriptor.cloudCodeCatalog)
+        XCTAssertEqual(decoded.providers.map(\.id), ["current", "anthropic", "custom"])
+        XCTAssertEqual(decoded.credentialProfiles.map(\.id), ["work", "backup"])
+        XCTAssertEqual(decoded.defaultProviderId, "anthropic")
+        XCTAssertEqual(decoded.defaultCredentialProfileId, "work")
+        XCTAssertTrue(decoded.supportsNewCredential)
+    }
+
     func testMockExposesAllElevenDesktopCodexInstances() async throws {
         let mock = MockTransport(historyCount: 10)
         try await mock.connect()
