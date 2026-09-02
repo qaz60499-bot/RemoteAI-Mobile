@@ -31,7 +31,13 @@ struct RootView: View {
                 Section {
                     HStack(spacing: 12) {
                         Image(systemName: "desktopcomputer").font(.title2)
-                        VStack(alignment: .leading, spacing: 3) { Text(store.machine.name).font(.headline); StatusLabel(text: store.machine.state.rawValue, active: store.machine.state == .online) }
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(store.machine.name).font(.headline)
+                            StatusLabel(text: store.machine.state.rawValue, active: store.machine.state == .online)
+                            if store.connectionPhase != .online {
+                                Text(store.connectionPhase.displayName).font(.caption2).foregroundColor(.secondary)
+                            }
+                        }
                         Spacer()
                     }.padding(.vertical, 8)
                 }
@@ -53,7 +59,10 @@ struct RootView: View {
                     }
                 }
                 if store.machine.state == .offline && store.isPaired {
-                    Section { Label("Cached workspaces remain available while the PC is offline.", systemImage: "wifi.slash").font(.footnote).foregroundColor(.secondary) }
+                    Section {
+                        Label("Cached workspaces remain available while the PC is offline.", systemImage: "wifi.slash").font(.footnote).foregroundColor(.secondary)
+                        if let error = store.errors["connection"] { Text(error).font(.footnote).foregroundColor(.secondary) }
+                    }
                 }
             }
             .listStyle(.insetGrouped)
@@ -856,32 +865,16 @@ struct PairingView: View {
             ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() }.disabled(pairing) }
             ToolbarItem(placement: .confirmationAction) {
                 Button(pairing ? "Pairing…" : "Pair") {
-                    guard !pairing else { return }
-                    guard let url = URL(string: relay), !machineId.isEmpty, code.count == 8 else {
-                        error = "Enter an HTTPS relay URL, Machine ID, and 8-digit code."
-                        return
-                    }
-                    pairing = true
-                    store.pairingStage = .preparing
-                    error = nil
-                    Task {
-                        do {
-                            try await store.savePairing(baseURL: url, machineId: machineId, code: code)
-                            pairing = false
-                            dismiss()
-                        } catch {
-                            pairing = false
-                            self.error = error.localizedDescription
-                        }
-                    }
+                    beginPairing()
                 }
                 .disabled(pairing)
             }
         }
         .sheet(isPresented: $scanner) {
             QRScannerView { value in
-                applyScannedPairing(value)
+                let complete = applyScannedPairing(value)
                 scanner = false
+                if complete { beginPairing() }
             }
         } }
     }
@@ -902,20 +895,38 @@ struct PairingView: View {
         }
     }
 
-    private func applyScannedPairing(_ value: String) {
-        if value.count == 8, value.allSatisfy({ $0.isNumber }) { code = value; return }
-        if let data = value.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
-            if let v = object["relayBaseURL"] ?? object["relay"] { relay = v }
-            if let v = object["machineId"] { machineId = v }
-            if let v = object["pairingCode"] ?? object["code"] { code = v }
+    private func beginPairing() {
+        guard !pairing else { return }
+        guard let url = URL(string: relay), !machineId.isEmpty, ProtocolSecurity.validatePairingCode(code) else {
+            error = "Enter an HTTPS relay URL, Machine ID, and 8-digit code."
             return
         }
-        if let url = URL(string: value), let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
-            let values = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item in item.value.map { (item.name, $0) } })
-            if let v = values["relay"] { relay = v }
-            if let v = values["machineId"] { machineId = v }
-            if let v = values["code"] { code = v }
+        pairing = true
+        store.pairingStage = .preparing
+        error = nil
+        Task {
+            do {
+                try await store.savePairing(baseURL: url, machineId: machineId, code: code)
+                pairing = false
+                dismiss()
+            } catch {
+                pairing = false
+                self.error = error.localizedDescription
+            }
         }
+    }
+
+    @discardableResult
+    private func applyScannedPairing(_ value: String) -> Bool {
+        guard let payload = PairingScanPayload.parse(value) else {
+            error = "The QR code does not contain RemoteAI pairing information."
+            return false
+        }
+        if let url = payload.relayBaseURL { relay = url.absoluteString }
+        if let value = payload.machineId { machineId = value }
+        if let value = payload.pairingCode { code = value }
+        error = payload.isComplete ? nil : "QR read successfully. Complete any missing pairing fields, then tap Pair."
+        return payload.isComplete
     }
 }
 

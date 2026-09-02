@@ -201,6 +201,58 @@ struct PairingResult {
     let deviceId: String
 }
 
+struct PairingScanPayload: Equatable {
+    let relayBaseURL: URL?
+    let machineId: String?
+    let pairingCode: String?
+
+    var isComplete: Bool {
+        relayBaseURL != nil && !(machineId ?? "").isEmpty && ProtocolSecurity.validatePairingCode(pairingCode ?? "")
+    }
+
+    static func parse(_ rawValue: String) -> PairingScanPayload? {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ProtocolSecurity.validatePairingCode(value) {
+            return PairingScanPayload(relayBaseURL: nil, machineId: nil, pairingCode: value)
+        }
+
+        if let data = value.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            func string(_ keys: String...) -> String? {
+                for key in keys {
+                    if let candidate = object[key] as? String {
+                        let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty { return trimmed }
+                    }
+                }
+                return nil
+            }
+            let relayText = string("relayBaseURL", "relay")
+            let relayURL = relayText.flatMap(URL.init(string:))
+            let parsed = PairingScanPayload(
+                relayBaseURL: relayURL,
+                machineId: string("machineId"),
+                pairingCode: string("pairingCode", "code")
+            )
+            if relayURL != nil || parsed.machineId != nil || parsed.pairingCode != nil { return parsed }
+        }
+
+        if let url = URL(string: value), let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            let values = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item in
+                item.value.map { (item.name, $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            })
+            let relayText = values["relayBaseURL"] ?? values["relay"]
+            let parsed = PairingScanPayload(
+                relayBaseURL: relayText.flatMap(URL.init(string:)),
+                machineId: values["machineId"],
+                pairingCode: values["pairingCode"] ?? values["code"]
+            )
+            if parsed.relayBaseURL != nil || parsed.machineId != nil || parsed.pairingCode != nil { return parsed }
+        }
+        return nil
+    }
+}
+
 enum PairingStage: String, CaseIterable {
     case preparing
     case connectingRelay

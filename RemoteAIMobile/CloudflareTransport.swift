@@ -133,7 +133,11 @@ actor CloudflareTransport: Transport {
                     connected = false
                     socket = nil
                     activeSocket.cancel(with: .goingAway, reason: nil)
-                    failAllPending(with: TransportError.disconnected)
+                    if (error as? TransportError) == .pairingRequired {
+                        failAllPending(with: TransportError.pairingRequired)
+                    } else {
+                        failAllPending(with: TransportError.disconnected)
+                    }
                 }
                 break
             }
@@ -216,8 +220,11 @@ actor CloudflareTransport: Transport {
     }
 
     private func waitForRelayReady(_ socket: URLSessionWebSocketTask, deviceId: String) async throws {
+        let deadline = Date().addingTimeInterval(connectionTimeoutSeconds)
         for _ in 0..<4 {
-            let message = try await WebSocketIO.receive(from: socket, timeout: connectionTimeoutSeconds, timeoutReason: "remoteai-connect-timeout")
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { throw TransportError.timeout }
+            let message = try await WebSocketIO.receive(from: socket, timeout: remaining, timeoutReason: "remoteai-connect-timeout")
             let data = WebSocketIO.data(from: message)
             guard !data.isEmpty else { continue }
             let frame = try ProtocolSecurity.decodeRelayFrame(data, maxBytes: maxInboundFrameBytes)

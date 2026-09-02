@@ -29,6 +29,58 @@ final class PairingTests: XCTestCase {
         }
     }
 
+    private actor ConnectionScenarioTransport: Transport {
+        enum Mode: Equatable {
+            case normal
+            case connectOffline
+            case statusTimeout
+            case stalePairing
+            case runtimesFailure
+        }
+
+        private let mode: Mode
+        private var connected = false
+        private var connectCalls = 0
+
+        init(mode: Mode) { self.mode = mode }
+
+        var isConnected: Bool { connected }
+        func connect() async throws {
+            connectCalls += 1
+            if mode == .connectOffline { throw TransportError.offline }
+            connected = true
+        }
+        func disconnect() async { connected = false }
+        func eventStream() async -> AsyncStream<RemoteEvent> { AsyncStream { _ in } }
+        func connectionCount() -> Int { connectCalls }
+        func forceDisconnect() { connected = false }
+
+        func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
+            guard connected else { throw TransportError.offline }
+            switch command.action {
+            case "getStatus":
+                if mode == .statusTimeout { throw TransportError.timeout }
+                if mode == .stalePairing { throw TransportError.pairingRequired }
+                return CommandResponseEnvelope(ok: true, result: .object([
+                    "machineId": .string(command.machineId),
+                    "latestSequence": .number(0),
+                    "capabilities": .array([]),
+                    "runtimes": .array([])
+                ]), error: nil, idempotentReplay: false)
+            case "getChangesAfterCursor":
+                return CommandResponseEnvelope(ok: true, result: try JSONValue.encode(DeltaSyncResult(events: [], nextCursor: 0, hasMore: false)), error: nil, idempotentReplay: false)
+            case "listRuntimes":
+                if mode == .runtimesFailure { throw TransportError.remote("CATALOG_TEMPORARY", "catalog unavailable") }
+                let now = Date()
+                return CommandResponseEnvelope(ok: true, result: try JSONValue.encode([
+                    ServerRuntime(runtimeId: "runtime.web", kind: RuntimeKind.web.rawValue, label: "Web", capabilities: [], status: "READY", updatedAt: now)
+                ]), error: nil, idempotentReplay: false)
+            default:
+                throw TransportError.remote("UNSUPPORTED_ACTION", command.action)
+            }
+        }
+    }
+
     private actor RuntimeLoadingTransport: Transport {
         private var connected = false
         var isConnected: Bool { connected }
@@ -42,6 +94,13 @@ final class PairingTests: XCTestCase {
             let now = Date()
             let result: JSONValue
             switch command.action {
+            case "getStatus":
+                result = .object([
+                    "machineId": .string(command.machineId),
+                    "latestSequence": .number(0),
+                    "capabilities": .array([]),
+                    "runtimes": .array([])
+                ])
             case "getChangesAfterCursor":
                 result = try JSONValue.encode(DeltaSyncResult(events: [], nextCursor: 0, hasMore: false))
             case "listRuntimes":
@@ -232,6 +291,31 @@ final class PairingTests: XCTestCase {
         } catch { assertStageError(error, .waitingApproval) }
     }
 
+    func testMixedTypeWindowsQRCodeParsesAndIsComplete() throws {
+        let payload = """
+        {"relay":"https://remoteai-relay.qaz60499.workers.dev","machineId":"machine-60e5101d-d386-464b-ac41-3e546ca800a0","pairingCode":"53029504","protocolVersion":1}
+        """
+        let parsed = try XCTUnwrap(PairingScanPayload.parse(payload))
+        XCTAssertEqual(parsed.relayBaseURL?.absoluteString, "https://remoteai-relay.qaz60499.workers.dev")
+        XCTAssertEqual(parsed.machineId, "machine-60e5101d-d386-464b-ac41-3e546ca800a0")
+        XCTAssertEqual(parsed.pairingCode, "53029504")
+        XCTAssertTrue(parsed.isComplete)
+    }
+
+    func testPairingURLQRCodeAcceptsFrozenFields() throws {
+        let payload = "remoteai://pair?relay=https%3A%2F%2Fremoteai-relay.qaz60499.workers.dev&machineId=machine-test-qr&code=12345678"
+        let parsed = try XCTUnwrap(PairingScanPayload.parse(payload))
+        XCTAssertEqual(parsed.relayBaseURL?.host, "remoteai-relay.qaz60499.workers.dev")
+        XCTAssertEqual(parsed.machineId, "machine-test-qr")
+        XCTAssertEqual(parsed.pairingCode, "12345678")
+        XCTAssertTrue(parsed.isComplete)
+    }
+
+    func testConnectingStateHasFiniteMaximumDurationContract() {
+        XCTAssertGreaterThan(WorkspaceStore.connectingStateMaxDuration, 0)
+        XCTAssertLessThanOrEqual(WorkspaceStore.connectingStateMaxDuration, 45)
+    }
+
     func testPairingTimeoutCannotRemainPendingForever() async throws {
         let machineId = "machine-timeout-\(UUID().uuidString)"
         let socket = ScriptedSocket([.failure(TransportError.timeout)])
@@ -377,6 +461,86 @@ final class PairingTests: XCTestCase {
         if challengeReceived {
             print("LIVE_PAIRING_OK deviceId=\(deviceId)")
         }
+    }
+
+    func testConnectSuccessTransitionsToOnlineAfterAuthenticatedStatus() async throws {
+        let machineId = "machine-connect-ok-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x31, count: 32))
+        let store = WorkspaceStore(transport: ConnectionScenarioTransport(mode: .normal), cache: try SQLiteStore.inMemory())
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        await store.start()
+        XCTAssertEqual(store.machine.state, .online)
+        XCTAssertEqual(store.connectionPhase, .online)
+        XCTAssertNil(store.errors["connection"])
+        await store.suspend()
+    }
+
+    func testRelayReachableButWindowsOfflineEndsOfflineNotConnecting() async throws {
+        let machineId = "machine-windows-offline-state-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x32, count: 32))
+        let store = WorkspaceStore(transport: ConnectionScenarioTransport(mode: .connectOffline), cache: try SQLiteStore.inMemory())
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        await store.start()
+        XCTAssertEqual(store.machine.state, .offline)
+        XCTAssertEqual(store.connectionPhase, .windowsOffline)
+        await store.suspend()
+    }
+
+    func testStalePairingBecomesExplicitRepairRequired() async throws {
+        let machineId = "machine-stale-state-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x33, count: 32))
+        let store = WorkspaceStore(transport: ConnectionScenarioTransport(mode: .stalePairing), cache: try SQLiteStore.inMemory())
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        await store.start()
+        XCTAssertEqual(store.machine.state, .offline)
+        XCTAssertEqual(store.connectionPhase, .pairingExpired)
+        XCTAssertFalse(store.isPaired)
+        XCTAssertTrue(store.errors["connection"]?.contains("Repair required") == true)
+    }
+
+    func testGetStatusTimeoutCannotLeaveConnecting() async throws {
+        let machineId = "machine-status-timeout-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x34, count: 32))
+        let store = WorkspaceStore(transport: ConnectionScenarioTransport(mode: .statusTimeout), cache: try SQLiteStore.inMemory())
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        await store.start()
+        XCTAssertEqual(store.machine.state, .offline)
+        XCTAssertEqual(store.connectionPhase, .timedOut)
+        await store.suspend()
+    }
+
+    func testListRuntimesFailureKeepsMachineOnline() async throws {
+        let machineId = "machine-metadata-degraded-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x35, count: 32))
+        let store = WorkspaceStore(transport: ConnectionScenarioTransport(mode: .runtimesFailure), cache: try SQLiteStore.inMemory())
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        await store.start()
+        XCTAssertEqual(store.machine.state, .online)
+        XCTAssertEqual(store.connectionPhase, .online)
+        XCTAssertNotNil(store.errors["sync"])
+        await store.suspend()
+    }
+
+    func testForegroundReconnectReturnsOnline() async throws {
+        let machineId = "machine-foreground-reconnect-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x36, count: 32))
+        let transport = ConnectionScenarioTransport(mode: .normal)
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        await store.start()
+        await store.suspend()
+        await store.resumeFromForeground()
+        XCTAssertEqual(store.machine.state, .online)
+        XCTAssertEqual(store.connectionPhase, .online)
+        let connectionCount = await transport.connectionCount()
+        XCTAssertGreaterThanOrEqual(connectionCount, 2)
+        await store.suspend()
     }
 
     func testSuccessfulPairingLoadsRuntimeCatalogAndDefersInstanceDiscovery() async throws {

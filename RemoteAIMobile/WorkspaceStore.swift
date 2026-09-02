@@ -19,6 +19,9 @@ final class WorkspaceStore: ObservableObject {
     @Published var hasMoreBySession: [String: Bool] = [:]
     @Published var isPaired = false
     @Published var pairingStage: PairingStage?
+    @Published var connectionPhase: ConnectionDiagnosticPhase = .relayConnecting
+
+    static let connectingStateMaxDuration: TimeInterval = 45
 
     var transport: Transport
     let cache: SQLiteStore
@@ -28,6 +31,7 @@ final class WorkspaceStore: ObservableObject {
     private var connectionMonitorTask: Task<Void, Never>?
     private var streamingBuffers: [String: (id: String, text: String, sequence: Int64)] = [:]
     private var flushTask: Task<Void, Never>?
+    private var startInProgress = false
 
     init(transport: Transport, cache: SQLiteStore) {
         self.transport = transport
@@ -51,14 +55,15 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func start(pairingProgress: ((PairingStage) -> Void)? = nil) async {
+        guard !startInProgress else { return }
+        startInProgress = true
+        defer { startInProgress = false }
+
         await loadCachedFirst()
         await normalizeCachedTransientState()
         if !(transport is MockTransport) { await removeLegacyMockFixtures() }
         isPaired = PairingKeyStore.isPaired(machineId: machine.id)
         if !isPaired && !(transport is MockTransport) {
-            // Older builds incorrectly used MockTransport whenever the phone was not
-            // paired, which could persist fake Photo/Excel workspaces in SQLite.
-            // Remove that stale workspace state and fail closed until real pairing.
             try? await cache.clearAll()
             runtimes.removeAll()
             instances.removeAll()
@@ -72,30 +77,36 @@ final class WorkspaceStore: ObservableObject {
             attachmentTransferBySession.removeAll()
             hasMoreBySession.removeAll()
             machine.state = .offline
+            connectionPhase = .pairingExpired
             errors["connection"] = "Not paired — scan the Windows pairing code to load your real runtimes and ChatGPT Projects."
             return
         }
         installEventConsumer()
+        machine.state = .connecting
+        connectionPhase = .relayConnecting
         do {
             pairingProgress?(.connectingRemoteAI)
             try await transport.connect()
+            connectionPhase = .relayConnected
+
+            // Relay connectivity alone is not enough to call the PC online. Require one
+            // authenticated encrypted command to round-trip through the Windows Agent.
+            connectionPhase = .authenticating
+            _ = try await transport.latestSequence(machineId: machine.id)
             machine.state = .online
             errors["connection"] = nil
+            startConnectionMonitor()
+
+            // Metadata is deliberately downstream of the online transition. A slow or
+            // failed catalog refresh must never leave the UI stuck in Connecting.
             pairingProgress?(.loadingRuntimes)
+            connectionPhase = .loadingRuntimes
             await recoverDelta()
             await refreshMetadata()
-            startConnectionMonitor()
+            connectionPhase = .online
         } catch {
-            machine.state = .offline
-            if (error as? TransportError) == .pairingRequired {
-                isPaired = false
-                errors["connection"] = "Pairing expired or was revoked — scan the current Windows pairing QR code to re-pair."
-                connectionMonitorTask?.cancel()
-                connectionMonitorTask = nil
-                return
-            }
-            errors["connection"] = error.localizedDescription
-            startConnectionMonitor()
+            applyConnectionFailure(error)
+            if (error as? TransportError) != .pairingRequired { startConnectionMonitor() }
         }
     }
 
@@ -104,10 +115,12 @@ final class WorkspaceStore: ObservableObject {
         connectionMonitorTask = nil
         await transport.disconnect()
         machine.state = .offline
+        connectionPhase = .idle
     }
 
     func resumeFromForeground() async {
         machine.state = .connecting
+        connectionPhase = .reconnecting
         await start()
     }
 
@@ -477,23 +490,48 @@ final class WorkspaceStore: ObservableObject {
                 guard !Task.isCancelled, let self else { break }
                 if !(await self.transport.isConnected) {
                     self.machine.state = .connecting
+                    self.connectionPhase = .reconnecting
                     do {
                         try await self.transport.connect()
+                        self.connectionPhase = .authenticating
+                        _ = try await self.transport.latestSequence(machineId: self.machine.id)
                         self.machine.state = .online
+                        self.connectionPhase = .online
                         self.errors["connection"] = nil
                         await self.recoverDelta()
                         await self.refreshMetadata()
                     } catch {
-                        self.machine.state = .offline
-                        if (error as? TransportError) == .pairingRequired {
-                            self.isPaired = false
-                            self.errors["connection"] = "Pairing expired or was revoked — scan the current Windows pairing QR code to re-pair."
-                            break
-                        }
-                        self.errors["connection"] = error.localizedDescription
+                        self.applyConnectionFailure(error)
+                        if (error as? TransportError) == .pairingRequired { break }
                     }
                 }
             }
+        }
+    }
+
+    private func applyConnectionFailure(_ error: Error) {
+        machine.state = .offline
+        if let transportError = error as? TransportError {
+            switch transportError {
+            case .pairingRequired:
+                isPaired = false
+                connectionPhase = .pairingExpired
+                errors["connection"] = "Pairing expired / Repair required — scan the current Windows pairing QR code."
+                connectionMonitorTask?.cancel()
+                connectionMonitorTask = nil
+            case .offline:
+                connectionPhase = .windowsOffline
+                errors["connection"] = "Windows offline — Relay is reachable but the RemoteAI Agent is not online."
+            case .timeout:
+                connectionPhase = .timedOut
+                errors["connection"] = "Connection timed out — check Relay reachability and the Windows Agent."
+            default:
+                connectionPhase = .relayError
+                errors["connection"] = transportError.localizedDescription
+            }
+        } else {
+            connectionPhase = .relayError
+            errors["connection"] = error.localizedDescription
         }
     }
 

@@ -10,6 +10,36 @@ enum RuntimeKind: String, Codable, CaseIterable, Identifiable {
 }
 
 enum MachineConnectionState: String, Codable { case online = "Online", offline = "Offline", connecting = "Connecting" }
+
+enum ConnectionDiagnosticPhase: String, Codable, Equatable {
+    case idle
+    case relayConnecting
+    case relayConnected
+    case authenticating
+    case loadingRuntimes
+    case online
+    case reconnecting
+    case windowsOffline
+    case pairingExpired
+    case relayError
+    case timedOut
+
+    var displayName: String {
+        switch self {
+        case .idle: return "Idle"
+        case .relayConnecting: return "Relay connecting"
+        case .relayConnected: return "Relay connected"
+        case .authenticating: return "Authenticating"
+        case .loadingRuntimes: return "Loading runtimes"
+        case .online: return "Online"
+        case .reconnecting: return "Reconnecting"
+        case .windowsOffline: return "Windows offline"
+        case .pairingExpired: return "Pairing expired"
+        case .relayError: return "Relay error"
+        case .timedOut: return "Connection timed out"
+        }
+    }
+}
 enum SessionState: String, Codable { case idle = "Idle", busy = "Busy", waiting = "Waiting", sleeping = "Sleeping", error = "Error" }
 enum CommandState: String, Codable { case pending = "Pending", acknowledged = "Acknowledged", executing = "Executing", completed = "Completed", failed = "Failed", unknown = "Unknown" }
 enum WebState: String, Codable { case registered = "Registered", browserClosed = "BrowserClosed", attached = "Attached", unsupported = "Unsupported" }
