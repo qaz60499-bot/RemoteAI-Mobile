@@ -710,6 +710,7 @@ struct PairingView: View {
     @State private var code = ""
     @State private var scanner = false
     @State private var error: String?
+    @State private var pairing = false
 
     var body: some View {
         NavigationView { Form {
@@ -722,21 +723,45 @@ struct PairingView: View {
             Section {
                 Text("Pairing uses X25519 + HKDF-SHA256. Device private/shared keys are ThisDeviceOnly Keychain items; Cloudflare only routes AES-256-GCM encrypted payloads.").font(.caption).foregroundColor(.secondary)
             }
-            if let error { Section { Text(error).foregroundColor(.red).font(.caption) } }
+            if pairing {
+                Section {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Pairing with Windows…").font(.subheadline.weight(.medium))
+                            Text("Waiting for the encrypted Relay handshake. This should finish within about 15 seconds.").font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+            if let error { Section("Pairing error") { Text(error).foregroundColor(.red).font(.caption) } }
         }
         .remoteAITopBreathingRoom()
         .navigationTitle("Pair Device")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
+            ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() }.disabled(pairing) }
             ToolbarItem(placement: .confirmationAction) {
-                Button("Pair") {
+                Button(pairing ? "Pairing…" : "Pair") {
+                    guard !pairing else { return }
+                    guard let url = URL(string: relay), !machineId.isEmpty, code.count == 8 else {
+                        error = "Enter an HTTPS relay URL, Machine ID, and 8-digit code."
+                        return
+                    }
+                    pairing = true
+                    error = nil
                     Task {
-                        guard let url = URL(string: relay), !machineId.isEmpty, code.count == 8 else { error = "Enter an HTTPS relay URL, Machine ID, and 8-digit code."; return }
-                        do { try await store.savePairing(baseURL: url, machineId: machineId, code: code); dismiss() }
-                        catch { self.error = error.localizedDescription }
+                        do {
+                            try await store.savePairing(baseURL: url, machineId: machineId, code: code)
+                            pairing = false
+                            dismiss()
+                        } catch {
+                            pairing = false
+                            self.error = error.localizedDescription
+                        }
                     }
                 }
+                .disabled(pairing)
             }
         }
         .sheet(isPresented: $scanner) {

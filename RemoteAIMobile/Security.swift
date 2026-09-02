@@ -196,6 +196,12 @@ final class RelayPairingClient {
         let publicKeyB64 = try PayloadCrypto.publicKeySPKIBase64(privateKeyRaw: privateKeyRaw)
         let socket = session.webSocketTask(with: try RemoteAIConfig.deviceWebSocketURL(baseURL: baseURL, machineId: machineId, deviceId: deviceId), protocols: ["remoteai.v1"])
         socket.resume()
+        let timeoutTask = Task {
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard !Task.isCancelled else { return }
+            socket.cancel(with: .goingAway, reason: Data("pairing-timeout".utf8))
+        }
+        defer { timeoutTask.cancel() }
         do {
             try await ping(socket)
             try await send(frame: RelayFrame(v: 1, kind: "PAIR_REQUEST", machineId: machineId, deviceId: deviceId, messageId: UUID().uuidString, body: [

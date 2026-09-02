@@ -361,26 +361,34 @@ final class WorkspaceStore: ObservableObject {
 
         if previousMachineId != result.machineId {
             PairingKeyStore.deletePairing(machineId: previousMachineId)
-            try await cache.clearAll()
-            runtimes.removeAll()
-            instances.removeAll()
-            sessions.removeAll()
-            messagesBySession.removeAll()
-            webProjects.removeAll()
-            projectConversationsByAlias.removeAll()
-            projectNextCursorByAlias.removeAll()
-            projectHasMoreByAlias.removeAll()
-            hasMoreBySession.removeAll()
-            tracker = SequenceTracker()
-            eventReplayGuard = BoundedReplayGuard(capacity: 8192)
         }
+
+        // A successful pairing establishes a new authoritative machine identity.
+        // Always clear connection-derived cache before reconnecting so an older cached
+        // MachineMetadata cannot overwrite the just-paired machine during start().
+        try await cache.clearAll()
+        runtimes.removeAll()
+        instances.removeAll()
+        sessions.removeAll()
+        messagesBySession.removeAll()
+        webProjects.removeAll()
+        projectConversationsByAlias.removeAll()
+        projectNextCursorByAlias.removeAll()
+        projectHasMoreByAlias.removeAll()
+        hasMoreBySession.removeAll()
+        tracker = SequenceTracker()
+        eventReplayGuard = BoundedReplayGuard(capacity: 8192)
 
         let config = RemoteAIConfig(relayBaseURL: baseURL, machineId: result.machineId)
         config.saveMetadata()
         transport = CloudflareTransport(config: config)
         machine = MachineMetadata(id: result.machineId, name: machine.name, state: .connecting)
         isPaired = true
+        errors["connection"] = nil
         await start()
+        if machine.state != .online {
+            throw TransportError.remote("PAIR_CONNECTED_BUT_OFFLINE", errors["connection"] ?? "Pairing succeeded, but the Windows service did not become reachable.")
+        }
     }
 
     func draft(sessionId: String) async -> String { (try? await cache.draft(sessionId: sessionId)) ?? "" }
