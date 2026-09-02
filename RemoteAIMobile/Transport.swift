@@ -174,7 +174,7 @@ extension Transport {
                 "sizeBytes": .number(Double(attachment.sizeBytes))
             ]
         )
-        let ticket = try requireSuccess(execute(begin)).decode(AttachmentUploadTicket.self)
+        let ticket = try await requireSuccess(execute(begin)).decode(AttachmentUploadTicket.self)
         let chunkSize = max(16 * 1024, min(ticket.chunkBytes, 96 * 1024))
         var index = 0
         var offset = 0
@@ -206,7 +206,7 @@ extension Transport {
                 action: "finishAttachmentUpload",
                 payload: ["uploadId": .string(ticket.uploadId)]
             )
-            return try requireSuccess(execute(finish)).decode(RemoteAttachmentDescriptor.self)
+            return try await requireSuccess(execute(finish)).decode(RemoteAttachmentDescriptor.self)
         } catch {
             let discard = RemoteCommand.make(
                 machineId: machineId,
