@@ -56,8 +56,12 @@ final class WorkspaceStore: ObservableObject {
     private var projectConversationRevisions: [String: UInt64] = [:]
     private var sessionRevisions: [String: UInt64] = [:]
 
+    private static func pendingCommandPrefix(machineId: String) -> String {
+        "pending.command.\(machineId)."
+    }
+
     private static func pendingCommandKey(_ id: UUID, machineId: String) -> String {
-        "pending.command.\(machineId).\(id.uuidString.lowercased())"
+        pendingCommandPrefix(machineId: machineId) + id.uuidString.lowercased()
     }
 
     init(transport: Transport, cache: SQLiteStore) {
@@ -136,7 +140,7 @@ final class WorkspaceStore: ObservableObject {
             // Relay connectivity alone is not enough to call the PC online. Require one
             // authenticated encrypted command to round-trip through the Windows Agent.
             connectionPhase = .authenticating
-            _ = try await activeTransport.latestSequence(machineId: machine.id)
+            let authenticatedSequence = try await activeTransport.latestSequence(machineId: machine.id)
             guard generation == lifecycleGeneration, !isSuspended, transport === activeTransport else {
                 await activeTransport.disconnect()
                 return
@@ -149,7 +153,7 @@ final class WorkspaceStore: ObservableObject {
             // failed catalog refresh must never leave the UI stuck in Connecting.
             pairingProgress?(.loadingRuntimes)
             connectionPhase = .loadingRuntimes
-            await recoverDelta()
+            await recoverDelta(freshLatestSequence: authenticatedSequence)
             guard generation == lifecycleGeneration, !isSuspended else { return }
             await refreshMetadata()
             guard generation == lifecycleGeneration, !isSuspended else { return }
@@ -373,6 +377,16 @@ final class WorkspaceStore: ObservableObject {
         guard sessionLoads.insert(sessionId).inserted else { return }
         defer { sessionLoads.remove(sessionId) }
         let generation = lifecycleGeneration
+
+        // Pending commands are authoritative recovery state in their own right. Do not
+        // depend on an optimistic message row surviving the previous lifecycle: the
+        // server echo may already have replaced/removed that row before the app exited.
+        let pendingPrefix = Self.pendingCommandPrefix(machineId: machine.id)
+        let persistedPending = (try? await cache.values(RemoteCommand.self, keyPrefix: pendingPrefix)) ?? []
+        for command in persistedPending where command.action == "sendMessage" && command.sessionId == sessionId {
+            if commandStates[command.commandId] == nil { commandStates[command.commandId] = .unknown }
+        }
+
         if messagesBySession[sessionId] == nil {
             var local = (try? await cache.recentMessages(sessionId: sessionId, limit: 50)) ?? []
             if sessions.first(where: { $0.id == sessionId })?.state != .busy {
@@ -385,19 +399,8 @@ final class WorkspaceStore: ObservableObject {
                 if changed { try? await cache.upsertMessages(local) }
             }
             messagesBySession[sessionId] = local
-            for message in local where message.role == .user {
-                guard let id = UUID(uuidString: message.id),
-                      (try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(id, machineId: machine.id))) != nil else { continue }
-                if message.sequence != nil {
-                    // A server-sequenced echo is authoritative proof that the unknown
-                    // command committed before the prior lifecycle ended.
-                    commandStates[id] = .completed
-                    try? await cache.remove(key: Self.pendingCommandKey(id, machineId: machine.id))
-                } else {
-                    commandStates[id] = .unknown
-                }
-            }
         }
+        await reconcilePendingUnknownCommands(with: messagesBySession[sessionId, default: []], sessionId: sessionId)
         guard machine.state == .online, let context = contextForSession(sessionId) else { return }
         do {
             let page = try await transport.loadRecent(machineId: machine.id, runtimeId: context.runtime.id, instanceId: context.instance.id, sessionId: sessionId, limit: 50)
@@ -815,7 +818,7 @@ final class WorkspaceStore: ObservableObject {
                             break
                         }
                         self.connectionPhase = .authenticating
-                        _ = try await monitoredTransport.latestSequence(machineId: self.machine.id)
+                        let authenticatedSequence = try await monitoredTransport.latestSequence(machineId: self.machine.id)
                         guard generation == self.lifecycleGeneration,
                               !self.isSuspended,
                               self.transport === monitoredTransport else {
@@ -825,7 +828,7 @@ final class WorkspaceStore: ObservableObject {
                         self.machine.state = .online
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
-                        await self.recoverDelta()
+                        await self.recoverDelta(freshLatestSequence: authenticatedSequence)
                         await self.refreshMetadata()
                     } catch {
                         guard generation == self.lifecycleGeneration,
@@ -1064,15 +1067,15 @@ final class WorkspaceStore: ObservableObject {
         try? await cache.setLastSequence(event.sequence)
     }
 
-    private func recoverDelta() async {
+    private func recoverDelta(freshLatestSequence: Int64? = nil) async {
         guard machine.state == .online else { return }
         var cursor = (try? await cache.lastSequence()) ?? 0
         do {
             if cursor == 0 && instances.isEmpty && sessions.isEmpty && webProjects.isEmpty {
-                // A fresh install has no local state to reconcile, so replaying the
-                // entire historical event log only delays startup. Current state is
-                // loaded lazily from the authoritative runtime/project/session APIs.
-                cursor = try await transport.latestSequence(machineId: machine.id)
+                // A fresh install has no local state to reconcile. Reuse the authenticated
+                // getStatus sequence when startup/reconnect already fetched it, so one
+                // initialization never issues a duplicate status request.
+                cursor = freshLatestSequence ?? (try await transport.latestSequence(machineId: machine.id))
                 try? await cache.setLastSequence(cursor)
                 tracker = SequenceTracker(lastSequence: cursor)
                 return

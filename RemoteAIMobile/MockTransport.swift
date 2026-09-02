@@ -20,6 +20,7 @@ actor MockTransport: Transport {
     private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
     private var commandAttempts: [String: Int] = [:]
+    private var connectAttempts = 0
     private var executionDelayNanoseconds: UInt64 = 0
     private var responseDelayNanoseconds: [String: UInt64] = [:]
     private var finishedAttachmentData: [String: Data] = [:]
@@ -84,6 +85,7 @@ actor MockTransport: Transport {
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
     func setResponseDelay(action: String, nanoseconds: UInt64) { responseDelayNanoseconds[action] = nanoseconds }
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
+    func connectionAttemptCount() -> Int { connectAttempts }
     func projectCount() -> Int { webProjects.count }
     func projectConversationCount(_ alias: String) -> Int { webProjectConversations[alias, default: []].count }
     func userMessageCount(sessionId: String, text: String) -> Int {
@@ -92,7 +94,11 @@ actor MockTransport: Transport {
     func attachmentData(id: String) -> Data? { finishedAttachmentData[id] }
     func finishedAttachmentCount() -> Int { finishedAttachmentData.count }
     func finishedAttachmentPayloads() -> [Data] { Array(finishedAttachmentData.values) }
-    func connect() async throws { guard scenario != .offline else { throw TransportError.offline }; connected = true }
+    func connect() async throws {
+        connectAttempts += 1
+        guard scenario != .offline else { throw TransportError.offline }
+        connected = true
+    }
     func disconnect() async { connected = false }
 
     func eventStream() async -> AsyncStream<RemoteEvent> {

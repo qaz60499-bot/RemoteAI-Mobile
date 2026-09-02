@@ -62,6 +62,25 @@ actor SQLiteStore {
         catch { throw StoreError.corruptData }
     }
 
+    func values<T: Decodable>(_ type: T.Type, keyPrefix: String) throws -> [T] {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT value FROM kv WHERE instr(key, ?) = 1 ORDER BY key", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, keyPrefix)
+        var result: [T] = []
+        while true {
+            let step = sqlite3_step(stmt)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else { throw StoreError.stepFailed }
+            let count = Int(sqlite3_column_bytes(stmt, 0))
+            guard count >= 0, count <= Self.maxKVBytes, let blob = sqlite3_column_blob(stmt, 0) else { throw StoreError.corruptData }
+            let data = Data(bytes: blob, count: count)
+            do { result.append(try decoder.decode(T.self, from: data)) }
+            catch { throw StoreError.corruptData }
+        }
+        return result
+    }
+
     func setLastSequence(_ value: Int64) throws { try put(String(value), key: "sync.lastSequence") }
     func lastSequence() throws -> Int64 { Int64(try get(String.self, key: "sync.lastSequence") ?? "0") ?? 0 }
     func saveDraft(_ text: String, sessionId: String) throws { try put(text, key: "draft.\(sessionId)") }

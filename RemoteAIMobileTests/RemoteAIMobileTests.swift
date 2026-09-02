@@ -382,8 +382,12 @@ final class RemoteAIMobileTests: XCTestCase {
         async let first: Void = store.start()
         async let second: Void = store.start()
         _ = await (first, second)
-        let getStatusAttempts = await mock.actionAttemptCount("getStatus")
-        XCTAssertEqual(getStatusAttempts, 1, "Duplicate start must share one authenticated initialization")
+        let connectionAttempts = await mock.connectionAttemptCount()
+        let statusAttempts = await mock.actionAttemptCount("getStatus")
+        let runtimeCatalogAttempts = await mock.actionAttemptCount("listRuntimes")
+        XCTAssertEqual(connectionAttempts, 1, "Duplicate start must share one transport connection")
+        XCTAssertEqual(statusAttempts, 1, "Startup authentication and fresh-delta seeding must reuse one getStatus request")
+        XCTAssertEqual(runtimeCatalogAttempts, 1, "Duplicate start must not initialize runtime metadata twice")
         XCTAssertEqual(store.machine.state, .online)
 
         await store.suspend()
@@ -632,6 +636,17 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(messages.filter { $0.role == .assistant && $0.text == "Remote AI mock streaming response." }.count, 1)
         XCTAssertFalse(messages.contains { $0.role == .assistant && $0.toolStatus == "Streaming" })
         await store.suspend()
+    }
+
+    func testSQLitePrefixKeysSupportPendingCommandRecoveryIsolation() async throws {
+        let db = try SQLiteStore.inMemory()
+        try await db.put("a", key: "pending.command.machine-a.111")
+        try await db.put("b", key: "pending.command.machine-a.222")
+        try await db.put("c", key: "pending.command.machine-b.333")
+        let machineA: [String] = try await db.values(String.self, keyPrefix: "pending.command.machine-a.")
+        XCTAssertEqual(machineA, ["a", "b"])
+        let machineB: [String] = try await db.values(String.self, keyPrefix: "pending.command.machine-b.")
+        XCTAssertEqual(machineB, ["c"])
     }
 
     func testSQLitePersistsMetadataAndCursor() async throws {
