@@ -308,13 +308,14 @@ final class PairingTests: XCTestCase {
     }
 
     func testLiveRelayChallengeFromIOSURLSession() async throws {
-        let environment = ProcessInfo.processInfo.environment
-        guard let relayText = environment["REMOTEAI_LIVE_RELAY_URL"],
-              let relayURL = URL(string: relayText),
-              let machineId = environment["REMOTEAI_LIVE_MACHINE_ID"],
-              !machineId.isEmpty else {
-            throw XCTSkip("Live Relay pairing smoke is enabled only by the GitHub workflow")
-        }
+#if REMOTEAI_LIVE_PAIRING
+        let relayURL = try XCTUnwrap(URL(string: "https://remoteai-relay.qaz60499.workers.dev"))
+        let machineId = "machine-60e5101d-d386-464b-ac41-3e546ca800a0"
+#else
+        let relayURL = URL(string: "https://relay.example.invalid")!
+        let machineId = "live-pairing-disabled"
+        throw XCTSkip("Live Relay pairing smoke is enabled only by the dedicated GitHub workflow step")
+#endif
 
         let deviceId = "ios-ci-\(UUID().uuidString.lowercased())"
         let socketURL = try RemoteAIConfig.deviceWebSocketURL(baseURL: relayURL, machineId: machineId, deviceId: deviceId)
@@ -373,6 +374,9 @@ final class PairingTests: XCTestCase {
             }
         }
         XCTAssertTrue(challengeReceived, "Real Windows Agent did not return PAIR_CHALLENGE to the iOS URLSession client")
+        if challengeReceived {
+            print("LIVE_PAIRING_OK deviceId=\(deviceId)")
+        }
     }
 
     func testSuccessfulPairingAutomaticallyLoadsRuntimesAfterReconnect() async throws {
