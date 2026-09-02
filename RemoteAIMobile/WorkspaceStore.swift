@@ -32,6 +32,33 @@ final class WorkspaceStore: ObservableObject {
     private var streamingBuffers: [String: (id: String, text: String, sequence: Int64)] = [:]
     private var flushTask: Task<Void, Never>?
     private var startInProgress = false
+    private var restartAfterStart = false
+    private var lifecycleGeneration: UInt64 = 0
+    private var isSuspended = false
+
+    // MainActor reentrancy means a second UI task can enter while the first request is
+    // awaiting I/O. Keep per-operation gates at the Store boundary, not only in Views.
+    private var refreshWebProjectsInFlight = false
+    private var projectConversationRefreshes = Set<String>()
+    private var projectConversationPageLoads = Set<String>()
+    private var runtimeRefreshes = Set<String>()
+    private var sessionRefreshes = Set<String>()
+    private var sessionLoads = Set<String>()
+    private var olderMessageLoads = Set<String>()
+    private var creatingWebProjects = Set<String>()
+    private var creatingWebConversations = Set<String>()
+    private var creatingSessions = Set<String>()
+    private var stoppingSessions = Set<String>()
+    private var commandSendsInFlight = Set<UUID>()
+    private var metadataRefreshInFlight = false
+    private var metadataRefreshQueued = false
+    private var webProjectsRevision: UInt64 = 0
+    private var projectConversationRevisions: [String: UInt64] = [:]
+    private var sessionRevisions: [String: UInt64] = [:]
+
+    private static func pendingCommandKey(_ id: UUID, machineId: String) -> String {
+        "pending.command.\(machineId).\(id.uuidString.lowercased())"
+    }
 
     init(transport: Transport, cache: SQLiteStore) {
         self.transport = transport
@@ -55,11 +82,20 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func start(pairingProgress: ((PairingStage) -> Void)? = nil) async {
-        guard !startInProgress else { return }
+        guard !isSuspended else { return }
+        if startInProgress { return }
         startInProgress = true
-        defer { startInProgress = false }
+        let generation = lifecycleGeneration
+        defer {
+            startInProgress = false
+            if restartAfterStart && !isSuspended {
+                restartAfterStart = false
+                Task { [weak self] in await self?.start() }
+            }
+        }
 
         await loadCachedFirst()
+        guard generation == lifecycleGeneration, !isSuspended else { return }
         await normalizeCachedTransientState()
         if !(transport is MockTransport) {
             await removeLegacyMockFixtures()
@@ -84,18 +120,27 @@ final class WorkspaceStore: ObservableObject {
             errors["connection"] = "Not paired — scan the Windows pairing code to load your real runtimes and ChatGPT Projects."
             return
         }
+        let activeTransport = transport
         installEventConsumer()
         machine.state = .connecting
         connectionPhase = .relayConnecting
         do {
             pairingProgress?(.connectingRemoteAI)
-            try await transport.connect()
+            try await activeTransport.connect()
+            guard generation == lifecycleGeneration, !isSuspended, transport === activeTransport else {
+                await activeTransport.disconnect()
+                return
+            }
             connectionPhase = .relayConnected
 
             // Relay connectivity alone is not enough to call the PC online. Require one
             // authenticated encrypted command to round-trip through the Windows Agent.
             connectionPhase = .authenticating
-            _ = try await transport.latestSequence(machineId: machine.id)
+            _ = try await activeTransport.latestSequence(machineId: machine.id)
+            guard generation == lifecycleGeneration, !isSuspended, transport === activeTransport else {
+                await activeTransport.disconnect()
+                return
+            }
             machine.state = .online
             errors["connection"] = nil
             startConnectionMonitor()
@@ -105,29 +150,49 @@ final class WorkspaceStore: ObservableObject {
             pairingProgress?(.loadingRuntimes)
             connectionPhase = .loadingRuntimes
             await recoverDelta()
+            guard generation == lifecycleGeneration, !isSuspended else { return }
             await refreshMetadata()
+            guard generation == lifecycleGeneration, !isSuspended else { return }
             connectionPhase = .online
         } catch {
+            guard generation == lifecycleGeneration, !isSuspended else { return }
             applyConnectionFailure(error)
             if (error as? TransportError) != .pairingRequired { startConnectionMonitor() }
         }
     }
 
     func suspend() async {
+        isSuspended = true
+        lifecycleGeneration &+= 1
+        restartAfterStart = false
         connectionMonitorTask?.cancel()
         connectionMonitorTask = nil
+        eventTask?.cancel()
+        eventTask = nil
+        flushAllStreaming()
         await transport.disconnect()
         machine.state = .offline
         connectionPhase = .idle
     }
 
     func resumeFromForeground() async {
+        isSuspended = false
+        lifecycleGeneration &+= 1
         machine.state = .connecting
         connectionPhase = .reconnecting
+        if startInProgress {
+            restartAfterStart = true
+            return
+        }
         await start()
     }
 
     func refreshWebProjects() async {
+        guard !refreshWebProjectsInFlight else { return }
+        refreshWebProjectsInFlight = true
+        defer { refreshWebProjectsInFlight = false }
+        let generation = lifecycleGeneration
+        let revision = webProjectsRevision
         if webProjects.isEmpty,
            let cached: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
             // Keep cache available for offline use, but do not mark it authoritative.
@@ -138,6 +203,7 @@ final class WorkspaceStore: ObservableObject {
         guard machine.state == .online else { return }
         do {
             let remote = try await transport.listProjects(machineId: machine.id)
+            guard generation == lifecycleGeneration, revision == webProjectsRevision, machine.state == .online, !isSuspended else { return }
             // Preserve the authoritative DOM order from Windows. Sorting by cached
             // timestamps can make a complete Project list look random or incomplete.
             webProjects = remote
@@ -145,19 +211,30 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.put(webProjects, key: "web.projects")
             errors["web.projects"] = nil
         } catch {
-            errors["web.projects"] = error.localizedDescription
+            if generation == lifecycleGeneration, !isSuspended { errors["web.projects"] = error.localizedDescription }
         }
     }
 
     func createWebProject(name: String) async -> WebProjectDescriptor? {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        let operationKey = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        guard creatingWebProjects.insert(operationKey).inserted else { return nil }
+        defer { creatingWebProjects.remove(operationKey) }
+        let generation = lifecycleGeneration
         guard machine.state == .online else {
             errors["web.projects"] = "PC Offline — new Projects require the Windows browser runtime."
             return nil
         }
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        webProjectsRevision &+= 1
         do {
-            let created = try await transport.createWebProject(machineId: machine.id, projectName: trimmed)
+            let commandId = await pendingOperationCommandId(key: "createProject.\(operationKey)", machineId: activeMachineId)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
+            let created = try await activeTransport.createWebProject(machineId: activeMachineId, projectName: trimmed, commandId: commandId)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, machine.state == .online, !isSuspended else { return nil }
+            await finishPendingOperation(key: "createProject.\(operationKey)", machineId: activeMachineId, expectedCommandId: commandId)
             webProjects.removeAll { $0.projectAlias == created.projectAlias }
             webProjects.insert(created, at: 0)
             hasLoadedWebProjects = true
@@ -165,12 +242,21 @@ final class WorkspaceStore: ObservableObject {
             errors["web.projects"] = nil
             return created
         } catch {
-            errors["web.projects"] = error.localizedDescription
+            if generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended {
+                if !isUnknownDelivery(error) { await finishPendingOperation(key: "createProject.\(operationKey)", machineId: activeMachineId) }
+                errors["web.projects"] = error.localizedDescription
+            }
             return nil
         }
     }
 
     func loadProjectConversations(projectAlias: String, refresh: Bool = true) async {
+        if refresh {
+            guard projectConversationRefreshes.insert(projectAlias).inserted else { return }
+        }
+        defer { if refresh { projectConversationRefreshes.remove(projectAlias) } }
+        let generation = lifecycleGeneration
+        let revision = projectConversationRevisions[projectAlias, default: 0]
         // Online Project pages should never flash cached placeholder/UUID titles before
         // the authoritative browser DOM has loaded. Cache is still useful offline.
         if (!refresh || machine.state != .online),
@@ -181,6 +267,7 @@ final class WorkspaceStore: ObservableObject {
         guard refresh, machine.state == .online else { return }
         do {
             let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30)
+            guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
             projectConversationsByAlias[projectAlias] = page.items
             if let cursor = page.nextCursor { projectNextCursorByAlias[projectAlias] = cursor }
             else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
@@ -189,16 +276,21 @@ final class WorkspaceStore: ObservableObject {
             mergeProjectSessions(page.items)
             errors["web.project.\(projectAlias)"] = nil
         } catch {
-            errors["web.project.\(projectAlias)"] = error.localizedDescription
+            if generation == lifecycleGeneration, !isSuspended { errors["web.project.\(projectAlias)"] = error.localizedDescription }
         }
     }
 
     func loadMoreProjectConversations(projectAlias: String) async {
+        guard projectConversationPageLoads.insert(projectAlias).inserted else { return }
+        defer { projectConversationPageLoads.remove(projectAlias) }
+        let generation = lifecycleGeneration
+        let revision = projectConversationRevisions[projectAlias, default: 0]
         guard machine.state == .online,
               projectHasMoreByAlias[projectAlias] == true,
               let cursor = projectNextCursorByAlias[projectAlias] else { return }
         do {
             let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, cursor: cursor)
+            guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
             var merged = projectConversationsByAlias[projectAlias, default: []]
             for item in page.items where !merged.contains(where: { $0.id == item.id }) { merged.append(item) }
             // Preserve the authoritative newest-first order supplied by ChatGPT.
@@ -211,17 +303,30 @@ final class WorkspaceStore: ObservableObject {
             mergeProjectSessions(page.items)
             errors["web.project.\(projectAlias)"] = nil
         } catch {
-            errors["web.project.\(projectAlias)"] = error.localizedDescription
+            if generation == lifecycleGeneration, !isSuspended { errors["web.project.\(projectAlias)"] = error.localizedDescription }
         }
     }
 
     func createWebConversation(projectAlias: String? = nil) async -> SessionDescriptor? {
+        let scope = projectAlias ?? "__root__"
+        guard creatingWebConversations.insert(scope).inserted else { return nil }
+        defer { creatingWebConversations.remove(scope) }
+        let generation = lifecycleGeneration
         guard machine.state == .online else {
             errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = "PC Offline — new conversations require the Windows browser runtime."
             return nil
         }
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        sessionRevisions["web.chatgpt", default: 0] &+= 1
+        if let projectAlias { projectConversationRevisions[projectAlias, default: 0] &+= 1 }
         do {
-            let created = try await transport.createWebConversation(machineId: machine.id, projectAlias: projectAlias)
+            let operationKey = "createConversation.\(scope)"
+            let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
+            let created = try await activeTransport.createWebConversation(machineId: activeMachineId, projectAlias: projectAlias, commandId: commandId)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, machine.state == .online, !isSuspended else { return nil }
+            await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
             let session = created.session
             sessions.removeAll { $0.id == session.id }
             sessions.insert(session, at: 0)
@@ -236,26 +341,38 @@ final class WorkspaceStore: ObservableObject {
             errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = nil
             return session
         } catch {
-            errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = error.localizedDescription
+            let operationKey = "createConversation.\(scope)"
+            if generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended {
+                if !isUnknownDelivery(error) { await finishPendingOperation(key: operationKey, machineId: activeMachineId) }
+                errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = error.localizedDescription
+            }
             return nil
         }
     }
 
     func refreshSessions(runtime: RuntimeDescriptor, instance: InstanceDescriptor) async {
+        guard sessionRefreshes.insert(instance.id).inserted else { return }
+        defer { sessionRefreshes.remove(instance.id) }
+        let generation = lifecycleGeneration
+        let revision = sessionRevisions[instance.id, default: 0]
         guard machine.state == .online else { return }
         do {
             let remote = try await transport.listSessions(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id)
+            guard generation == lifecycleGeneration, revision == sessionRevisions[instance.id, default: 0], machine.state == .online, !isSuspended else { return }
             sessions.removeAll { $0.instanceId == instance.id }
             sessions.append(contentsOf: remote)
             sessions.sort { $0.updatedAt > $1.updatedAt }
             await persistMetadata()
             errors["instance.\(instance.id)"] = nil
         } catch {
-            errors["instance.\(instance.id)"] = error.localizedDescription
+            if generation == lifecycleGeneration, !isSuspended { errors["instance.\(instance.id)"] = error.localizedDescription }
         }
     }
 
     func loadSession(_ sessionId: String) async {
+        guard sessionLoads.insert(sessionId).inserted else { return }
+        defer { sessionLoads.remove(sessionId) }
+        let generation = lifecycleGeneration
         if messagesBySession[sessionId] == nil {
             var local = (try? await cache.recentMessages(sessionId: sessionId, limit: 50)) ?? []
             if sessions.first(where: { $0.id == sessionId })?.state != .busy {
@@ -268,25 +385,46 @@ final class WorkspaceStore: ObservableObject {
                 if changed { try? await cache.upsertMessages(local) }
             }
             messagesBySession[sessionId] = local
+            for message in local where message.role == .user {
+                guard let id = UUID(uuidString: message.id),
+                      (try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(id, machineId: machine.id))) != nil else { continue }
+                if message.sequence != nil {
+                    // A server-sequenced echo is authoritative proof that the unknown
+                    // command committed before the prior lifecycle ended.
+                    commandStates[id] = .completed
+                    try? await cache.remove(key: Self.pendingCommandKey(id, machineId: machine.id))
+                } else {
+                    commandStates[id] = .unknown
+                }
+            }
         }
         guard machine.state == .online, let context = contextForSession(sessionId) else { return }
         do {
             let page = try await transport.loadRecent(machineId: machine.id, runtimeId: context.runtime.id, instanceId: context.instance.id, sessionId: sessionId, limit: 50)
+            guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+            await reconcilePendingUnknownCommands(with: page.items, sessionId: sessionId)
+            for remoteUser in page.items where remoteUser.role == .user {
+                await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+            }
             try? await cache.upsertMessages(page.items)
             merge(page.items, into: sessionId)
             hasMoreBySession[sessionId] = page.hasMore
             errors[sessionId] = nil
         } catch {
-            errors[sessionId] = error.localizedDescription
+            if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = error.localizedDescription }
         }
     }
 
     func loadOlder(_ sessionId: String) async {
+        guard olderMessageLoads.insert(sessionId).inserted else { return }
+        defer { olderMessageLoads.remove(sessionId) }
+        let generation = lifecycleGeneration
         guard let first = messagesBySession[sessionId]?.first, hasMoreBySession[sessionId] != false else { return }
         do {
             let page: Page<ChatMessage>
             if machine.state == .online, let context = contextForSession(sessionId) {
                 page = try await transport.loadBefore(machineId: machine.id, runtimeId: context.runtime.id, instanceId: context.instance.id, sessionId: sessionId, before: first.cursor, limit: 40)
+                guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
             } else {
                 let local = try await cache.messagesBefore(sessionId: sessionId, before: first.cursor, limit: 40)
                 page = Page(items: local, beforeCursor: local.first?.cursor, hasMore: local.count == 40)
@@ -296,12 +434,15 @@ final class WorkspaceStore: ObservableObject {
             hasMoreBySession[sessionId] = page.hasMore
             errors[sessionId] = nil
         } catch {
-            errors[sessionId] = error.localizedDescription
+            if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = error.localizedDescription }
         }
     }
 
     @discardableResult
     func send(text: String, runtimeId: String, instanceId: String, sessionId: String, attachments: [PendingAttachment] = [], model: String = "", commandId: UUID = UUID()) async -> Bool {
+        guard commandSendsInFlight.insert(commandId).inserted else { return false }
+        defer { commandSendsInFlight.remove(commandId) }
+        let generation = lifecycleGeneration
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
         guard attachments.count <= 8, attachments.allSatisfy({ $0.sizeBytes > 0 && $0.sizeBytes <= 20 * 1024 * 1024 }) else {
@@ -315,8 +456,11 @@ final class WorkspaceStore: ObservableObject {
                 : "PC Offline — 附件需要连接 Windows 后才能上传。"
             return false
         }
+        let activeTransport = transport
+        let activeMachineId = machine.id
 
         commandStates[commandId] = .pending
+        var messageCommandPersisted = false
         do {
             var remoteAttachments: [RemoteAttachmentDescriptor] = []
             if !attachments.isEmpty {
@@ -325,17 +469,21 @@ final class WorkspaceStore: ObservableObject {
             for (index, attachment) in attachments.enumerated() {
                 try Task.checkCancellation()
                 attachmentTransferBySession[sessionId] = AttachmentTransferProgress(completed: index, total: attachments.count, name: attachment.name)
-                let remote = try await transport.uploadAttachment(
-                    machineId: machine.id,
+                guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { throw CancellationError() }
+                let remote = try await activeTransport.uploadAttachment(
+                    machineId: activeMachineId,
                     runtimeId: runtimeId,
                     instanceId: instanceId,
                     sessionId: sessionId,
-                    attachment: attachment
+                    attachment: attachment,
+                    operationId: commandId,
+                    attachmentIndex: index
                 )
                 remoteAttachments.append(remote)
                 attachmentTransferBySession[sessionId] = AttachmentTransferProgress(completed: index + 1, total: attachments.count, name: attachment.name)
             }
             try Task.checkCancellation()
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { throw CancellationError() }
             attachmentTransferBySession.removeValue(forKey: sessionId)
 
             let names = remoteAttachments.map(\.name).joined(separator: ", ")
@@ -343,47 +491,121 @@ final class WorkspaceStore: ObservableObject {
             let optimistic = ChatMessage(id: commandId.uuidString, sessionId: sessionId, sequence: nil, role: .user, kind: .text, text: displayText, toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
             merge([optimistic], into: sessionId)
             try? await cache.upsertMessages([optimistic])
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
 
             var payload: [String: JSONValue] = ["text": .string(trimmed)]
             if !model.isEmpty { payload["model"] = .string(model) }
             if !remoteAttachments.isEmpty { payload["attachmentIds"] = .array(remoteAttachments.map { .string($0.attachmentId) }) }
-            let command = RemoteCommand.make(machineId: machine.id, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "sendMessage", payload: payload, commandId: commandId)
+            let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "sendMessage", payload: payload, commandId: commandId)
+            try? await cache.put(command, key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+            messageCommandPersisted = true
             commandStates[commandId] = .executing
-            commandStates[commandId] = try await transport.send(command)
+            let finalState = try await activeTransport.send(command)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+            commandStates[commandId] = finalState
+            try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             try? await cache.saveDraft("", sessionId: sessionId)
-            errors[sessionId] = nil
+            if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = nil }
             return true
         } catch is CancellationError {
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             attachmentTransferBySession.removeValue(forKey: sessionId)
             commandStates[commandId] = .failed
-            errors[sessionId] = "Attachment upload cancelled. The message was not sent; you can retry without reselecting the files."
+            try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
+            await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
+            errors[sessionId] = "Attachment upload cancelled before message delivery. The composer keeps your local text/files so you can send again."
             return false
-        } catch TransportError.disconnected {
+        } catch let error as TransportError where error == .disconnected || error == .timeout {
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             attachmentTransferBySession.removeValue(forKey: sessionId)
             commandStates[commandId] = .unknown
-            errors[sessionId] = "Connection dropped after send. Delivery is unknown; retry reuses the same command ID."
+            errors[sessionId] = messageCommandPersisted
+                ? "Delivery is unknown after a disconnect/timeout. Use Retry on this message; it replays the exact same command ID and payload."
+                : "Attachment transfer was interrupted before message delivery was attempted. Retry from the composer reuses the same operation ID."
             return false
         } catch {
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             attachmentTransferBySession.removeValue(forKey: sessionId)
             commandStates[commandId] = .failed
+            try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
+            await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
             errors[sessionId] = error.localizedDescription
             return false
         }
     }
 
     func retry(message: ChatMessage, runtimeId: String, instanceId: String, model: String = "") async {
-        let commandId = UUID(uuidString: message.id) ?? UUID()
-        await send(text: message.text, runtimeId: runtimeId, instanceId: instanceId, sessionId: message.sessionId, model: model, commandId: commandId)
+        guard let commandId = UUID(uuidString: message.id) else { return }
+        guard commandStates[commandId] == .unknown else { return }
+        guard commandSendsInFlight.insert(commandId).inserted else { return }
+        defer { commandSendsInFlight.remove(commandId) }
+        guard machine.state == .online else {
+            errors[message.sessionId] = "PC Offline — reconnect before retrying this unknown delivery."
+            return
+        }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        do {
+            let command: RemoteCommand
+            if let stored = try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(commandId, machineId: activeMachineId)) {
+                command = stored
+            } else {
+                guard !message.text.contains("[Attachments:") else {
+                    errors[message.sessionId] = "The saved attachment retry payload is unavailable. Refresh the conversation before sending anything again."
+                    return
+                }
+                command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: message.sessionId, action: "sendMessage", payload: ["text": .string(message.text)], commandId: commandId)
+            }
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
+            commandStates[commandId] = .executing
+            let finalState = try await activeTransport.send(command)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
+            commandStates[commandId] = finalState
+            try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
+            errors[message.sessionId] = nil
+            // A replayed command response proves the side effect result, but the replay
+            // itself may not re-emit the original MESSAGE_ADDED event. Re-read the
+            // authoritative session so optimistic UI/cache state converges as well.
+            await loadSession(message.sessionId)
+        } catch let error as TransportError where error == .disconnected || error == .timeout {
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
+            commandStates[commandId] = .unknown
+            errors[message.sessionId] = "Delivery is still unknown. Retry will continue to use the same command ID."
+        } catch {
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
+            commandStates[commandId] = .failed
+            try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
+            errors[message.sessionId] = error.localizedDescription
+        }
     }
 
     func stop(runtimeId: String, instanceId: String, sessionId: String) async {
-        let command = RemoteCommand.make(machineId: machine.id, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "stopGeneration")
+        guard stoppingSessions.insert(sessionId).inserted else { return }
+        defer { stoppingSessions.remove(sessionId) }
+        guard machine.state == .online else {
+            errors[sessionId] = "PC Offline — stop will not be queued blindly."
+            return
+        }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        let operationKey = "stop.\(runtimeId).\(instanceId).\(sessionId)"
+        let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
+        guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
+        let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "stopGeneration", commandId: commandId)
         commandStates[command.commandId] = .pending
         do {
-            commandStates[command.commandId] = try await transport.send(command)
+            let state = try await activeTransport.send(command)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
+            commandStates[command.commandId] = state
+            await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
             errors[sessionId] = nil
         } catch {
-            commandStates[command.commandId] = .failed
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
+            commandStates[command.commandId] = isUnknownDelivery(error) ? .unknown : .failed
+            if !isUnknownDelivery(error) { await finishPendingOperation(key: operationKey, machineId: activeMachineId) }
             errors[sessionId] = error.localizedDescription
         }
     }
@@ -394,8 +616,12 @@ final class WorkspaceStore: ObservableObject {
         title: String,
         model: String = ""
     ) async -> Bool {
+        guard creatingSessions.insert(instance.id).inserted else { return false }
+        defer { creatingSessions.remove(instance.id) }
+        let generation = lifecycleGeneration
+        let effectiveTitle = title.isEmpty ? "New Session" : title
         var payload: [String: JSONValue] = [
-            "title": .string(title.isEmpty ? "New Session" : title)
+            "title": .string(effectiveTitle)
         ]
         if runtime.kind == .codex, !model.isEmpty {
             payload["model"] = .string(model)
@@ -404,34 +630,54 @@ final class WorkspaceStore: ObservableObject {
             errors[instance.id] = "PC Offline — new sessions are not queued automatically."
             return false
         }
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        sessionRevisions[instance.id, default: 0] &+= 1
+        let operationKey = "createSession.\(runtime.id).\(instance.id).\(effectiveTitle).\(model)"
         do {
-            if let created = try await transport.createSession(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id, payload: payload) {
+            let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+            if let created = try await activeTransport.createSession(machineId: activeMachineId, runtimeId: runtime.id, instanceId: instance.id, payload: payload, commandId: commandId) {
+                guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, machine.state == .online, !isSuspended else { return false }
+                await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
                 sessions.removeAll { $0.id == created.id }
                 sessions.insert(created, at: 0)
                 errors[instance.id] = nil
                 await persistMetadata()
                 return true
-            } else if transport is MockTransport {
+            } else if activeTransport is MockTransport {
+                guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+                await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
                 let local = SessionDescriptor(id: UUID().uuidString, instanceId: instance.id, title: title.isEmpty ? (runtime.kind == .web ? "New Chat" : "New Session") : title, state: .idle, updatedAt: Date())
                 sessions.insert(local, at: 0)
                 errors[instance.id] = nil
                 await persistMetadata()
                 return true
             } else {
+                guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+                await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
                 await refreshMetadata()
                 errors[instance.id] = nil
                 return true
             }
         } catch {
-            errors[instance.id] = error.localizedDescription
+            if generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended {
+                if !isUnknownDelivery(error) { await finishPendingOperation(key: operationKey, machineId: activeMachineId) }
+                errors[instance.id] = error.localizedDescription
+            }
             return false
         }
     }
 
     func savePairing(baseURL: URL, machineId: String, code: String) async throws {
         pairingStage = .preparing
+        isSuspended = false
+        lifecycleGeneration &+= 1
+        restartAfterStart = false
         eventTask?.cancel()
+        eventTask = nil
         connectionMonitorTask?.cancel()
+        connectionMonitorTask = nil
         await transport.disconnect()
         let previousMachineId = machine.id
         let result = try await RelayPairingClient().pair(baseURL: baseURL, machineId: machineId, pairingCode: code) { [weak self] stage in
@@ -457,8 +703,27 @@ final class WorkspaceStore: ObservableObject {
         hasLoadedWebProjects = false
         attachmentTransferBySession.removeAll()
         hasMoreBySession.removeAll()
+        commandStates.removeAll()
+        errors.removeAll()
         tracker = SequenceTracker()
         eventReplayGuard = BoundedReplayGuard(capacity: 8192)
+        refreshWebProjectsInFlight = false
+        projectConversationRefreshes.removeAll()
+        projectConversationPageLoads.removeAll()
+        runtimeRefreshes.removeAll()
+        sessionRefreshes.removeAll()
+        sessionLoads.removeAll()
+        olderMessageLoads.removeAll()
+        creatingWebProjects.removeAll()
+        creatingWebConversations.removeAll()
+        creatingSessions.removeAll()
+        stoppingSessions.removeAll()
+        commandSendsInFlight.removeAll()
+        metadataRefreshInFlight = false
+        metadataRefreshQueued = false
+        webProjectsRevision &+= 1
+        projectConversationRevisions.removeAll()
+        sessionRevisions.removeAll()
 
         let config = RemoteAIConfig(relayBaseURL: baseURL, machineId: result.machineId)
         config.saveMetadata()
@@ -466,6 +731,9 @@ final class WorkspaceStore: ObservableObject {
         machine = MachineMetadata(id: result.machineId, name: machine.name, state: .connecting)
         isPaired = true
         errors["connection"] = nil
+        while startInProgress {
+            try? await Task.sleep(nanoseconds: 25_000_000)
+        }
         await start { [weak self] stage in
             self?.pairingStage = stage
         }
@@ -478,13 +746,46 @@ final class WorkspaceStore: ObservableObject {
     func draft(sessionId: String) async -> String { (try? await cache.draft(sessionId: sessionId)) ?? "" }
     func clearError(sessionId: String) { errors[sessionId] = nil }
 
+    private func pendingOperationCommandId(key: String, machineId: String) async -> UUID {
+        let cacheKey = "pending.operation.\(machineId).\(key)"
+        if let raw = try? await cache.get(String.self, key: cacheKey), let id = UUID(uuidString: raw) { return id }
+        let id = UUID()
+        try? await cache.put(id.uuidString.lowercased(), key: cacheKey)
+        return id
+    }
+
+    private func finishPendingOperation(key: String, machineId: String, expectedCommandId: UUID? = nil) async {
+        let cacheKey = "pending.operation.\(machineId).\(key)"
+        if let expectedCommandId {
+            let raw = try? await cache.get(String.self, key: cacheKey)
+            guard raw?.caseInsensitiveCompare(expectedCommandId.uuidString) == .orderedSame else { return }
+        }
+        try? await cache.remove(key: cacheKey)
+    }
+
+    private func isUnknownDelivery(_ error: Error) -> Bool {
+        guard let transportError = error as? TransportError else { return false }
+        return transportError == .disconnected || transportError == .timeout
+    }
+
+    private func removeOptimisticCommandMessage(commandId: UUID, sessionId: String) async {
+        let id = commandId.uuidString
+        messagesBySession[sessionId]?.removeAll { $0.id.caseInsensitiveCompare(id) == .orderedSame && $0.sequence == nil }
+        try? await cache.deleteMessage(id: id)
+    }
+
     private func installEventConsumer() {
         eventTask?.cancel()
+        let sourceTransport = transport
+        let generation = lifecycleGeneration
         eventTask = Task { [weak self] in
             guard let self else { return }
-            let stream = await self.transport.eventStream()
+            let stream = await sourceTransport.eventStream()
             for await event in stream {
-                guard !Task.isCancelled else { break }
+                guard !Task.isCancelled,
+                      generation == self.lifecycleGeneration,
+                      !self.isSuspended,
+                      self.transport === sourceTransport else { break }
                 await self.ingest(event)
             }
         }
@@ -492,23 +793,44 @@ final class WorkspaceStore: ObservableObject {
 
     private func startConnectionMonitor() {
         connectionMonitorTask?.cancel()
+        let monitoredTransport = transport
+        let generation = lifecycleGeneration
         connectionMonitorTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                guard !Task.isCancelled, let self else { break }
-                if !(await self.transport.isConnected) {
+                guard !Task.isCancelled,
+                      let self,
+                      generation == self.lifecycleGeneration,
+                      !self.isSuspended,
+                      self.transport === monitoredTransport else { break }
+                if !(await monitoredTransport.isConnected) {
                     self.machine.state = .connecting
                     self.connectionPhase = .reconnecting
                     do {
-                        try await self.transport.connect()
+                        try await monitoredTransport.connect()
+                        guard generation == self.lifecycleGeneration,
+                              !self.isSuspended,
+                              self.transport === monitoredTransport else {
+                            await monitoredTransport.disconnect()
+                            break
+                        }
                         self.connectionPhase = .authenticating
-                        _ = try await self.transport.latestSequence(machineId: self.machine.id)
+                        _ = try await monitoredTransport.latestSequence(machineId: self.machine.id)
+                        guard generation == self.lifecycleGeneration,
+                              !self.isSuspended,
+                              self.transport === monitoredTransport else {
+                            await monitoredTransport.disconnect()
+                            break
+                        }
                         self.machine.state = .online
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
                         await self.recoverDelta()
                         await self.refreshMetadata()
                     } catch {
+                        guard generation == self.lifecycleGeneration,
+                              !self.isSuspended,
+                              self.transport === monitoredTransport else { break }
                         self.applyConnectionFailure(error)
                         if (error as? TransportError) == .pairingRequired { break }
                     }
@@ -544,9 +866,13 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func refreshRuntime(_ runtime: RuntimeDescriptor) async {
+        guard runtimeRefreshes.insert(runtime.id).inserted else { return }
+        defer { runtimeRefreshes.remove(runtime.id) }
+        let generation = lifecycleGeneration
         guard machine.state == .online else { return }
         do {
             let rows = try await transport.listInstances(machineId: machine.id, runtimeId: runtime.id)
+            guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
             instances.removeAll { $0.runtimeId == runtime.id }
             instances.append(contentsOf: rows)
             instances.sort { lhs, rhs in
@@ -559,14 +885,28 @@ final class WorkspaceStore: ObservableObject {
             errors["runtime.\(runtime.id)"] = nil
             await persistMetadata()
         } catch {
-            errors["runtime.\(runtime.id)"] = error.localizedDescription
+            if generation == lifecycleGeneration, !isSuspended { errors["runtime.\(runtime.id)"] = error.localizedDescription }
         }
     }
 
     private func refreshMetadata() async {
+        if metadataRefreshInFlight {
+            metadataRefreshQueued = true
+            return
+        }
+        metadataRefreshInFlight = true
+        let generation = lifecycleGeneration
+        defer {
+            metadataRefreshInFlight = false
+            if metadataRefreshQueued && !isSuspended {
+                metadataRefreshQueued = false
+                Task { [weak self] in await self?.refreshMetadata() }
+            }
+        }
         guard machine.state == .online else { return }
         do {
             let remoteRuntimes = try await transport.listRuntimes(machineId: machine.id)
+            guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
             if !remoteRuntimes.isEmpty { runtimes = remoteRuntimes }
             // Runtime instance discovery is intentionally lazy. Each RuntimeView
             // refreshes only the selected runtime, which keeps app launch and
@@ -574,7 +914,7 @@ final class WorkspaceStore: ObservableObject {
             errors["sync"] = nil
             await persistMetadata()
         } catch {
-            errors["sync"] = error.localizedDescription
+            if generation == lifecycleGeneration, !isSuspended { errors["sync"] = error.localizedDescription }
         }
     }
 
@@ -836,6 +1176,26 @@ final class WorkspaceStore: ObservableObject {
         var list = messagesBySession[sessionId, default: []]
         list.removeAll { $0.role == .assistant && ($0.toolStatus == "Streaming" || $0.id == "stream-\(sessionId)") }
         messagesBySession[sessionId] = list
+    }
+
+    private func reconcilePendingUnknownCommands(with remote: [ChatMessage], sessionId: String) async {
+        let unknownIds = commandStates.compactMap { $0.value == .unknown ? $0.key : nil }
+        guard !unknownIds.isEmpty else { return }
+        for id in unknownIds {
+            guard let command = try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(id, machineId: machine.id)),
+                  command.sessionId == sessionId else { continue }
+            let text = command.payload["text"]?.stringValue ?? ""
+            let delivered = remote.contains { message in
+                guard message.role == .user else { return false }
+                if message.id.caseInsensitiveCompare(id.uuidString) == .orderedSame { return true }
+                guard !text.isEmpty, message.text == text else { return false }
+                return abs(message.createdAt.timeIntervalSince(command.createdAt)) < 300
+            }
+            if delivered {
+                commandStates[id] = .completed
+                try? await cache.remove(key: Self.pendingCommandKey(id, machineId: machine.id))
+            }
+        }
     }
 
     private func reconcileOptimisticUserEcho(_ serverMessage: ChatMessage, sessionId: String) async {

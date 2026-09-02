@@ -68,6 +68,15 @@ actor SQLiteStore {
     func draft(sessionId: String) throws -> String { try get(String.self, key: "draft.\(sessionId)") ?? "" }
     func saveUIState(_ value: String, key: String) throws { try put(value, key: "ui.\(key)") }
 
+    func remove(key: String) throws {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "DELETE FROM kv WHERE key=?", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, key)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.stepFailed }
+        protectDatabaseFiles()
+    }
+
     func upsertMessages(_ messages: [ChatMessage]) throws {
         guard !messages.isEmpty else { return }
         let sql = "INSERT OR REPLACE INTO messages(id,session_id,sequence,created_at,json) VALUES(?,?,?,?,?)"

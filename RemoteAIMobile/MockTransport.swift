@@ -1,6 +1,10 @@
 import Foundation
 
-enum MockScenario: String, CaseIterable { case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend, duplicateEvent, sequenceGap, offline }
+enum MockScenario: String, CaseIterable {
+    case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
+    case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
+    case duplicateEvent, sequenceGap, offline
+}
 
 actor MockTransport: Transport {
     private var connected = false
@@ -15,6 +19,10 @@ actor MockTransport: Transport {
     private var webProjects: [WebProjectDescriptor] = []
     private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
+    private var commandAttempts: [String: Int] = [:]
+    private var executionDelayNanoseconds: UInt64 = 0
+    private var responseDelayNanoseconds: [String: UInt64] = [:]
+    private var finishedAttachmentData: [String: Data] = [:]
 
     private let machineId = "my-pc"
     private let runtimes: [ServerRuntime]
@@ -73,6 +81,17 @@ actor MockTransport: Transport {
 
     var isConnected: Bool { connected }
     func setScenario(_ value: MockScenario) { scenario = value }
+    func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
+    func setResponseDelay(action: String, nanoseconds: UInt64) { responseDelayNanoseconds[action] = nanoseconds }
+    func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
+    func projectCount() -> Int { webProjects.count }
+    func projectConversationCount(_ alias: String) -> Int { webProjectConversations[alias, default: []].count }
+    func userMessageCount(sessionId: String, text: String) -> Int {
+        history[sessionId, default: []].filter { $0.role == "user" && $0.content == text }.count
+    }
+    func attachmentData(id: String) -> Data? { finishedAttachmentData[id] }
+    func finishedAttachmentCount() -> Int { finishedAttachmentData.count }
+    func finishedAttachmentPayloads() -> [Data] { Array(finishedAttachmentData.values) }
     func connect() async throws { guard scenario != .offline else { throw TransportError.offline }; connected = true }
     func disconnect() async { connected = false }
 
@@ -87,6 +106,8 @@ actor MockTransport: Transport {
 
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
         try ProtocolSecurity.validate(command, expectedMachineId: machineId)
+        commandAttempts[command.action, default: 0] += 1
+        if executionDelayNanoseconds > 0 { try? await Task.sleep(nanoseconds: executionDelayNanoseconds) }
         if let prior = processedCommands[command.commandId] {
             return CommandResponseEnvelope(ok: prior.ok, result: prior.result, error: prior.error, idempotentReplay: true)
         }
@@ -172,6 +193,7 @@ actor MockTransport: Transport {
                 break
             }
             let descriptor = RemoteAttachmentDescriptor(attachmentId: "attachment-\(UUID().uuidString.lowercased())", name: upload.name, contentType: upload.contentType, sizeBytes: upload.sizeBytes, sha256: String(repeating: "0", count: 64))
+            finishedAttachmentData[descriptor.attachmentId] = upload.data
             response = try success(descriptor)
         case "discardAttachmentUpload":
             if let uploadId = command.payload["uploadId"]?.stringValue { attachmentUploads.removeValue(forKey: uploadId) }
@@ -224,7 +246,16 @@ actor MockTransport: Transport {
             response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "INVALID_COMMAND", message: "Unsupported mock action", retryable: false, details: nil), idempotentReplay: nil)
         }
         processedCommands[command.commandId] = response
-        if scenario == .disconnectImmediatelyAfterSend {
+        if let delay = responseDelayNanoseconds[command.action], delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+        if scenario == .disconnectImmediatelyAfterSend, command.action == "sendMessage" {
+            connected = false
+            throw TransportError.disconnected
+        }
+        if scenario == .disconnectAfterAttachmentChunk, command.action == "uploadAttachmentChunk" {
+            connected = false
+            throw TransportError.disconnected
+        }
+        if scenario == .disconnectAfterCreateProject, command.action == "createProject" {
             connected = false
             throw TransportError.disconnected
         }

@@ -363,6 +363,261 @@ final class RemoteAIMobileTests: XCTestCase {
         reader.cancel()
     }
 
+    func testDerivedCommandIdsAreStableAndSeparatedByStep() {
+        let parent = UUID(uuidString: "11111111-2222-4333-8444-555555555555")!
+        let beginA = RemoteCommand.derivedCommandId(namespace: parent, label: "attachment:0:begin")
+        let beginB = RemoteCommand.derivedCommandId(namespace: parent, label: "attachment:0:begin")
+        let chunk = RemoteCommand.derivedCommandId(namespace: parent, label: "attachment:0:chunk:0")
+        XCTAssertEqual(beginA, beginB)
+        XCTAssertNotEqual(beginA, chunk)
+        XCTAssertNotEqual(beginA, parent)
+    }
+
+    @MainActor
+    func testWorkspaceCoalescesDuplicateInitializationAndLifecycleRace() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.setExecutionDelay(nanoseconds: 120_000_000)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+
+        async let first: Void = store.start()
+        async let second: Void = store.start()
+        _ = await (first, second)
+        let getStatusAttempts = await mock.actionAttemptCount("getStatus")
+        XCTAssertEqual(getStatusAttempts, 1, "Duplicate start must share one authenticated initialization")
+        XCTAssertEqual(store.machine.state, .online)
+
+        await store.suspend()
+        await mock.setExecutionDelay(nanoseconds: 220_000_000)
+        let starting = Task { await store.resumeFromForeground() }
+        try await Task.sleep(nanoseconds: 35_000_000)
+        await store.suspend()
+        await starting.value
+        XCTAssertEqual(store.machine.state, .offline, "A stale startup must not overwrite a later background suspend")
+        XCTAssertEqual(store.connectionPhase, .idle)
+
+        await mock.setExecutionDelay(nanoseconds: 0)
+        await store.resumeFromForeground()
+        XCTAssertEqual(store.machine.state, .online)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWorkspaceCoalescesRefreshAndDoubleCreateWithFinalServerState() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await mock.setExecutionDelay(nanoseconds: 140_000_000)
+
+        async let refreshA: Void = store.refreshWebProjects()
+        async let refreshB: Void = store.refreshWebProjects()
+        _ = await (refreshA, refreshB)
+        let listProjectAttempts = await mock.actionAttemptCount("listProjects")
+        XCTAssertEqual(listProjectAttempts, 1)
+        XCTAssertEqual(store.webProjects.count, 2)
+
+        async let createA = store.createWebProject(name: "Race Project")
+        async let createB = store.createWebProject(name: "Race Project")
+        let (createdA, createdB) = await (createA, createB)
+        let created = [createdA, createdB].compactMap { $0 }
+        XCTAssertEqual(created.count, 1)
+        let createProjectAttempts = await mock.actionAttemptCount("createProject")
+        let finalProjectCount = await mock.projectCount()
+        XCTAssertEqual(createProjectAttempts, 1)
+        XCTAssertEqual(finalProjectCount, 3, "Server state must contain exactly one newly created Project")
+        XCTAssertEqual(store.webProjects.filter { $0.displayName == "Race Project" }.count, 1)
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        async let conversationA = store.createWebConversation(projectAlias: "g-p-remoteai")
+        async let conversationB = store.createWebConversation(projectAlias: "g-p-remoteai")
+        let (conversationResultA, conversationResultB) = await (conversationA, conversationB)
+        let conversations = [conversationResultA, conversationResultB].compactMap { $0 }
+        XCTAssertEqual(conversations.count, 1)
+        let createConversationAttempts = await mock.actionAttemptCount("createConversation")
+        let finalConversationCount = await mock.projectConversationCount("g-p-remoteai")
+        XCTAssertEqual(createConversationAttempts, 1)
+        XCTAssertEqual(finalConversationCount, 2, "Server Project must gain exactly one conversation")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 2)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testStaleProjectAndConversationResponsesCannotOverwriteNewerMutations() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+
+        await mock.setResponseDelay(action: "listProjects", nanoseconds: 220_000_000)
+        let staleProjectRefresh = Task { await store.refreshWebProjects() }
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("listProjects") > 0 { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let createdProjectResult = await store.createWebProject(name: "Created During Stale Refresh")
+        let createdProject = try XCTUnwrap(createdProjectResult)
+        await staleProjectRefresh.value
+        let serverProjectCount = await mock.projectCount()
+        XCTAssertEqual(serverProjectCount, 3)
+        XCTAssertEqual(store.webProjects.filter { $0.projectAlias == createdProject.projectAlias }.count, 1)
+        XCTAssertEqual(store.webProjects.first?.projectAlias, createdProject.projectAlias, "A stale listProjects response must not erase the newly created Project")
+
+        await mock.setResponseDelay(action: "listProjects", nanoseconds: 0)
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 220_000_000)
+        let baselineAttempts = await mock.actionAttemptCount("listProjectConversations")
+        let staleConversationRefresh = Task { await store.loadProjectConversations(projectAlias: "g-p-remoteai") }
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("listProjectConversations") > baselineAttempts { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let createdConversationResult = await store.createWebConversation(projectAlias: "g-p-remoteai")
+        let createdConversation = try XCTUnwrap(createdConversationResult)
+        await staleConversationRefresh.value
+        let serverConversationCount = await mock.projectConversationCount("g-p-remoteai")
+        XCTAssertEqual(serverConversationCount, 2)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.filter { $0.id == createdConversation.id }.count, 1)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.first?.id, createdConversation.id, "A stale conversation page must not overwrite the newly created conversation")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testUnknownCreateProjectDeliveryReusesCommandAndDoesNotDuplicateServerProject() async throws {
+        let mock = MockTransport(scenario: .disconnectAfterCreateProject, historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+
+        let first = await store.createWebProject(name: "Idempotent Project")
+        XCTAssertNil(first)
+        let afterUnknown = await mock.projectCount()
+        XCTAssertEqual(afterUnknown, 3, "The first create side effect was committed before the response was lost")
+
+        await mock.setScenario(.normal)
+        try await mock.connect()
+        let secondResult = await store.createWebProject(name: "Idempotent Project")
+        let second = try XCTUnwrap(secondResult)
+        let finalCount = await mock.projectCount()
+        let createAttempts = await mock.actionAttemptCount("createProject")
+        XCTAssertEqual(finalCount, 3, "Retry must replay the same command instead of creating a second Project")
+        XCTAssertEqual(createAttempts, 2)
+        XCTAssertEqual(store.webProjects.filter { $0.projectAlias == second.projectAlias }.count, 1)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testAttachmentChunkDisconnectReplaysSameUploadWithoutDuplicatingBytes() async throws {
+        let mock = MockTransport(scenario: .disconnectAfterAttachmentChunk, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let operationId = UUID()
+        let payload = Data((0..<220_000).map { UInt8($0 % 251) })
+        let attachment = PendingAttachment(name: "large.bin", contentType: "application/octet-stream", data: payload)
+
+        let first = await store.send(text: "chunk-recovery", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", attachments: [attachment], commandId: operationId)
+        XCTAssertFalse(first)
+        XCTAssertEqual(store.commandStates[operationId], .unknown)
+        let interruptedFinishedCount = await mock.finishedAttachmentCount()
+        XCTAssertEqual(interruptedFinishedCount, 0, "Interrupted upload must not be finalized early")
+
+        await mock.setScenario(.normal)
+        try await mock.connect()
+        let second = await store.send(text: "chunk-recovery", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", attachments: [attachment], commandId: operationId)
+        XCTAssertTrue(second)
+        let finishedCount = await mock.finishedAttachmentCount()
+        let finishedPayloads = await mock.finishedAttachmentPayloads()
+        let serverUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "chunk-recovery")
+        XCTAssertEqual(finishedCount, 1)
+        XCTAssertEqual(finishedPayloads, [payload], "Chunk replay must converge to exactly the original bytes once")
+        XCTAssertEqual(serverUserCount, 1)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testUnknownAttachmentDeliveryRetriesExactCommandWithoutDuplicateSideEffect() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .disconnectImmediatelyAfterSend, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let commandId = UUID()
+        let attachment = PendingAttachment(name: "proof.txt", contentType: "text/plain", data: Data("payload".utf8))
+
+        let sent = await store.send(text: "unknown-with-attachment", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", attachments: [attachment], commandId: commandId)
+        XCTAssertFalse(sent)
+        XCTAssertEqual(store.commandStates[commandId], .unknown)
+        let saved = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertEqual(saved?.commandId, commandId)
+        XCTAssertEqual(saved?.payload["attachmentIds"]?.arrayValue?.count, 1, "Retry payload must retain remote attachment IDs")
+        let initialServerUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "unknown-with-attachment")
+        XCTAssertEqual(initialServerUserCount, 1)
+
+        await mock.setScenario(.normal)
+        try await mock.connect()
+        let web = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(web)
+        let photo = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: web, instance: photo)
+        let optimistic = try XCTUnwrap(store.messagesBySession["photo-upload"]?.first(where: { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame }))
+        await store.retry(message: optimistic, runtimeId: "runtime.web", instanceId: "photo")
+
+        XCTAssertEqual(store.commandStates[commandId], .completed)
+        let sendAttempts = await mock.actionAttemptCount("sendMessage")
+        let finalServerUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "unknown-with-attachment")
+        XCTAssertEqual(sendAttempts, 2, "One initial attempt plus one idempotent replay is expected")
+        XCTAssertEqual(finalServerUserCount, 1, "Replay must not create a second server user message")
+        let pendingAfter: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertNil(pendingAfter)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testRestartReconcilesUnknownDeliveryFromAuthoritativeServerState() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let cache = try SQLiteStore(url: url)
+        let mock = MockTransport(scenario: .disconnectImmediatelyAfterSend, historyCount: 0)
+        let firstStore = WorkspaceStore(transport: mock, cache: cache)
+        await firstStore.start()
+        let commandId = UUID()
+        let firstSent = await firstStore.send(text: "restart-unknown", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
+        XCTAssertFalse(firstSent)
+        XCTAssertEqual(firstStore.commandStates[commandId], .unknown)
+        await firstStore.suspend()
+
+        await mock.setScenario(.normal)
+        let restored = WorkspaceStore(transport: mock, cache: cache)
+        await restored.start()
+        let web = try XCTUnwrap(restored.runtimes.first(where: { $0.id == "runtime.web" }))
+        await restored.refreshRuntime(web)
+        let photo = try XCTUnwrap(restored.instances.first(where: { $0.id == "photo" }))
+        await restored.refreshSessions(runtime: web, instance: photo)
+        await restored.loadSession("photo-upload")
+
+        XCTAssertEqual(restored.commandStates[commandId], .completed, "Remote history should resolve unknown delivery after restart")
+        let restartServerUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "restart-unknown")
+        XCTAssertEqual(restartServerUserCount, 1)
+        XCTAssertEqual(restored.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "restart-unknown" }.count, 1)
+        let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertNil(pending)
+        await restored.suspend()
+    }
+
+    @MainActor
+    func testDefiniteSendFailureRemovesOptimisticAndPendingState() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await mock.setScenario(.commandFailure)
+        let commandId = UUID()
+        let sent = await store.send(text: "definite-failure", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
+        XCTAssertFalse(sent)
+        XCTAssertEqual(store.commandStates[commandId], .failed)
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame })
+        let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertNil(pending)
+        let failedServerUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "definite-failure")
+        XCTAssertEqual(failedServerUserCount, 0, "HTTP/transport failure must not be mistaken for a committed server message")
+        await store.suspend()
+    }
+
     @MainActor
     func testWorkspaceStoreReconcilesOptimisticAndStreamingMessages() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")

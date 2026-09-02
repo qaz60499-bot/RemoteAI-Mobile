@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 struct RemoteAIConfig: Codable, Equatable {
     var relayBaseURL: URL
@@ -83,6 +84,19 @@ extension RemoteCommand {
     static func make(machineId: String, runtimeId: String, instanceId: String, sessionId: String? = nil, action: String, payload: [String: JSONValue] = [:], commandId: UUID = UUID()) -> RemoteCommand {
         RemoteCommand(protocolVersion: 1, commandId: commandId, machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: action, payload: payload, createdAt: Date())
     }
+
+    /// Stable child command IDs let a multi-step operation be replayed safely after a
+    /// timeout/disconnect without creating a second remote side effect.
+    static func derivedCommandId(namespace: UUID, label: String) -> UUID {
+        let seed = Data((namespace.uuidString.lowercased() + "|" + label).utf8)
+        let digest = SHA256.hash(data: seed)
+        var bytes = Array(digest.prefix(16))
+        bytes[6] = (bytes[6] & 0x0f) | 0x50
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
+        let hex = bytes.map { String(format: "%02x", $0) }.joined()
+        let text = "\(hex.prefix(8))-\(hex.dropFirst(8).prefix(4))-\(hex.dropFirst(12).prefix(4))-\(hex.dropFirst(16).prefix(4))-\(hex.dropFirst(20).prefix(12))"
+        return UUID(uuidString: text)!
+    }
 }
 
 extension Transport {
@@ -121,8 +135,8 @@ extension Transport {
         return try response.decode([ServerSession].self).map(\.descriptor)
     }
 
-    func createSession(machineId: String, runtimeId: String, instanceId: String, payload: [String: JSONValue]) async throws -> SessionDescriptor? {
-        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, action: "createSession", payload: payload)
+    func createSession(machineId: String, runtimeId: String, instanceId: String, payload: [String: JSONValue], commandId: UUID = UUID()) async throws -> SessionDescriptor? {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, action: "createSession", payload: payload, commandId: commandId)
         let response = try await requireSuccess(execute(command))
         return try? response.decode(ServerSession.self).descriptor
     }
@@ -145,22 +159,23 @@ extension Transport {
         return try response.decode(WebProjectConversationPage.self)
     }
 
-    func createWebProject(machineId: String, projectName: String) async throws -> WebProjectDescriptor {
+    func createWebProject(machineId: String, projectName: String, commandId: UUID = UUID()) async throws -> WebProjectDescriptor {
         let command = RemoteCommand.make(
             machineId: machineId,
             runtimeId: "runtime.web",
             instanceId: "web.chatgpt",
             action: "createProject",
-            payload: ["projectName": .string(projectName)]
+            payload: ["projectName": .string(projectName)],
+            commandId: commandId
         )
         let response = try await requireSuccess(execute(command))
         return try response.decode(WebProjectDescriptor.self)
     }
 
-    func createWebConversation(machineId: String, projectAlias: String? = nil) async throws -> WebConversationDescriptor {
+    func createWebConversation(machineId: String, projectAlias: String? = nil, commandId: UUID = UUID()) async throws -> WebConversationDescriptor {
         var payload: [String: JSONValue] = [:]
         if let projectAlias { payload["projectAlias"] = .string(projectAlias) }
-        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "createConversation", payload: payload)
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "createConversation", payload: payload, commandId: commandId)
         let response = try await requireSuccess(execute(command))
         return try response.decode(WebConversationDescriptor.self)
     }
@@ -170,7 +185,7 @@ extension Transport {
         _ = try await requireSuccess(execute(command))
     }
 
-    func uploadAttachment(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachment: PendingAttachment) async throws -> RemoteAttachmentDescriptor {
+    func uploadAttachment(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachment: PendingAttachment, operationId: UUID = UUID(), attachmentIndex: Int = 0) async throws -> RemoteAttachmentDescriptor {
         let begin = RemoteCommand.make(
             machineId: machineId,
             runtimeId: runtimeId,
@@ -181,7 +196,8 @@ extension Transport {
                 "name": .string(attachment.name),
                 "contentType": .string(attachment.contentType),
                 "sizeBytes": .number(Double(attachment.sizeBytes))
-            ]
+            ],
+            commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "attachment:\(attachmentIndex):begin")
         )
         let ticket = try await requireSuccess(execute(begin)).decode(AttachmentUploadTicket.self)
         let chunkSize = max(16 * 1024, min(ticket.chunkBytes, 128 * 1024))
@@ -202,7 +218,8 @@ extension Transport {
                         "uploadId": .string(ticket.uploadId),
                         "index": .number(Double(index)),
                         "dataBase64": .string(chunk.base64EncodedString())
-                    ]
+                    ],
+                    commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "attachment:\(attachmentIndex):chunk:\(index)")
                 )
                 _ = try await requireSuccess(execute(command))
                 index += 1
@@ -214,19 +231,27 @@ extension Transport {
                 instanceId: instanceId,
                 sessionId: sessionId,
                 action: "finishAttachmentUpload",
-                payload: ["uploadId": .string(ticket.uploadId)]
+                payload: ["uploadId": .string(ticket.uploadId)],
+                commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "attachment:\(attachmentIndex):finish")
             )
             return try await requireSuccess(execute(finish)).decode(RemoteAttachmentDescriptor.self)
         } catch {
-            let discard = RemoteCommand.make(
-                machineId: machineId,
-                runtimeId: runtimeId,
-                instanceId: instanceId,
-                sessionId: sessionId,
-                action: "discardAttachmentUpload",
-                payload: ["uploadId": .string(ticket.uploadId)]
-            )
-            _ = try? await execute(discard)
+            let keepForReplay: Bool = {
+                guard let transportError = error as? TransportError else { return false }
+                return transportError == .timeout || transportError == .disconnected || transportError == .offline
+            }()
+            if !keepForReplay {
+                let discard = RemoteCommand.make(
+                    machineId: machineId,
+                    runtimeId: runtimeId,
+                    instanceId: instanceId,
+                    sessionId: sessionId,
+                    action: "discardAttachmentUpload",
+                    payload: ["uploadId": .string(ticket.uploadId)],
+                    commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "attachment:\(attachmentIndex):discard")
+                )
+                _ = try? await execute(discard)
+            }
             throw error
         }
     }

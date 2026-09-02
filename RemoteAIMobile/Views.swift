@@ -283,6 +283,7 @@ struct ChatView: View {
     @State private var attachmentError: String?
     @State private var sending = false
     @State private var sendTask: Task<Void, Never>?
+    @State private var composerCommandId: UUID?
     @State private var selectedCodexModel = ""
     @FocusState private var focused: Bool
 
@@ -299,7 +300,9 @@ struct ChatView: View {
                         if loadingOlder { ProgressView().padding(.vertical, 6) }
                         ForEach(messages) { message in
                             let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
-                            let retryable = message.kind == .error || commandState == .failed || commandState == .unknown
+                            // Definite failures restore the composer and use a new operation.
+                            // Only unknown delivery is replayed with the original command ID.
+                            let retryable = message.kind == .error || commandState == .unknown
                             MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil).id(message.id)
                         }
                     }.padding(.horizontal, 12).padding(.vertical, 10)
@@ -356,18 +359,33 @@ struct ChatView: View {
                     send: {
                         let text = input
                         let attachments = pendingAttachments
+                        let commandId = composerCommandId ?? UUID()
                         focused = false
                         input = ""
                         pendingAttachments.removeAll()
                         sending = true
                         sendTask = Task {
-                            let sent = await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, attachments: attachments, model: runtime.kind == .codex ? selectedCodexModel : "")
+                            let sent = await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, attachments: attachments, model: runtime.kind == .codex ? selectedCodexModel : "", commandId: commandId)
                             await MainActor.run {
                                 sending = false
                                 sendTask = nil
-                                guard !sent else { return }
+                                if sent {
+                                    composerCommandId = nil
+                                    return
+                                }
+                                let state = store.commandStates[commandId]
+                                let hasOptimisticMessage = store.messagesBySession[session.id, default: []].contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame }
+                                if state == .unknown && hasOptimisticMessage {
+                                    // The final send may already have happened remotely. Keep the
+                                    // composer empty; the message-row Retry replays exactly once.
+                                    composerCommandId = nil
+                                    return
+                                }
                                 if input.isEmpty { input = text }
                                 if pendingAttachments.isEmpty { pendingAttachments = attachments }
+                                // If only attachment transfer was interrupted, there is no remote
+                                // message yet. Reusing this ID also reuses deterministic upload IDs.
+                                composerCommandId = state == .unknown ? commandId : nil
                             }
                         }
                     }
