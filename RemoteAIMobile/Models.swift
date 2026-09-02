@@ -34,11 +34,16 @@ struct CloudCodeProviderOption: Codable, Identifiable, Hashable {
     let defaultModel: String?
     let custom: Bool
     let requiresApiKey: Bool
+    var credentialMode: String? = nil
 }
 
 struct CloudCodeCredentialOption: Codable, Identifiable, Hashable {
     let id: String
     let label: String
+    var providerId: String? = nil
+    var slot: Int? = nil
+    var managedBy: String? = nil
+    var secretExposed: Bool? = nil
 }
 
 struct CloudCodeCatalog: Codable, Hashable {

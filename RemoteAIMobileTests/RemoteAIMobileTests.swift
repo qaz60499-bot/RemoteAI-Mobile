@@ -208,12 +208,15 @@ final class RemoteAIMobileTests: XCTestCase {
         let catalog = CloudCodeCatalog(
             providers: [
                 CloudCodeProviderOption(id: "current", label: "Current", models: ["default"], defaultModel: "default", custom: false, requiresApiKey: false),
+                CloudCodeProviderOption(id: "seekai", label: "SeekAI", models: ["claude-sonnet-5"], defaultModel: "claude-sonnet-5", custom: false, requiresApiKey: true, credentialMode: "local-relay-slot"),
+                CloudCodeProviderOption(id: "tabitoken", label: "Tabitoken", models: ["claude-opus-5"], defaultModel: "claude-opus-5", custom: false, requiresApiKey: true, credentialMode: "local-relay-slot"),
                 CloudCodeProviderOption(id: "anthropic", label: "Anthropic", models: ["sonnet", "opus"], defaultModel: "sonnet", custom: false, requiresApiKey: true),
                 CloudCodeProviderOption(id: "custom", label: "Custom", models: [], defaultModel: nil, custom: true, requiresApiKey: true)
             ],
             credentialProfiles: [
-                CloudCodeCredentialOption(id: "work", label: "work"),
-                CloudCodeCredentialOption(id: "backup", label: "backup")
+                CloudCodeCredentialOption(id: "seekai-slot-1", label: "Key 1", providerId: "seekai", slot: 1, managedBy: "windows-local-relay", secretExposed: false),
+                CloudCodeCredentialOption(id: "tabitoken-slot-1", label: "Key 1", providerId: "tabitoken", slot: 1, managedBy: "windows-local-relay", secretExposed: false),
+                CloudCodeCredentialOption(id: "work", label: "work")
             ],
             defaultProviderId: "anthropic",
             defaultCredentialProfileId: "work",
@@ -234,8 +237,11 @@ final class RemoteAIMobileTests: XCTestCase {
         let descriptor = server.descriptor
         XCTAssertEqual(descriptor.subtitle, "D:\\wendangcodex\\RemoteAI")
         let decoded = try XCTUnwrap(descriptor.cloudCodeCatalog)
-        XCTAssertEqual(decoded.providers.map(\.id), ["current", "anthropic", "custom"])
-        XCTAssertEqual(decoded.credentialProfiles.map(\.id), ["work", "backup"])
+        XCTAssertEqual(decoded.providers.map(\.id), ["current", "seekai", "tabitoken", "anthropic", "custom"])
+        XCTAssertEqual(decoded.credentialProfiles.map(\.id), ["seekai-slot-1", "tabitoken-slot-1", "work"])
+        XCTAssertEqual(decoded.providers.first(where: { $0.id == "seekai" })?.credentialMode, "local-relay-slot")
+        XCTAssertEqual(decoded.credentialProfiles.first(where: { $0.id == "seekai-slot-1" })?.providerId, "seekai")
+        XCTAssertEqual(decoded.credentialProfiles.first(where: { $0.id == "seekai-slot-1" })?.slot, 1)
         XCTAssertEqual(decoded.defaultProviderId, "anthropic")
         XCTAssertEqual(decoded.defaultCredentialProfileId, "work")
         XCTAssertTrue(decoded.supportsNewCredential)

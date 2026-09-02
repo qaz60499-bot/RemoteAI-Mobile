@@ -598,6 +598,17 @@ struct NewSessionView: View {
         catalog.providers.first { $0.id == providerId }
     }
 
+    private var credentialOptions: [CloudCodeCredentialOption] {
+        let exact = catalog.credentialProfiles.filter { $0.providerId == providerId }
+        if !exact.isEmpty { return exact }
+        if providerId == "current" { return [] }
+        return catalog.credentialProfiles.filter { $0.providerId == nil }
+    }
+
+    private var allowsNewCredential: Bool {
+        catalog.supportsNewCredential && selectedProvider?.credentialMode != "local-relay-slot"
+    }
+
     private var modelOptions: [String] {
         let models = selectedProvider?.models ?? []
         return models.isEmpty ? ["__custom__"] : models + ["__custom__"]
@@ -648,8 +659,8 @@ struct NewSessionView: View {
                     Section("Key") {
                         Picker("Credential", selection: $credentialProfileId) {
                             Text("使用 Cloud Code 当前登录 / 环境").tag("")
-                            ForEach(catalog.credentialProfiles) { option in Text(option.label).tag(option.id) }
-                            if catalog.supportsNewCredential { Text("新增 Key…").tag("__new__") }
+                            ForEach(credentialOptions) { option in Text(option.label).tag(option.id) }
+                            if allowsNewCredential { Text("新增 Key…").tag("__new__") }
                         }
                         if credentialProfileId == "__new__" {
                             TextField("Key 名称", text: $newCredentialProfileId)
@@ -689,6 +700,11 @@ struct NewSessionView: View {
             .onChange(of: providerId) { newValue in
                 if let provider = catalog.providers.first(where: { $0.id == newValue }) {
                     model = provider.defaultModel ?? (provider.models.first ?? "__custom__")
+                }
+                if credentialProfileId == "__new__" && !allowsNewCredential {
+                    credentialProfileId = ""
+                } else if !credentialProfileId.isEmpty && credentialProfileId != "__new__" && !credentialOptions.contains(where: { $0.id == credentialProfileId }) {
+                    credentialProfileId = ""
                 }
             }
             .toolbar {
