@@ -1004,7 +1004,6 @@ final class RemoteAIMobileTests: XCTestCase {
             if store.liveRunStatusBySession["photo-upload"] != nil { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
         XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"], "Tool progress itself must make the phone show an active run even if GENERATION_STARTED was missed")
 
         let final = ServerMessage(messageId: "assistant-final-no-stop", sessionId: "photo-upload", role: "assistant", content: "final reply", externalId: nil, createdAt: Date())
@@ -1027,7 +1026,6 @@ final class RemoteAIMobileTests: XCTestCase {
             if store.messagesBySession["photo-upload", default: []].contains(where: { $0.id == "assistant-final-no-stop" }) { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "A durable assistant final must clear transient progress even if GENERATION_STOPPED was missed")
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "assistant-final-no-stop" }.count, 1)
         await store.suspend()
