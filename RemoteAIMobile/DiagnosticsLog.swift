@@ -12,6 +12,7 @@ final class DiagnosticsLog: ObservableObject {
     private let retention: TimeInterval = 3 * 24 * 60 * 60
     private let fileURL: URL
     private let iso = ISO8601DateFormatter()
+    private var persistWorkItem: DispatchWorkItem?
     private let forbiddenKeys = ["secret", "token", "password", "credential", "proof", "cipher", "message", "text", "content", "attachmentdata"]
 
     private init() {
@@ -43,7 +44,7 @@ final class DiagnosticsLog: ObservableObject {
         let line = "\(iso.string(from: Date())) \(level) \(safeEvent)\(safeFields.isEmpty ? "" : " \(safeFields)")"
         lines.append(line)
         pruneInMemory()
-        persist()
+        schedulePersist()
     }
 
     func copyToPasteboard() {
@@ -51,6 +52,8 @@ final class DiagnosticsLog: ObservableObject {
     }
 
     func clear() {
+        persistWorkItem?.cancel()
+        persistWorkItem = nil
         lines.removeAll()
         try? FileManager.default.removeItem(at: fileURL)
     }
@@ -74,6 +77,15 @@ final class DiagnosticsLog: ObservableObject {
 
     private func pruneInMemory() {
         if lines.count > maxLines { lines.removeFirst(lines.count - maxLines) }
+    }
+
+    private func schedulePersist() {
+        persistWorkItem?.cancel()
+        guard let data = lines.joined(separator: "\n").data(using: .utf8) else { return }
+        let url = fileURL
+        let work = DispatchWorkItem { try? data.write(to: url, options: .atomic) }
+        persistWorkItem = work
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(250), execute: work)
     }
 
     private func persist() {
