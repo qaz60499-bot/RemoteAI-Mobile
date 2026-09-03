@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      candidate_build:
+        description: "Build an installable candidate while skipping only the external live Relay pairing smoke"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -133,7 +139,7 @@ jobs:
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/protocol-security.log | tail -1
 
       - name: Live iOS Relay pairing challenge smoke
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && !inputs.candidate_build
         shell: bash
         run: |
           set -euo pipefail
