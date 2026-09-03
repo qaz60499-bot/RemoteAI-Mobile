@@ -492,6 +492,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
         let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.codex" }))
+        await store.refreshRuntime(runtime)
         let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "codex.6" }))
 
         await mock.setRequestDelay(action: "createSession", nanoseconds: 120_000_000)
