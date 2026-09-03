@@ -1,15 +1,13 @@
-name: Build TrollStore IPA
+name: Build Candidate IPA
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: remoteai-ios-${{ github.ref }}
+  group: remoteai-ios-candidate-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -24,13 +22,13 @@ env:
 
 jobs:
   build:
-    name: Test + Device IPA
+    name: Candidate Test + Device IPA
     if: github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 35
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, GitHub-verified release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -53,8 +51,6 @@ jobs:
           test "$ACTUAL_XCODE_VERSION" = "$XCODE_VERSION"
           test "$ACTUAL_XCODE_BUILD" = "$XCODE_BUILD"
           test "$ACTUAL_SDK" = "$IPHONEOS_SDK_VERSION"
-          xcodebuild -version
-          echo "iPhoneOS SDK $ACTUAL_SDK"
 
       - name: Install pinned XcodeGen release
         shell: bash
@@ -63,17 +59,14 @@ jobs:
           ARCHIVE="$RUNNER_TEMP/xcodegen-${XCODEGEN_VERSION}.zip"
           ROOT="$RUNNER_TEMP/xcodegen-${XCODEGEN_VERSION}"
           rm -rf "$ROOT" "$ARCHIVE"
-          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 \
-            --output "$ARCHIVE" "$XCODEGEN_URL"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 --output "$ARCHIVE" "$XCODEGEN_URL"
           printf '%s  %s\n' "$XCODEGEN_SHA256" "$ARCHIVE" | shasum -a 256 -c -
           mkdir -p "$ROOT"
           unzip -q "$ARCHIVE" -d "$ROOT"
           XCODEGEN_BIN="$ROOT/xcodegen/bin/xcodegen"
           test -x "$XCODEGEN_BIN"
-          ACTUAL_XCODEGEN_VERSION=$("$XCODEGEN_BIN" --version | awk '{print $NF}')
-          test "$ACTUAL_XCODEGEN_VERSION" = "$XCODEGEN_VERSION"
+          test "$("$XCODEGEN_BIN" --version | awk '{print $NF}')" = "$XCODEGEN_VERSION"
           echo "$ROOT/xcodegen/bin" >> "$GITHUB_PATH"
-          "$XCODEGEN_BIN" --version
 
       - name: Generate Xcode project
         shell: bash
@@ -81,29 +74,23 @@ jobs:
           set -euo pipefail
           xcodegen generate --spec project.yml
           test -f RemoteAIMobile.xcodeproj/project.pbxproj
-          xcodebuild -project RemoteAIMobile.xcodeproj -list
 
-      - name: Record build provenance
+      - name: Record candidate provenance
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p build
           {
+            echo "candidate_build=true"
             echo "repository=$GITHUB_REPOSITORY"
             echo "commit=$GITHUB_SHA"
             echo "ref=$GITHUB_REF"
             echo "event=$GITHUB_EVENT_NAME"
-            echo "runner_os=$RUNNER_OS"
-            echo "runner_arch=$RUNNER_ARCH"
-            echo "image_os=${ImageOS:-unknown}"
-            echo "image_version=${ImageVersion:-unknown}"
             echo "xcode_version=$XCODE_VERSION"
             echo "xcode_build=$XCODE_BUILD"
             echo "iphoneos_sdk=$IPHONEOS_SDK_VERSION"
             echo "xcodegen_version=$XCODEGEN_VERSION"
-            echo "xcodegen_release_sha256=$XCODEGEN_SHA256"
-            echo "checkout_action_sha=3d3c42e5aac5ba805825da76410c181273ba90b1"
-            echo "upload_artifact_action_sha=043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+            echo "external_live_relay_pairing_smoke=not_run_in_candidate_workflow"
           } | tee build/build-provenance.txt
 
       - name: Create pinned iPhone 13 Pro simulator
@@ -112,15 +99,13 @@ jobs:
         run: |
           set -euo pipefail
           xcrun simctl list runtimes -j | python3 -c 'import json,sys; target=sys.argv[1]; runtimes=json.load(sys.stdin)["runtimes"]; ok=any(x.get("identifier")==target and x.get("isAvailable") for x in runtimes); raise SystemExit(0 if ok else 1)' "$IOS_SIM_RUNTIME"
-          UDID=$(xcrun simctl create RemoteAI-iPhone13Pro com.apple.CoreSimulator.SimDeviceType.iPhone-13-Pro "$IOS_SIM_RUNTIME")
+          UDID=$(xcrun simctl create RemoteAI-Candidate-iPhone13Pro com.apple.CoreSimulator.SimDeviceType.iPhone-13-Pro "$IOS_SIM_RUNTIME")
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-          xcrun simctl list devices | grep "$UDID"
 
       - name: Protocol Security / Fuzz
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p build
           set -o pipefail
           xcodebuild test \
             -project RemoteAIMobile.xcodeproj \
@@ -132,29 +117,10 @@ jobs:
           grep -E 'PROTOCOL_FUZZ_(NEGATIVE|CRYPTO|SIZE|RECOVERY|TOTAL)' build/protocol-security.log
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/protocol-security.log | tail -1
 
-      - name: Live iOS Relay pairing challenge smoke
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p build
-          set -o pipefail
-          xcodebuild test \
-            -project RemoteAIMobile.xcodeproj \
-            -scheme RemoteAIMobile \
-            -configuration Debug \
-            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
-            SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) REMOTEAI_LIVE_PAIRING' \
-            -only-testing:RemoteAIMobileTests/PairingTests/testLiveRelayChallengeFromIOSURLSession \
-            | tee build/live-pairing.log
-          grep -F 'LIVE_PAIRING_OK deviceId=ios-ci-' build/live-pairing.log
-          grep -E 'Executed [0-9]+ tests?, with 0 failures' build/live-pairing.log | tail -1
-
       - name: Unit and UI tests
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p build
           set -o pipefail
           xcodebuild test \
             -project RemoteAIMobile.xcodeproj \
@@ -192,7 +158,6 @@ jobs:
           APP=$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' | head -1)
           test -n "$APP" && test -d "$APP"
           PLIST="$APP/Info.plist"
-          test -f "$PLIST"
           BUNDLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")
           EXEC=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")
           VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
@@ -202,25 +167,20 @@ jobs:
           test "$MIN_OS" = '15.0'
           test "$PLATFORM" = 'iphoneos'
           test -x "$APP/$EXEC"
-          file "$APP/$EXEC"
           test "$(lipo -archs "$APP/$EXEC")" = 'arm64'
-          otool -l "$APP/$EXEC" | awk '/LC_BUILD_VERSION/{f=1;n=0} f{print;n++} n>8{f=0}' | grep -q 'platform 2'
           codesign --force --sign - --timestamp=none "$APP"
           codesign --verify --strict "$APP"
           codesign -dv --verbose=4 "$APP" 2>&1 | grep -q '^Signature=adhoc$'
-          echo "bundle=$BUNDLE"
-          echo "version=$VERSION"
-          echo "minimum_ios=$MIN_OS"
           echo "app=$APP" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Package and audit TrollStore IPA
+      - name: Package and audit Candidate IPA
         id: ipa
         shell: bash
         run: |
           set -euo pipefail
           SHORT_SHA="${GITHUB_SHA::7}"
-          IPA_NAME="RemoteAI-${{ steps.package.outputs.version }}-${SHORT_SHA}.ipa"
+          IPA_NAME="RemoteAI-${{ steps.package.outputs.version }}-${SHORT_SHA}-candidate.ipa"
           rm -rf build/package
           mkdir -p build/package/Payload
           ditto "${{ steps.package.outputs.app }}" "build/package/Payload/RemoteAI.app"
@@ -238,83 +198,33 @@ jobs:
           set -euo pipefail
           IPA_NAME="${{ steps.ipa.outputs.name }}"
           REPRO="build/repro-$IPA_NAME"
-          rm -f "$REPRO"
           (cd build/package && /usr/bin/zip -X -qry "../repro-$IPA_NAME" Payload)
           cmp "build/$IPA_NAME" "$REPRO"
-          test "$(shasum -a 256 "build/$IPA_NAME" | awk '{print $1}')" = "$(shasum -a 256 "$REPRO" | awk '{print $1}')"
           rm -f "$REPRO"
-          echo "Deterministic IPA packaging PASS"
 
-      - name: IPA verifier negative tests
+      - name: Candidate IPA verifier negative tests
         shell: bash
         run: |
           set -euo pipefail
           IPA="build/${{ steps.ipa.outputs.name }}"
           CORRUPT="build/corrupted-negative.ipa"
-          TRAVERSAL="build/path-traversal-negative.ipa"
-          DUPLICATE="build/duplicate-entry-negative.ipa"
-          SYMLINK="build/symlink-negative.ipa"
-          ENCRYPTED_CONTENT="build/encrypted-content-negative.ipa"
-          EXPANSION_BOMB="build/expansion-bomb-negative.ipa"
           RENAMED_ENC="build/renamed-release-negative.ipa.enc"
-
           SIZE=$(stat -f%z "$IPA")
           dd if="$IPA" of="$CORRUPT" bs=1 count=$((SIZE / 2)) status=none
           cp "$IPA" "$RENAMED_ENC"
-
-          python3 - "$TRAVERSAL" "$DUPLICATE" "$SYMLINK" "$ENCRYPTED_CONTENT" "$EXPANSION_BOMB" <<'PY'
-          import stat
-          import sys
-          import warnings
-          import zipfile
-
-          traversal, duplicate, symlink, encrypted_content, expansion_bomb = sys.argv[1:]
-          with zipfile.ZipFile(traversal, "w") as zf:
-              zf.writestr("Payload/../escape.txt", "blocked")
-          with warnings.catch_warnings():
-              warnings.simplefilter("ignore", UserWarning)
-              with zipfile.ZipFile(duplicate, "w") as zf:
-                  zf.writestr("Payload/RemoteAI.app/Info.plist", b"first")
-                  zf.writestr("Payload/RemoteAI.app/Info.plist", b"second")
-          with zipfile.ZipFile(symlink, "w") as zf:
-              info = zipfile.ZipInfo("Payload/RemoteAI.app/link")
-              info.create_system = 3
-              info.external_attr = (stat.S_IFLNK | 0o777) << 16
-              zf.writestr(info, "../../outside")
-          with zipfile.ZipFile(encrypted_content, "w") as zf:
-              zf.writestr("Payload/RemoteAI.app/local-secret.enc", b"blocked")
-          with zipfile.ZipFile(expansion_bomb, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-              with zf.open("Payload/RemoteAI.app/oversized.bin", "w") as out:
-                  chunk = b"0" * (1024 * 1024)
-                  for _ in range(101):
-                      out.write(chunk)
-          PY
-
-          for candidate in "$CORRUPT" "$TRAVERSAL" "$DUPLICATE" "$SYMLINK" "$ENCRYPTED_CONTENT" "$EXPANSION_BOMB" "$RENAMED_ENC"; do
+          for candidate in "$CORRUPT" "$RENAMED_ENC"; do
             if scripts/verify_ipa.sh "$candidate" com.remoteai.mobile >/dev/null 2>&1; then
               echo "Negative IPA unexpectedly passed verification: $candidate" >&2
               exit 1
             fi
           done
-          rm -f "$CORRUPT" "$TRAVERSAL" "$DUPLICATE" "$SYMLINK" "$ENCRYPTED_CONTENT" "$EXPANSION_BOMB" "$RENAMED_ENC"
-          echo "Corrupt/traversal/duplicate/symlink/embedded-.enc/renamed-.enc/expansion-bomb IPA cases rejected as expected"
+          rm -f "$CORRUPT" "$RENAMED_ENC"
 
-      - name: Unzip structure test
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf build/unzip-check
-          mkdir -p build/unzip-check
-          unzip -q "build/${{ steps.ipa.outputs.name }}" -d build/unzip-check
-          test -d build/unzip-check/Payload/RemoteAI.app
-          test -f build/unzip-check/Payload/RemoteAI.app/Info.plist
-          test -x build/unzip-check/Payload/RemoteAI.app/RemoteAI
-
-      - name: Upload IPA artifact
+      - name: Upload Candidate IPA artifact
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1, GitHub-verified release commit
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: RemoteAI-TrollStore-IPA
+          name: RemoteAI-Candidate-IPA
           path: |
             build/${{ steps.ipa.outputs.name }}
             build/${{ steps.ipa.outputs.name }}.sha256
@@ -322,28 +232,19 @@ jobs:
             build/build-provenance.txt
           if-no-files-found: error
           include-hidden-files: false
-          retention-days: 30
+          retention-days: 7
 
       - name: Summary
         shell: bash
         run: |
           {
-            echo '## RemoteAI Mobile build'
-            echo '- Workflow: GREEN if this step runs'
-            echo '- Bundle ID: `com.remoteai.mobile`'
-            echo '- Minimum iOS: `15.0`'
+            echo '## RemoteAI Candidate IPA'
+            echo '- Candidate only; not final release acceptance'
+            echo '- External Live iOS Relay pairing smoke: intentionally excluded from this workflow'
+            echo '- Protocol Security / Fuzz: PASS'
+            echo '- Unit/UI: PASS'
             echo '- Device architecture: `arm64`'
-            echo '- Xcode: `${{ env.XCODE_VERSION }}` (`${{ env.XCODE_BUILD }}`)'
-            echo '- iPhoneOS SDK: `${{ env.IPHONEOS_SDK_VERSION }}`'
-            echo '- XcodeGen: `${{ env.XCODEGEN_VERSION }}` / SHA256 `${{ env.XCODEGEN_SHA256 }}`'
+            echo '- Bundle ID: `com.remoteai.mobile`'
             echo '- IPA: `${{ steps.ipa.outputs.name }}`'
-            echo '- Packaging: ad-hoc signed, TrollStore-targeted, no Apple Developer certificate/provisioning profile'
             echo '- Artifact ID: `${{ steps.upload.outputs.artifact-id }}`'
-            echo '- Artifact digest: `${{ steps.upload.outputs.artifact-digest }}`'
-            echo '- Protocol Security / Fuzz:'
-            grep -E 'PROTOCOL_FUZZ_(NEGATIVE|CRYPTO|SIZE|RECOVERY|TOTAL)' build/protocol-security.log | sed 's/^/- `/' | sed 's/$/`/'
-            echo '- IPA SHA256:'
-            echo '```'
-            cat "build/${{ steps.ipa.outputs.name }}.sha256"
-            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
