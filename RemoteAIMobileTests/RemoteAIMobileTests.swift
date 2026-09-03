@@ -553,7 +553,8 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
         let refreshProjectTask = Task { await store.refreshWebProjects() }
-        let createdProject = try XCTUnwrap(await createProjectTask.value)
+        let createdProjectResult = await createProjectTask.value
+        let createdProject = try XCTUnwrap(createdProjectResult)
         await refreshProjectTask.value
         XCTAssertEqual(store.webProjects.filter { $0.projectAlias == createdProject.projectAlias }.count, 1)
         XCTAssertEqual(store.webProjects.first?.projectAlias, createdProject.projectAlias, "A refresh launched during create must be invalidated by the create commit epoch")
@@ -570,7 +571,8 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
         let refreshConversationTask = Task { await store.loadProjectConversations(projectAlias: "g-p-remoteai") }
-        let createdConversation = try XCTUnwrap(await createConversationTask.value)
+        let createdConversationResult = await createConversationTask.value
+        let createdConversation = try XCTUnwrap(createdConversationResult)
         await refreshConversationTask.value
         XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.filter { $0.id == createdConversation.id }.count, 1)
         XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.first?.id, createdConversation.id, "A refresh launched during create must not erase the committed conversation")
