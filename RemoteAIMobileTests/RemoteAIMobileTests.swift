@@ -977,6 +977,63 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testToolProgressAndFinalAssistantConvergeEvenWhenGenerationBoundaryEventsAreMissing() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        let toolStarted = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("tool-live"), "name": .string("web_search"), "summary": .string("Searching the web")]),
+                "summary": .string("Searching the web")
+            ],
+            createdAt: Date()
+        )
+        await mock.injectEvent(toolStarted, deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.liveRunStatusBySession["photo-upload"] != nil { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"], "Tool progress itself must make the phone show an active run even if GENERATION_STARTED was missed")
+
+        let final = ServerMessage(messageId: "assistant-final-no-stop", sessionId: "photo-upload", role: "assistant", content: "final reply", externalId: nil, createdAt: Date())
+        let finalPayload = try XCTUnwrap(try JSONValue.encode(final).objectValue)
+        let messageAdded = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1202,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: finalPayload,
+            createdAt: Date()
+        )
+        await mock.injectEvent(messageAdded, deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.messagesBySession["photo-upload", default: []].contains(where: { $0.id == "assistant-final-no-stop" }) { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "A durable assistant final must clear transient progress even if GENERATION_STOPPED was missed")
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "assistant-final-no-stop" }.count, 1)
+        await store.suspend()
+    }
+
+    @MainActor
     func testWorkspaceStoreReconcilesOptimisticAndStreamingMessages() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
         let db = try SQLiteStore(url: url)

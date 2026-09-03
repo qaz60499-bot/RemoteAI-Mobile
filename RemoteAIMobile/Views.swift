@@ -356,7 +356,11 @@ struct ChatView: View {
     private var currentSessionState: SessionState {
         store.sessions.first(where: { $0.id == session.id })?.state ?? session.state
     }
-    private var isGenerating: Bool { currentSessionState == .busy || currentSessionState == .waiting }
+    private var isGenerating: Bool {
+        currentSessionState == .busy
+            || currentSessionState == .waiting
+            || store.liveRunStatusBySession[session.id] != nil
+    }
     var body: some View {
         VStack(spacing: 0) {
             if let error = store.errors[session.id] { ErrorBanner(text: error) { store.clearError(sessionId: session.id) } }

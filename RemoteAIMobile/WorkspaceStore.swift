@@ -1378,12 +1378,22 @@ final class WorkspaceStore: ObservableObject {
             let id = event.payload["messageId"]?.stringValue ?? streamingBuffers[sessionId]?.id ?? "stream-\(sessionId)"
             bufferStreaming(sessionId: sessionId, id: id, content: content, sequence: event.sequence)
             if event.payload["partial"]?.boolValue != false {
+                // A transient event can arrive even when GENERATION_STARTED was lost in
+                // transit. Treat streaming content itself as proof that the run is busy
+                // so the progress strip remains visible on the phone.
+                setSessionState(sessionId, .busy)
                 liveRunStatusBySession[sessionId] = processStatusLabel(for: content)
             }
         case "MESSAGE_ADDED":
             if let server = try? JSONValue.object(event.payload).decode(ServerMessage.self) {
                 let base = server.chatMessage
-                if base.role == .assistant { discardStreamingPlaceholder(sessionId: sessionId) }
+                if base.role == .assistant {
+                    discardStreamingPlaceholder(sessionId: sessionId)
+                    // MESSAGE_ADDED is the durable final boundary. Converge the visible
+                    // run state even if the following GENERATION_STOPPED event is lost.
+                    setSessionState(sessionId, .idle)
+                    liveRunStatusBySession.removeValue(forKey: sessionId)
+                }
                 if base.role == .user { await reconcileOptimisticUserEcho(base, sessionId: sessionId) }
                 let message = ChatMessage(id: base.id, sessionId: base.sessionId, sequence: event.sequence, role: base.role, kind: base.kind, text: base.text, toolName: nil, toolStatus: nil, detail: nil, createdAt: base.createdAt)
                 merge([message], into: sessionId)
@@ -1391,6 +1401,7 @@ final class WorkspaceStore: ObservableObject {
             }
         case "TOOL_STARTED", "TOOL_FINISHED":
             let completed = event.type == "TOOL_FINISHED"
+            if !completed { setSessionState(sessionId, .busy) }
             let toolValue = event.payload["tool"]
             let toolObject = toolValue?.objectValue
             let rawToolName = toolValue?.stringValue ?? toolObject?["name"]?.stringValue ?? toolObject?["type"]?.stringValue ?? "Tool"
