@@ -445,7 +445,8 @@ final class RemoteAIMobileTests: XCTestCase {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
-        XCTAssertEqual(try await cache.lastSequence(), 1200)
+        let initialSequence = try await cache.lastSequence()
+        XCTAssertEqual(initialSequence, 1200)
 
         let invalid = RemoteEvent(
             protocolVersion: 1,
@@ -479,7 +480,8 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertNotNil(store.errors["sync"], "Delta replay must fail closed when an event belongs to another machine")
-        XCTAssertEqual(try await cache.lastSequence(), 1200, "Invalid replay events must not advance the durable sequence cursor")
+        let replaySequence = try await cache.lastSequence()
+        XCTAssertEqual(replaySequence, 1200, "Invalid replay events must not advance the durable sequence cursor")
         await store.suspend()
     }
 
@@ -901,7 +903,8 @@ final class RemoteAIMobileTests: XCTestCase {
 
         XCTAssertTrue(results.0)
         XCTAssertTrue(results.1, "A repeated Stop tap must join the in-flight idempotent Stop instead of reporting a false failure")
-        XCTAssertEqual(await mock.actionAttemptCount("stopGeneration"), 1, "Concurrent Stop taps must produce exactly one remote Stop command")
+        let stopAttempts = await mock.actionAttemptCount("stopGeneration")
+        XCTAssertEqual(stopAttempts, 1, "Concurrent Stop taps must produce exactly one remote Stop command")
         await store.suspend()
     }
 
