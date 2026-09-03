@@ -491,11 +491,13 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.start()
 
         await store.refreshWebProjects()
+        await mock.setProjectConversationTitle(alias: "g-p-remoteai", conversationAlias: "mock-1", title: "ChatGPT deadbeef")
         await store.loadProjectConversations(projectAlias: "g-p-remoteai")
         let verifiedProjects = store.webProjects
         let verifiedConversations = store.projectConversationsByAlias["g-p-remoteai"] ?? []
         XCTAssertEqual(verifiedProjects.count, 2)
         XCTAssertEqual(verifiedConversations.count, 1)
+        XCTAssertEqual(verifiedConversations.first?.displayTitle, "ChatGPT deadbeef")
 
         await mock.setProjectConversationTitle(alias: "g-p-remoteai", conversationAlias: "mock-1", title: "Recovered real title")
         await mock.setScenario(.partialWebCatalog)
@@ -750,6 +752,10 @@ final class RemoteAIMobileTests: XCTestCase {
         let mock = MockTransport(historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
+        let webRuntime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(webRuntime)
+        let photoInstance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: webRuntime, instance: photoInstance)
         let stopped = await store.stop(runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload")
         XCTAssertTrue(stopped)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
