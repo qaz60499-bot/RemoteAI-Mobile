@@ -75,6 +75,7 @@ final class WorkspaceStore: ObservableObject {
     init(transport: Transport, cache: SQLiteStore) {
         self.transport = transport
         self.cache = cache
+        DiagnosticsLog.shared.record("store_initialized", fields: ["transport": String(describing: type(of: transport))])
     }
 
     static func makeDefault() -> WorkspaceStore {
@@ -142,6 +143,7 @@ final class WorkspaceStore: ObservableObject {
         installEventConsumer()
         machine.state = .connecting
         connectionPhase = .relayConnecting
+        DiagnosticsLog.shared.record("connection_start")
         do {
             pairingProgress?(.connectingRemoteAI)
             try await activeTransport.connect()
@@ -161,6 +163,7 @@ final class WorkspaceStore: ObservableObject {
             }
             machine.state = .online
             errors["connection"] = nil
+            DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence)])
             startConnectionMonitor()
 
             // Metadata is deliberately downstream of the online transition. A slow or
@@ -191,6 +194,7 @@ final class WorkspaceStore: ObservableObject {
         await transport.disconnect()
         machine.state = .offline
         connectionPhase = .idle
+        DiagnosticsLog.shared.record("connection_suspended")
     }
 
     func resumeFromForeground() async {
@@ -226,6 +230,7 @@ final class WorkspaceStore: ObservableObject {
         }
         guard machine.state == .online else {
             hasLoadedWebProjects = !webProjects.isEmpty
+            DiagnosticsLog.shared.record("projects_refresh_skipped_offline", fields: ["cachedCount": String(webProjects.count)], level: "WARN")
             return
         }
         do {
@@ -243,11 +248,13 @@ final class WorkspaceStore: ObservableObject {
                     webProjectsSnapshotState = .staleCache
                     hasLoadedWebProjects = true
                     errors["web.projects"] = "Showing the last verified Windows Project list while ChatGPT refreshes."
+                    DiagnosticsLog.shared.record("projects_refresh_stale", fields: ["count": String(response.items.count)], level: "WARN")
                     return
                 }
                 webProjectsSnapshotState = response.state ?? .providerUnavailable
                 hasLoadedWebProjects = !webProjects.isEmpty
                 errors["web.projects"] = "ChatGPT Projects are temporarily incomplete; keeping the last verified Project list."
+                DiagnosticsLog.shared.record("projects_refresh_incomplete", fields: ["cachedCount": String(webProjects.count), "state": String(describing: response.state)], level: "WARN")
                 return
             }
             // Preserve the authoritative DOM order from Windows. Sorting by cached
@@ -259,11 +266,13 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.put(webProjects, key: "web.projects")
             guard generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended else { return }
             errors["web.projects"] = nil
+            DiagnosticsLog.shared.record("projects_refresh_ok", fields: ["count": String(webProjects.count)])
         } catch {
             if generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended {
                 webProjectsSnapshotState = .providerUnavailable
                 hasLoadedWebProjects = !webProjects.isEmpty
                 errors["web.projects"] = error.localizedDescription
+                DiagnosticsLog.shared.record("projects_refresh_failed", fields: ["errorType": String(describing: type(of: error))], level: "ERROR")
             }
         }
     }
@@ -336,7 +345,14 @@ final class WorkspaceStore: ObservableObject {
                 projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
             }
         }
-        guard refresh, machine.state == .online else { return }
+        guard refresh else { return }
+        guard machine.state == .online else {
+            if projectConversationsByAlias[projectAlias, default: []].isEmpty {
+                errors["web.project.\(projectAlias)"] = "PC Offline — connect to Windows to load this Project's conversations."
+            }
+            DiagnosticsLog.shared.record("project_load_offline", fields: ["project": projectAlias, "cachedCount": String(projectConversationsByAlias[projectAlias, default: []].count)], level: "WARN")
+            return
+        }
         do {
             var page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
@@ -369,6 +385,7 @@ final class WorkspaceStore: ObservableObject {
                     projectHasMoreByAlias[projectAlias] = page.hasMore
                     mergeProjectSessions(page.items)
                     errors["web.project.\(projectAlias)"] = "Showing the last verified Windows conversation list while ChatGPT refreshes."
+                    DiagnosticsLog.shared.record("project_load_stale", fields: ["project": projectAlias, "count": String(page.items.count)], level: "WARN")
                     return
                 }
                 projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
@@ -380,6 +397,7 @@ final class WorkspaceStore: ObservableObject {
                     mergeProjectSessions(projectConversationsByAlias[projectAlias] ?? [])
                 }
                 errors["web.project.\(projectAlias)"] = "ChatGPT conversations are temporarily incomplete; keeping the last verified list."
+                DiagnosticsLog.shared.record("project_load_incomplete", fields: ["project": projectAlias, "state": String(describing: page.state), "observedCount": String(page.items.count)], level: "WARN")
                 return
             }
             projectConversationsByAlias[projectAlias] = page.items
@@ -393,10 +411,12 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended else { return }
             mergeProjectSessions(page.items)
             errors["web.project.\(projectAlias)"] = nil
+            DiagnosticsLog.shared.record("project_load_ok", fields: ["project": projectAlias, "count": String(page.items.count), "hasMore": String(page.hasMore)])
         } catch {
             if generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended {
                 projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
                 errors["web.project.\(projectAlias)"] = error.localizedDescription
+                DiagnosticsLog.shared.record("project_load_failed", fields: ["project": projectAlias, "errorType": String(describing: type(of: error))], level: "ERROR")
             }
         }
     }
@@ -593,6 +613,7 @@ final class WorkspaceStore: ObservableObject {
         defer { commandSendsInFlight.remove(commandId) }
         let generation = lifecycleGeneration
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        DiagnosticsLog.shared.record("send_begin", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "hasInput": String(!trimmed.isEmpty), "attachments": String(attachments.count), "commandId": commandId.uuidString])
         guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
         guard attachments.count <= 8, attachments.allSatisfy({ $0.sizeBytes > 0 && $0.sizeBytes <= 20 * 1024 * 1024 }) else {
             errors[sessionId] = "最多一次发送 8 个附件，每个附件不能超过 20MB。"
@@ -603,6 +624,7 @@ final class WorkspaceStore: ObservableObject {
             errors[sessionId] = attachments.isEmpty
                 ? "PC Offline — draft saved. Tap Send after reconnecting."
                 : "PC Offline — 附件需要连接 Windows 后才能上传。"
+            DiagnosticsLog.shared.record("send_offline", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString], level: "WARN")
             return false
         }
         let activeTransport = transport
@@ -656,6 +678,7 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             try? await cache.saveDraft("", sessionId: sessionId)
             if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = nil }
+            DiagnosticsLog.shared.record("send_ok", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "state": finalState.rawValue])
             return true
         } catch is CancellationError {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
@@ -672,6 +695,7 @@ final class WorkspaceStore: ObservableObject {
             errors[sessionId] = messageCommandPersisted
                 ? "Delivery is unknown after a disconnect/timeout. Use Retry on this message; it replays the exact same command ID and payload."
                 : "Attachment transfer was interrupted before message delivery was attempted. Retry from the composer reuses the same operation ID."
+            DiagnosticsLog.shared.record("send_unknown_delivery", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "persisted": String(messageCommandPersisted)], level: "WARN")
             return false
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
@@ -680,6 +704,7 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
             errors[sessionId] = error.localizedDescription
+            DiagnosticsLog.shared.record("send_failed", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "errorType": String(describing: type(of: error))], level: "ERROR")
             return false
         }
     }
@@ -1016,6 +1041,7 @@ final class WorkspaceStore: ObservableObject {
 
     private func applyConnectionFailure(_ error: Error) {
         machine.state = .offline
+        DiagnosticsLog.shared.record("connection_failure", fields: ["errorType": String(describing: type(of: error))], level: "ERROR")
         if let transportError = error as? TransportError {
             switch transportError {
             case .pairingRequired:

@@ -25,6 +25,7 @@ private extension View {
 struct RootView: View {
     @EnvironmentObject var store: WorkspaceStore
     @State private var showingPair = false
+    @State private var showingDiagnostics = false
     var body: some View {
         NavigationView {
             List {
@@ -68,11 +69,59 @@ struct RootView: View {
             .listStyle(.insetGrouped)
             .remoteAITopBreathingRoom()
             .navigationTitle("Remote AI")
-            .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button { showingPair = true } label: { Image(systemName: store.isPaired ? "checkmark.shield" : "qrcode.viewfinder") }.accessibilityLabel("Pair Device") } }
+            .toolbar {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    Button { showingDiagnostics = true } label: { Image(systemName: "doc.text.magnifyingglass") }.accessibilityLabel("Diagnostics Log")
+                    Button { showingPair = true } label: { Image(systemName: store.isPaired ? "checkmark.shield" : "qrcode.viewfinder") }.accessibilityLabel("Pair Device")
+                }
+            }
             .sheet(isPresented: $showingPair) { PairingView().environmentObject(store) }
+            .sheet(isPresented: $showingDiagnostics) { DiagnosticsView().environmentObject(store) }
         }.navigationViewStyle(.stack)
     }
     private func runtimeIcon(_ kind: RuntimeKind) -> String { switch kind { case .web: return "globe"; case .codex: return "terminal" } }
+}
+
+struct DiagnosticsView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var log = DiagnosticsLog.shared
+    @State private var copied = false
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    Label(store.machine.state.rawValue, systemImage: store.machine.state == .online ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    Text(store.connectionPhase.displayName)
+                    Spacer()
+                }
+                .font(.caption)
+                .padding()
+                Divider()
+                ScrollView {
+                    Text(log.text)
+                        .font(.system(.caption2, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding()
+                }
+            }
+            .navigationTitle("诊断日志")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } }
+                ToolbarItemGroup(placement: .confirmationAction) {
+                    Button("清空") { log.clear() }
+                    Button(copied ? "已复制" : "复制") {
+                        log.copyToPasteboard()
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct RuntimeView: View {
@@ -274,6 +323,10 @@ struct WebProjectView: View {
         .navigationTitle(project.displayName)
         .navigationBarTitleDisplayMode(.inline)
         .task { await store.loadProjectConversations(projectAlias: project.projectAlias) }
+        .onChange(of: store.machine.state) { state in
+            guard state == .online, rows.isEmpty else { return }
+            Task { await store.loadProjectConversations(projectAlias: project.projectAlias) }
+        }
         .refreshable { await store.loadProjectConversations(projectAlias: project.projectAlias) }
     }
 }

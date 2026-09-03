@@ -622,6 +622,51 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testUnseenProjectExplainsOfflineStateAndLoadsAfterReconnect() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-photo", count: 1)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await store.refreshWebProjects()
+
+        let cachedBefore: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-photo.conversations")
+        XCTAssertNil(cachedBefore, "The regression requires a Project the phone has never loaded before")
+
+        await store.suspend()
+        await store.loadProjectConversations(projectAlias: "g-p-photo")
+        XCTAssertTrue(store.projectConversationsByAlias["g-p-photo", default: []].isEmpty)
+        XCTAssertEqual(store.errors["web.project.g-p-photo"], "PC Offline — connect to Windows to load this Project's conversations.")
+
+        await store.resumeFromForeground()
+        XCTAssertEqual(store.machine.state, .online)
+        await store.loadProjectConversations(projectAlias: "g-p-photo")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-photo"]?.count, 1)
+        XCTAssertNil(store.errors["web.project.g-p-photo"])
+        let cachedAfter: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-photo.conversations")
+        XCTAssertEqual(cachedAfter?.count, 1, "The first authoritative live load should become the phone's last-known-good Project cache")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testDiagnosticsLogFiltersSensitiveFieldsAndKeepsSafeOperationalMetadata() throws {
+        let log = DiagnosticsLog.shared
+        log.clear()
+        log.record("send_failed", fields: [
+            "project": "g-p-safe",
+            "messageText": "TOP_SECRET_MESSAGE",
+            "accessToken": "TOP_SECRET_TOKEN",
+            "errorType": "TransportError"
+        ], level: "ERROR")
+        XCTAssertTrue(log.text.contains("send_failed"))
+        XCTAssertTrue(log.text.contains("project=g-p-safe"))
+        XCTAssertTrue(log.text.contains("errorType=TransportError"))
+        XCTAssertFalse(log.text.contains("TOP_SECRET_MESSAGE"))
+        XCTAssertFalse(log.text.contains("TOP_SECRET_TOKEN"))
+        log.clear()
+    }
+
+    @MainActor
     func testFreshPhoneBootstrapsFromWindowsLastKnownGoodWithoutPromotingItToAuthoritativeCache() async throws {
         let mock = MockTransport(historyCount: 1)
         await mock.setScenario(.staleWebCatalog)
