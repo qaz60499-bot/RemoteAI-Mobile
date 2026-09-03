@@ -43,7 +43,9 @@ final class WorkspaceStore: ObservableObject {
     // MainActor reentrancy means a second UI task can enter while the first request is
     // awaiting I/O. Keep per-operation gates at the Store boundary, not only in Views.
     private var refreshWebProjectsInFlight = false
+    private var refreshWebProjectsQueued = false
     private var projectConversationRefreshes = Set<String>()
+    private var projectConversationRefreshQueued = Set<String>()
     private var projectConversationPageLoads = Set<String>()
     private var runtimeRefreshes = Set<String>()
     private var sessionRefreshes = Set<String>()
@@ -210,9 +212,18 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func refreshWebProjects() async {
-        guard !refreshWebProjectsInFlight else { return }
+        if refreshWebProjectsInFlight {
+            refreshWebProjectsQueued = true
+            return
+        }
         refreshWebProjectsInFlight = true
-        defer { refreshWebProjectsInFlight = false }
+        defer {
+            refreshWebProjectsInFlight = false
+            if refreshWebProjectsQueued {
+                refreshWebProjectsQueued = false
+                Task { @MainActor [weak self] in await self?.refreshWebProjects() }
+            }
+        }
         let generation = lifecycleGeneration
         let revision = webProjectsRevision
         if webProjects.isEmpty,
@@ -320,7 +331,10 @@ final class WorkspaceStore: ObservableObject {
 
     func loadProjectConversations(projectAlias: String, refresh: Bool = true) async {
         if refresh {
-            guard projectConversationRefreshes.insert(projectAlias).inserted else { return }
+            guard projectConversationRefreshes.insert(projectAlias).inserted else {
+                projectConversationRefreshQueued.insert(projectAlias)
+                return
+            }
             projectConversationLoadingByAlias[projectAlias] = true
             // A full refresh supersedes any page-load already in flight for this Project.
             projectConversationRevisions[projectAlias, default: 0] &+= 1
@@ -329,6 +343,9 @@ final class WorkspaceStore: ObservableObject {
             if refresh {
                 projectConversationRefreshes.remove(projectAlias)
                 projectConversationLoadingByAlias[projectAlias] = false
+                if projectConversationRefreshQueued.remove(projectAlias) != nil {
+                    Task { @MainActor [weak self] in await self?.loadProjectConversations(projectAlias: projectAlias, refresh: true) }
+                }
             }
         }
         let generation = lifecycleGeneration
@@ -577,6 +594,7 @@ final class WorkspaceStore: ObservableObject {
             }
             try? await cache.upsertMessages(page.items)
             merge(page.items, into: sessionId)
+            await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
             hasMoreBySession[sessionId] = page.hasMore
             errors[sessionId] = nil
         } catch {
@@ -675,6 +693,11 @@ final class WorkspaceStore: ObservableObject {
             let finalState = try await activeTransport.send(command)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             commandStates[commandId] = finalState
+            // A confirmed browser send is not the end of synchronization. Immediately
+            // reconcile the authoritative event delta so a missed websocket user echo,
+            // generation/progress event, or fast assistant final cannot leave the phone stale.
+            await recoverDelta()
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             try? await cache.saveDraft("", sessionId: sessionId)
             if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = nil }
@@ -697,12 +720,31 @@ final class WorkspaceStore: ObservableObject {
                 : "Attachment transfer was interrupted before message delivery was attempted. Retry from the composer reuses the same operation ID."
             DiagnosticsLog.shared.record("send_unknown_delivery", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "persisted": String(messageCommandPersisted)], level: "WARN")
             return false
+        } catch let error as TransportError {
+            if case .remote(let code, let message) = error, code == "WEB_SEND_DELIVERY_UNKNOWN" {
+                guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+                attachmentTransferBySession.removeValue(forKey: sessionId)
+                commandStates[commandId] = .unknown
+                errors[sessionId] = "Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."
+                DiagnosticsLog.shared.record("send_unknown_delivery", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "remoteCode": code, "message": message], level: "WARN")
+                await recoverDelta()
+                return false
+            }
+            attachmentTransferBySession.removeValue(forKey: sessionId)
+            commandStates[commandId] = .failed
+            try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
+            await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
+            if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
+            errors[sessionId] = error.localizedDescription
+            DiagnosticsLog.shared.record("send_failed", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "errorType": String(describing: type(of: error))], level: "ERROR")
+            return false
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             attachmentTransferBySession.removeValue(forKey: sessionId)
             commandStates[commandId] = .failed
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
+            if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
             errors[sessionId] = error.localizedDescription
             DiagnosticsLog.shared.record("send_failed", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "errorType": String(describing: type(of: error))], level: "ERROR")
             return false
@@ -907,7 +949,9 @@ final class WorkspaceStore: ObservableObject {
         tracker = SequenceTracker()
         eventReplayGuard = BoundedReplayGuard(capacity: 8192)
         refreshWebProjectsInFlight = false
+        refreshWebProjectsQueued = false
         projectConversationRefreshes.removeAll()
+        projectConversationRefreshQueued.removeAll()
         projectConversationPageLoads.removeAll()
         runtimeRefreshes.removeAll()
         sessionRefreshes.removeAll()
@@ -965,7 +1009,9 @@ final class WorkspaceStore: ObservableObject {
 
     private func isUnknownDelivery(_ error: Error) -> Bool {
         guard let transportError = error as? TransportError else { return false }
-        return transportError == .disconnected || transportError == .timeout
+        if transportError == .disconnected || transportError == .timeout { return true }
+        if case .remote(let code, _) = transportError { return code == "WEB_SEND_DELIVERY_UNKNOWN" }
+        return false
     }
 
     private func removeOptimisticCommandMessage(commandId: UUID, sessionId: String) async {
@@ -1490,6 +1536,27 @@ final class WorkspaceStore: ObservableObject {
         var list = messagesBySession[sessionId, default: []]
         list.removeAll { $0.role == .assistant && ($0.toolStatus == "Streaming" || $0.id == "stream-\(sessionId)") }
         messagesBySession[sessionId] = list
+    }
+
+    private func settleRunStateIfAuthoritativeFinalExists(_ remote: [ChatMessage], sessionId: String) async {
+        guard let latestUserIndex = remote.lastIndex(where: { $0.role == .user }) else { return }
+        let suffixStart = remote.index(after: latestUserIndex)
+        guard suffixStart < remote.endIndex,
+              remote[suffixStart...].contains(where: { $0.role == .assistant && $0.kind == .text && $0.toolStatus != "Streaming" }) else { return }
+
+        discardStreamingPlaceholder(sessionId: sessionId)
+        liveRunStatusBySession.removeValue(forKey: sessionId)
+        setSessionState(sessionId, .idle)
+
+        var changed: [ChatMessage] = []
+        if var local = messagesBySession[sessionId] {
+            for index in local.indices where local[index].kind == .toolEvent && local[index].toolStatus == "Running" {
+                local[index].toolStatus = "Completed"
+                changed.append(local[index])
+            }
+            messagesBySession[sessionId] = local
+        }
+        if !changed.isEmpty { try? await cache.upsertMessages(changed) }
     }
 
     private func reconcilePendingUnknownCommands(with remote: [ChatMessage], sessionId: String) async {

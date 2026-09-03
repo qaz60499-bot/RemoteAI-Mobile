@@ -79,6 +79,16 @@ final class ProtocolSecurityTests: XCTestCase {
         )
     }
 
+    func testWebSendDeliveryErrorsAreAcceptedProtocolCodes() throws {
+        for code in ["WEB_SEND_NOT_ACCEPTED", "WEB_SEND_DELIVERY_UNKNOWN"] {
+            let object: [String: Any] = [
+                "kind": "error",
+                "error": ["code": code, "message": "delivery state", "retryable": code == "WEB_SEND_NOT_ACCEPTED"]
+            ]
+            XCTAssertNoThrow(try ProtocolSecurity.decodeDecryptedPayload(json(object), expectedMachineId: "my-pc"), "\(code) must survive strict relay protocol validation")
+        }
+    }
+
     func testProtocolNegativeMatrix() throws {
         var passed = 0
         var total = 0

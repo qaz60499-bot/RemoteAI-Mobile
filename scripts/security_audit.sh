@@ -18,7 +18,7 @@ else
 fi
 
 "$PYTHON" -m json.tool contracts/protocol-v1.json >/dev/null
-EXPECTED_CONTRACT_SHA="1cd5e2872dab2f9622b5c3901b1681395f44048258ae8453b17967ec268103c3"
+EXPECTED_CONTRACT_SHA="5a4c0a21dbe91de5b92f4e18597043c8a2979971ddd7ee5bf2123768398c7e77"
 ACTUAL_CONTRACT_SHA="$("$PYTHON" -c 'import hashlib; print(hashlib.sha256(open("contracts/protocol-v1.json","rb").read()).hexdigest())')"
 [[ "$ACTUAL_CONTRACT_SHA" == "$EXPECTED_CONTRACT_SHA" ]] || fail "protocol-v1.json hash drifted: $ACTUAL_CONTRACT_SHA"
 
@@ -88,6 +88,10 @@ grep -q 'persist-credentials: false' .github/workflows/build-ipa.yml || fail "ch
 grep -q 'Protocol Security / Fuzz' .github/workflows/build-ipa.yml || fail "protocol security fuzz step missing from macOS CI"
 grep -q 'commandResponseKeys' RemoteAIMobile/ProtocolSecurity.swift || fail "strict decrypted command-response key validation missing"
 grep -q 'errorCodes' RemoteAIMobile/ProtocolSecurity.swift || fail "protocol-v1 remote error allowlist missing"
+grep -q 'WEB_SEND_NOT_ACCEPTED' RemoteAIMobile/ProtocolSecurity.swift || fail "WEB_SEND_NOT_ACCEPTED protocol code missing"
+grep -q 'WEB_SEND_DELIVERY_UNKNOWN' RemoteAIMobile/ProtocolSecurity.swift || fail "WEB_SEND_DELIVERY_UNKNOWN protocol code missing"
+grep -q 'WEB_SEND_NOT_ACCEPTED' contracts/protocol-v1.json || fail "WEB_SEND_NOT_ACCEPTED schema enum missing"
+grep -q 'WEB_SEND_DELIVERY_UNKNOWN' contracts/protocol-v1.json || fail "WEB_SEND_DELIVERY_UNKNOWN schema enum missing"
 grep -q 'encode(decoded) == value' RemoteAIMobile/Security.swift || fail "canonical Base64URL validation missing"
 grep -q 'connectionWaiters' RemoteAIMobile/CloudflareTransport.swift || fail "concurrent WebSocket connect coalescing missing"
 grep -Fq 'pending[command.commandId] == nil' RemoteAIMobile/CloudflareTransport.swift || fail "duplicate in-flight commandId guard missing"

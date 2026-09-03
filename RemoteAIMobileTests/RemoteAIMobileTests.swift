@@ -517,9 +517,14 @@ final class RemoteAIMobileTests: XCTestCase {
 
         async let refreshA: Void = store.refreshWebProjects()
         async let refreshB: Void = store.refreshWebProjects()
-        _ = await (refreshA, refreshB)
+        async let refreshC: Void = store.refreshWebProjects()
+        _ = await (refreshA, refreshB, refreshC)
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("listProjects") >= 2 { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
         let listProjectAttempts = await mock.actionAttemptCount("listProjects")
-        XCTAssertEqual(listProjectAttempts, 1)
+        XCTAssertEqual(listProjectAttempts, 2, "Refreshes requested while one request is in flight must coalesce into exactly one queued rerun")
         XCTAssertEqual(store.webProjects.count, 2)
 
         async let createA = store.createWebProject(name: "Race Project")
@@ -532,6 +537,20 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(createProjectAttempts, 1)
         XCTAssertEqual(finalProjectCount, 3, "Server state must contain exactly one newly created Project")
         XCTAssertEqual(store.webProjects.filter { $0.displayName == "Race Project" }.count, 1)
+
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 140_000_000)
+        let baselineConversationRefreshes = await mock.actionAttemptCount("listProjectConversations")
+        async let conversationRefreshA: Void = store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        async let conversationRefreshB: Void = store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        async let conversationRefreshC: Void = store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        _ = await (conversationRefreshA, conversationRefreshB, conversationRefreshC)
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("listProjectConversations") >= baselineConversationRefreshes + 2 { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let finalConversationRefreshes = await mock.actionAttemptCount("listProjectConversations")
+        XCTAssertEqual(finalConversationRefreshes, baselineConversationRefreshes + 2, "Per-Project refreshes must coalesce into one queued rerun instead of being dropped")
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 0)
 
         await store.loadProjectConversations(projectAlias: "g-p-remoteai")
         async let conversationA = store.createWebConversation(projectAlias: "g-p-remoteai")
@@ -915,6 +934,79 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertNil(pending)
         let failedServerUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "definite-failure")
         XCTAssertEqual(failedServerUserCount, 0, "HTTP/transport failure must not be mistaken for a committed server message")
+        let definiteFailureDraft = await store.draft(sessionId: "photo-upload")
+        XCTAssertEqual(definiteFailureDraft, "definite-failure", "A definitely rejected send must preserve the user's text for re-send")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebSendNotAcceptedRollsBackOptimisticStateAndPreservesDraft() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .webSendNotAccepted, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let commandId = UUID()
+
+        let sent = await store.send(text: "not-accepted", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
+
+        XCTAssertFalse(sent)
+        XCTAssertEqual(store.commandStates[commandId], .failed)
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame })
+        let notAcceptedDraft = await store.draft(sessionId: "photo-upload")
+        XCTAssertEqual(notAcceptedDraft, "not-accepted")
+        let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertNil(pending)
+        let notAcceptedServerCount = await mock.userMessageCount(sessionId: "photo-upload", text: "not-accepted")
+        XCTAssertEqual(notAcceptedServerCount, 0)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebSendDeliveryUnknownKeepsExactRetryStateWithoutBlindResend() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .webSendDeliveryUnknown, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let commandId = UUID()
+
+        let sent = await store.send(text: "delivery-unknown", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
+
+        XCTAssertFalse(sent)
+        XCTAssertEqual(store.commandStates[commandId], .unknown)
+        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame })
+        let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertEqual(pending?.commandId, commandId)
+        let unknownSendAttempts = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(unknownSendAttempts, 1, "Unknown delivery must not trigger an automatic second send")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testConfirmedSendImmediatelyRecoversDeltaAndDeduplicatesOptimisticUser() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .deltaOnlySend, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let commandId = UUID()
+        let now = Date()
+        let user = ServerMessage(messageId: commandId.uuidString, sessionId: "photo-upload", role: "user", content: "delta-confirmed", externalId: nil, createdAt: now)
+        let assistant = ServerMessage(messageId: "delta-assistant-final", sessionId: "photo-upload", role: "assistant", content: "delta final", externalId: nil, createdAt: now.addingTimeInterval(0.1))
+        let userPayload = try XCTUnwrap(try JSONValue.encode(user).objectValue)
+        let assistantPayload = try XCTUnwrap(try JSONValue.encode(assistant).objectValue)
+        await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1201, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "MESSAGE_ADDED", payload: userPayload, createdAt: now), deliverLive: false)
+        await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1202, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "MESSAGE_ADDED", payload: assistantPayload, createdAt: now.addingTimeInterval(0.1)), deliverLive: false)
+        let deltaAttemptsBefore = await mock.actionAttemptCount("getChangesAfterCursor")
+
+        let sent = await store.send(text: "delta-confirmed", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
+
+        XCTAssertTrue(sent)
+        let deltaAttemptsAfter = await mock.actionAttemptCount("getChangesAfterCursor")
+        XCTAssertGreaterThan(deltaAttemptsAfter, deltaAttemptsBefore, "A successful send must immediately reconcile the authoritative delta")
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "delta-confirmed" }.count, 1)
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "delta-assistant-final" }.count, 1)
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertNil(pending)
         await store.suspend()
     }
 
@@ -1028,6 +1120,31 @@ final class RemoteAIMobileTests: XCTestCase {
         }
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "A durable assistant final must clear transient progress even if GENERATION_STOPPED was missed")
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "assistant-final-no-stop" }.count, 1)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testLoadSessionClearsStaleStreamingAndRunStatusWhenAuthoritativeFinalAlreadyExists() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1201, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "GENERATION_STARTED", payload: ["provider": .string("mock")], createdAt: now), deliverLive: true)
+        await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1202, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "MESSAGE_UPDATED", payload: ["messageId": .string("stale-stream"), "role": .string("assistant"), "content": .string("partial reply"), "partial": .bool(true)], createdAt: now.addingTimeInterval(0.01)), deliverLive: true)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.toolStatus == "Streaming" })
+
+        await mock.appendHistoryMessage(ServerMessage(messageId: "authoritative-user", sessionId: "photo-upload", role: "user", content: "prompt", externalId: nil, createdAt: now.addingTimeInterval(1)))
+        await mock.appendHistoryMessage(ServerMessage(messageId: "authoritative-final", sessionId: "photo-upload", role: "assistant", content: "final reply", externalId: nil, createdAt: now.addingTimeInterval(2)))
+        await store.loadSession("photo-upload")
+
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.toolStatus == "Streaming" || $0.id == "stale-stream" })
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "authoritative-final" }.count, 1)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
         await store.suspend()
     }
 

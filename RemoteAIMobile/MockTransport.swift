@@ -3,6 +3,7 @@ import Foundation
 enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
+    case webSendNotAccepted, webSendDeliveryUnknown, deltaOnlySend
     case duplicateEvent, sequenceGap, partialWebCatalog, staleWebCatalog, unclassifiedWebCatalog, offline
 }
 
@@ -124,6 +125,9 @@ actor MockTransport: Transport {
     func userMessageCount(sessionId: String, text: String) -> Int {
         history[sessionId, default: []].filter { $0.role == "user" && $0.content == text }.count
     }
+    func appendHistoryMessage(_ message: ServerMessage) {
+        history[message.sessionId, default: []].append(message)
+    }
     func injectEvent(_ event: RemoteEvent, deliverLive: Bool = false) {
         eventLog.append(event)
         if deliverLive { continuation?.yield(event) }
@@ -158,6 +162,16 @@ actor MockTransport: Transport {
         guard connected, scenario != .offline else { throw TransportError.offline }
         if scenario == .commandFailure {
             let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "PROVIDER_UNAVAILABLE", message: "Mock provider unavailable", retryable: true, details: nil), idempotentReplay: nil)
+            processedCommands[command.commandId] = response
+            return response
+        }
+        if command.action == "sendMessage", scenario == .webSendNotAccepted {
+            let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SEND_NOT_ACCEPTED", message: "Mock page kept the original composer text", retryable: true, details: nil), idempotentReplay: nil)
+            processedCommands[command.commandId] = response
+            return response
+        }
+        if command.action == "sendMessage", scenario == .webSendDeliveryUnknown {
+            let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SEND_DELIVERY_UNKNOWN", message: "Mock page changed without proof of delivery", retryable: false, details: nil), idempotentReplay: nil)
             processedCommands[command.commandId] = response
             return response
         }
@@ -285,7 +299,7 @@ actor MockTransport: Transport {
             let sessionId = command.sessionId ?? ""
             let user = ServerMessage(messageId: command.commandId.uuidString, sessionId: sessionId, role: "user", content: text, externalId: nil, createdAt: Date())
             history[sessionId, default: []].append(user)
-            Task { await self.simulateResponse(for: command, user: user) }
+            if scenario != .deltaOnlySend { Task { await self.simulateResponse(for: command, user: user) } }
             response = success(["accepted": .bool(true), "sessionId": .string(sessionId), "messageId": .string(user.messageId)])
         case "stopGeneration", "stopSession":
             await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: command.sessionId, type: "GENERATION_STOPPED", payload: ["ok": .bool(true)])
