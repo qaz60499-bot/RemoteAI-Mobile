@@ -12,6 +12,8 @@ final class WorkspaceStore: ObservableObject {
     @Published var projectConversationsByAlias: [String: [WebConversationDescriptor]] = [:]
     @Published var projectNextCursorByAlias: [String: String] = [:]
     @Published var projectHasMoreByAlias: [String: Bool] = [:]
+    @Published var webProjectsSnapshotState: WebSnapshotState?
+    @Published var projectConversationSnapshotStateByAlias: [String: WebSnapshotState] = [:]
     @Published var hasLoadedWebProjects = false
     @Published var attachmentTransferBySession: [String: AttachmentTransferProgress] = [:]
     @Published var commandStates: [UUID: CommandState] = [:]
@@ -53,7 +55,9 @@ final class WorkspaceStore: ObservableObject {
     private var metadataRefreshInFlight = false
     private var metadataRefreshQueued = false
     private var webProjectsRevision: UInt64 = 0
+    private var webProjectsSnapshotId: String?
     private var projectConversationRevisions: [String: UInt64] = [:]
+    private var projectConversationSnapshotIds: [String: String] = [:]
     private var sessionRevisions: [String: UInt64] = [:]
 
     private static func pendingCommandPrefix(machineId: String) -> String {
@@ -116,6 +120,10 @@ final class WorkspaceStore: ObservableObject {
             projectConversationsByAlias.removeAll()
             projectNextCursorByAlias.removeAll()
             projectHasMoreByAlias.removeAll()
+            webProjectsSnapshotState = nil
+            projectConversationSnapshotStateByAlias.removeAll()
+            webProjectsSnapshotId = nil
+            projectConversationSnapshotIds.removeAll()
             hasLoadedWebProjects = false
             attachmentTransferBySession.removeAll()
             hasMoreBySession.removeAll()
@@ -199,23 +207,45 @@ final class WorkspaceStore: ObservableObject {
         let revision = webProjectsRevision
         if webProjects.isEmpty,
            let cached: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
-            // Keep cache available for offline use, but do not mark it authoritative.
-            // The live Web view hides this stale snapshot until Windows returns the
-            // current ChatGPT DOM list, preventing the old/wrong Project flash.
-            webProjects = cached
+            // Cache is last-known-good because degraded snapshots are never persisted.
+            // Re-check the resource epoch after the await so a concurrent create cannot
+            // be erased by a late cache hydration.
+            if generation == lifecycleGeneration,
+               revision == webProjectsRevision,
+               webProjects.isEmpty,
+               !isSuspended {
+                webProjects = cached
+                webProjectsSnapshotState = .staleCache
+            }
         }
-        guard machine.state == .online else { return }
+        guard machine.state == .online else {
+            hasLoadedWebProjects = !webProjects.isEmpty
+            return
+        }
         do {
-            let remote = try await transport.listProjects(machineId: machine.id)
+            let response = try await transport.listProjectsResponse(machineId: machine.id)
             guard generation == lifecycleGeneration, revision == webProjectsRevision, machine.state == .online, !isSuspended else { return }
+            guard response.isAuthoritativeLiveDOM else {
+                webProjectsSnapshotState = response.state ?? .providerUnavailable
+                hasLoadedWebProjects = !webProjects.isEmpty
+                errors["web.projects"] = "ChatGPT Projects are temporarily incomplete; keeping the last verified Project list."
+                return
+            }
             // Preserve the authoritative DOM order from Windows. Sorting by cached
             // timestamps can make a complete Project list look random or incomplete.
-            webProjects = remote
+            webProjects = response.items
+            webProjectsSnapshotState = .authoritativeLiveDOM
+            webProjectsSnapshotId = response.snapshotId
             hasLoadedWebProjects = true
             try? await cache.put(webProjects, key: "web.projects")
+            guard generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended else { return }
             errors["web.projects"] = nil
         } catch {
-            if generation == lifecycleGeneration, !isSuspended { errors["web.projects"] = error.localizedDescription }
+            if generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended {
+                webProjectsSnapshotState = .providerUnavailable
+                hasLoadedWebProjects = !webProjects.isEmpty
+                errors["web.projects"] = error.localizedDescription
+            }
         }
     }
 
@@ -238,9 +268,15 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
             let created = try await activeTransport.createWebProject(machineId: activeMachineId, projectName: trimmed, commandId: commandId)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, machine.state == .online, !isSuspended else { return nil }
+            // Commit a second epoch bump after the remote mutation succeeds. Any refresh
+            // that began while createProject was in flight must not overwrite this row.
+            webProjectsRevision &+= 1
             await finishPendingOperation(key: "createProject.\(operationKey)", machineId: activeMachineId, expectedCommandId: commandId)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
             webProjects.removeAll { $0.projectAlias == created.projectAlias }
             webProjects.insert(created, at: 0)
+            webProjectsSnapshotState = .localConfirmed
+            webProjectsSnapshotId = nil
             hasLoadedWebProjects = true
             try? await cache.put(webProjects, key: "web.projects")
             errors["web.projects"] = nil
@@ -257,57 +293,92 @@ final class WorkspaceStore: ObservableObject {
     func loadProjectConversations(projectAlias: String, refresh: Bool = true) async {
         if refresh {
             guard projectConversationRefreshes.insert(projectAlias).inserted else { return }
+            // A full refresh supersedes any page-load already in flight for this Project.
+            projectConversationRevisions[projectAlias, default: 0] &+= 1
         }
         defer { if refresh { projectConversationRefreshes.remove(projectAlias) } }
         let generation = lifecycleGeneration
         let revision = projectConversationRevisions[projectAlias, default: 0]
-        // Online Project pages should never flash cached placeholder/UUID titles before
-        // the authoritative browser DOM has loaded. Cache is still useful offline.
-        if (!refresh || machine.state != .online),
-           projectConversationsByAlias[projectAlias] == nil,
+        if projectConversationsByAlias[projectAlias] == nil,
            let cached: [WebConversationDescriptor] = try? await cache.get([WebConversationDescriptor].self, key: "web.project.\(projectAlias).conversations") {
-            projectConversationsByAlias[projectAlias] = cached
+            // This cache contains only previously accepted authoritative snapshots.
+            // Check the epoch after the await so a create/refresh cannot be erased.
+            if generation == lifecycleGeneration,
+               revision == projectConversationRevisions[projectAlias, default: 0],
+               projectConversationsByAlias[projectAlias] == nil,
+               !isSuspended {
+                projectConversationsByAlias[projectAlias] = cached
+                projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
+            }
         }
         guard refresh, machine.state == .online else { return }
         do {
             let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
+            guard page.isAuthoritativeLiveDOM else {
+                projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
+                errors["web.project.\(projectAlias)"] = "ChatGPT conversations are temporarily incomplete; keeping the last verified list."
+                return
+            }
             projectConversationsByAlias[projectAlias] = page.items
+            projectConversationSnapshotStateByAlias[projectAlias] = .authoritativeLiveDOM
+            if let snapshotId = page.snapshotId { projectConversationSnapshotIds[projectAlias] = snapshotId }
+            else { projectConversationSnapshotIds.removeValue(forKey: projectAlias) }
             if let cursor = page.nextCursor { projectNextCursorByAlias[projectAlias] = cursor }
             else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
             projectHasMoreByAlias[projectAlias] = page.hasMore
             try? await cache.put(page.items, key: "web.project.\(projectAlias).conversations")
+            guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended else { return }
             mergeProjectSessions(page.items)
             errors["web.project.\(projectAlias)"] = nil
         } catch {
-            if generation == lifecycleGeneration, !isSuspended { errors["web.project.\(projectAlias)"] = error.localizedDescription }
+            if generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended {
+                projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
+                errors["web.project.\(projectAlias)"] = error.localizedDescription
+            }
         }
     }
 
     func loadMoreProjectConversations(projectAlias: String) async {
+        guard !projectConversationRefreshes.contains(projectAlias) else { return }
         guard projectConversationPageLoads.insert(projectAlias).inserted else { return }
         defer { projectConversationPageLoads.remove(projectAlias) }
         let generation = lifecycleGeneration
         let revision = projectConversationRevisions[projectAlias, default: 0]
         guard machine.state == .online,
               projectHasMoreByAlias[projectAlias] == true,
-              let cursor = projectNextCursorByAlias[projectAlias] else { return }
+              let cursor = projectNextCursorByAlias[projectAlias],
+              let expectedSnapshotId = projectConversationSnapshotIds[projectAlias] else { return }
         do {
             let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, cursor: cursor)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
+            guard page.isAuthoritativeLiveDOM else {
+                projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
+                errors["web.project.\(projectAlias)"] = "ChatGPT conversations are temporarily incomplete; keeping the last verified list."
+                return
+            }
+            guard page.snapshotId == expectedSnapshotId else {
+                errors["web.project.\(projectAlias)"] = "ChatGPT conversation list changed while loading more; refresh to keep ordering consistent."
+                return
+            }
             var merged = projectConversationsByAlias[projectAlias, default: []]
             for item in page.items where !merged.contains(where: { $0.id == item.id }) { merged.append(item) }
             // Preserve the authoritative newest-first order supplied by ChatGPT.
             // Registry update timestamps reflect our scan time, not conversation age.
             projectConversationsByAlias[projectAlias] = Array(merged.prefix(50))
+            projectConversationSnapshotStateByAlias[projectAlias] = .authoritativeLiveDOM
             if let next = page.nextCursor { projectNextCursorByAlias[projectAlias] = next }
             else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
             projectHasMoreByAlias[projectAlias] = page.hasMore
             try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+            guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended else { return }
             mergeProjectSessions(page.items)
             errors["web.project.\(projectAlias)"] = nil
         } catch {
-            if generation == lifecycleGeneration, !isSuspended { errors["web.project.\(projectAlias)"] = error.localizedDescription }
+            if generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended {
+                projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
+                errors["web.project.\(projectAlias)"] = error.localizedDescription
+            }
         }
     }
 
@@ -330,7 +401,12 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
             let created = try await activeTransport.createWebConversation(machineId: activeMachineId, projectAlias: projectAlias, commandId: commandId)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, machine.state == .online, !isSuspended else { return nil }
+            // Successful remote create is a new commit epoch. Refresh/page responses
+            // started during the mutation must not erase or reorder this conversation.
+            sessionRevisions["web.chatgpt", default: 0] &+= 1
+            if let projectAlias { projectConversationRevisions[projectAlias, default: 0] &+= 1 }
             await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
             let session = created.session
             sessions.removeAll { $0.id == session.id }
             sessions.insert(session, at: 0)
@@ -339,6 +415,10 @@ final class WorkspaceStore: ObservableObject {
                 rows.removeAll { $0.id == created.id }
                 rows.insert(created, at: 0)
                 projectConversationsByAlias[alias] = Array(rows.prefix(50))
+                projectConversationSnapshotStateByAlias[alias] = .localConfirmed
+                projectConversationSnapshotIds.removeValue(forKey: alias)
+                projectNextCursorByAlias.removeValue(forKey: alias)
+                projectHasMoreByAlias[alias] = false
                 try? await cache.put(projectConversationsByAlias[alias] ?? [], key: "web.project.\(alias).conversations")
             }
             await persistMetadata()
@@ -703,6 +783,10 @@ final class WorkspaceStore: ObservableObject {
         projectConversationsByAlias.removeAll()
         projectNextCursorByAlias.removeAll()
         projectHasMoreByAlias.removeAll()
+        webProjectsSnapshotState = nil
+        projectConversationSnapshotStateByAlias.removeAll()
+        webProjectsSnapshotId = nil
+        projectConversationSnapshotIds.removeAll()
         hasLoadedWebProjects = false
         attachmentTransferBySession.removeAll()
         hasMoreBySession.removeAll()

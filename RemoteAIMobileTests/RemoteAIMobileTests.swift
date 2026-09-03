@@ -484,6 +484,122 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testPartialWebCatalogCannotOverwriteVerifiedProjectsConversationsOrCache() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        await store.refreshWebProjects()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        let verifiedProjects = store.webProjects
+        let verifiedConversations = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(verifiedProjects.count, 2)
+        XCTAssertEqual(verifiedConversations.count, 1)
+
+        await mock.setScenario(.partialWebCatalog)
+        await store.refreshWebProjects()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+
+        XCTAssertEqual(store.webProjects, verifiedProjects, "A successful-but-partial Project snapshot must not replace verified live DOM state")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"], verifiedConversations, "A partial conversation snapshot must not collapse the verified list")
+        let cachedProjects: [WebProjectDescriptor]? = try await cache.get([WebProjectDescriptor].self, key: "web.projects")
+        let cachedConversations: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
+        XCTAssertEqual(cachedProjects, verifiedProjects)
+        XCTAssertEqual(cachedConversations, verifiedConversations)
+        XCTAssertNotNil(store.errors["web.projects"])
+        XCTAssertNotNil(store.errors["web.project.g-p-remoteai"])
+        await store.suspend()
+    }
+
+    @MainActor
+    func testUnclassifiedWebCatalogFailsClosedAndKeepsLastKnownGoodState() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await store.refreshWebProjects()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        let verifiedProjects = store.webProjects
+        let verifiedConversations = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+
+        await mock.setScenario(.unclassifiedWebCatalog)
+        await store.refreshWebProjects()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+
+        XCTAssertEqual(store.webProjects, verifiedProjects, "Missing freshness metadata must never be treated as authoritative")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"], verifiedConversations)
+        XCTAssertEqual(store.webProjectsSnapshotState, .providerUnavailable)
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .providerUnavailable)
+        let cachedProjects: [WebProjectDescriptor]? = try await cache.get([WebProjectDescriptor].self, key: "web.projects")
+        let cachedConversations: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
+        XCTAssertEqual(cachedProjects, verifiedProjects)
+        XCTAssertEqual(cachedConversations, verifiedConversations)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testRefreshStartedDuringCreateCannotOverwriteCommittedProjectOrConversation() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.refreshWebProjects()
+
+        await mock.setRequestDelay(action: "createProject", nanoseconds: 220_000_000)
+        await mock.setResponseDelay(action: "listProjects", nanoseconds: 320_000_000)
+        let createProjectTask = Task { await store.createWebProject(name: "Create Wins") }
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("createProject") > 0 { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let refreshProjectTask = Task { await store.refreshWebProjects() }
+        let createdProject = try XCTUnwrap(await createProjectTask.value)
+        await refreshProjectTask.value
+        XCTAssertEqual(store.webProjects.filter { $0.projectAlias == createdProject.projectAlias }.count, 1)
+        XCTAssertEqual(store.webProjects.first?.projectAlias, createdProject.projectAlias, "A refresh launched during create must be invalidated by the create commit epoch")
+
+        await mock.setRequestDelay(action: "createProject", nanoseconds: 0)
+        await mock.setResponseDelay(action: "listProjects", nanoseconds: 0)
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        let baselineCreateAttempts = await mock.actionAttemptCount("createConversation")
+        await mock.setRequestDelay(action: "createConversation", nanoseconds: 220_000_000)
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 320_000_000)
+        let createConversationTask = Task { await store.createWebConversation(projectAlias: "g-p-remoteai") }
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("createConversation") > baselineCreateAttempts { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let refreshConversationTask = Task { await store.loadProjectConversations(projectAlias: "g-p-remoteai") }
+        let createdConversation = try XCTUnwrap(await createConversationTask.value)
+        await refreshConversationTask.value
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.filter { $0.id == createdConversation.id }.count, 1)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.first?.id, createdConversation.id, "A refresh launched during create must not erase the committed conversation")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testConversationPaginationRejectsSnapshotChange() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 65)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 30)
+        XCTAssertEqual(store.projectHasMoreByAlias["g-p-remoteai"], true)
+
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 66)
+        await store.loadMoreProjectConversations(projectAlias: "g-p-remoteai")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 30, "A page from a different server snapshot must not be merged")
+        XCTAssertNotNil(store.errors["web.project.g-p-remoteai"])
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 30)
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .authoritativeLiveDOM)
+        XCTAssertNil(store.errors["web.project.g-p-remoteai"])
+        await store.suspend()
+    }
+
+    @MainActor
     func testUnknownCreateProjectDeliveryReusesCommandAndDoesNotDuplicateServerProject() async throws {
         let mock = MockTransport(scenario: .disconnectAfterCreateProject, historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())

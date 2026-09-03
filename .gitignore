@@ -19,5 +19,8 @@ Secrets/
 *.cer
 pairing-secret*
 
+# Local shell/device artifacts
+NUL
+
 # macOS
 .DS_Store

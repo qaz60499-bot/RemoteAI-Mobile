@@ -141,10 +141,14 @@ extension Transport {
         return try? response.decode(ServerSession.self).descriptor
     }
 
-    func listProjects(machineId: String) async throws -> [WebProjectDescriptor] {
+    func listProjectsResponse(machineId: String) async throws -> WebProjectListResponse {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "listProjects")
         let response = try await requireSuccess(execute(command))
-        return try response.decode(WebProjectListResponse.self).items
+        return try response.decode(WebProjectListResponse.self)
+    }
+
+    func listProjects(machineId: String) async throws -> [WebProjectDescriptor] {
+        try await listProjectsResponse(machineId: machineId).items
     }
 
     func listProjectConversations(machineId: String, projectAlias: String, limit: Int = 30, cursor: String? = nil) async throws -> WebProjectConversationPage {

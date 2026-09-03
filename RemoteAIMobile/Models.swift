@@ -145,9 +145,36 @@ struct WebConversationDescriptor: Codable, Identifiable, Hashable {
     }
 }
 
+enum WebSnapshotState: String, Codable, Hashable {
+    case authoritativeLiveDOM = "authoritative-live-dom"
+    case partialDOM = "partial-dom"
+    case staleCache = "stale-cache"
+    case providerUnavailable = "provider-unavailable"
+    case localConfirmed = "local-confirmed"
+}
+
 struct WebProjectListResponse: Codable {
     let items: [WebProjectDescriptor]
     let observedAt: Date?
+    let source: String?
+    let stale: Bool?
+    let state: WebSnapshotState?
+    let snapshotId: String?
+    let unavailable: Bool?
+
+    init(items: [WebProjectDescriptor], observedAt: Date?, source: String? = nil, stale: Bool? = nil, state: WebSnapshotState? = nil, snapshotId: String? = nil, unavailable: Bool? = nil) {
+        self.items = items
+        self.observedAt = observedAt
+        self.source = source
+        self.stale = stale
+        self.state = state
+        self.snapshotId = snapshotId
+        self.unavailable = unavailable
+    }
+
+    var isAuthoritativeLiveDOM: Bool {
+        state == .authoritativeLiveDOM && stale != true
+    }
 }
 
 struct WebProjectConversationPage: Codable {
@@ -157,6 +184,27 @@ struct WebProjectConversationPage: Codable {
     let nextCursor: String?
     let hasMore: Bool
     let observedAt: Date?
+    let source: String?
+    let stale: Bool?
+    let state: WebSnapshotState?
+    let snapshotId: String?
+
+    init(project: WebProjectDescriptor, items: [WebConversationDescriptor], cursor: String?, nextCursor: String?, hasMore: Bool, observedAt: Date?, source: String? = nil, stale: Bool? = nil, state: WebSnapshotState? = nil, snapshotId: String? = nil) {
+        self.project = project
+        self.items = items
+        self.cursor = cursor
+        self.nextCursor = nextCursor
+        self.hasMore = hasMore
+        self.observedAt = observedAt
+        self.source = source
+        self.stale = stale
+        self.state = state
+        self.snapshotId = snapshotId
+    }
+
+    var isAuthoritativeLiveDOM: Bool {
+        state == .authoritativeLiveDOM && stale != true
+    }
 }
 
 struct MessageCursor: Codable, Hashable {

@@ -3,7 +3,7 @@ import Foundation
 enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
-    case duplicateEvent, sequenceGap, offline
+    case duplicateEvent, sequenceGap, partialWebCatalog, unclassifiedWebCatalog, offline
 }
 
 actor MockTransport: Transport {
@@ -22,6 +22,7 @@ actor MockTransport: Transport {
     private var commandAttempts: [String: Int] = [:]
     private var connectAttempts = 0
     private var executionDelayNanoseconds: UInt64 = 0
+    private var requestDelayNanoseconds: [String: UInt64] = [:]
     private var responseDelayNanoseconds: [String: UInt64] = [:]
     private var finishedAttachmentData: [String: Data] = [:]
 
@@ -83,11 +84,27 @@ actor MockTransport: Transport {
     var isConnected: Bool { connected }
     func setScenario(_ value: MockScenario) { scenario = value }
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
+    func setRequestDelay(action: String, nanoseconds: UInt64) { requestDelayNanoseconds[action] = nanoseconds }
     func setResponseDelay(action: String, nanoseconds: UInt64) { responseDelayNanoseconds[action] = nanoseconds }
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
     func connectionAttemptCount() -> Int { connectAttempts }
     func projectCount() -> Int { webProjects.count }
     func projectConversationCount(_ alias: String) -> Int { webProjectConversations[alias, default: []].count }
+    func seedProjectConversations(alias: String, count: Int) {
+        let now = Date()
+        webProjectConversations[alias] = (0..<max(0, count)).map { index in
+            WebConversationDescriptor(
+                localConversationId: "webconv-seed-\(index)",
+                canonicalUrl: "https://chatgpt.com/g/\(alias)/c/seed-\(index)",
+                projectId: nil,
+                displayTitle: "Seed \(index)",
+                projectAlias: alias,
+                conversationAlias: "seed-\(index)",
+                lastVisited: now.addingTimeInterval(Double(-index)),
+                updatedAt: now.addingTimeInterval(Double(-index))
+            )
+        }
+    }
     func userMessageCount(sessionId: String, text: String) -> Int {
         history[sessionId, default: []].filter { $0.role == "user" && $0.content == text }.count
     }
@@ -113,6 +130,7 @@ actor MockTransport: Transport {
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
         try ProtocolSecurity.validate(command, expectedMachineId: machineId)
         commandAttempts[command.action, default: 0] += 1
+        if let delay = requestDelayNanoseconds[command.action], delay > 0 { try? await Task.sleep(nanoseconds: delay) }
         if executionDelayNanoseconds > 0 { try? await Task.sleep(nanoseconds: executionDelayNanoseconds) }
         if let prior = processedCommands[command.commandId] {
             return CommandResponseEnvelope(ok: prior.ok, result: prior.result, error: prior.error, idempotentReplay: true)
@@ -148,7 +166,13 @@ actor MockTransport: Transport {
             }
             response = try success(Array(eligible.suffix(max(1, min(limit, 100)))))
         case "listProjects":
-            response = try success(WebProjectListResponse(items: webProjects, observedAt: Date()))
+            if scenario == .partialWebCatalog {
+                response = try success(WebProjectListResponse(items: Array(webProjects.prefix(1)), observedAt: Date(), source: "browser-dom", stale: true, state: .partialDOM, snapshotId: "mock-projects-partial-1"))
+            } else if scenario == .unclassifiedWebCatalog {
+                response = try success(WebProjectListResponse(items: Array(webProjects.prefix(1)), observedAt: Date(), source: "browser-dom", stale: nil, state: nil, snapshotId: nil))
+            } else {
+                response = try success(WebProjectListResponse(items: webProjects, observedAt: Date(), source: "browser-dom", stale: false, state: .authoritativeLiveDOM, snapshotId: "mock-projects-\(webProjects.count)"))
+            }
         case "listProjectConversations":
             let alias = command.payload["projectAlias"]?.stringValue ?? ""
             guard let project = webProjects.first(where: { $0.projectAlias == alias }) else {
@@ -161,9 +185,21 @@ actor MockTransport: Transport {
                 return max(0, value)
             }()
             let all = webProjectConversations[alias, default: []]
-            let slice = Array(all.dropFirst(offset).prefix(limit))
+            let degraded = scenario == .partialWebCatalog || scenario == .unclassifiedWebCatalog
+            let slice = degraded ? [] : Array(all.dropFirst(offset).prefix(limit))
             let nextOffset = offset + slice.count
-            response = try success(WebProjectConversationPage(project: project, items: slice, cursor: command.payload["cursor"]?.stringValue, nextCursor: nextOffset < all.count ? "offset:\(nextOffset)" : nil, hasMore: nextOffset < all.count, observedAt: Date()))
+            response = try success(WebProjectConversationPage(
+                project: project,
+                items: slice,
+                cursor: command.payload["cursor"]?.stringValue,
+                nextCursor: degraded ? nil : (nextOffset < all.count ? "offset:\(nextOffset)" : nil),
+                hasMore: degraded ? false : nextOffset < all.count,
+                observedAt: Date(),
+                source: "browser-dom",
+                stale: scenario == .partialWebCatalog ? true : (scenario == .unclassifiedWebCatalog ? nil : false),
+                state: scenario == .partialWebCatalog ? .partialDOM : (scenario == .unclassifiedWebCatalog ? nil : .authoritativeLiveDOM),
+                snapshotId: degraded ? nil : "mock-conversations-\(alias)-\(all.count)"
+            ))
         case "openProject":
             response = success(["focused": .bool(false)])
         case "createProject":
