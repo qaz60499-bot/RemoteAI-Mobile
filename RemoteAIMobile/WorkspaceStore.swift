@@ -14,6 +14,8 @@ final class WorkspaceStore: ObservableObject {
     @Published var projectHasMoreByAlias: [String: Bool] = [:]
     @Published var webProjectsSnapshotState: WebSnapshotState?
     @Published var projectConversationSnapshotStateByAlias: [String: WebSnapshotState] = [:]
+    @Published var projectConversationLoadingByAlias: [String: Bool] = [:]
+    @Published var liveRunStatusBySession: [String: String] = [:]
     @Published var hasLoadedWebProjects = false
     @Published var attachmentTransferBySession: [String: AttachmentTransferProgress] = [:]
     @Published var commandStates: [UUID: CommandState] = [:]
@@ -50,7 +52,7 @@ final class WorkspaceStore: ObservableObject {
     private var creatingWebProjects = Set<String>()
     private var creatingWebConversations = Set<String>()
     private var creatingSessions = Set<String>()
-    private var stoppingSessions = Set<String>()
+    private var stopTasksBySession: [String: Task<Bool, Never>] = [:]
     private var commandSendsInFlight = Set<UUID>()
     private var metadataRefreshInFlight = false
     private var metadataRefreshQueued = false
@@ -124,6 +126,8 @@ final class WorkspaceStore: ObservableObject {
             projectHasMoreByAlias.removeAll()
             webProjectsSnapshotState = nil
             projectConversationSnapshotStateByAlias.removeAll()
+            projectConversationLoadingByAlias.removeAll()
+            liveRunStatusBySession.removeAll()
             webProjectsSnapshotId = nil
             projectConversationSnapshotIds.removeAll()
             hasLoadedWebProjects = false
@@ -228,6 +232,19 @@ final class WorkspaceStore: ObservableObject {
             let response = try await transport.listProjectsResponse(machineId: machine.id)
             guard generation == lifecycleGeneration, revision == webProjectsRevision, machine.state == .online, !isSuspended else { return }
             guard response.isAuthoritativeLiveDOM else {
+                if response.state == .staleCache,
+                   webProjects.isEmpty,
+                   !response.items.isEmpty {
+                    // A fresh install may have no iOS-side cache even though Windows has
+                    // a previously verified live-DOM Project snapshot. Bootstrap from
+                    // that explicit stale snapshot only when there is no local truth;
+                    // never persist it or let it replace a non-empty local list.
+                    webProjects = response.items
+                    webProjectsSnapshotState = .staleCache
+                    hasLoadedWebProjects = true
+                    errors["web.projects"] = "Showing the last verified Windows Project list while ChatGPT refreshes."
+                    return
+                }
                 webProjectsSnapshotState = response.state ?? .providerUnavailable
                 hasLoadedWebProjects = !webProjects.isEmpty
                 errors["web.projects"] = "ChatGPT Projects are temporarily incomplete; keeping the last verified Project list."
@@ -295,10 +312,16 @@ final class WorkspaceStore: ObservableObject {
     func loadProjectConversations(projectAlias: String, refresh: Bool = true) async {
         if refresh {
             guard projectConversationRefreshes.insert(projectAlias).inserted else { return }
+            projectConversationLoadingByAlias[projectAlias] = true
             // A full refresh supersedes any page-load already in flight for this Project.
             projectConversationRevisions[projectAlias, default: 0] &+= 1
         }
-        defer { if refresh { projectConversationRefreshes.remove(projectAlias) } }
+        defer {
+            if refresh {
+                projectConversationRefreshes.remove(projectAlias)
+                projectConversationLoadingByAlias[projectAlias] = false
+            }
+        }
         let generation = lifecycleGeneration
         let revision = projectConversationRevisions[projectAlias, default: 0]
         if projectConversationsByAlias[projectAlias] == nil,
@@ -315,9 +338,39 @@ final class WorkspaceStore: ObservableObject {
         }
         guard refresh, machine.state == .online else { return }
         do {
-            let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30)
+            var page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
+            // The ChatGPT sidebar lazily mounts untouched Project conversation panels.
+            // If the first read explicitly reports a partial DOM and we have no verified
+            // rows yet, one bounded read-only retry is safe and avoids requiring the
+            // user to create a New Chat merely to make history appear.
+            if !page.isAuthoritativeLiveDOM,
+               projectConversationsByAlias[projectAlias, default: []].isEmpty {
+                try? await Task.sleep(nanoseconds: 450_000_000)
+                if generation == lifecycleGeneration,
+                   revision == projectConversationRevisions[projectAlias, default: 0],
+                   machine.state == .online,
+                   !isSuspended,
+                   let retry = try? await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30),
+                   retry.isAuthoritativeLiveDOM {
+                    page = retry
+                }
+            }
             guard page.isAuthoritativeLiveDOM else {
+                if page.state == .staleCache,
+                   projectConversationsByAlias[projectAlias, default: []].isEmpty,
+                   !page.items.isEmpty {
+                    // Same bootstrap rule as Projects: accept Windows last-known-good
+                    // identities/order only when this phone has none yet. Keep the
+                    // snapshot explicitly stale and do not persist it as authoritative.
+                    projectConversationsByAlias[projectAlias] = page.items
+                    projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
+                    projectNextCursorByAlias[projectAlias] = page.nextCursor
+                    projectHasMoreByAlias[projectAlias] = page.hasMore
+                    mergeProjectSessions(page.items)
+                    errors["web.project.\(projectAlias)"] = "Showing the last verified Windows conversation list while ChatGPT refreshes."
+                    return
+                }
                 projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
                 // Degraded responses may carry only metadata title hints from local
                 // Chrome History. Merge those only when the conversation identity was
@@ -679,8 +732,20 @@ final class WorkspaceStore: ObservableObject {
 
     @discardableResult
     func stop(runtimeId: String, instanceId: String, sessionId: String) async -> Bool {
-        guard stoppingSessions.insert(sessionId).inserted else { return false }
-        defer { stoppingSessions.remove(sessionId) }
+        if let inFlight = stopTasksBySession[sessionId] {
+            return await inFlight.value
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            return await self.performStop(runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId)
+        }
+        stopTasksBySession[sessionId] = task
+        let result = await task.value
+        stopTasksBySession.removeValue(forKey: sessionId)
+        return result
+    }
+
+    private func performStop(runtimeId: String, instanceId: String, sessionId: String) async -> Bool {
         guard machine.state == .online else {
             errors[sessionId] = "PC Offline — stop will not be queued blindly."
             return false
@@ -740,6 +805,7 @@ final class WorkspaceStore: ObservableObject {
             if let created = try await activeTransport.createSession(machineId: activeMachineId, runtimeId: runtime.id, instanceId: instance.id, payload: payload, commandId: commandId) {
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, machine.state == .online, !isSuspended else { return false }
                 await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
+                sessionRevisions[instance.id, default: 0] &+= 1
                 sessions.removeAll { $0.id == created.id }
                 sessions.insert(created, at: 0)
                 errors[instance.id] = nil
@@ -748,6 +814,7 @@ final class WorkspaceStore: ObservableObject {
             } else if activeTransport is MockTransport {
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
                 await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
+                sessionRevisions[instance.id, default: 0] &+= 1
                 let local = SessionDescriptor(id: UUID().uuidString, instanceId: instance.id, title: title.isEmpty ? (runtime.kind == .web ? "New Chat" : "New Session") : title, state: .idle, updatedAt: Date())
                 sessions.insert(local, at: 0)
                 errors[instance.id] = nil
@@ -756,6 +823,7 @@ final class WorkspaceStore: ObservableObject {
             } else {
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
                 await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
+                sessionRevisions[instance.id, default: 0] &+= 1
                 await refreshMetadata()
                 errors[instance.id] = nil
                 return true
@@ -802,6 +870,8 @@ final class WorkspaceStore: ObservableObject {
         projectHasMoreByAlias.removeAll()
         webProjectsSnapshotState = nil
         projectConversationSnapshotStateByAlias.removeAll()
+        projectConversationLoadingByAlias.removeAll()
+        liveRunStatusBySession.removeAll()
         webProjectsSnapshotId = nil
         projectConversationSnapshotIds.removeAll()
         hasLoadedWebProjects = false
@@ -821,7 +891,8 @@ final class WorkspaceStore: ObservableObject {
         creatingWebProjects.removeAll()
         creatingWebConversations.removeAll()
         creatingSessions.removeAll()
-        stoppingSessions.removeAll()
+        for task in stopTasksBySession.values { task.cancel() }
+        stopTasksBySession.removeAll()
         commandSendsInFlight.removeAll()
         metadataRefreshInFlight = false
         metadataRefreshQueued = false
@@ -1251,6 +1322,7 @@ final class WorkspaceStore: ObservableObject {
                 let result = try await transport.delta(machineId: machine.id, after: cursor)
                 guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
                 for event in result.events where event.sequence > cursor {
+                    try ProtocolSecurity.validate(event, expectedMachineId: machine.id)
                     guard eventReplayGuard.accept(event.eventId.uuidString.lowercased()) else { throw TransportError.replayDetected }
                     await applyEvent(event)
                     cursor = event.sequence
@@ -1279,6 +1351,9 @@ final class WorkspaceStore: ObservableObject {
             let content = event.payload["content"]?.stringValue ?? ""
             let id = event.payload["messageId"]?.stringValue ?? streamingBuffers[sessionId]?.id ?? "stream-\(sessionId)"
             bufferStreaming(sessionId: sessionId, id: id, content: content, sequence: event.sequence)
+            if event.payload["partial"]?.boolValue != false {
+                liveRunStatusBySession[sessionId] = processStatusLabel(for: content)
+            }
         case "MESSAGE_ADDED":
             if let server = try? JSONValue.object(event.payload).decode(ServerMessage.self) {
                 let base = server.chatMessage
@@ -1308,11 +1383,18 @@ final class WorkspaceStore: ObservableObject {
             let message = ChatMessage(id: messageId, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: detail, createdAt: event.createdAt)
             merge([message], into: sessionId)
             try? await cache.upsertMessages([message])
+            if rawToolName == "ChatGPT Web", let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                liveRunStatusBySession[sessionId] = completed ? "ChatGPT Web 已完成" : detail
+            } else {
+                liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
+            }
         case "GENERATION_STARTED":
             setSessionState(sessionId, .busy)
+            liveRunStatusBySession[sessionId] = "ChatGPT 正在处理…"
         case "GENERATION_STOPPED":
             flushStreaming(sessionId: sessionId)
             setSessionState(sessionId, .idle)
+            liveRunStatusBySession.removeValue(forKey: sessionId)
         case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED":
             await refreshMetadata()
         case "COMMAND_RESULT", "COMMAND_REJECTED":
@@ -1322,6 +1404,18 @@ final class WorkspaceStore: ObservableObject {
         default:
             break
         }
+    }
+
+    private func processStatusLabel(for content: String) -> String {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "正在生成回答…" }
+        let lower = trimmed.lowercased()
+        if lower == "thinking" || lower.hasPrefix("thinking ") { return "思考中…" }
+        if lower.contains("analyzing image") || lower.contains("analysing image") { return "正在分析图片…" }
+        if lower.contains("searching the web") || lower == "searching" { return "正在搜索网页…" }
+        if lower.contains("reading") && trimmed.count < 120 { return trimmed }
+        if !trimmed.contains("\n"), trimmed.count <= 80 { return trimmed }
+        return "正在生成回答…"
     }
 
     private func setSessionState(_ sessionId: String, _ state: SessionState) {

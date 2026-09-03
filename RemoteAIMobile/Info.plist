@@ -14,4 +14,6 @@
 <key>UILaunchScreen</key><dict/>
 <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
 <key>NSCameraUsageDescription</key><string>RemoteAI uses the camera only to scan a Windows pairing QR code.</string>
+<key>NSMicrophoneUsageDescription</key><string>RemoteAI uses the microphone only when you choose voice input for a message.</string>
+<key>NSSpeechRecognitionUsageDescription</key><string>RemoteAI converts your voice to message text when you choose voice input.</string>
 </dict></plist>

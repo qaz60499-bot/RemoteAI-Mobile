@@ -12,18 +12,26 @@ fail() {
 }
 
 [[ -s "$IPA" ]] || fail "IPA missing or empty: $IPA"
-unzip -t "$IPA" >/dev/null || fail "ZIP integrity check failed"
+[[ "$IPA" == *.ipa ]] || fail "release artifact must use the .ipa suffix: $IPA"
 
+# Validate the central directory and resource ceilings before asking unzip to walk
+# or inflate archive entries. This keeps malformed/compression-bomb inputs bounded.
 python3 - "$IPA" <<'PY' || fail "ZIP safety preflight failed"
+import os
 import stat
 import sys
 import zipfile
 
 path = sys.argv[1]
+max_archive_bytes = 50 * 1024 * 1024
 max_entries = 2000
 max_uncompressed = 100 * 1024 * 1024
 seen = set()
 total = 0
+
+archive_bytes = os.path.getsize(path)
+if archive_bytes <= 0 or archive_bytes >= max_archive_bytes:
+    raise SystemExit(f"unexpected ZIP size: {archive_bytes}")
 
 with zipfile.ZipFile(path) as archive:
     infos = archive.infolist()
@@ -52,6 +60,7 @@ with zipfile.ZipFile(path) as archive:
             raise SystemExit(f"ZIP expands beyond {max_uncompressed} bytes")
 PY
 
+unzip -t "$IPA" >/dev/null || fail "ZIP integrity check failed"
 unzip -q "$IPA" -d "$TMP"
 [[ -d "$TMP/Payload" ]] || fail "Payload directory missing"
 [[ -z "$(find "$TMP" -type l -print -quit)" ]] || fail "symlink found inside IPA"
@@ -73,6 +82,10 @@ SUPPORTED_PLATFORM=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatfor
 [[ "$MIN_OS" == "15.0" ]] || fail "minimum iOS drifted: $MIN_OS"
 [[ "$PLATFORM" == "iphoneos" ]] || fail "DTPlatformName is not iphoneos: $PLATFORM"
 [[ "$SUPPORTED_PLATFORM" == "iPhoneOS" ]] || fail "CFBundleSupportedPlatforms is not iPhoneOS: $SUPPORTED_PLATFORM"
+[[ -f "$APP/Assets.car" ]] || fail "compiled asset catalog missing; AppIcon would not be available on device"
+ICON_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName' "$PLIST" 2>/dev/null || true)
+[[ "$ICON_NAME" == "AppIcon" ]] || fail "primary AppIcon metadata missing: ${ICON_NAME:-none}"
+echo "AppIcon audit: PASS"
 
 BIN="$APP/$EXEC"
 [[ -f "$BIN" && -x "$BIN" ]] || fail "executable missing: $BIN"
@@ -123,7 +136,7 @@ PY
 fi
 echo "Entitlement audit: PASS"
 
-FORBIDDEN_PATH="$(find "$APP" \( -type d \( -name '.git' -o -name '.github' -o -name 'Fixtures' -o -name '*Tests*' -o -name '*.xctest' -o -name '*.dSYM' \) -o -type f \( -name '*.map' -o -name '*.swift' -o -name '*.m' -o -name '*.mm' -o -name '*.h' -o -name '*.py' -o -name '*.sh' -o -name '*.xcconfig' -o -name '*.mobileprovision' -o -name 'embedded.mobileprovision' -o -name '*.p12' -o -name '*.pem' -o -name '*.key' -o -name '.env' -o -name '.env.*' \) \) -print -quit)"
+FORBIDDEN_PATH="$(find "$APP" \( -type d \( -name '.git' -o -name '.github' -o -name 'Fixtures' -o -name '*Tests*' -o -name '*.xctest' -o -name '*.dSYM' \) -o -type f \( -name '*.map' -o -name '*.swift' -o -name '*.m' -o -name '*.mm' -o -name '*.h' -o -name '*.py' -o -name '*.sh' -o -name '*.xcconfig' -o -name '*.mobileprovision' -o -name 'embedded.mobileprovision' -o -name '*.p12' -o -name '*.pem' -o -name '*.key' -o -name '*.enc' -o -name '.env' -o -name '.env.*' \) \) -print -quit)"
 [[ -z "$FORBIDDEN_PATH" ]] || fail "forbidden release content found: ${FORBIDDEN_PATH#$TMP/}"
 echo "Release content contamination scan: PASS"
 
@@ -134,16 +147,14 @@ while IFS= read -r -d '' item; do
   strings -a "$item" || true
 done < <(find "$APP" -type f -print0) > "$ALL_STRINGS"
 if grep -nE "$SECRET_PATTERN" "$ALL_STRINGS" >/dev/null 2>&1; then
-  grep -nE "$SECRET_PATTERN" "$ALL_STRINGS" >&2 || true
-  fail "secret-like material found in app content"
+  fail "secret-like material found in app content (match redacted)"
 fi
 DEV_URL_HITS="$TMP/dev-url-hits.txt"
 grep -nE "$DEV_URL_PATTERN" "$ALL_STRINGS" \
   | grep -vF 'http://www.apple.com/DTDs/PropertyList-1.0.dtd' \
   > "$DEV_URL_HITS" || true
 if [[ -s "$DEV_URL_HITS" ]]; then
-  cat "$DEV_URL_HITS" >&2
-  fail "development/local URL found in app content"
+  fail "development/local URL found in app content (match redacted)"
 fi
 echo "Sensitive-content scan: PASS"
 

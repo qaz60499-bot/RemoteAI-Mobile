@@ -19,6 +19,9 @@ actor CloudflareTransport: Transport {
     private var pending: [UUID: CheckedContinuation<CommandResponseEnvelope, Error>] = [:]
     private var timeoutTasks: [UUID: Task<Void, Never>] = [:]
     private var inboundReplayGuard = BoundedReplayGuard(capacity: 4096)
+    private var orphanedResponses: [UUID: CommandResponseEnvelope] = [:]
+    private var orphanedResponseOrder: [UUID] = []
+    private let orphanedResponseLimit = 256
 
     init(config: RemoteAIConfig, session: URLSession = .shared, keychain: KeychainStore = .shared) {
         self.config = config
@@ -89,8 +92,11 @@ actor CloudflareTransport: Transport {
     }
 
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
-        guard connected, socket != nil else { throw TransportError.offline }
         try ProtocolSecurity.validate(command, expectedMachineId: config.machineId)
+        if let replayed = takeOrphanedResponse(command.commandId) {
+            return replayed
+        }
+        guard connected, socket != nil else { throw TransportError.offline }
         guard pending[command.commandId] == nil else { throw TransportError.replayDetected }
         let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
         guard let key = PairingKeyStore.sharedKey(machineId: config.machineId, keychain: keychain) else { throw TransportError.pairingRequired }
@@ -169,7 +175,12 @@ actor CloudflareTransport: Transport {
         let clear = try PayloadCrypto.decrypt(encrypted, keyData: key, machineId: config.machineId, deviceId: deviceId, messageId: frame.messageId)
         guard clear.count <= maxInboundFrameBytes else { throw TransportError.frameTooLarge }
         let payload = try ProtocolSecurity.decodeDecryptedPayload(clear, expectedMachineId: config.machineId)
-        guard inboundReplayGuard.accept(frame.messageId) else { throw TransportError.replayDetected }
+        let firstDelivery = inboundReplayGuard.accept(frame.messageId)
+        // Durable relay frames are retained across 1006 until this device ACKs the
+        // exact relay message id. ACK only after the encrypted payload validates; if
+        // the ACK is lost the frame may replay and is safely ignored below.
+        try? await sendRelayDeliveryAck(frame.messageId, direction: "to-device")
+        guard firstDelivery else { return }
 
         if payload.kind == "event", let event = payload.event {
             continuation?.yield(event)
@@ -177,7 +188,11 @@ actor CloudflareTransport: Transport {
         }
         if payload.kind == "commandResponse", let rawId = payload.commandId, let id = UUID(uuidString: rawId), let response = payload.response {
             if let event = payload.event { continuation?.yield(event) }
-            completePending(id, response: response)
+            if pending[id] != nil {
+                completePending(id, response: response)
+            } else {
+                cacheOrphanedResponse(id, response: response)
+            }
             return
         }
         if payload.kind == "error", let error = payload.error {
@@ -192,9 +207,40 @@ actor CloudflareTransport: Transport {
         try await WebSocketIO.send(.data(data), on: socket, timeout: sendTimeoutSeconds, timeoutReason: "remoteai-send-timeout")
     }
 
+    private func sendRelayDeliveryAck(_ relayMessageId: String, direction: String) async throws {
+        let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
+        let frame = RelayFrame(
+            v: 1,
+            kind: "ACK",
+            machineId: config.machineId,
+            deviceId: deviceId,
+            messageId: UUID().uuidString,
+            body: [
+                "relayAckMessageId": .string(relayMessageId),
+                "relayAckDirection": .string(direction)
+            ]
+        )
+        try await sendFrame(frame)
+    }
+
     private func completePending(_ id: UUID, response: CommandResponseEnvelope) {
         timeoutTasks.removeValue(forKey: id)?.cancel()
         pending.removeValue(forKey: id)?.resume(returning: response)
+    }
+
+    private func cacheOrphanedResponse(_ id: UUID, response: CommandResponseEnvelope) {
+        if orphanedResponses[id] == nil { orphanedResponseOrder.append(id) }
+        orphanedResponses[id] = response
+        while orphanedResponseOrder.count > orphanedResponseLimit {
+            let expired = orphanedResponseOrder.removeFirst()
+            orphanedResponses.removeValue(forKey: expired)
+        }
+    }
+
+    private func takeOrphanedResponse(_ id: UUID) -> CommandResponseEnvelope? {
+        guard let response = orphanedResponses.removeValue(forKey: id) else { return nil }
+        orphanedResponseOrder.removeAll { $0 == id }
+        return response
     }
 
     private func failPending(_ id: UUID, error: Error) {

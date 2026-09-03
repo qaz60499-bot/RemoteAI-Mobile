@@ -5,9 +5,11 @@ build/
 xcuserdata/
 *.ipa
 *.dSYM
+__pycache__/
 
-# XcodeGen generates this deterministically in CI/local macOS
+# XcodeGen/build scripts generate these deterministically in CI/local macOS
 RemoteAIMobile.xcodeproj/
+RemoteAIMobile/Assets.xcassets/AppIcon.appiconset/AppIcon.png
 
 # Secrets / local runtime config
 .env

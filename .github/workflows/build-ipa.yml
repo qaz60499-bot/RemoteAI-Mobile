@@ -254,17 +254,21 @@ jobs:
           TRAVERSAL="build/path-traversal-negative.ipa"
           DUPLICATE="build/duplicate-entry-negative.ipa"
           SYMLINK="build/symlink-negative.ipa"
+          ENCRYPTED_CONTENT="build/encrypted-content-negative.ipa"
+          EXPANSION_BOMB="build/expansion-bomb-negative.ipa"
+          RENAMED_ENC="build/renamed-release-negative.ipa.enc"
 
           SIZE=$(stat -f%z "$IPA")
           dd if="$IPA" of="$CORRUPT" bs=1 count=$((SIZE / 2)) status=none
+          cp "$IPA" "$RENAMED_ENC"
 
-          python3 - "$TRAVERSAL" "$DUPLICATE" "$SYMLINK" <<'PY'
+          python3 - "$TRAVERSAL" "$DUPLICATE" "$SYMLINK" "$ENCRYPTED_CONTENT" "$EXPANSION_BOMB" <<'PY'
           import stat
           import sys
           import warnings
           import zipfile
 
-          traversal, duplicate, symlink = sys.argv[1:]
+          traversal, duplicate, symlink, encrypted_content, expansion_bomb = sys.argv[1:]
           with zipfile.ZipFile(traversal, "w") as zf:
               zf.writestr("Payload/../escape.txt", "blocked")
           with warnings.catch_warnings():
@@ -277,16 +281,23 @@ jobs:
               info.create_system = 3
               info.external_attr = (stat.S_IFLNK | 0o777) << 16
               zf.writestr(info, "../../outside")
+          with zipfile.ZipFile(encrypted_content, "w") as zf:
+              zf.writestr("Payload/RemoteAI.app/local-secret.enc", b"blocked")
+          with zipfile.ZipFile(expansion_bomb, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              with zf.open("Payload/RemoteAI.app/oversized.bin", "w") as out:
+                  chunk = b"0" * (1024 * 1024)
+                  for _ in range(101):
+                      out.write(chunk)
           PY
 
-          for candidate in "$CORRUPT" "$TRAVERSAL" "$DUPLICATE" "$SYMLINK"; do
+          for candidate in "$CORRUPT" "$TRAVERSAL" "$DUPLICATE" "$SYMLINK" "$ENCRYPTED_CONTENT" "$EXPANSION_BOMB" "$RENAMED_ENC"; do
             if scripts/verify_ipa.sh "$candidate" com.remoteai.mobile >/dev/null 2>&1; then
               echo "Negative IPA unexpectedly passed verification: $candidate" >&2
               exit 1
             fi
           done
-          rm -f "$CORRUPT" "$TRAVERSAL" "$DUPLICATE" "$SYMLINK"
-          echo "Corrupt/traversal/duplicate/symlink IPA cases rejected as expected"
+          rm -f "$CORRUPT" "$TRAVERSAL" "$DUPLICATE" "$SYMLINK" "$ENCRYPTED_CONTENT" "$EXPANSION_BOMB" "$RENAMED_ENC"
+          echo "Corrupt/traversal/duplicate/symlink/embedded-.enc/renamed-.enc/expansion-bomb IPA cases rejected as expected"
 
       - name: Unzip structure test
         shell: bash

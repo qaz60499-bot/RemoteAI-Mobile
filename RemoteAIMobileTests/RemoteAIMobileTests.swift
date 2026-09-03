@@ -3,6 +3,40 @@ import Security
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
+    func testSpeechInputLifecyclePermissionAndInterruptionStateMachine() {
+        var state: SpeechInputLifecycleState = .idle
+        state = SpeechInputLifecycleReducer.reduce(state, event: .startRequested)
+        XCTAssertEqual(state, .requestingPermissions)
+        state = SpeechInputLifecycleReducer.reduce(state, event: .permissionDenied)
+        XCTAssertEqual(state, .idle, "Denied permissions must return voice input to an interactive idle composer")
+
+        state = SpeechInputLifecycleReducer.reduce(state, event: .startRequested)
+        state = SpeechInputLifecycleReducer.reduce(state, event: .recordingStarted)
+        XCTAssertEqual(state, .recording)
+        state = SpeechInputLifecycleReducer.reduce(state, event: .interrupted)
+        XCTAssertEqual(state, .idle, "Backgrounding or recognition interruption must not leave the composer stuck recording")
+
+        state = SpeechInputLifecycleReducer.reduce(state, event: .startRequested)
+        state = SpeechInputLifecycleReducer.reduce(state, event: .stopRequested)
+        XCTAssertEqual(state, .idle, "Repeated user stop must remain idempotent")
+        state = SpeechInputLifecycleReducer.reduce(state, event: .stopRequested)
+        XCTAssertEqual(state, .idle)
+    }
+
+    func testSpeechRecognitionCallbackStopsOnPartialResultWithTerminalError() {
+        let partialFailure = SpeechRecognitionCallbackDecision.evaluate(isFinal: false, hasError: true)
+        XCTAssertTrue(partialFailure.shouldStop, "A terminal recognition error must stop audio even when the callback also carries a partial transcript")
+        XCTAssertTrue(partialFailure.shouldReportError)
+
+        let finalSuccessWithTrailingError = SpeechRecognitionCallbackDecision.evaluate(isFinal: true, hasError: true)
+        XCTAssertTrue(finalSuccessWithTrailingError.shouldStop)
+        XCTAssertFalse(finalSuccessWithTrailingError.shouldReportError, "A final transcript should win over a trailing recognizer error")
+
+        let partialSuccess = SpeechRecognitionCallbackDecision.evaluate(isFinal: false, hasError: false)
+        XCTAssertFalse(partialSuccess.shouldStop)
+        XCTAssertFalse(partialSuccess.shouldReportError)
+    }
+
     func testCommandRoundTripKeepsIdempotencyIdAndNumericProtocolVersion() throws {
         let id = UUID()
         let command = RemoteCommand.make(machineId: "pc", runtimeId: "runtime.web", instanceId: "agent", sessionId: "s", action: "sendMessage", payload: ["text": .string("hello")], commandId: id)
@@ -406,6 +440,72 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testDeltaRecoveryRejectsWrongMachineEventBeforeApplyingReplay() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        XCTAssertEqual(try await cache.lastSequence(), 1200)
+
+        let invalid = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "other-machine",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: Date()
+        )
+        let gapTrigger = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1202,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TRANSPORT_STATUS",
+            payload: ["state": .string("gap-trigger")],
+            createdAt: Date()
+        )
+        await mock.injectEvent(invalid)
+        await mock.injectEvent(gapTrigger, deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.errors["sync"] != nil { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNotNil(store.errors["sync"], "Delta replay must fail closed when an event belongs to another machine")
+        XCTAssertEqual(try await cache.lastSequence(), 1200, "Invalid replay events must not advance the durable sequence cursor")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testCreateSessionCannotBeErasedByConcurrentOlderRefresh() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.codex" }))
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "codex.6" }))
+
+        await mock.setRequestDelay(action: "createSession", nanoseconds: 120_000_000)
+        await mock.setResponseDelay(action: "listSessions", nanoseconds: 250_000_000)
+        async let created = store.createSession(runtime: runtime, instance: instance, title: "Race New Session")
+        try await Task.sleep(nanoseconds: 20_000_000)
+        async let refreshed: Void = store.refreshSessions(runtime: runtime, instance: instance)
+        let createResult = await created
+        await refreshed
+
+        XCTAssertTrue(createResult)
+        XCTAssertTrue(store.sessions.contains { $0.instanceId == instance.id && $0.title == "Race New Session" }, "A late stale refresh must not erase a successfully created session")
+        await store.suspend()
+    }
+
+    @MainActor
     func testWorkspaceCoalescesRefreshAndDoubleCreateWithFinalServerState() async throws {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
@@ -515,6 +615,30 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(cachedConversations?.first?.displayTitle, "Recovered real title")
         XCTAssertNotNil(store.errors["web.projects"])
         XCTAssertNotNil(store.errors["web.project.g-p-remoteai"])
+        await store.suspend()
+    }
+
+    @MainActor
+    func testFreshPhoneBootstrapsFromWindowsLastKnownGoodWithoutPromotingItToAuthoritativeCache() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.setScenario(.staleWebCatalog)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        XCTAssertTrue(store.webProjects.isEmpty)
+        await store.refreshWebProjects()
+        XCTAssertEqual(store.webProjects.map(\.projectAlias), ["g-p-remoteai", "g-p-photo"])
+        XCTAssertEqual(store.webProjectsSnapshotState, .staleCache)
+        XCTAssertTrue(store.hasLoadedWebProjects)
+        let cachedProjects: [WebProjectDescriptor]? = try await cache.get([WebProjectDescriptor].self, key: "web.projects")
+        XCTAssertNil(cachedProjects, "Remote stale bootstrap must not become the phone's authoritative cache")
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"])
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .staleCache)
+        let cachedConversations: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
+        XCTAssertNil(cachedConversations, "Remote stale conversation bootstrap must stay non-authoritative")
         await store.suspend()
     }
 
@@ -759,6 +883,47 @@ final class RemoteAIMobileTests: XCTestCase {
         let stopped = await store.stop(runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload")
         XCTAssertTrue(stopped)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testConcurrentStopRequestsShareOneIdempotentRemoteCommand() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        await mock.setRequestDelay(action: "stopGeneration", nanoseconds: 120_000_000)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        async let first = store.stop(runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload")
+        try await Task.sleep(nanoseconds: 15_000_000)
+        async let second = store.stop(runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload")
+        let results = await (first, second)
+
+        XCTAssertTrue(results.0)
+        XCTAssertTrue(results.1, "A repeated Stop tap must join the in-flight idempotent Stop instead of reporting a false failure")
+        XCTAssertEqual(await mock.actionAttemptCount("stopGeneration"), 1, "Concurrent Stop taps must produce exactly one remote Stop command")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWorkspaceStoreExposesLiveRunStatusUntilGenerationStops() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        _ = await store.send(text: "show-progress", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload")
+
+        for _ in 0..<80 {
+            if store.liveRunStatusBySession["photo-upload"] != nil { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"], "Live generation/tool progress should be visible while the remote run is active")
+
+        for _ in 0..<100 {
+            if store.liveRunStatusBySession["photo-upload"] == nil { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "Generation stop must clear the transient progress strip")
         await store.suspend()
     }
 

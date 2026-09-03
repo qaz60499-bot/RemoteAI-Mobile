@@ -245,6 +245,15 @@ struct WebProjectView: View {
     var body: some View {
         List {
             Section("最近对话") {
+                if store.projectConversationLoadingByAlias[project.projectAlias] == true && rows.isEmpty {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("正在加载这个 Project 的最新对话…")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                }
                 ForEach(rows) { conversation in
                     NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: conversation.session)) {
                         SessionRow(session: conversation.session)
@@ -271,6 +280,7 @@ struct WebProjectView: View {
 
 struct ChatView: View {
     @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.scenePhase) private var scenePhase
     let runtime: RuntimeDescriptor
     let instance: InstanceDescriptor
     let session: SessionDescriptor
@@ -284,6 +294,8 @@ struct ChatView: View {
     @State private var sendTask: Task<Void, Never>?
     @State private var composerCommandId: UUID?
     @State private var selectedCodexModel = ""
+    @State private var voiceBaseText = ""
+    @StateObject private var speechInput = SpeechInputController()
     @FocusState private var focused: Bool
 
     var messages: [ChatMessage] { store.messagesBySession[session.id, default: []] }
@@ -296,6 +308,7 @@ struct ChatView: View {
         VStack(spacing: 0) {
             if let error = store.errors[session.id] { ErrorBanner(text: error) { store.clearError(sessionId: session.id) } }
             if let attachmentError { ErrorBanner(text: attachmentError) { self.attachmentError = nil } }
+            if let voiceError = speechInput.errorMessage { ErrorBanner(text: voiceError) { speechInput.dismissError() } }
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 12) {
@@ -336,6 +349,30 @@ struct ChatView: View {
                     .padding(.vertical, 6)
                     .background(.ultraThinMaterial)
                 }
+                if isGenerating {
+                    HStack(spacing: 9) {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(store.liveRunStatusBySession[session.id] ?? "正在处理…")
+                                .font(.caption.weight(.medium))
+                                .lineLimit(2)
+                            Text("可以直接输入新的指令并发送来纠正方向；也可以先停止。")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Button {
+                            Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) }
+                        } label: {
+                            Image(systemName: "stop.circle.fill").font(.title3)
+                        }
+                        .accessibilityLabel("Stop generation")
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(.ultraThinMaterial)
+                }
                 if let transfer = store.attachmentTransferBySession[session.id] {
                     HStack(spacing: 10) {
                         ProgressView(value: transfer.fraction)
@@ -357,9 +394,14 @@ struct ChatView: View {
                     text: $input,
                     attachments: $pendingAttachments,
                     enabled: store.machine.state == .online && !sending,
+                    isGenerating: isGenerating,
+                    isRecording: speechInput.isRecording,
                     addPhoto: { showPhotoPicker = true },
                     addFile: { showFilePicker = true },
+                    toggleVoice: { toggleVoiceInput() },
+                    stop: { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } },
                     send: {
+                        if speechInput.isRecording { speechInput.stop() }
                         let text = input
                         let attachments = pendingAttachments
                         let commandId = composerCommandId ?? UUID()
@@ -420,6 +462,10 @@ struct ChatView: View {
             case .failure(let error): attachmentError = error.localizedDescription
             }
         }
+        .onDisappear { speechInput.stop() }
+        .onChange(of: scenePhase) { phase in
+            if phase != .active { speechInput.stop() }
+        }
         .task {
             if runtime.kind == .codex, selectedCodexModel.isEmpty {
                 selectedCodexModel = instance.configuredModel
@@ -429,6 +475,20 @@ struct ChatView: View {
             }
             await store.loadSession(session.id)
             if input.isEmpty { input = await store.draft(sessionId: session.id) }
+        }
+    }
+
+    private func toggleVoiceInput() {
+        if speechInput.isRecording {
+            speechInput.stop()
+            return
+        }
+        let existing = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        voiceBaseText = existing
+        speechInput.toggle { transcript in
+            let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !spoken.isEmpty else { return }
+            input = voiceBaseText.isEmpty ? spoken : "\(voiceBaseText) \(spoken)"
         }
     }
 
@@ -473,12 +533,22 @@ struct Composer: View {
     @Binding var text: String
     @Binding var attachments: [PendingAttachment]
     let enabled: Bool
+    let isGenerating: Bool
+    let isRecording: Bool
     let addPhoto: () -> Void
     let addFile: () -> Void
+    let toggleVoice: () -> Void
+    let stop: () -> Void
     let send: () -> Void
 
+    private var hasDraft: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+    }
+
+    private var shouldShowStop: Bool { isGenerating && !hasDraft }
+
     private var canSend: Bool {
-        enabled && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
+        enabled && hasDraft
     }
 
     var body: some View {
@@ -519,6 +589,15 @@ struct Composer: View {
                 .disabled(attachments.count >= 8)
                 .accessibilityLabel("Attachments")
 
+                Button(action: toggleVoice) {
+                    Image(systemName: isRecording ? "waveform.circle.fill" : "mic.circle")
+                        .font(.title2)
+                        .frame(width: 38, height: 44)
+                        .foregroundColor(isRecording ? .accentColor : .secondary)
+                }
+                .disabled(!enabled)
+                .accessibilityLabel(isRecording ? "Stop voice input" : "Voice input")
+
                 TextEditor(text: $text)
                     .frame(minHeight: 36, maxHeight: 92)
                     .padding(.horizontal, 7).padding(.vertical, 2)
@@ -526,12 +605,14 @@ struct Composer: View {
                     .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color(.separator), lineWidth: 0.5))
                     .accessibilityIdentifier("MessageComposer")
 
-                Button(action: send) {
-                    Image(systemName: "arrow.up.circle.fill").font(.title).frame(width: 44, height: 44)
-                        .foregroundColor(canSend ? .accentColor : .secondary)
+                Button(action: shouldShowStop ? stop : send) {
+                    Image(systemName: shouldShowStop ? "stop.circle.fill" : "arrow.up.circle.fill")
+                        .font(.title)
+                        .frame(width: 44, height: 44)
+                        .foregroundColor((shouldShowStop && enabled) || canSend ? .accentColor : .secondary)
                 }
-                .disabled(!canSend)
-                .accessibilityLabel("Send")
+                .disabled(shouldShowStop ? !enabled : !canSend)
+                .accessibilityLabel(shouldShowStop ? "Stop generation" : (isGenerating ? "Send correction" : "Send"))
             }
             .padding(.horizontal, 10)
         }

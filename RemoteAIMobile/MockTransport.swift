@@ -3,7 +3,7 @@ import Foundation
 enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
-    case duplicateEvent, sequenceGap, partialWebCatalog, unclassifiedWebCatalog, offline
+    case duplicateEvent, sequenceGap, partialWebCatalog, staleWebCatalog, unclassifiedWebCatalog, offline
 }
 
 actor MockTransport: Transport {
@@ -124,6 +124,10 @@ actor MockTransport: Transport {
     func userMessageCount(sessionId: String, text: String) -> Int {
         history[sessionId, default: []].filter { $0.role == "user" && $0.content == text }.count
     }
+    func injectEvent(_ event: RemoteEvent, deliverLive: Bool = false) {
+        eventLog.append(event)
+        if deliverLive { continuation?.yield(event) }
+    }
     func attachmentData(id: String) -> Data? { finishedAttachmentData[id] }
     func finishedAttachmentCount() -> Int { finishedAttachmentData.count }
     func finishedAttachmentPayloads() -> [Data] { Array(finishedAttachmentData.values) }
@@ -184,6 +188,8 @@ actor MockTransport: Transport {
         case "listProjects":
             if scenario == .partialWebCatalog {
                 response = try success(WebProjectListResponse(items: Array(webProjects.prefix(1)), observedAt: Date(), source: "browser-dom", stale: true, state: .partialDOM, snapshotId: "mock-projects-partial-1"))
+            } else if scenario == .staleWebCatalog {
+                response = try success(WebProjectListResponse(items: webProjects, observedAt: Date(), source: "windows-last-known-good", stale: true, state: .staleCache, snapshotId: "mock-projects-stale-\(webProjects.count)"))
             } else if scenario == .unclassifiedWebCatalog {
                 response = try success(WebProjectListResponse(items: Array(webProjects.prefix(1)), observedAt: Date(), source: "browser-dom", stale: nil, state: nil, snapshotId: nil))
             } else {
@@ -202,6 +208,7 @@ actor MockTransport: Transport {
             }()
             let all = webProjectConversations[alias, default: []]
             let degraded = scenario == .partialWebCatalog || scenario == .unclassifiedWebCatalog
+            let staleBootstrap = scenario == .staleWebCatalog
             // A degraded DOM can still expose safe metadata hints for identities the
             // client already knows. Keep one matching row so WorkspaceStore can prove
             // it repairs titles without replacing the verified identity snapshot.
@@ -214,9 +221,9 @@ actor MockTransport: Transport {
                 nextCursor: degraded ? nil : (nextOffset < all.count ? "offset:\(nextOffset)" : nil),
                 hasMore: degraded ? false : nextOffset < all.count,
                 observedAt: Date(),
-                source: "browser-dom",
-                stale: scenario == .partialWebCatalog ? true : (scenario == .unclassifiedWebCatalog ? nil : false),
-                state: scenario == .partialWebCatalog ? .partialDOM : (scenario == .unclassifiedWebCatalog ? nil : .authoritativeLiveDOM),
+                source: staleBootstrap ? "windows-last-known-good" : "browser-dom",
+                stale: staleBootstrap ? true : (scenario == .partialWebCatalog ? true : (scenario == .unclassifiedWebCatalog ? nil : false)),
+                state: staleBootstrap ? .staleCache : (scenario == .partialWebCatalog ? .partialDOM : (scenario == .unclassifiedWebCatalog ? nil : .authoritativeLiveDOM)),
                 snapshotId: degraded ? nil : "mock-conversations-\(alias)-\(all.count)"
             ))
         case "openProject":
