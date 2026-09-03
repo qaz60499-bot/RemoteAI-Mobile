@@ -54,6 +54,8 @@ final class WorkspaceStore: ObservableObject {
     private var commandSendsInFlight = Set<UUID>()
     private var metadataRefreshInFlight = false
     private var metadataRefreshQueued = false
+    private var deltaRecoveryInFlight = false
+    private var deltaRecoveryQueued = false
     private var webProjectsRevision: UInt64 = 0
     private var webProjectsSnapshotId: String?
     private var projectConversationRevisions: [String: UInt64] = [:]
@@ -317,6 +319,13 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
             guard page.isAuthoritativeLiveDOM else {
                 projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
+                // Degraded responses may carry only metadata title hints from local
+                // Chrome History. Merge those only when the conversation identity was
+                // already verified; stale identity/order is never accepted.
+                if mergeConversationTitleHints(page.items, projectAlias: projectAlias) {
+                    try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+                    mergeProjectSessions(projectConversationsByAlias[projectAlias] ?? [])
+                }
                 errors["web.project.\(projectAlias)"] = "ChatGPT conversations are temporarily incomplete; keeping the last verified list."
                 return
             }
@@ -354,6 +363,10 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
             guard page.isAuthoritativeLiveDOM else {
                 projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
+                if mergeConversationTitleHints(page.items, projectAlias: projectAlias) {
+                    try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+                    mergeProjectSessions(projectConversationsByAlias[projectAlias] ?? [])
+                }
                 errors["web.project.\(projectAlias)"] = "ChatGPT conversations are temporarily incomplete; keeping the last verified list."
                 return
             }
@@ -664,32 +677,36 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func stop(runtimeId: String, instanceId: String, sessionId: String) async {
-        guard stoppingSessions.insert(sessionId).inserted else { return }
+    @discardableResult
+    func stop(runtimeId: String, instanceId: String, sessionId: String) async -> Bool {
+        guard stoppingSessions.insert(sessionId).inserted else { return false }
         defer { stoppingSessions.remove(sessionId) }
         guard machine.state == .online else {
             errors[sessionId] = "PC Offline — stop will not be queued blindly."
-            return
+            return false
         }
         let generation = lifecycleGeneration
         let activeTransport = transport
         let activeMachineId = machine.id
         let operationKey = "stop.\(runtimeId).\(instanceId).\(sessionId)"
         let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
-        guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
+        guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
         let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "stopGeneration", commandId: commandId)
         commandStates[command.commandId] = .pending
         do {
             let state = try await activeTransport.send(command)
-            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             commandStates[command.commandId] = state
             await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
+            setSessionState(sessionId, .idle)
             errors[sessionId] = nil
+            return true
         } catch {
-            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             commandStates[command.commandId] = isUnknownDelivery(error) ? .unknown : .failed
             if !isUnknownDelivery(error) { await finishPendingOperation(key: operationKey, machineId: activeMachineId) }
             errors[sessionId] = error.localizedDescription
+            return false
         }
     }
 
@@ -1112,6 +1129,44 @@ final class WorkspaceStore: ObservableObject {
         ]
     }
 
+    private func isSyntheticConversationTitle(_ title: String, conversationAlias: String?) -> Bool {
+        let value = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty || value.caseInsensitiveCompare("ChatGPT Conversation") == .orderedSame { return true }
+        if value.range(of: #"^ChatGPT [0-9a-fA-F]{8}$"#, options: .regularExpression) != nil { return true }
+        if let conversationAlias, value.caseInsensitiveCompare(conversationAlias) == .orderedSame { return true }
+        return false
+    }
+
+    @discardableResult
+    private func mergeConversationTitleHints(_ hints: [WebConversationDescriptor], projectAlias: String) -> Bool {
+        guard var current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
+        let byAlias = Dictionary(uniqueKeysWithValues: hints.compactMap { hint -> (String, WebConversationDescriptor)? in
+            guard let alias = hint.conversationAlias, hint.projectAlias == projectAlias else { return nil }
+            return (alias, hint)
+        })
+        var changed = false
+        for index in current.indices {
+            guard let alias = current[index].conversationAlias,
+                  let hint = byAlias[alias],
+                  isSyntheticConversationTitle(current[index].displayTitle, conversationAlias: alias),
+                  !isSyntheticConversationTitle(hint.displayTitle, conversationAlias: alias) else { continue }
+            let prior = current[index]
+            current[index] = WebConversationDescriptor(
+                localConversationId: prior.localConversationId,
+                canonicalUrl: prior.canonicalUrl,
+                projectId: prior.projectId,
+                displayTitle: hint.displayTitle,
+                projectAlias: prior.projectAlias,
+                conversationAlias: prior.conversationAlias,
+                lastVisited: prior.lastVisited,
+                updatedAt: max(prior.updatedAt, hint.updatedAt)
+            )
+            changed = true
+        }
+        if changed { projectConversationsByAlias[projectAlias] = current }
+        return changed
+    }
+
     private func mergeProjectSessions(_ items: [WebConversationDescriptor]) {
         for item in items {
             let session = item.session
@@ -1153,6 +1208,29 @@ final class WorkspaceStore: ObservableObject {
 
     private func recoverDelta(freshLatestSequence: Int64? = nil) async {
         guard machine.state == .online else { return }
+        if deltaRecoveryInFlight {
+            // Event ingestion and the reconnect monitor can both notice the same gap
+            // while MainActor is suspended in network I/O. Coalesce them instead of
+            // creating parallel getChangesAfterCursor loops. One queued pass runs after
+            // the active pass so an event that arrived after its final page is not lost.
+            deltaRecoveryQueued = true
+            return
+        }
+        deltaRecoveryInFlight = true
+        let generation = lifecycleGeneration
+        defer {
+            deltaRecoveryInFlight = false
+            if deltaRecoveryQueued,
+               generation == lifecycleGeneration,
+               machine.state == .online,
+               !isSuspended {
+                deltaRecoveryQueued = false
+                Task { [weak self] in await self?.recoverDelta() }
+            } else {
+                deltaRecoveryQueued = false
+            }
+        }
+
         var cursor = (try? await cache.lastSequence()) ?? 0
         do {
             if cursor == 0 && instances.isEmpty && sessions.isEmpty && webProjects.isEmpty {
@@ -1169,7 +1247,9 @@ final class WorkspaceStore: ObservableObject {
                 return
             }
             while true {
+                guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
                 let result = try await transport.delta(machineId: machine.id, after: cursor)
+                guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
                 for event in result.events where event.sequence > cursor {
                     guard eventReplayGuard.accept(event.eventId.uuidString.lowercased()) else { throw TransportError.replayDetected }
                     await applyEvent(event)
@@ -1182,7 +1262,7 @@ final class WorkspaceStore: ObservableObject {
             }
             tracker = SequenceTracker(lastSequence: cursor)
         } catch {
-            errors["sync"] = error.localizedDescription
+            if generation == lifecycleGeneration, !isSuspended { errors["sync"] = error.localizedDescription }
         }
     }
 
@@ -1211,9 +1291,21 @@ final class WorkspaceStore: ObservableObject {
         case "TOOL_STARTED", "TOOL_FINISHED":
             let completed = event.type == "TOOL_FINISHED"
             let toolValue = event.payload["tool"]
-            let toolName = toolValue?.stringValue ?? toolValue?.objectValue?["name"]?.stringValue ?? toolValue?.objectValue?["type"]?.stringValue ?? "Tool"
-            let detail = event.payload["summary"]?.stringValue ?? event.payload["provider"]?.stringValue
-            let message = ChatMessage(id: event.eventId.uuidString, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: detail, createdAt: event.createdAt)
+            let toolObject = toolValue?.objectValue
+            let rawToolName = toolValue?.stringValue ?? toolObject?["name"]?.stringValue ?? toolObject?["type"]?.stringValue ?? "Tool"
+            let toolName: String
+            switch rawToolName {
+            case "command_execution": toolName = "Command"
+            case "mcp_tool_call": toolName = "MCP Tool"
+            case "web_search": toolName = "Web Search"
+            default: toolName = rawToolName
+            }
+            let detail = event.payload["summary"]?.stringValue
+                ?? toolObject?["summary"]?.stringValue
+                ?? event.payload["provider"]?.stringValue
+            let stableToolId = toolObject?["id"]?.stringValue
+            let messageId = stableToolId.map { "tool-\(sessionId)-\($0)" } ?? event.eventId.uuidString
+            let message = ChatMessage(id: messageId, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: detail, createdAt: event.createdAt)
             merge([message], into: sessionId)
             try? await cache.upsertMessages([message])
         case "GENERATION_STARTED":

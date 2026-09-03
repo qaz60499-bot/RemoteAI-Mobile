@@ -497,16 +497,20 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(verifiedProjects.count, 2)
         XCTAssertEqual(verifiedConversations.count, 1)
 
+        await mock.setProjectConversationTitle(alias: "g-p-remoteai", conversationAlias: "mock-1", title: "Recovered real title")
         await mock.setScenario(.partialWebCatalog)
         await store.refreshWebProjects()
         await store.loadProjectConversations(projectAlias: "g-p-remoteai")
 
         XCTAssertEqual(store.webProjects, verifiedProjects, "A successful-but-partial Project snapshot must not replace verified live DOM state")
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"], verifiedConversations, "A partial conversation snapshot must not collapse the verified list")
+        let repairedConversations = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(repairedConversations.map(\.localConversationId), verifiedConversations.map(\.localConversationId), "A partial conversation snapshot must not replace verified identities")
+        XCTAssertEqual(repairedConversations.first?.displayTitle, "Recovered real title", "A matching verified alias may accept safer live title metadata from a partial DOM")
         let cachedProjects: [WebProjectDescriptor]? = try await cache.get([WebProjectDescriptor].self, key: "web.projects")
         let cachedConversations: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
         XCTAssertEqual(cachedProjects, verifiedProjects)
-        XCTAssertEqual(cachedConversations, verifiedConversations)
+        XCTAssertEqual(cachedConversations?.map(\.localConversationId), verifiedConversations.map(\.localConversationId))
+        XCTAssertEqual(cachedConversations?.first?.displayTitle, "Recovered real title")
         XCTAssertNotNil(store.errors["web.projects"])
         XCTAssertNotNil(store.errors["web.project.g-p-remoteai"])
         await store.suspend()
@@ -741,6 +745,18 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testWorkspaceStoreStopReturnsSuccessAndConvergesSessionIdle() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let stopped = await store.stop(runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload")
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        await store.suspend()
+    }
+
+    @MainActor
     func testWorkspaceStoreReconcilesOptimisticAndStreamingMessages() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
         let db = try SQLiteStore(url: url)
@@ -753,6 +769,10 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(messages.filter { $0.role == .user && $0.text == "dedupe-check" }.count, 1)
         XCTAssertEqual(messages.filter { $0.role == .assistant && $0.text == "Remote AI mock streaming response." }.count, 1)
         XCTAssertFalse(messages.contains { $0.role == .assistant && $0.toolStatus == "Streaming" })
+        let tools = messages.filter { $0.kind == .toolEvent }
+        XCTAssertEqual(tools.count, 1, "Tool start/finish events with the same provider tool id should update one card")
+        XCTAssertEqual(tools.first?.toolStatus, "Completed")
+        XCTAssertTrue(tools.first?.detail?.contains("Output\n384 tests passed") == true)
         await store.suspend()
     }
 

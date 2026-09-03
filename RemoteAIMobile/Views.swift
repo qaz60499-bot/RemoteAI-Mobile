@@ -109,11 +109,10 @@ struct InstanceView: View {
     @State private var projectSearch = ""
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
     private var visibleProjects: [WebProjectDescriptor] {
-        // While connected, only show a Project list after the current live DOM refresh
-        // has completed. Cached rows remain available offline but never flash as if
-        // they were the current ChatGPT sidebar.
-        if store.machine.state != .offline && !store.hasLoadedWebProjects { return [] }
-        return store.webProjects
+        // Cache contains only previously accepted Project snapshots. Render it
+        // immediately while the live DOM refresh runs so opening Web never starts with
+        // a blank list on a slow account. Legacy/mock rows are purged by WorkspaceStore.
+        store.webProjects
     }
     private var filteredProjects: [WebProjectDescriptor] {
         let query = projectSearch.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -289,6 +288,10 @@ struct ChatView: View {
 
     var messages: [ChatMessage] { store.messagesBySession[session.id, default: []] }
     private var codexModels: [CodexModelOption] { instance.codexCatalog?.models ?? [] }
+    private var currentSessionState: SessionState {
+        store.sessions.first(where: { $0.id == session.id })?.state ?? session.state
+    }
+    private var isGenerating: Bool { currentSessionState == .busy || currentSessionState == .waiting }
     var body: some View {
         VStack(spacing: 0) {
             if let error = store.errors[session.id] { ErrorBanner(text: error) { store.clearError(sessionId: session.id) } }
@@ -360,11 +363,24 @@ struct ChatView: View {
                         let text = input
                         let attachments = pendingAttachments
                         let commandId = composerCommandId ?? UUID()
+                        let correctingActiveRun = isGenerating
                         focused = false
                         input = ""
                         pendingAttachments.removeAll()
                         sending = true
                         sendTask = Task {
+                            if correctingActiveRun {
+                                let stopped = await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id)
+                                if !stopped {
+                                    await MainActor.run {
+                                        sending = false
+                                        sendTask = nil
+                                        if input.isEmpty { input = text }
+                                        if pendingAttachments.isEmpty { pendingAttachments = attachments }
+                                    }
+                                    return
+                                }
+                            }
                             let sent = await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, attachments: attachments, model: runtime.kind == .codex ? selectedCodexModel : "", commandId: commandId)
                             await MainActor.run {
                                 sending = false
@@ -578,9 +594,18 @@ struct MessageRow: View {
     let message: ChatMessage
     let commandState: CommandState?
     let retry: (() -> Void)?
+    @State private var toolExpanded = true
     var body: some View {
         if message.kind == .toolEvent {
-            DisclosureGroup { if let detail = message.detail { Text(detail).font(.caption).foregroundColor(.secondary).padding(.top, 4) } } label: {
+            DisclosureGroup(isExpanded: $toolExpanded) {
+                if let detail = message.detail {
+                    Text(detail)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .padding(.top, 6)
+                }
+            } label: {
                 HStack { Image(systemName: message.toolStatus == "Completed" ? "checkmark.circle.fill" : "gearshape.2"); VStack(alignment: .leading, spacing: 2) { Text(message.toolName ?? "Tool").font(.subheadline.weight(.semibold)); Text(message.toolStatus ?? "Running").font(.caption).foregroundColor(.secondary) }; Spacer() }
             }.padding(12).background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
         } else {

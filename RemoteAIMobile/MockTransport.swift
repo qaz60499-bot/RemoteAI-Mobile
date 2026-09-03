@@ -90,6 +90,22 @@ actor MockTransport: Transport {
     func connectionAttemptCount() -> Int { connectAttempts }
     func projectCount() -> Int { webProjects.count }
     func projectConversationCount(_ alias: String) -> Int { webProjectConversations[alias, default: []].count }
+    func setProjectConversationTitle(alias: String, conversationAlias: String, title: String) {
+        guard var rows = webProjectConversations[alias],
+              let index = rows.firstIndex(where: { $0.conversationAlias == conversationAlias }) else { return }
+        let current = rows[index]
+        rows[index] = WebConversationDescriptor(
+            localConversationId: current.localConversationId,
+            canonicalUrl: current.canonicalUrl,
+            projectId: current.projectId,
+            displayTitle: title,
+            projectAlias: current.projectAlias,
+            conversationAlias: current.conversationAlias,
+            lastVisited: current.lastVisited,
+            updatedAt: current.updatedAt
+        )
+        webProjectConversations[alias] = rows
+    }
     func seedProjectConversations(alias: String, count: Int) {
         let now = Date()
         webProjectConversations[alias] = (0..<max(0, count)).map { index in
@@ -186,7 +202,10 @@ actor MockTransport: Transport {
             }()
             let all = webProjectConversations[alias, default: []]
             let degraded = scenario == .partialWebCatalog || scenario == .unclassifiedWebCatalog
-            let slice = degraded ? [] : Array(all.dropFirst(offset).prefix(limit))
+            // A degraded DOM can still expose safe metadata hints for identities the
+            // client already knows. Keep one matching row so WorkspaceStore can prove
+            // it repairs titles without replacing the verified identity snapshot.
+            let slice = degraded ? Array(all.dropFirst(offset).prefix(1)) : Array(all.dropFirst(offset).prefix(limit))
             let nextOffset = offset + slice.count
             response = try success(WebProjectConversationPage(
                 project: project,
@@ -308,7 +327,13 @@ actor MockTransport: Transport {
         guard let sessionId = command.sessionId else { return }
         await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: sessionId, type: "GENERATION_STARTED", payload: ["provider": .string("mock")])
         await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: sessionId, type: "MESSAGE_ADDED", payload: (try? JSONValue.encode(user).objectValue) ?? [:])
-        await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: sessionId, type: "TOOL_STARTED", payload: ["provider": .string("mock"), "tool": .string(command.runtimeId == "runtime.web" ? "Web Adapter" : "DevSpace")])
+        let mockToolId = "mock-tool-\(command.commandId.uuidString.lowercased())"
+        let mockToolName = command.runtimeId == "runtime.web" ? "Web Adapter" : "DevSpace"
+        await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: sessionId, type: "TOOL_STARTED", payload: [
+            "provider": .string("mock"),
+            "tool": .object(["id": .string(mockToolId), "name": .string(mockToolName), "summary": .string("Input\nmock operation")]),
+            "summary": .string("Input\nmock operation")
+        ])
         let responseId = "message-\(UUID().uuidString.lowercased())"
         var text = ""
         for chunk in ["Remote ", "AI ", "mock ", "streaming ", "response."] {
@@ -319,7 +344,11 @@ actor MockTransport: Transport {
         let assistant = ServerMessage(messageId: responseId, sessionId: sessionId, role: "assistant", content: text, externalId: nil, createdAt: Date())
         history[sessionId, default: []].append(assistant)
         await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: sessionId, type: "MESSAGE_ADDED", payload: (try? JSONValue.encode(assistant).objectValue) ?? [:])
-        await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: sessionId, type: "TOOL_FINISHED", payload: ["provider": .string("mock"), "tool": .string(command.runtimeId == "runtime.web" ? "Web Adapter" : "DevSpace"), "summary": .string("384 tests passed")])
+        await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: sessionId, type: "TOOL_FINISHED", payload: [
+            "provider": .string("mock"),
+            "tool": .object(["id": .string(mockToolId), "name": .string(mockToolName), "summary": .string("Input\nmock operation\n\nOutput\n384 tests passed")]),
+            "summary": .string("Input\nmock operation\n\nOutput\n384 tests passed")
+        ])
         await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: sessionId, type: "GENERATION_STOPPED", payload: ["provider": .string("mock"), "ok": .bool(true)])
         if scenario == .duplicateEvent, let last = eventLog.last { continuation?.yield(last) }
         if scenario == .sequenceGap {
