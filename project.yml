@@ -38,6 +38,8 @@ targets:
     preBuildScripts:
       - name: Generate App Icon
         basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(SRCROOT)/scripts/generate_app_icon.py
         outputFiles:
           - $(SRCROOT)/RemoteAIMobile/Assets.xcassets/AppIcon.appiconset/AppIcon.png
         script: |
