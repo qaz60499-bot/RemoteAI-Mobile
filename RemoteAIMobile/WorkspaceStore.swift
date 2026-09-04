@@ -65,6 +65,10 @@ final class WorkspaceStore: ObservableObject {
     private var projectConversationRevisions: [String: UInt64] = [:]
     private var projectConversationSnapshotIds: [String: String] = [:]
     private var sessionRevisions: [String: UInt64] = [:]
+    // Live events carry authoritative runtime/instance routing even when the mobile
+    // catalog is still intentionally lazy. Keep that route so opening a conversation
+    // can recover its history before the instance/session list has been expanded.
+    private var sessionRouteHints: [String: (machineId: String, runtimeId: String, instanceId: String)] = [:]
 
     private static func pendingCommandPrefix(machineId: String) -> String {
         "pending.command.\(machineId)."
@@ -584,9 +588,10 @@ final class WorkspaceStore: ObservableObject {
             messagesBySession[sessionId] = local
         }
         await reconcilePendingUnknownCommands(with: messagesBySession[sessionId, default: []], sessionId: sessionId)
-        guard machine.state == .online, let context = contextForSession(sessionId) else { return }
+        guard machine.state == .online, let route = routeForSession(sessionId) else { return }
+        await hydrateSessionDescriptorIfNeeded(sessionId: sessionId, route: route, generation: generation)
         do {
-            let page = try await transport.loadRecent(machineId: machine.id, runtimeId: context.runtime.id, instanceId: context.instance.id, sessionId: sessionId, limit: 50)
+            let page = try await transport.loadRecent(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, limit: 50)
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
             await reconcilePendingUnknownCommands(with: page.items, sessionId: sessionId)
             for remoteUser in page.items where remoteUser.role == .user {
@@ -594,6 +599,7 @@ final class WorkspaceStore: ObservableObject {
             }
             try? await cache.upsertMessages(page.items)
             merge(page.items, into: sessionId)
+            ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: page.items.last?.createdAt ?? Date())
             await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
             hasMoreBySession[sessionId] = page.hasMore
             errors[sessionId] = nil
@@ -609,8 +615,8 @@ final class WorkspaceStore: ObservableObject {
         guard let first = messagesBySession[sessionId]?.first, hasMoreBySession[sessionId] != false else { return }
         do {
             let page: Page<ChatMessage>
-            if machine.state == .online, let context = contextForSession(sessionId) {
-                page = try await transport.loadBefore(machineId: machine.id, runtimeId: context.runtime.id, instanceId: context.instance.id, sessionId: sessionId, before: first.cursor, limit: 40)
+            if machine.state == .online, let route = routeForSession(sessionId) {
+                page = try await transport.loadBefore(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, before: first.cursor, limit: 40)
                 guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
             } else {
                 let local = try await cache.messagesBefore(sessionId: sessionId, before: first.cursor, limit: 40)
@@ -1172,6 +1178,49 @@ final class WorkspaceStore: ObservableObject {
         return (runtime, instance)
     }
 
+    private func routeForSession(_ sessionId: String) -> (runtimeId: String, instanceId: String)? {
+        if let context = contextForSession(sessionId) {
+            return (context.runtime.id, context.instance.id)
+        }
+        guard let hint = sessionRouteHints[sessionId], hint.machineId == machine.id else { return nil }
+        return (hint.runtimeId, hint.instanceId)
+    }
+
+    private func hydrateSessionDescriptorIfNeeded(
+        sessionId: String,
+        route: (runtimeId: String, instanceId: String),
+        generation: UInt64
+    ) async {
+        guard !sessions.contains(where: { $0.id == sessionId }),
+              machine.state == .online,
+              generation == lifecycleGeneration,
+              !isSuspended else { return }
+        do {
+            let remote = try await transport.listSessions(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId)
+            guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+            if let resolved = remote.first(where: { $0.id == sessionId }) {
+                sessions.append(resolved)
+                sessions.sort { $0.updatedAt > $1.updatedAt }
+                await persistMetadata()
+            }
+        } catch {
+            // The route hint is still sufficient for a read-only message fetch. Do not
+            // fail loadSession merely because the lazy session catalog refresh failed.
+        }
+    }
+
+    private func ensureSessionDescriptorExists(sessionId: String, instanceId: String, updatedAt: Date) {
+        guard !sessions.contains(where: { $0.id == sessionId }) else { return }
+        sessions.append(SessionDescriptor(
+            id: sessionId,
+            instanceId: instanceId,
+            title: "ChatGPT Conversation",
+            state: .idle,
+            updatedAt: updatedAt
+        ))
+        sessions.sort { $0.updatedAt > $1.updatedAt }
+    }
+
     private func loadCachedFirst() async {
         if let cached: MachineMetadata = try? await cache.get(MachineMetadata.self, key: "machine") {
             machine = MachineMetadata(id: cached.id, name: cached.name, state: .connecting)
@@ -1418,6 +1467,15 @@ final class WorkspaceStore: ObservableObject {
             return
         }
 
+        sessionRouteHints[sessionId] = (event.machineId, event.runtimeId, event.instanceId)
+        if ["MESSAGE_UPDATED", "MESSAGE_ADDED", "TOOL_STARTED", "TOOL_FINISHED", "GENERATION_STARTED", "GENERATION_STOPPED"].contains(event.type) {
+            // Live delivery can legitimately beat lazy instance/session catalog loading.
+            // Materialize one in-memory row so busy/error/idle transitions are visible
+            // immediately; a later authoritative listSessions refresh replaces its
+            // generic title rather than losing the run state entirely.
+            ensureSessionDescriptorExists(sessionId: sessionId, instanceId: event.instanceId, updatedAt: event.createdAt)
+        }
+
         switch event.type {
         case "MESSAGE_UPDATED":
             let content = event.payload["content"]?.stringValue ?? ""
@@ -1475,9 +1533,31 @@ final class WorkspaceStore: ObservableObject {
             setSessionState(sessionId, .busy)
             liveRunStatusBySession[sessionId] = "ChatGPT 正在处理…"
         case "GENERATION_STOPPED":
-            flushStreaming(sessionId: sessionId)
-            setSessionState(sessionId, .idle)
-            liveRunStatusBySession.removeValue(forKey: sessionId)
+            if event.payload["ok"]?.boolValue == false {
+                // A provider can terminate a Web generation after exposing only a DOM
+                // prefix (for example when ChatGPT shows a strong rate-limit banner).
+                // That prefix is transient UI state, not a durable assistant reply.
+                // Remove any already-flushed Streaming bubble instead of promoting it
+                // to final content when the terminal event explicitly reports failure.
+                discardStreamingPlaceholder(sessionId: sessionId)
+                await settleRunningToolRows(sessionId: sessionId)
+                setSessionState(sessionId, .error)
+                liveRunStatusBySession.removeValue(forKey: sessionId)
+                let code = event.payload["errorCode"]?.stringValue ?? "PROVIDER_UNAVAILABLE"
+                let message = event.payload["errorMessage"]?.stringValue
+                if let message, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    errors[sessionId] = message
+                } else if code == "PROVIDER_RATE_LIMITED" {
+                    errors[sessionId] = "ChatGPT 请求过快，当前会话已被临时限流。本次回答未完成，RemoteAI 没有保存截断内容，请稍后重试。"
+                } else {
+                    errors[sessionId] = "ChatGPT 本次生成未完成（\(code)）。RemoteAI 没有保存截断回答。"
+                }
+            } else {
+                flushStreaming(sessionId: sessionId)
+                setSessionState(sessionId, .idle)
+                liveRunStatusBySession.removeValue(forKey: sessionId)
+                errors[sessionId] = nil
+            }
         case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED":
             await refreshMetadata()
         case "COMMAND_RESULT", "COMMAND_REJECTED":
@@ -1548,6 +1628,10 @@ final class WorkspaceStore: ObservableObject {
         liveRunStatusBySession.removeValue(forKey: sessionId)
         setSessionState(sessionId, .idle)
 
+        await settleRunningToolRows(sessionId: sessionId)
+    }
+
+    private func settleRunningToolRows(sessionId: String) async {
         var changed: [ChatMessage] = []
         if var local = messagesBySession[sessionId] {
             for index in local.indices where local[index].kind == .toolEvent && local[index].toolStatus == "Running" {

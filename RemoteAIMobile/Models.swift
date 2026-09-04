@@ -416,6 +416,7 @@ extension SessionState {
         case "running", "busy", "generating": return .busy
         case "waiting": return .waiting
         case "sleeping": return .sleeping
+        case "interrupted": return .error
         default: return raw.lowercased().contains("error") || raw.lowercased().contains("fail") ? .error : .idle
         }
     }

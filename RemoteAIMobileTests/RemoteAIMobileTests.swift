@@ -37,6 +37,12 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(partialSuccess.shouldReportError)
     }
 
+    func testInterruptedServerSessionMapsToErrorUntilAuthoritativeRecovery() {
+        XCTAssertEqual(SessionState.server("interrupted"), .error)
+        XCTAssertEqual(SessionState.server("generating"), .busy)
+        XCTAssertEqual(SessionState.server("idle"), .idle)
+    }
+
     func testCommandRoundTripKeepsIdempotencyIdAndNumericProtocolVersion() throws {
         let id = UUID()
         let command = RemoteCommand.make(machineId: "pc", runtimeId: "runtime.web", instanceId: "agent", sessionId: "s", action: "sendMessage", payload: ["text": .string("hello")], commandId: id)
@@ -1120,6 +1126,49 @@ final class RemoteAIMobileTests: XCTestCase {
         }
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "A durable assistant final must clear transient progress even if GENERATION_STOPPED was missed")
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "assistant-final-no-stop" }.count, 1)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testFailedGenerationDiscardsStreamingPrefixAndShowsProviderError() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1201, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "GENERATION_STARTED", payload: ["provider": .string("chatgpt-web")], createdAt: now), deliverLive: true)
+        await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1202, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "MESSAGE_UPDATED", payload: ["role": .string("assistant"), "content": .string("REMOTEAI_PARTIAL_"), "partial": .bool(true)], createdAt: now.addingTimeInterval(0.01)), deliverLive: true)
+        await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1203, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "TOOL_STARTED", payload: ["tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]), "summary": .string("Thinking")], createdAt: now.addingTimeInterval(0.015)), deliverLive: true)
+        try await Task.sleep(nanoseconds: 180_000_000)
+        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.role == .assistant && $0.toolStatus == "Streaming" && $0.text == "REMOTEAI_PARTIAL_" })
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1204,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STOPPED",
+            payload: [
+                "ok": .bool(false),
+                "errorCode": .string("PROVIDER_RATE_LIMITED"),
+                "errorMessage": .string("ChatGPT temporarily rate-limited this browser session")
+            ],
+            createdAt: now.addingTimeInterval(0.02)
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.sessions.first(where: { $0.id == "photo-upload" })?.state == .error { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.role == .assistant && ($0.toolStatus == "Streaming" || $0.text == "REMOTEAI_PARTIAL_") })
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .error)
+        XCTAssertEqual(store.errors["photo-upload"], "ChatGPT temporarily rate-limited this browser session")
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.kind == .toolEvent && $0.toolStatus == "Running" })
         await store.suspend()
     }
 
