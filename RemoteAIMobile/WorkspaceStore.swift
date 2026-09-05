@@ -727,13 +727,23 @@ final class WorkspaceStore: ObservableObject {
                 sessionId: sessionId
             )
             guard machine.state == .online, !isSuspended else { return nil }
+            let liveActivityAt = liveRunActivityAtBySession[sessionId]
+            let remoteEvidenceAt = [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
+            let staleIdleSnapshot: Bool
+            if snapshot.state == .idle, let liveActivityAt {
+                staleIdleSnapshot = remoteEvidenceAt.map { $0 < liveActivityAt } ?? true
+            } else {
+                staleIdleSnapshot = false
+            }
             if let index = sessions.firstIndex(where: { $0.id == sessionId }) {
-                sessions[index].state = snapshot.state
+                if !staleIdleSnapshot {
+                    sessions[index].state = snapshot.state
+                    sessions[index].lastProgressStatus = snapshot.lastProgressStatus
+                    sessions[index].lastProgressAt = snapshot.lastProgressAt
+                }
                 if let activity = snapshot.lastActivityAt {
                     sessions[index].lastActivityAt = max(sessions[index].lastActivityAt ?? sessions[index].updatedAt, activity)
                 }
-                sessions[index].lastProgressStatus = snapshot.lastProgressStatus
-                sessions[index].lastProgressAt = snapshot.lastProgressAt
             }
             if route.runtimeId == "runtime.web", let browserConnected = snapshot.browserConnected {
                 let previous = desktopBrowserConnected
@@ -746,6 +756,14 @@ final class WorkspaceStore: ObservableObject {
                     let recovered = systemTransportOfflineChannels.remove("browser-bridge") != nil || previous == false
                     if recovered { recentSystemNotice = "电脑端 Browser Bridge 已恢复，当前会话正在补同步。" }
                 }
+            }
+            if staleIdleSnapshot {
+                DiagnosticsLog.shared.record("stale_session_idle_ignored", fields: [
+                    "session": sessionId,
+                    "liveActivityAt": liveActivityAt?.ISO8601Format() ?? "unknown",
+                    "remoteEvidenceAt": remoteEvidenceAt?.ISO8601Format() ?? "missing",
+                ], level: "WARN")
+                return nil
             }
             if snapshot.state == .busy || snapshot.state == .waiting {
                 markLiveRunActivity(sessionId: sessionId, at: snapshot.lastProgressAt ?? snapshot.lastActivityAt ?? Date())
