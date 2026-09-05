@@ -18,6 +18,7 @@ enum ConnectionDiagnosticPhase: String, Codable, Equatable {
     case loadingRuntimes
     case online
     case reconnecting
+    case windowsReconnecting
     case windowsOffline
     case pairingExpired
     case relayError
@@ -31,8 +32,9 @@ enum ConnectionDiagnosticPhase: String, Codable, Equatable {
         case .authenticating: return "Authenticating"
         case .loadingRuntimes: return "Loading runtimes"
         case .online: return "Online"
-        case .reconnecting: return "Reconnecting"
-        case .windowsOffline: return "Windows offline"
+        case .reconnecting: return "Relay reconnecting"
+        case .windowsReconnecting: return "Windows Agent reconnecting"
+        case .windowsOffline: return "Windows Agent offline"
         case .pairingExpired: return "Pairing expired"
         case .relayError: return "Relay error"
         case .timedOut: return "Connection timed out"

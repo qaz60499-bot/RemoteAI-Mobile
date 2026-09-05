@@ -50,6 +50,26 @@ protocol Transport: AnyObject {
     func disconnect() async
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope
     func eventStream() async -> AsyncStream<RemoteEvent>
+    func healthStream() async -> AsyncStream<TransportHealthEvent>
+}
+
+enum TransportHealthChannel: String, Equatable {
+    case relay
+    case agent
+}
+
+enum TransportHealthState: String, Equatable {
+    case connecting
+    case online
+    case reconnecting
+    case offline
+}
+
+struct TransportHealthEvent: Equatable {
+    let channel: TransportHealthChannel
+    let state: TransportHealthState
+    let at: Date
+    let detail: String?
 }
 
 struct AgentStatusSnapshot: Equatable {
@@ -132,6 +152,10 @@ extension RemoteCommand {
 }
 
 extension Transport {
+    func healthStream() async -> AsyncStream<TransportHealthEvent> {
+        AsyncStream { _ in }
+    }
+
     func send(_ command: RemoteCommand) async throws -> CommandState {
         let response = try await execute(command)
         if response.ok { return .completed }

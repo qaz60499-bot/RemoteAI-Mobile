@@ -13,6 +13,8 @@ actor MockTransport: Transport {
     private var sequence: Int64 = 1200
     private var continuation: AsyncStream<RemoteEvent>.Continuation?
     private var stream: AsyncStream<RemoteEvent>?
+    private var healthContinuation: AsyncStream<TransportHealthEvent>.Continuation?
+    private var healthEventStream: AsyncStream<TransportHealthEvent>?
     private var processedCommands: [UUID: CommandResponseEnvelope] = [:]
     private var history: [String: [ServerMessage]] = [:]
     private var eventLog: [RemoteEvent] = []
@@ -132,6 +134,9 @@ actor MockTransport: Transport {
         eventLog.append(event)
         if deliverLive { continuation?.yield(event) }
     }
+    func injectHealth(_ event: TransportHealthEvent) {
+        healthContinuation?.yield(event)
+    }
     func attachmentData(id: String) -> Data? { finishedAttachmentData[id] }
     func finishedAttachmentCount() -> Int { finishedAttachmentData.count }
     func finishedAttachmentPayloads() -> [Data] { Array(finishedAttachmentData.values) }
@@ -148,6 +153,15 @@ actor MockTransport: Transport {
         let created = AsyncStream<RemoteEvent> { captured = $0 }
         continuation = captured
         stream = created
+        return created
+    }
+
+    func healthStream() async -> AsyncStream<TransportHealthEvent> {
+        if let healthEventStream { return healthEventStream }
+        var captured: AsyncStream<TransportHealthEvent>.Continuation?
+        let created = AsyncStream<TransportHealthEvent> { captured = $0 }
+        healthContinuation = captured
+        healthEventStream = created
         return created
     }
 

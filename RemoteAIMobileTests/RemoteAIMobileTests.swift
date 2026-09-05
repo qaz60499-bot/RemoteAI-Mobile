@@ -544,6 +544,71 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testImmediateTransportHealthSeparatesWindowsAgentFromRelayWithoutAdvancingEventCursor() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let initialSequence = try await cache.lastSequence()
+        let now = Date()
+
+        await mock.injectHealth(TransportHealthEvent(channel: .relay, state: .online, at: now, detail: nil))
+        await mock.injectHealth(TransportHealthEvent(channel: .agent, state: .reconnecting, at: now.addingTimeInterval(0.1), detail: "test reconnect"))
+        for _ in 0..<40 where store.connectionPhase != .windowsReconnecting {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(store.connectionPhase, .windowsReconnecting)
+        XCTAssertEqual(store.machine.state, .connecting)
+        XCTAssertEqual(store.desktopRelayConnected, true, "Agent loss must not be represented as Relay loss")
+        XCTAssertEqual(store.desktopAgentConnected, false)
+        XCTAssertEqual(try await cache.lastSequence(), initialSequence, "Raw Relay health must not pollute the durable RemoteEvent cursor")
+
+        await mock.injectHealth(TransportHealthEvent(channel: .agent, state: .offline, at: now.addingTimeInterval(3), detail: "confirmed offline"))
+        for _ in 0..<40 where store.connectionPhase != .windowsOffline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(store.connectionPhase, .windowsOffline)
+        XCTAssertEqual(store.machine.state, .offline)
+        XCTAssertEqual(store.desktopRelayConnected, true)
+
+        await mock.injectHealth(TransportHealthEvent(channel: .agent, state: .online, at: now.addingTimeInterval(4), detail: nil))
+        for _ in 0..<120 where store.machine.state != .online {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(store.machine.state, .online, "Agent recovery on the retained Relay socket must trigger authenticated reconciliation")
+        XCTAssertEqual(store.connectionPhase, .online)
+        XCTAssertEqual(store.desktopAgentConnected, true)
+        XCTAssertEqual(store.desktopRelayConnected, true)
+        XCTAssertEqual(try await cache.lastSequence(), initialSequence)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testVisibleSessionPollingRecoversMissedWebProgressAndFinalWithoutPushEvents() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let initialSequence = try await cache.lastSequence()
+        let now = Date()
+        await mock.appendHistoryMessage(ServerMessage(messageId: "poll-user", sessionId: "photo-upload", role: "user", content: "run without push", externalId: nil, createdAt: now))
+
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.lastProgressStatus, "Thinking")
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"], "Authoritative getSessionStatus must recover progress even when websocket progress events were missed")
+        XCTAssertEqual(try await cache.lastSequence(), initialSequence, "Status polling is reconciliation, not a synthetic RemoteEvent")
+
+        await mock.appendHistoryMessage(ServerMessage(messageId: "poll-final", sessionId: "photo-upload", role: "assistant", content: "final recovered by polling", externalId: nil, createdAt: now.addingTimeInterval(1)))
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "poll-final" }.count, 1)
+        XCTAssertEqual(try await cache.lastSequence(), initialSequence)
+        await store.suspend()
+    }
+
+    @MainActor
     func testCreateSessionCannotBeErasedByConcurrentOlderRefresh() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 1)
@@ -1027,8 +1092,10 @@ final class RemoteAIMobileTests: XCTestCase {
 
         XCTAssertTrue(sent, "ALREADY_EXECUTED is a transient idempotent state and must be resolved with the same command ID")
         XCTAssertEqual(store.commandStates[commandId], .completed)
-        XCTAssertEqual(await mock.actionAttemptCount("sendMessage"), 2)
-        XCTAssertEqual(await mock.userMessageCount(sessionId: "photo-upload", text: "running-replay"), 1)
+        let sendAttempts = await mock.actionAttemptCount("sendMessage")
+        let deliveredUserMessages = await mock.userMessageCount(sessionId: "photo-upload", text: "running-replay")
+        XCTAssertEqual(sendAttempts, 2)
+        XCTAssertEqual(deliveredUserMessages, 1)
         let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
         XCTAssertNil(pending)
         let draft = await store.draft(sessionId: "photo-upload")

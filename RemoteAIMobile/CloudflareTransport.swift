@@ -19,6 +19,8 @@ actor CloudflareTransport: Transport {
     private var connectionWaiters: [CheckedContinuation<Void, Error>] = []
     private var continuation: AsyncStream<RemoteEvent>.Continuation?
     private var stream: AsyncStream<RemoteEvent>?
+    private var healthContinuation: AsyncStream<TransportHealthEvent>.Continuation?
+    private var healthEventStream: AsyncStream<TransportHealthEvent>?
     private var pending: [UUID: CheckedContinuation<CommandResponseEnvelope, Error>] = [:]
     private var timeoutTasks: [UUID: Task<Void, Never>] = [:]
     private var inboundReplayGuard = BoundedReplayGuard(capacity: 4096)
@@ -28,7 +30,7 @@ actor CloudflareTransport: Transport {
     private var heartbeatTask: Task<Void, Never>?
     private var agentOfflineTask: Task<Void, Never>?
     private var awaitingPongMessageId: String?
-    private var agentOnline = true
+    private var agentOnline = false
 
     init(config: RemoteAIConfig, session: URLSession = .shared, keychain: KeychainStore = .shared) {
         self.config = config
@@ -60,14 +62,17 @@ actor CloudflareTransport: Transport {
             attemptedSocket = task
             task.maximumMessageSize = maxInboundFrameBytes
             socket = task
+            publishHealth(channel: .relay, state: .connecting, detail: nil)
             task.resume()
-            try await waitForRelayReady(task, deviceId: deviceId)
+            let relayAgentOnline = try await waitForRelayReady(task, deviceId: deviceId)
             guard socket === task else { throw TransportError.disconnected }
             connected = true
-            agentOnline = true
+            agentOnline = relayAgentOnline
             agentOfflineTask?.cancel()
             agentOfflineTask = nil
             connecting = false
+            publishHealth(channel: .relay, state: .online, detail: nil)
+            publishHealth(channel: .agent, state: relayAgentOnline ? .online : .offline, detail: relayAgentOnline ? nil : "Windows Agent is not connected to Relay")
             finishConnectionWaiters()
             Task { [weak self, weak task] in
                 guard let self, let task else { return }
@@ -80,6 +85,9 @@ actor CloudflareTransport: Transport {
                 attemptedSocket.cancel(with: .goingAway, reason: nil)
             }
             connecting = false
+            if (error as? TransportError) != .pairingRequired {
+                publishHealth(channel: .relay, state: .offline, detail: String(describing: type(of: error)))
+            }
             finishConnectionWaiters(error: error)
             throw error
         }
@@ -108,12 +116,22 @@ actor CloudflareTransport: Transport {
         return created
     }
 
+    func healthStream() async -> AsyncStream<TransportHealthEvent> {
+        if let healthEventStream { return healthEventStream }
+        var captured: AsyncStream<TransportHealthEvent>.Continuation?
+        let created = AsyncStream<TransportHealthEvent> { captured = $0 }
+        healthContinuation = captured
+        healthEventStream = created
+        return created
+    }
+
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
         try ProtocolSecurity.validate(command, expectedMachineId: config.machineId)
         if let replayed = takeOrphanedResponse(command.commandId) {
             return replayed
         }
         guard connected, socket != nil else { throw TransportError.offline }
+        guard agentOnline else { throw TransportError.offline }
         guard pending[command.commandId] == nil else { throw TransportError.replayDetected }
         let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
         guard let key = PairingKeyStore.sharedKey(machineId: config.machineId, keychain: keychain) else { throw TransportError.pairingRequired }
@@ -182,9 +200,11 @@ actor CloudflareTransport: Transport {
                     agentOnline = true
                     agentOfflineTask?.cancel()
                     agentOfflineTask = nil
+                    publishHealth(channel: .agent, state: .online, detail: nil)
                     await recordDiagnostic("relay_agent_online")
                 } else if relayState == "agent-offline" {
                     agentOnline = false
+                    publishHealth(channel: .agent, state: .reconnecting, detail: "Windows Agent disconnected from Relay")
                     await recordDiagnostic("relay_agent_offline", level: "WARN")
                     scheduleAgentOfflineConfirmation()
                 }
@@ -283,8 +303,12 @@ actor CloudflareTransport: Transport {
     private func confirmAgentOffline(_ activeSocket: URLSessionWebSocketTask) async {
         agentOfflineTask = nil
         guard !agentOnline, connected, socket === activeSocket else { return }
+        // The phone-to-Relay websocket is still healthy. Keep it open so Relay can
+        // announce agent-online immediately when Windows returns; do not turn one
+        // Windows outage into a second Relay reconnect loop.
+        publishHealth(channel: .agent, state: .offline, detail: "Windows Agent remained offline after reconnect grace")
         await recordDiagnostic("relay_agent_offline_confirmed", level: "WARN")
-        closeActiveSocket(activeSocket, pendingError: TransportError.offline)
+        failAllPending(with: TransportError.offline)
     }
 
     private func recordDiagnostic(_ event: String, fields: [String: String] = [:], level: String = "INFO") async {
@@ -296,14 +320,20 @@ actor CloudflareTransport: Transport {
     private func closeActiveSocket(_ activeSocket: URLSessionWebSocketTask, pendingError: Error) {
         guard socket === activeSocket else { return }
         connected = false
+        agentOnline = false
         heartbeatTask?.cancel()
         heartbeatTask = nil
         agentOfflineTask?.cancel()
         agentOfflineTask = nil
         awaitingPongMessageId = nil
         socket = nil
+        publishHealth(channel: .relay, state: .offline, detail: String(describing: type(of: pendingError)))
         activeSocket.cancel(with: .goingAway, reason: nil)
         failAllPending(with: pendingError)
+    }
+
+    private func publishHealth(channel: TransportHealthChannel, state: TransportHealthState, detail: String?) {
+        healthContinuation?.yield(TransportHealthEvent(channel: channel, state: state, at: Date(), detail: detail))
     }
 
     private func sendFrame(_ frame: RelayFrame) async throws {
@@ -371,7 +401,7 @@ actor CloudflareTransport: Transport {
         }
     }
 
-    private func waitForRelayReady(_ socket: URLSessionWebSocketTask, deviceId: String) async throws {
+    private func waitForRelayReady(_ socket: URLSessionWebSocketTask, deviceId: String) async throws -> Bool {
         let deadline = Date().addingTimeInterval(connectionTimeoutSeconds)
         for _ in 0..<4 {
             let remaining = deadline.timeIntervalSinceNow
@@ -390,8 +420,7 @@ actor CloudflareTransport: Transport {
                 throw TransportError.remote(code, frame.body["message"]?.stringValue ?? "Relay rejected the connection.")
             }
             if frame.kind == "ACK", frame.body["relay"]?.stringValue == "device-connected" {
-                if frame.body["agentOnline"]?.boolValue == false { throw TransportError.offline }
-                return
+                return frame.body["agentOnline"]?.boolValue ?? true
             }
         }
         throw TransportError.timeout

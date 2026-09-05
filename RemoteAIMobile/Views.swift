@@ -502,7 +502,11 @@ struct ChatView: View {
                             Text(generationStatusText)
                                 .font(.caption.weight(.medium))
                                 .lineLimit(2)
-                            if store.desktopBrowserConnected == false, runtime.kind == .web {
+                            if store.desktopAgentConnected == false {
+                                Text("Windows Agent 当前未在线；手机仍会保留 Relay 连接并等待电脑恢复。")
+                                    .font(.caption2)
+                                    .foregroundColor(.orange)
+                            } else if store.desktopBrowserConnected == false, runtime.kind == .web {
                                 Text("电脑端 Browser Bridge 已断开，正在等待恢复；当前进度可能暂停。")
                                     .font(.caption2)
                                     .foregroundColor(.orange)

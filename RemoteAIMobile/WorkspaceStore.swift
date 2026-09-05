@@ -28,6 +28,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var recentSystemNotice: String?
     @Published var desktopBrowserConnected: Bool?
     @Published var desktopRelayConnected: Bool?
+    @Published var desktopAgentConnected: Bool?
     @Published var desktopStatusUpdatedAt: Date?
 
     static let connectingStateMaxDuration: TimeInterval = 45
@@ -37,6 +38,7 @@ final class WorkspaceStore: ObservableObject {
     private var tracker = SequenceTracker()
     private var eventReplayGuard = BoundedReplayGuard(capacity: 8192)
     private var eventTask: Task<Void, Never>?
+    private var healthTask: Task<Void, Never>?
     private var connectionMonitorTask: Task<Void, Never>?
     private var streamingBuffers: [String: (id: String, text: String, sequence: Int64, attachments: [MessageAttachment])] = [:]
     private let messageAttachmentCache = NSCache<NSString, NSData>()
@@ -181,6 +183,7 @@ final class WorkspaceStore: ObservableObject {
         }
         let activeTransport = transport
         installEventConsumer()
+        installHealthConsumer()
         machine.state = .connecting
         connectionPhase = .relayConnecting
         DiagnosticsLog.shared.record("connection_start")
@@ -232,6 +235,8 @@ final class WorkspaceStore: ObservableObject {
         connectionMonitorTask = nil
         eventTask?.cancel()
         eventTask = nil
+        healthTask?.cancel()
+        healthTask = nil
         flushAllStreaming()
         await transport.disconnect()
         machine.state = .offline
@@ -1265,6 +1270,8 @@ final class WorkspaceStore: ObservableObject {
         restartAfterStart = false
         eventTask?.cancel()
         eventTask = nil
+        healthTask?.cancel()
+        healthTask = nil
         connectionMonitorTask?.cancel()
         connectionMonitorTask = nil
         await transport.disconnect()
@@ -1393,6 +1400,23 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    private func installHealthConsumer() {
+        healthTask?.cancel()
+        let sourceTransport = transport
+        let generation = lifecycleGeneration
+        healthTask = Task { [weak self] in
+            guard let self else { return }
+            let stream = await sourceTransport.healthStream()
+            for await event in stream {
+                guard !Task.isCancelled,
+                      generation == self.lifecycleGeneration,
+                      !self.isSuspended,
+                      self.transport === sourceTransport else { break }
+                self.applyTransportHealth(event)
+            }
+        }
+    }
+
     private func startConnectionMonitor() {
         connectionMonitorTask?.cancel()
         let monitoredTransport = transport
@@ -1442,6 +1466,31 @@ final class WorkspaceStore: ObservableObject {
                         self.applyConnectionFailure(error)
                         if (error as? TransportError) == .pairingRequired { break }
                     }
+                } else if self.desktopAgentConnected == true && self.machine.state != .online {
+                    // The phone can remain connected to Relay while the Windows Agent
+                    // reconnects. When Relay announces agent-online, authenticate over
+                    // the retained socket instead of needlessly reopening WebSocket.
+                    do {
+                        self.connectionPhase = .authenticating
+                        let agentStatus = try await monitoredTransport.agentStatusSnapshot(machineId: self.machine.id)
+                        let authenticatedSequence = agentStatus.latestSequence
+                        self.applyAgentStatusSnapshot(agentStatus)
+                        guard generation == self.lifecycleGeneration,
+                              !self.isSuspended,
+                              self.transport === monitoredTransport else { break }
+                        self.machine.state = .online
+                        self.connectionPhase = .online
+                        self.errors["connection"] = nil
+                        DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence), "source": "agent-recovered"])
+                        await self.recoverDelta(freshLatestSequence: authenticatedSequence)
+                        await self.refreshMetadata()
+                    } catch {
+                        guard generation == self.lifecycleGeneration,
+                              !self.isSuspended,
+                              self.transport === monitoredTransport else { break }
+                        self.applyConnectionFailure(error)
+                        if (error as? TransportError) == .pairingRequired { break }
+                    }
                 }
             }
         }
@@ -1459,8 +1508,9 @@ final class WorkspaceStore: ObservableObject {
                 connectionMonitorTask?.cancel()
                 connectionMonitorTask = nil
             case .offline:
+                desktopAgentConnected = false
                 connectionPhase = .windowsOffline
-                errors["connection"] = "Windows offline — Relay is reachable but the RemoteAI Agent is not online."
+                errors["connection"] = "Windows Agent offline — Relay is reachable but the RemoteAI Agent is not online."
             case .timeout:
                 connectionPhase = .timedOut
                 errors["connection"] = "Connection timed out — check Relay reachability and the Windows Agent."
@@ -1993,10 +2043,68 @@ final class WorkspaceStore: ObservableObject {
         recentSystemNotice = nil
     }
 
+    private func applyTransportHealth(_ event: TransportHealthEvent) {
+        desktopStatusUpdatedAt = event.at
+        switch event.channel {
+        case .relay:
+            let wasOnline = desktopRelayConnected == true
+            desktopRelayConnected = event.state == .online
+            if event.state == .online {
+                let recovered = systemTransportOfflineChannels.remove("device-relay") != nil
+                if recovered && !wasOnline {
+                    recentSystemNotice = "手机到 Cloudflare Relay 的连接已恢复；正在核对 Windows Agent 和当前会话。"
+                }
+                return
+            }
+            if event.state == .connecting { return }
+            systemTransportOfflineChannels.insert("device-relay")
+            if machine.state == .online || connectionPhase == .online {
+                machine.state = .connecting
+                connectionPhase = .reconnecting
+            }
+            if event.state == .offline {
+                errors["connection"] = "Cloudflare Relay 连接已断开，RemoteAI 正在重连；已确认的命令和事件游标会保留。"
+                recentSystemNotice = "手机到 Cloudflare Relay 的连接已断开，正在自动重连。"
+            } else if connectionPhase == .reconnecting {
+                errors["connection"] = "Cloudflare Relay 正在重连；Windows Agent 状态将于 Relay 恢复后重新核对。"
+            }
+
+        case .agent:
+            let wasOnline = desktopAgentConnected == true
+            switch event.state {
+            case .online:
+                desktopAgentConnected = true
+                let recovered = systemTransportOfflineChannels.remove("windows-agent") != nil
+                if machine.state != .online {
+                    machine.state = .connecting
+                    connectionPhase = .authenticating
+                }
+                if recovered {
+                    recentSystemNotice = "Windows Agent 已重新连上 Relay，正在补同步当前会话。"
+                }
+            case .connecting, .reconnecting:
+                desktopAgentConnected = false
+                systemTransportOfflineChannels.insert("windows-agent")
+                machine.state = .connecting
+                connectionPhase = .windowsReconnecting
+                errors["connection"] = "Windows Agent 正在重新连接 Relay；手机到 Relay 本身仍保持连接。"
+                recentSystemNotice = "Windows Agent 暂时离线，RemoteAI 正在等待它重新上线；不会把这次状态误报成 Relay 断线。"
+            case .offline:
+                desktopAgentConnected = false
+                systemTransportOfflineChannels.insert("windows-agent")
+                machine.state = .offline
+                connectionPhase = .windowsOffline
+                errors["connection"] = "Windows Agent 离线 — 手机仍连接 Cloudflare Relay，将在电脑恢复后自动补同步。"
+                recentSystemNotice = "Windows Agent 已确认离线；Cloudflare Relay 连接仍会保持，电脑恢复后会自动继续。"
+            }
+        }
+    }
+
     private func applyAgentStatusSnapshot(_ snapshot: AgentStatusSnapshot) {
         let previousBrowser = desktopBrowserConnected
+        desktopAgentConnected = true
         desktopBrowserConnected = snapshot.browserConnected
-        desktopRelayConnected = snapshot.relayOnline
+        if let relayOnline = snapshot.relayOnline { desktopRelayConnected = relayOnline }
         desktopStatusUpdatedAt = Date()
 
         if snapshot.browserConnected == false {
