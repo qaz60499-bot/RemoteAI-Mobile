@@ -529,9 +529,10 @@ final class RemoteAIMobileTests: XCTestCase {
             payload: ["channel": .string("relay"), "state": .string("online")],
             createdAt: now.addingTimeInterval(1.2)
         ), deliverLive: true)
-        for _ in 0..<40 where store.recentSystemNotice?.contains("恢复") != true {
+        for _ in 0..<40 where store.recentSystemNotice?.contains("已于") != true {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
+        XCTAssertTrue(store.recentSystemNotice?.contains("已于") == true)
         XCTAssertTrue(store.recentSystemNotice?.contains("恢复") == true)
         let recoveredNotice = try XCTUnwrap(store.recentSystemNotice)
         try await Task.sleep(nanoseconds: 50_000_000)
