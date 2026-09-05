@@ -24,6 +24,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var isPaired = false
     @Published var pairingStage: PairingStage?
     @Published var connectionPhase: ConnectionDiagnosticPhase = .relayConnecting
+    @Published var recentSystemNotice: String?
 
     static let connectingStateMaxDuration: TimeInterval = 45
 
@@ -52,6 +53,10 @@ final class WorkspaceStore: ObservableObject {
     private var runtimeRefreshes = Set<String>()
     private var sessionRefreshes = Set<String>()
     private var sessionLoads = Set<String>()
+    private var visibleSessionSyncAt: [String: Date] = [:]
+    private var systemTransportOfflineChannels = Set<String>()
+    private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 1.2
+    private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 6
     private var olderMessageLoads = Set<String>()
     private var creatingWebProjects = Set<String>()
     private var creatingWebConversations = Set<String>()
@@ -635,10 +640,43 @@ final class WorkspaceStore: ObservableObject {
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: page.items.last?.createdAt ?? Date())
             await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
             hasMoreBySession[sessionId] = page.hasMore
-            errors[sessionId] = nil
+            // A successful history read must not erase a provider terminal failure that
+            // was delivered as GENERATION_STOPPED. Keeping the error while the session
+            // is explicitly .error lets ChatView continue showing rate-limit / unusual-
+            // activity evidence even while periodic reconciliation polls are running.
+            if sessions.first(where: { $0.id == sessionId })?.state != .error {
+                errors[sessionId] = nil
+            }
         } catch {
             if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = error.localizedDescription }
         }
+    }
+
+    /// Catch up a conversation that is currently visible on the phone. Websocket push
+    /// remains the fast path; this bounded reconciliation is the safety net for a live
+    /// event that was lost while the relay socket still looked connected. Active runs
+    /// poll more frequently so a provider final/progress state appears without requiring
+    /// the user to leave and reopen the chat.
+    func synchronizeVisibleSession(_ sessionId: String, force: Bool = false) async {
+        guard machine.state == .online, !isSuspended else { return }
+        guard !sessionLoads.contains(sessionId) else { return }
+
+        let active = sessions.first(where: { $0.id == sessionId }).map { $0.state == .busy || $0.state == .waiting } == true
+            || liveRunStatusBySession[sessionId] != nil
+        let minimumInterval = active
+            ? Self.activeVisibleSessionSyncMinimumInterval
+            : Self.idleVisibleSessionSyncMinimumInterval
+        let now = Date()
+        if !force,
+           let last = visibleSessionSyncAt[sessionId],
+           now.timeIntervalSince(last) < minimumInterval {
+            return
+        }
+        visibleSessionSyncAt[sessionId] = now
+
+        await recoverDelta()
+        guard machine.state == .online, !isSuspended else { return }
+        await loadSession(sessionId)
     }
 
     func loadOlder(_ sessionId: String) async {
@@ -732,6 +770,14 @@ final class WorkspaceStore: ObservableObject {
             let finalState = try await activeTransport.send(command)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             commandStates[commandId] = finalState
+            // Delivery confirmation is already enough to tell the phone that this turn
+            // is active. Do not wait for a GENERATION_STARTED websocket event: that event
+            // can be lost during a ChatGPT SPA document replacement even though Send was
+            // accepted. The next authoritative final/delta will settle this state.
+            setSessionState(sessionId, .busy)
+            liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
+                ? "已发送，等待 ChatGPT 响应…"
+                : "已发送，等待远端响应…"
             // A confirmed browser send is not the end of synchronization. Immediately
             // reconcile the authoritative event delta so a missed websocket user echo,
             // generation/progress event, or fast assistant final cannot leave the phone stale.
@@ -1494,6 +1540,10 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func applyEvent(_ event: RemoteEvent) async {
+        if event.type == "TRANSPORT_STATUS" {
+            applyTransportStatusEvent(event)
+            return
+        }
         guard let sessionId = event.sessionId else {
             if ["INSTANCE_UPDATED", "RUNTIME_STATUS", "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED"].contains(event.type) {
                 await refreshMetadata()
@@ -1618,6 +1668,32 @@ final class WorkspaceStore: ObservableObject {
             }
         default:
             break
+        }
+    }
+
+    func clearRecentSystemNotice() {
+        recentSystemNotice = nil
+    }
+
+    private func applyTransportStatusEvent(_ event: RemoteEvent) {
+        let channel = event.payload["channel"]?.stringValue ?? "relay"
+        let state = event.payload["state"]?.stringValue?.lowercased() ?? "unknown"
+        let label: String
+        switch channel {
+        case "browser-bridge": label = "电脑端 Browser Bridge"
+        default: label = "电脑端 Relay"
+        }
+        let time = event.createdAt.formatted(date: .omitted, time: .standard)
+
+        if state == "offline" {
+            systemTransportOfflineChannels.insert(channel)
+            recentSystemNotice = "\(label) 于 \(time) 断开，RemoteAI 正在自动恢复连接。"
+            DiagnosticsLog.shared.record("remote_transport_offline", fields: ["channel": channel, "at": time], level: "WARN")
+            return
+        }
+        if state == "online", systemTransportOfflineChannels.remove(channel) != nil {
+            recentSystemNotice = "\(label) 已于 \(time) 恢复；刚刚发生过一次断连，当前会话正在补同步。"
+            DiagnosticsLog.shared.record("remote_transport_recovered", fields: ["channel": channel, "at": time])
         }
     }
 

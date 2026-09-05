@@ -363,6 +363,22 @@ struct ChatView: View {
     }
     var body: some View {
         VStack(spacing: 0) {
+            if store.machine.state != .online || store.connectionPhase != .online {
+                StatusBanner(
+                    text: store.errors["connection"] ?? store.connectionPhase.displayName,
+                    systemImage: "wifi.exclamationmark"
+                )
+            }
+            if let syncError = store.errors["sync"] {
+                StatusBanner(text: "同步异常：\(syncError)", systemImage: "arrow.triangle.2.circlepath")
+            }
+            if let notice = store.recentSystemNotice {
+                StatusBanner(
+                    text: notice,
+                    systemImage: "desktopcomputer.and.arrow.down",
+                    dismiss: { store.clearRecentSystemNotice() }
+                )
+            }
             if let error = store.errors[session.id] { ErrorBanner(text: error) { store.clearError(sessionId: session.id) } }
             if let attachmentError { ErrorBanner(text: attachmentError) { self.attachmentError = nil } }
             if let voiceError = speechInput.errorMessage { ErrorBanner(text: voiceError) { speechInput.dismissError() } }
@@ -521,7 +537,11 @@ struct ChatView: View {
         }
         .onDisappear { speechInput.stop() }
         .onChange(of: scenePhase) { phase in
-            if phase != .active { speechInput.stop() }
+            if phase != .active {
+                speechInput.stop()
+            } else {
+                Task { await store.synchronizeVisibleSession(session.id, force: true) }
+            }
         }
         .task {
             if runtime.kind == .codex, selectedCodexModel.isEmpty {
@@ -532,6 +552,18 @@ struct ChatView: View {
             }
             await store.loadSession(session.id)
             if input.isEmpty { input = await store.draft(sessionId: session.id) }
+
+            // Push remains the primary path, but a logically-connected websocket can
+            // still miss one event around SPA/document replacement. Reconcile only the
+            // currently visible conversation at a bounded cadence so the final reply,
+            // process state, or provider failure appears without leaving/reopening it.
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 900_000_000)
+                guard !Task.isCancelled else { break }
+                if scenePhase == .active {
+                    await store.synchronizeVisibleSession(session.id)
+                }
+            }
         }
     }
 
@@ -767,6 +799,23 @@ struct MessageRow: View {
 }
 
 struct ErrorBanner: View { let text: String; let dismiss: () -> Void; var body: some View { HStack { Image(systemName: "exclamationmark.triangle"); Text(text).font(.caption); Spacer(); Button(action: dismiss) { Image(systemName: "xmark") } }.padding(10).background(Color.red.opacity(0.12)) } }
+struct StatusBanner: View {
+    let text: String
+    let systemImage: String
+    var dismiss: (() -> Void)? = nil
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+            Text(text).font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+            if let dismiss {
+                Button(action: dismiss) { Image(systemName: "xmark") }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
+    }
+}
 struct StatusLabel: View { let text: String; let active: Bool; var body: some View { HStack(spacing: 5) { Circle().fill(active ? Color.green : Color.secondary).frame(width: 7, height: 7); Text(text).font(.caption).foregroundColor(.secondary) } } }
 
 struct NewWebProjectView: View {

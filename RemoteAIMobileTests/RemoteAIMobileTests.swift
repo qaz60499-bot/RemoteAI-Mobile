@@ -492,6 +492,55 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testTransportStatusSurvivesFastDisconnectRecoveryAsVisibleNotice() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.system",
+            instanceId: "agent",
+            sessionId: nil,
+            type: "TRANSPORT_STATUS",
+            payload: ["channel": .string("relay"), "state": .string("offline")],
+            createdAt: now
+        ), deliverLive: true)
+        for _ in 0..<40 where store.recentSystemNotice == nil {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(store.recentSystemNotice?.contains("Relay") == true)
+        XCTAssertTrue(store.recentSystemNotice?.contains("断开") == true)
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1202,
+            machineId: "my-pc",
+            runtimeId: "runtime.system",
+            instanceId: "agent",
+            sessionId: nil,
+            type: "TRANSPORT_STATUS",
+            payload: ["channel": .string("relay"), "state": .string("online")],
+            createdAt: now.addingTimeInterval(1.2)
+        ), deliverLive: true)
+        for _ in 0..<40 where store.recentSystemNotice?.contains("恢复") != true {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(store.recentSystemNotice?.contains("恢复") == true)
+        XCTAssertTrue(store.recentSystemNotice?.contains("刚刚发生过一次断连") == true)
+
+        store.clearRecentSystemNotice()
+        XCTAssertNil(store.recentSystemNotice)
+        await store.suspend()
+    }
+
+    @MainActor
     func testCreateSessionCannotBeErasedByConcurrentOlderRefresh() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 1)
@@ -1216,6 +1265,47 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.errors["photo-upload"], "ChatGPT temporarily rate-limited this browser session")
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
         XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.kind == .toolEvent && $0.toolStatus == "Running" })
+
+        // Periodic visible-chat reconciliation is allowed to read history after a
+        // provider failure, but that successful read must not erase the failure banner.
+        await store.loadSession("photo-upload")
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .error)
+        XCTAssertEqual(store.errors["photo-upload"], "ChatGPT temporarily rate-limited this browser session")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testVisibleSessionSynchronizationRecoversMissedLiveAssistantWithoutReopen() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+        let assistant = ServerMessage(
+            messageId: "missed-live-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "recovered while chat stays visible",
+            externalId: nil,
+            createdAt: now
+        )
+        let payload = try XCTUnwrap(try JSONValue.encode(assistant).objectValue)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: payload,
+            createdAt: now
+        ), deliverLive: false)
+
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.id == "missed-live-final" })
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "missed-live-final" }.count, 1)
         await store.suspend()
     }
 
