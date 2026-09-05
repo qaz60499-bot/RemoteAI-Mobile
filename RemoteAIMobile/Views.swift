@@ -857,7 +857,7 @@ struct MessageContentSegment: Identifiable, Equatable {
     }
 }
 
-struct SelectableMessageText: UIViewRepresentable {
+struct SelectableTextEditor: UIViewRepresentable {
     let text: String
     var monospaced = false
 
@@ -866,25 +866,17 @@ struct SelectableMessageText: UIViewRepresentable {
         view.backgroundColor = .clear
         view.isEditable = false
         view.isSelectable = true
-        view.isScrollEnabled = false
-        view.textContainerInset = .zero
+        view.isScrollEnabled = true
+        view.alwaysBounceVertical = true
+        view.textContainerInset = UIEdgeInsets(top: 12, left: 8, bottom: 12, right: 8)
         view.textContainer.lineFragmentPadding = 0
         view.adjustsFontForContentSizeCategory = true
-        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
         configure(view)
         return view
     }
 
     func updateUIView(_ uiView: UITextView, context: Context) {
         configure(uiView)
-    }
-
-    @available(iOS 16.0, *)
-    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
-        guard let width = proposal.width, width > 0 else { return nil }
-        let measured = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
-        return CGSize(width: width, height: ceil(measured.height))
     }
 
     private func configure(_ view: UITextView) {
@@ -896,7 +888,28 @@ struct SelectableMessageText: UIViewRepresentable {
             view.font = UIFont.preferredFont(forTextStyle: .body)
         }
         view.textColor = .label
-        view.accessibilityValue = text
+    }
+}
+
+struct TextSelectionSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let text: String
+    let monospaced: Bool
+
+    var body: some View {
+        NavigationView {
+            SelectableTextEditor(text: text, monospaced: monospaced)
+                .navigationTitle("选择文字")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("全部复制") { UIPasteboard.general.string = text }
+                    }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("完成") { dismiss() }
+                    }
+                }
+        }
     }
 }
 
@@ -905,67 +918,99 @@ struct MessageRow: View {
     let commandState: CommandState?
     let retry: (() -> Void)?
     @State private var toolExpanded = true
+    @State private var selectionText = ""
+    @State private var selectionMonospaced = false
+    @State private var showingTextSelection = false
     private var contentSegments: [MessageContentSegment] { MessageContentSegment.parse(message.text) }
+
     var body: some View {
-        if message.kind == .toolEvent {
-            DisclosureGroup(isExpanded: $toolExpanded) {
-                if let detail = message.detail {
-                    VStack(alignment: .trailing, spacing: 4) {
-                        SelectableMessageText(text: detail, monospaced: true)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Button {
-                            UIPasteboard.general.string = detail
-                        } label: {
-                            Label("复制", systemImage: "doc.on.doc")
-                                .font(.caption2)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                    .padding(.top, 6)
-                }
-            } label: {
-                HStack { Image(systemName: message.toolStatus == "Completed" ? "checkmark.circle.fill" : "gearshape.2"); VStack(alignment: .leading, spacing: 2) { Text(message.toolName ?? "Tool").font(.subheadline.weight(.semibold)); Text(message.toolStatus ?? "Running").font(.caption).foregroundColor(.secondary) }; Spacer() }
-            }.padding(12).background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
-        } else {
-            HStack(alignment: .bottom) {
-                if message.role == .user { Spacer(minLength: 44) }
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(contentSegments) { segment in
-                        if segment.isCode {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(spacing: 8) {
-                                    Text(segment.language?.isEmpty == false ? segment.language! : "EDIT / Code")
-                                        .font(.caption2.weight(.medium))
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                    Button {
-                                        UIPasteboard.general.string = segment.text
-                                    } label: {
-                                        Label("复制", systemImage: "doc.on.doc")
-                                            .font(.caption2)
-                                    }
-                                    .buttonStyle(.borderless)
+        Group {
+            if message.kind == .toolEvent {
+                DisclosureGroup(isExpanded: $toolExpanded) {
+                    if let detail = message.detail {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(detail)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                            HStack(spacing: 12) {
+                                Button("选择部分") {
+                                    selectionText = detail
+                                    selectionMonospaced = true
+                                    showingTextSelection = true
                                 }
-                                SelectableMessageText(text: segment.text, monospaced: true)
-                                    .fixedSize(horizontal: false, vertical: true)
+                                Button("复制") { UIPasteboard.general.string = detail }
                             }
-                            .padding(9)
-                            .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
-                        } else {
-                            SelectableMessageText(text: segment.text)
-                                .fixedSize(horizontal: false, vertical: true)
+                            .font(.caption2)
+                            .buttonStyle(.borderless)
                         }
+                        .padding(.top, 6)
                     }
-                    if message.toolStatus == "Streaming" { ProgressView().scaleEffect(0.7) }
-                    if message.role == .user, let commandState {
-                        Text(commandState.rawValue).font(.caption2).foregroundColor(commandState == .failed || commandState == .unknown ? .red : .secondary)
+                } label: {
+                    HStack { Image(systemName: message.toolStatus == "Completed" ? "checkmark.circle.fill" : "gearshape.2"); VStack(alignment: .leading, spacing: 2) { Text(message.toolName ?? "Tool").font(.subheadline.weight(.semibold)); Text(message.toolStatus ?? "Running").font(.caption).foregroundColor(.secondary) }; Spacer() }
+                }.padding(12).background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
+            } else {
+                HStack(alignment: .bottom) {
+                    if message.role == .user { Spacer(minLength: 44) }
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(contentSegments) { segment in
+                            if segment.isCode {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack(spacing: 8) {
+                                        Text(segment.language?.isEmpty == false ? segment.language! : "EDIT / Code")
+                                            .font(.caption2.weight(.medium))
+                                            .foregroundColor(.secondary)
+                                        Spacer()
+                                        Button("选择部分") {
+                                            selectionText = segment.text
+                                            selectionMonospaced = true
+                                            showingTextSelection = true
+                                        }
+                                        .font(.caption2)
+                                        .buttonStyle(.borderless)
+                                        Button {
+                                            UIPasteboard.general.string = segment.text
+                                        } label: {
+                                            Label("复制", systemImage: "doc.on.doc")
+                                                .font(.caption2)
+                                        }
+                                        .buttonStyle(.borderless)
+                                    }
+                                    Text(segment.text)
+                                        .font(.system(.body, design: .monospaced))
+                                        .textSelection(.enabled)
+                                }
+                                .padding(9)
+                                .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
+                            } else {
+                                Text(segment.text).textSelection(.enabled)
+                            }
+                        }
+                        if !message.text.isEmpty {
+                            Button {
+                                selectionText = message.text
+                                selectionMonospaced = false
+                                showingTextSelection = true
+                            } label: {
+                                Label("选择文字", systemImage: "text.cursor")
+                                    .font(.caption2)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                        if message.toolStatus == "Streaming" { ProgressView().scaleEffect(0.7) }
+                        if message.role == .user, let commandState {
+                            Text(commandState.rawValue).font(.caption2).foregroundColor(commandState == .failed || commandState == .unknown ? .red : .secondary)
+                        }
+                        if let retry { Button("Retry", action: retry).font(.caption) }
                     }
-                    if let retry { Button("Retry", action: retry).font(.caption) }
+                    .padding(.horizontal, 12).padding(.vertical, 9)
+                    .background(RoundedRectangle(cornerRadius: 16).fill(message.role == .user ? Color.accentColor.opacity(0.18) : Color(.secondarySystemGroupedBackground)))
+                    if message.role != .user { Spacer(minLength: 44) }
                 }
-                .padding(.horizontal, 12).padding(.vertical, 9)
-                .background(RoundedRectangle(cornerRadius: 16).fill(message.role == .user ? Color.accentColor.opacity(0.18) : Color(.secondarySystemGroupedBackground)))
-                if message.role != .user { Spacer(minLength: 44) }
             }
+        }
+        .sheet(isPresented: $showingTextSelection) {
+            TextSelectionSheet(text: selectionText, monospaced: selectionMonospaced)
         }
     }
 }
