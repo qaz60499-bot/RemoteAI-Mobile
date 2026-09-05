@@ -542,6 +542,32 @@ final class PairingTests: XCTestCase {
         await store.suspend()
     }
 
+    func testConnectionMonitorRecoversSocketDropWithinOneSecond() async throws {
+        let machineId = "machine-fast-reconnect-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x37, count: 32))
+        let transport = ConnectionScenarioTransport(mode: .normal)
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        await store.start()
+
+        await transport.forceDisconnect()
+        let startedAt = Date()
+        for _ in 0..<25 {
+            if await transport.isConnected { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let connected = await transport.isConnected
+        let elapsed = Date().timeIntervalSince(startedAt)
+        let connectionCount = await transport.connectionCount()
+
+        XCTAssertTrue(connected, "The background monitor should reconnect without waiting for a manual foreground cycle")
+        XCTAssertLessThan(elapsed, 1.0, "Socket-drop recovery should be noticeably faster than the previous 2-second polling loop")
+        XCTAssertGreaterThanOrEqual(connectionCount, 2)
+        XCTAssertEqual(store.connectionPhase, .online)
+        await store.suspend()
+    }
+
     func testSuccessfulPairingLoadsRuntimeCatalogAndDefersInstanceDiscovery() async throws {
         let machineId = "machine-load-runtimes-\(UUID().uuidString)"
         defer { PairingKeyStore.deletePairing(machineId: machineId) }

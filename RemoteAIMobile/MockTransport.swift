@@ -3,7 +3,7 @@ import Foundation
 enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
-    case webSendNotAccepted, webSendDeliveryUnknown, deltaOnlySend
+    case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, deltaOnlySend
     case duplicateEvent, sequenceGap, partialWebCatalog, staleWebCatalog, unclassifiedWebCatalog, offline
 }
 
@@ -172,6 +172,15 @@ actor MockTransport: Transport {
         }
         if command.action == "sendMessage", scenario == .webSendDeliveryUnknown {
             let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SEND_DELIVERY_UNKNOWN", message: "Mock page changed without proof of delivery", retryable: false, details: nil), idempotentReplay: nil)
+            processedCommands[command.commandId] = response
+            return response
+        }
+        if command.action == "sendMessage", scenario == .webSendDeliveryUnknownAfterCommit {
+            let text = command.payload["text"]?.stringValue ?? ""
+            let sessionId = command.sessionId ?? ""
+            let user = ServerMessage(messageId: "provider-user-\(command.commandId.uuidString.lowercased())", sessionId: sessionId, role: "user", content: text, externalId: nil, createdAt: Date())
+            history[sessionId, default: []].append(user)
+            let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SEND_DELIVERY_UNKNOWN", message: "Mock provider committed the user turn before canonicalization obscured the acknowledgement", retryable: false, details: nil), idempotentReplay: nil)
             processedCommands[command.commandId] = response
             return response
         }

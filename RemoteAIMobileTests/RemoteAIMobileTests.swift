@@ -992,7 +992,7 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testUnknownAttachmentDeliveryRetriesExactCommandWithoutDuplicateSideEffect() async throws {
+    func testTransportDisconnectAutoReconnectsAndReplaysExactCommandWithoutDuplicateSideEffect() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .disconnectImmediatelyAfterSend, historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
@@ -1001,28 +1001,15 @@ final class RemoteAIMobileTests: XCTestCase {
         let attachment = PendingAttachment(name: "proof.txt", contentType: "text/plain", data: Data("payload".utf8))
 
         let sent = await store.send(text: "unknown-with-attachment", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", attachments: [attachment], commandId: commandId)
-        XCTAssertFalse(sent)
-        XCTAssertEqual(store.commandStates[commandId], .unknown)
-        let saved = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
-        XCTAssertEqual(saved?.commandId, commandId)
-        XCTAssertEqual(saved?.payload["attachmentIds"]?.arrayValue?.count, 1, "Retry payload must retain remote attachment IDs")
-        let initialServerUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "unknown-with-attachment")
-        XCTAssertEqual(initialServerUserCount, 1)
 
-        await mock.setScenario(.normal)
-        try await mock.connect()
-        let web = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
-        await store.refreshRuntime(web)
-        let photo = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
-        await store.refreshSessions(runtime: web, instance: photo)
-        let optimistic = try XCTUnwrap(store.messagesBySession["photo-upload"]?.first(where: { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame }))
-        await store.retry(message: optimistic, runtimeId: "runtime.web", instanceId: "photo")
-
+        XCTAssertTrue(sent, "A 1006-style disconnect after send should reconnect immediately and replay the exact idempotent command")
         XCTAssertEqual(store.commandStates[commandId], .completed)
         let sendAttempts = await mock.actionAttemptCount("sendMessage")
         let finalServerUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "unknown-with-attachment")
-        XCTAssertEqual(sendAttempts, 2, "One initial attempt plus one idempotent replay is expected")
-        XCTAssertEqual(finalServerUserCount, 1, "Replay must not create a second server user message")
+        XCTAssertEqual(sendAttempts, 2, "One initial attempt plus one automatic idempotent replay is expected")
+        XCTAssertEqual(finalServerUserCount, 1, "Automatic replay must not create a second server user message")
+        let connectedAfterRecovery = await mock.isConnected
+        XCTAssertTrue(connectedAfterRecovery, "The send recovery path should leave the transport connected")
         let pendingAfter: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
         XCTAssertNil(pendingAfter)
         await store.suspend()
@@ -1033,7 +1020,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
         defer { try? FileManager.default.removeItem(at: url) }
         let cache = try SQLiteStore(url: url)
-        let mock = MockTransport(scenario: .disconnectImmediatelyAfterSend, historyCount: 0)
+        let mock = MockTransport(scenario: .webSendDeliveryUnknown, historyCount: 0)
         let firstStore = WorkspaceStore(transport: mock, cache: cache)
         await firstStore.start()
         let commandId = UUID()
@@ -1042,6 +1029,7 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(firstStore.commandStates[commandId], .unknown)
         await firstStore.suspend()
 
+        await mock.appendHistoryMessage(ServerMessage(messageId: "provider-after-restart", sessionId: "photo-upload", role: "user", content: "restart-unknown", externalId: nil, createdAt: Date()))
         await mock.setScenario(.normal)
         let restored = WorkspaceStore(transport: mock, cache: cache)
         await restored.start()
@@ -1120,6 +1108,29 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(pending?.commandId, commandId)
         let unknownSendAttempts = await mock.actionAttemptCount("sendMessage")
         XCTAssertEqual(unknownSendAttempts, 1, "Unknown delivery must not trigger an automatic second send")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebSendDeliveryUnknownAutoReconcilesCommittedProviderTurnWithoutSecondSend() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .webSendDeliveryUnknownAfterCommit, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let commandId = UUID()
+
+        let sent = await store.send(text: "delivery-committed", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
+
+        XCTAssertTrue(sent, "A provider user turn found by read-only reconciliation should resolve unknown delivery")
+        XCTAssertEqual(store.commandStates[commandId], .completed)
+        let sendAttempts = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sendAttempts, 1, "Reconciliation must never issue a second send side effect")
+        let serverUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "delivery-committed")
+        XCTAssertEqual(serverUserCount, 1)
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "delivery-committed" }.count, 1)
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "已确认发送，等待 ChatGPT 响应…")
+        let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertNil(pending)
         await store.suspend()
     }
 

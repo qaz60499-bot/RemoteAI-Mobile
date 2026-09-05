@@ -59,8 +59,10 @@ final class WorkspaceStore: ObservableObject {
     private var sessionLoads = Set<String>()
     private var visibleSessionSyncAt: [String: Date] = [:]
     private var systemTransportOfflineChannels = Set<String>()
-    private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 1.2
+    private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 1.5
     private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 6
+    private static let connectionMonitorIntervalNanoseconds: UInt64 = 500_000_000
+    private static let sendRecoveryBackoffNanoseconds: [UInt64] = [0, 250_000_000, 750_000_000]
     private var olderMessageLoads = Set<String>()
     private var creatingWebProjects = Set<String>()
     private var creatingWebConversations = Set<String>()
@@ -879,8 +881,54 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             attachmentTransferBySession.removeValue(forKey: sessionId)
             commandStates[commandId] = .unknown
+            DiagnosticsLog.shared.record("send_transport_interrupted", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "persisted": String(messageCommandPersisted)]), level: "WARN")
+
+            // Once the exact send command has been persisted locally, replaying that same
+            // commandId after a transport reconnect is safe: the Windows command registry
+            // is idempotent, so a frame that reached the Agent before the 1006 cannot
+            // create a duplicate provider turn. This also covers the opposite race where
+            // the WebSocket died before the encrypted frame ever reached the Relay.
+            if messageCommandPersisted,
+               let persisted = try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(commandId, machineId: activeMachineId)) {
+                for (attempt, backoff) in Self.sendRecoveryBackoffNanoseconds.enumerated() {
+                    if backoff > 0 { try? await Task.sleep(nanoseconds: backoff) }
+                    guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+                    do {
+                        if !(await activeTransport.isConnected) { try await activeTransport.connect() }
+                        let authenticatedSequence = try await activeTransport.latestSequence(machineId: activeMachineId)
+                        guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+                        machine.state = .online
+                        connectionPhase = .online
+                        errors["connection"] = nil
+                        await recoverDelta(freshLatestSequence: authenticatedSequence)
+                        commandStates[commandId] = .executing
+                        let replayedState = try await activeTransport.send(persisted)
+                        commandStates[commandId] = replayedState
+                        await recoverDelta()
+                        try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
+                        try? await cache.saveDraft("", sessionId: sessionId)
+                        errors[sessionId] = nil
+                        if messagesBySession[sessionId, default: []].last?.role == .user {
+                            setSessionState(sessionId, .busy)
+                            markLiveRunActivity(sessionId: sessionId, at: Date())
+                            liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
+                                ? "连接已恢复，等待 ChatGPT 响应…"
+                                : "连接已恢复，等待远端响应…"
+                        }
+                        DiagnosticsLog.shared.record("send_recovered_after_disconnect", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)])
+                        return true
+                    } catch let retryError as TransportError where retryError == .disconnected || retryError == .timeout || retryError == .offline {
+                        DiagnosticsLog.shared.record("send_reconnect_retry", fields: Self.diagnosticFields(for: retryError, adding: ["session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)]), level: "WARN")
+                        continue
+                    } catch {
+                        DiagnosticsLog.shared.record("send_reconnect_abort", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)]), level: "WARN")
+                        break
+                    }
+                }
+            }
+
             errors[sessionId] = messageCommandPersisted
-                ? "Delivery is unknown after a disconnect/timeout. Use Retry on this message; it replays the exact same command ID and payload."
+                ? "Connection dropped while sending. RemoteAI retried the same operation safely, but delivery is still unknown; Retry continues to use the same command ID."
                 : "Attachment transfer was interrupted before message delivery was attempted. Retry from the composer reuses the same operation ID."
             DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "persisted": String(messageCommandPersisted)]), level: "WARN")
             return false
@@ -891,7 +939,34 @@ final class WorkspaceStore: ObservableObject {
                 commandStates[commandId] = .unknown
                 errors[sessionId] = "Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."
                 DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "remoteCode": code]), level: "WARN")
+                // Unknown delivery must never be resolved by blindly sending again. First
+                // perform bounded read-only reconciliation: if the provider user turn is
+                // already visible, loadSession matches it to the persisted command payload
+                // and marks this exact command completed without another send side effect.
                 await recoverDelta()
+                for attempt in 0..<3 where commandStates[commandId] == .unknown {
+                    await loadSession(sessionId)
+                    if commandStates[commandId] == .completed { break }
+                    if attempt < 2 { try? await Task.sleep(nanoseconds: 400_000_000) }
+                }
+                if commandStates[commandId] == .completed {
+                    try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
+                    try? await cache.saveDraft("", sessionId: sessionId)
+                    errors[sessionId] = nil
+                    // If reconciliation found only the committed provider user turn,
+                    // keep the visible chat in active-poll mode until an authoritative
+                    // assistant final arrives. If loadSession already found that final,
+                    // its terminal state wins and must not be overwritten here.
+                    if messagesBySession[sessionId, default: []].last?.role == .user {
+                        setSessionState(sessionId, .busy)
+                        markLiveRunActivity(sessionId: sessionId, at: Date())
+                        liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
+                            ? "已确认发送，等待 ChatGPT 响应…"
+                            : "已确认发送，等待远端响应…"
+                    }
+                    DiagnosticsLog.shared.record("send_reconciled_delivery", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString])
+                    return true
+                }
                 return false
             }
             attachmentTransferBySession.removeValue(forKey: sessionId)
@@ -1209,7 +1284,7 @@ final class WorkspaceStore: ObservableObject {
         let generation = lifecycleGeneration
         connectionMonitorTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                try? await Task.sleep(nanoseconds: Self.connectionMonitorIntervalNanoseconds)
                 guard !Task.isCancelled,
                       let self,
                       generation == self.lifecycleGeneration,
@@ -1237,6 +1312,10 @@ final class WorkspaceStore: ObservableObject {
                         self.machine.state = .online
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
+                        DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence), "source": "reconnect"])
+                        // Reconcile the durable event gap before any catalog refresh. A
+                        // reconnect must restore the active chat first; project/runtime
+                        // metadata is lower priority and may be comparatively slow.
                         await self.recoverDelta(freshLatestSequence: authenticatedSequence)
                         await self.refreshMetadata()
                     } catch {
