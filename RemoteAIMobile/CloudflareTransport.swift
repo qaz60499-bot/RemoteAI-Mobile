@@ -182,10 +182,10 @@ actor CloudflareTransport: Transport {
                     agentOnline = true
                     agentOfflineTask?.cancel()
                     agentOfflineTask = nil
-                    DiagnosticsLog.shared.record("relay_agent_online")
+                    await recordDiagnostic("relay_agent_online")
                 } else if relayState == "agent-offline" {
                     agentOnline = false
-                    DiagnosticsLog.shared.record("relay_agent_offline", level: "WARN")
+                    await recordDiagnostic("relay_agent_offline", level: "WARN")
                     scheduleAgentOfflineConfirmation()
                 }
             }
@@ -257,13 +257,13 @@ actor CloudflareTransport: Transport {
                 try? await Task.sleep(nanoseconds: heartbeatTimeoutNanoseconds)
                 guard !Task.isCancelled, connected, socket === activeSocket else { return }
                 if awaitingPongMessageId == messageId {
-                    DiagnosticsLog.shared.record("relay_heartbeat_timeout", fields: ["messageId": messageId], level: "WARN")
+                    await recordDiagnostic("relay_heartbeat_timeout", fields: ["messageId": messageId], level: "WARN")
                     closeActiveSocket(activeSocket, pendingError: TransportError.disconnected)
                     return
                 }
             } catch {
                 guard connected, socket === activeSocket else { return }
-                DiagnosticsLog.shared.record("relay_heartbeat_send_failed", fields: ["errorType": String(describing: type(of: error))], level: "WARN")
+                await recordDiagnostic("relay_heartbeat_send_failed", fields: ["errorType": String(describing: type(of: error))], level: "WARN")
                 closeActiveSocket(activeSocket, pendingError: TransportError.disconnected)
                 return
             }
@@ -280,11 +280,17 @@ actor CloudflareTransport: Transport {
         }
     }
 
-    private func confirmAgentOffline(_ activeSocket: URLSessionWebSocketTask) {
+    private func confirmAgentOffline(_ activeSocket: URLSessionWebSocketTask) async {
         agentOfflineTask = nil
         guard !agentOnline, connected, socket === activeSocket else { return }
-        DiagnosticsLog.shared.record("relay_agent_offline_confirmed", level: "WARN")
+        await recordDiagnostic("relay_agent_offline_confirmed", level: "WARN")
         closeActiveSocket(activeSocket, pendingError: TransportError.offline)
+    }
+
+    private func recordDiagnostic(_ event: String, fields: [String: String] = [:], level: String = "INFO") async {
+        await MainActor.run {
+            DiagnosticsLog.shared.record(event, fields: fields, level: level)
+        }
     }
 
     private func closeActiveSocket(_ activeSocket: URLSessionWebSocketTask, pendingError: Error) {
