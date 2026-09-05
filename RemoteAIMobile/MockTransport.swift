@@ -235,7 +235,7 @@ actor MockTransport: Transport {
                 nextCursor: degraded ? nil : (nextOffset < all.count ? "offset:\(nextOffset)" : nil),
                 hasMore: degraded ? false : nextOffset < all.count,
                 observedAt: Date(),
-                source: staleBootstrap ? "windows-last-known-good" : "browser-dom",
+                source: staleBootstrap ? "windows-last-known-good" : (scenario == .partialWebCatalog ? "browser-dom-partial-title-hints" : "browser-dom"),
                 stale: staleBootstrap ? true : (scenario == .partialWebCatalog ? true : (scenario == .unclassifiedWebCatalog ? nil : false)),
                 state: staleBootstrap ? .staleCache : (scenario == .partialWebCatalog ? .partialDOM : (scenario == .unclassifiedWebCatalog ? nil : .authoritativeLiveDOM)),
                 snapshotId: degraded ? nil : "mock-conversations-\(alias)-\(all.count)"

@@ -723,7 +723,53 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(cachedConversations?.map(\.localConversationId), verifiedConversations.map(\.localConversationId))
         XCTAssertEqual(cachedConversations?.first?.displayTitle, "Recovered real title")
         XCTAssertNotNil(store.errors["web.projects"])
-        XCTAssertNotNil(store.errors["web.project.g-p-remoteai"])
+        XCTAssertNil(store.errors["web.project.g-p-remoteai"], "A partial conversation DOM with verified rows is a background freshness state, not a red user-visible failure")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testFreshPhoneUsesVerifiedWindowsConversationRowsWhileCurrentDOMIsPartial() async throws {
+        let mock = MockTransport(scenario: .partialWebCatalog, historyCount: 1)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"])
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .partialDOM)
+        XCTAssertNil(store.errors["web.project.g-p-remoteai"], "Verified Windows rows must stay usable while ChatGPT finishes mounting the sidebar")
+        let cached: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
+        XCTAssertNil(cached, "A partial-DOM bootstrap remains non-authoritative and must not replace the phone's durable verified cache")
+        await store.suspend()
+    }
+
+    func testMessageContentSegmentsExposeCodeBlocksForOneTapCopyAndPartialSelection() {
+        let segments = MessageContentSegment.parse("Before\n```swift\nlet answer = 42\n```\nAfter")
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertEqual(segments[0], MessageContentSegment(id: 0, text: "Before\n", isCode: false, language: nil))
+        XCTAssertEqual(segments[1], MessageContentSegment(id: 1, text: "let answer = 42", isCode: true, language: "swift"))
+        XCTAssertEqual(segments[2], MessageContentSegment(id: 2, text: "\nAfter", isCode: false, language: nil))
+    }
+
+    @MainActor
+    func testCachedFinalClearsStaleConversationErrorBeforeRemoteRefreshCompletes() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+        store.sessions = [SessionDescriptor(id: "photo-upload", instanceId: "photo", title: "Cached Final", state: .error, updatedAt: now)]
+        store.errors["photo-upload"] = "stale transient refresh error"
+        let user = ChatMessage(id: "cached-user", sessionId: "photo-upload", sequence: 1, role: .user, kind: .text, text: "hello", toolName: nil, toolStatus: nil, detail: nil, createdAt: now.addingTimeInterval(-2))
+        let assistant = ChatMessage(id: "cached-assistant", sessionId: "photo-upload", sequence: 2, role: .assistant, kind: .text, text: "done", toolName: nil, toolStatus: nil, detail: nil, createdAt: now.addingTimeInterval(-1))
+        try await cache.upsertMessages([user, assistant])
+
+        await store.loadSession("photo-upload")
+
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        XCTAssertNil(store.errors["photo-upload"])
+        XCTAssertEqual(store.messagesBySession["photo-upload"]?.map(\.id), ["cached-user", "cached-assistant"])
         await store.suspend()
     }
 

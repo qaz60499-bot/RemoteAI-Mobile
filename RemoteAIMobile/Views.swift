@@ -295,14 +295,18 @@ struct WebProjectView: View {
     var body: some View {
         List {
             Section("最近对话") {
-                if store.projectConversationLoadingByAlias[project.projectAlias] == true && rows.isEmpty {
+                if store.projectConversationLoadingByAlias[project.projectAlias] == true {
                     HStack(spacing: 10) {
                         ProgressView()
-                        Text("正在加载这个 Project 的最新对话…")
+                        Text(rows.isEmpty ? "正在加载这个 Project 的最新对话…" : "正在后台刷新，当前列表仍可使用…")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
                     .padding(.vertical, 4)
+                } else if store.projectConversationSnapshotStateByAlias[project.projectAlias] == .partialDOM && !rows.isEmpty {
+                    Label("当前显示 Windows 已验证的对话列表，ChatGPT 页面仍在后台补全。", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
                 ForEach(rows) { conversation in
                     let resolvedSession = store.sessions.first(where: { $0.id == conversation.localConversationId }) ?? conversation.session
@@ -324,12 +328,12 @@ struct WebProjectView: View {
         .remoteAITopBreathingRoom()
         .navigationTitle(project.displayName)
         .navigationBarTitleDisplayMode(.inline)
-        .task { await store.loadProjectConversations(projectAlias: project.projectAlias) }
+        .task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: false) }
         .onChange(of: store.machine.state) { state in
             guard state == .online, rows.isEmpty else { return }
-            Task { await store.loadProjectConversations(projectAlias: project.projectAlias) }
+            Task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: false) }
         }
-        .refreshable { await store.loadProjectConversations(projectAlias: project.projectAlias) }
+        .refreshable { await store.loadProjectConversations(projectAlias: project.projectAlias, force: true) }
     }
 }
 
@@ -819,20 +823,105 @@ struct PhotoLibraryAttachmentPicker: UIViewControllerRepresentable {
     }
 }
 
+struct MessageContentSegment: Identifiable, Equatable {
+    let id: Int
+    let text: String
+    let isCode: Bool
+    let language: String?
+
+    static func parse(_ value: String) -> [MessageContentSegment] {
+        let parts = value.components(separatedBy: "```")
+        guard parts.count > 1 else {
+            return [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)]
+        }
+        var result: [MessageContentSegment] = []
+        for (index, rawPart) in parts.enumerated() where !rawPart.isEmpty {
+            let isCode = index % 2 == 1
+            var text = rawPart
+            var language: String? = nil
+            if isCode, let newline = text.firstIndex(of: "\n") {
+                let firstLine = String(text[..<newline]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !firstLine.isEmpty,
+                   firstLine.count <= 24,
+                   firstLine.range(of: "^[A-Za-z0-9_+.-]+$", options: .regularExpression) != nil {
+                    language = firstLine
+                    text = String(text[text.index(after: newline)...])
+                }
+            }
+            let cleaned = isCode ? text.trimmingCharacters(in: .newlines) : text
+            if !cleaned.isEmpty {
+                result.append(MessageContentSegment(id: result.count, text: cleaned, isCode: isCode, language: language))
+            }
+        }
+        return result.isEmpty ? [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)] : result
+    }
+}
+
+struct SelectableMessageText: UIViewRepresentable {
+    let text: String
+    var monospaced = false
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.backgroundColor = .clear
+        view.isEditable = false
+        view.isSelectable = true
+        view.isScrollEnabled = false
+        view.textContainerInset = .zero
+        view.textContainer.lineFragmentPadding = 0
+        view.adjustsFontForContentSizeCategory = true
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        configure(view)
+        return view
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        configure(uiView)
+    }
+
+    @available(iOS 16.0, *)
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        guard let width = proposal.width, width > 0 else { return nil }
+        let measured = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        return CGSize(width: width, height: ceil(measured.height))
+    }
+
+    private func configure(_ view: UITextView) {
+        if view.text != text { view.text = text }
+        if monospaced {
+            let size = UIFont.preferredFont(forTextStyle: .body).pointSize
+            view.font = UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        } else {
+            view.font = UIFont.preferredFont(forTextStyle: .body)
+        }
+        view.textColor = .label
+        view.accessibilityValue = text
+    }
+}
+
 struct MessageRow: View {
     let message: ChatMessage
     let commandState: CommandState?
     let retry: (() -> Void)?
     @State private var toolExpanded = true
+    private var contentSegments: [MessageContentSegment] { MessageContentSegment.parse(message.text) }
     var body: some View {
         if message.kind == .toolEvent {
             DisclosureGroup(isExpanded: $toolExpanded) {
                 if let detail = message.detail {
-                    Text(detail)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .textSelection(.enabled)
-                        .padding(.top, 6)
+                    VStack(alignment: .trailing, spacing: 4) {
+                        SelectableMessageText(text: detail, monospaced: true)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button {
+                            UIPasteboard.general.string = detail
+                        } label: {
+                            Label("复制", systemImage: "doc.on.doc")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(.top, 6)
                 }
             } label: {
                 HStack { Image(systemName: message.toolStatus == "Completed" ? "checkmark.circle.fill" : "gearshape.2"); VStack(alignment: .leading, spacing: 2) { Text(message.toolName ?? "Tool").font(.subheadline.weight(.semibold)); Text(message.toolStatus ?? "Running").font(.caption).foregroundColor(.secondary) }; Spacer() }
@@ -840,9 +929,33 @@ struct MessageRow: View {
         } else {
             HStack(alignment: .bottom) {
                 if message.role == .user { Spacer(minLength: 44) }
-                VStack(alignment: .leading, spacing: 6) {
-                    if message.text.contains("```") { ScrollView(.horizontal, showsIndicators: false) { Text(message.text.replacingOccurrences(of: "```", with: "")).font(.system(.body, design: .monospaced)).textSelection(.enabled) } }
-                    else { Text(message.text).textSelection(.enabled) }
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(contentSegments) { segment in
+                        if segment.isCode {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 8) {
+                                    Text(segment.language?.isEmpty == false ? segment.language! : "EDIT / Code")
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundColor(.secondary)
+                                    Spacer()
+                                    Button {
+                                        UIPasteboard.general.string = segment.text
+                                    } label: {
+                                        Label("复制", systemImage: "doc.on.doc")
+                                            .font(.caption2)
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+                                SelectableMessageText(text: segment.text, monospaced: true)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(9)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
+                        } else {
+                            SelectableMessageText(text: segment.text)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
                     if message.toolStatus == "Streaming" { ProgressView().scaleEffect(0.7) }
                     if message.role == .user, let commandState {
                         Text(commandState.rawValue).font(.caption2).foregroundColor(commandState == .failed || commandState == .unknown ? .red : .secondary)

@@ -49,6 +49,8 @@ final class WorkspaceStore: ObservableObject {
     private static let webProjectsAutomaticRefreshMinimumInterval: TimeInterval = 20
     private var projectConversationRefreshes = Set<String>()
     private var projectConversationRefreshQueued = Set<String>()
+    private var projectConversationLastRefreshAttemptAt: [String: Date] = [:]
+    private static let projectConversationAutomaticRefreshMinimumInterval: TimeInterval = 8
     private var projectConversationPageLoads = Set<String>()
     private var runtimeRefreshes = Set<String>()
     private var sessionRefreshes = Set<String>()
@@ -371,12 +373,21 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func loadProjectConversations(projectAlias: String, refresh: Bool = true) async {
+    func loadProjectConversations(projectAlias: String, refresh: Bool = true, force: Bool = true) async {
         if refresh {
-            guard projectConversationRefreshes.insert(projectAlias).inserted else {
-                projectConversationRefreshQueued.insert(projectAlias)
+            if !force,
+               !projectConversationsByAlias[projectAlias, default: []].isEmpty,
+               let lastAttempt = projectConversationLastRefreshAttemptAt[projectAlias],
+               Date().timeIntervalSince(lastAttempt) < Self.projectConversationAutomaticRefreshMinimumInterval {
                 return
             }
+            guard projectConversationRefreshes.insert(projectAlias).inserted else {
+                // Automatic view/task churn should coalesce into the request already in
+                // flight. Only an explicit user refresh asks for one rerun afterwards.
+                if force { projectConversationRefreshQueued.insert(projectAlias) }
+                return
+            }
+            projectConversationLastRefreshAttemptAt[projectAlias] = Date()
             projectConversationLoadingByAlias[projectAlias] = true
             // A full refresh supersedes any page-load already in flight for this Project.
             projectConversationRevisions[projectAlias, default: 0] &+= 1
@@ -386,7 +397,7 @@ final class WorkspaceStore: ObservableObject {
                 projectConversationRefreshes.remove(projectAlias)
                 projectConversationLoadingByAlias[projectAlias] = false
                 if projectConversationRefreshQueued.remove(projectAlias) != nil {
-                    Task { @MainActor [weak self] in await self?.loadProjectConversations(projectAlias: projectAlias, refresh: true) }
+                    Task { @MainActor [weak self] in await self?.loadProjectConversations(projectAlias: projectAlias, refresh: true, force: true) }
                 }
             }
         }
@@ -432,19 +443,24 @@ final class WorkspaceStore: ObservableObject {
                 }
             }
             guard page.isAuthoritativeLiveDOM else {
-                if page.state == .staleCache,
+                let verifiedWindowsBootstrap = page.source == "browser-dom-partial-title-hints"
+                    && projectConversationsByAlias[projectAlias, default: []].isEmpty
+                    && !page.items.isEmpty
+                if (page.state == .staleCache || verifiedWindowsBootstrap),
                    projectConversationsByAlias[projectAlias, default: []].isEmpty,
                    !page.items.isEmpty {
-                    // Same bootstrap rule as Projects: accept Windows last-known-good
-                    // identities/order only when this phone has none yet. Keep the
-                    // snapshot explicitly stale and do not persist it as authoritative.
+                    // Windows may already hold a verified conversation identity/order
+                    // snapshot even while the current ChatGPT sidebar DOM is only
+                    // partially mounted. Show those verified rows immediately instead
+                    // of presenting an empty/error screen, but keep the state non-
+                    // authoritative so a later live DOM pass can replace it.
                     projectConversationsByAlias[projectAlias] = page.items
-                    projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
+                    projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .staleCache
                     projectNextCursorByAlias[projectAlias] = page.nextCursor
                     projectHasMoreByAlias[projectAlias] = page.hasMore
                     mergeProjectSessions(page.items)
-                    errors["web.project.\(projectAlias)"] = "Showing the last verified Windows conversation list while ChatGPT refreshes."
-                    DiagnosticsLog.shared.record("project_load_stale", fields: ["project": projectAlias, "count": String(page.items.count)], level: "WARN")
+                    errors["web.project.\(projectAlias)"] = nil
+                    DiagnosticsLog.shared.record("project_load_stale", fields: ["project": projectAlias, "count": String(page.items.count), "source": page.source ?? "unknown"], level: "WARN")
                     return
                 }
                 projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
@@ -455,7 +471,14 @@ final class WorkspaceStore: ObservableObject {
                     try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
                     mergeProjectSessions(projectConversationsByAlias[projectAlias] ?? [])
                 }
-                errors["web.project.\(projectAlias)"] = "ChatGPT conversations are temporarily incomplete; keeping the last verified list."
+                // A partial DOM is a freshness condition, not a confirmed provider
+                // failure. Keep any verified rows interactive and avoid flashing a red
+                // error banner while the background refresh converges.
+                if !projectConversationsByAlias[projectAlias, default: []].isEmpty {
+                    errors["web.project.\(projectAlias)"] = nil
+                } else {
+                    errors["web.project.\(projectAlias)"] = "ChatGPT conversations are still loading."
+                }
                 DiagnosticsLog.shared.record("project_load_incomplete", fields: ["project": projectAlias, "state": String(describing: page.state), "observedCount": String(page.items.count)], level: "WARN")
                 return
             }
@@ -625,7 +648,13 @@ final class WorkspaceStore: ObservableObject {
             }
             messagesBySession[sessionId] = local
         }
-        await reconcilePendingUnknownCommands(with: messagesBySession[sessionId, default: []], sessionId: sessionId)
+        let cachedMessages = messagesBySession[sessionId, default: []]
+        await reconcilePendingUnknownCommands(with: cachedMessages, sessionId: sessionId)
+        // A cached final assistant after the latest user turn is enough to clear a
+        // stale .error/.busy navigation snapshot immediately. Do not make the user
+        // wait for the network read just to discover that the conversation already
+        // completed successfully on the PC.
+        await settleRunStateIfAuthoritativeFinalExists(cachedMessages, sessionId: sessionId)
         guard machine.state == .online, let route = routeForSession(sessionId) else { return }
         await hydrateSessionDescriptorIfNeeded(sessionId: sessionId, route: route, generation: generation)
         do {
@@ -648,7 +677,18 @@ final class WorkspaceStore: ObservableObject {
                 errors[sessionId] = nil
             }
         } catch {
-            if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = error.localizedDescription }
+            guard generation == lifecycleGeneration, !isSuspended else { return }
+            let hasUsableLocalHistory = !messagesBySession[sessionId, default: []].isEmpty
+            if let transportError = error as? TransportError,
+               hasUsableLocalHistory,
+               transportError == .timeout || transportError == .disconnected || transportError == .offline {
+                // This is a refresh failure, not a conversation failure. Preserve the
+                // cached transcript and let the visible-session reconciler retry instead
+                // of flashing a red error that disappears on the next successful poll.
+                DiagnosticsLog.shared.record("session_refresh_deferred", fields: ["session": sessionId, "reason": transportError.localizedDescription], level: "WARN")
+                return
+            }
+            errors[sessionId] = error.localizedDescription
         }
     }
 
@@ -1792,6 +1832,7 @@ final class WorkspaceStore: ObservableObject {
         discardStreamingPlaceholder(sessionId: sessionId)
         liveRunStatusBySession.removeValue(forKey: sessionId)
         setSessionState(sessionId, .idle)
+        errors[sessionId] = nil
 
         await settleRunningToolRows(sessionId: sessionId)
     }
