@@ -533,7 +533,9 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertTrue(store.recentSystemNotice?.contains("恢复") == true)
-        XCTAssertTrue(store.recentSystemNotice?.contains("刚刚发生过一次断连") == true)
+        let recoveredNotice = try XCTUnwrap(store.recentSystemNotice)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(store.recentSystemNotice, recoveredNotice, "A fast recovered disconnect must remain visible until the user dismisses it")
 
         store.clearRecentSystemNotice()
         XCTAssertNil(store.recentSystemNotice)
