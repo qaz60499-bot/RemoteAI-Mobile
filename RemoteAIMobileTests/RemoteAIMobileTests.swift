@@ -1230,7 +1230,7 @@ final class RemoteAIMobileTests: XCTestCase {
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
             eventId: UUID(),
-            sequence: 1251,
+            sequence: 1201,
             machineId: "my-pc",
             runtimeId: "runtime.web",
             instanceId: "photo",
@@ -1245,7 +1245,7 @@ final class RemoteAIMobileTests: XCTestCase {
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
             eventId: UUID(),
-            sequence: 1252,
+            sequence: 1202,
             machineId: "my-pc",
             runtimeId: "runtime.web",
             instanceId: "photo",
