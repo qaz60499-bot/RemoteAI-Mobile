@@ -75,7 +75,18 @@ extension InstanceDescriptor {
         config["model"]?.stringValue
     }
 }
-struct SessionDescriptor: Codable, Identifiable, Hashable { let id: String; let instanceId: String; var title: String; var state: SessionState; var updatedAt: Date; var projectAlias: String? = nil; var canonicalUrl: String? = nil }
+struct SessionDescriptor: Codable, Identifiable, Hashable {
+    let id: String
+    let instanceId: String
+    var title: String
+    var state: SessionState
+    var updatedAt: Date
+    var projectAlias: String? = nil
+    var canonicalUrl: String? = nil
+    var lastActivityAt: Date? = nil
+
+    var orderingDate: Date { max(updatedAt, lastActivityAt ?? updatedAt) }
+}
 
 struct AttachmentTransferProgress: Equatable {
     let completed: Int
@@ -141,7 +152,16 @@ struct WebConversationDescriptor: Codable, Identifiable, Hashable {
     let updatedAt: Date
 
     var session: SessionDescriptor {
-        SessionDescriptor(id: localConversationId, instanceId: "web.chatgpt", title: displayTitle, state: .idle, updatedAt: updatedAt, projectAlias: projectAlias, canonicalUrl: canonicalUrl)
+        SessionDescriptor(
+            id: localConversationId,
+            instanceId: "web.chatgpt",
+            title: displayTitle,
+            state: .idle,
+            updatedAt: updatedAt,
+            projectAlias: projectAlias,
+            canonicalUrl: canonicalUrl,
+            lastActivityAt: lastVisited
+        )
     }
 }
 
@@ -437,14 +457,16 @@ extension ServerInstance {
 
 extension ServerSession {
     var descriptor: SessionDescriptor {
-        SessionDescriptor(
+        let persistedActivity = metadata["lastActivityAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+        return SessionDescriptor(
             id: sessionId,
             instanceId: instanceId,
             title: title,
             state: .server(status),
             updatedAt: updatedAt,
             projectAlias: metadata["projectAlias"]?.stringValue,
-            canonicalUrl: canonicalUrl
+            canonicalUrl: canonicalUrl,
+            lastActivityAt: persistedActivity ?? lastVisited
         )
     }
 }

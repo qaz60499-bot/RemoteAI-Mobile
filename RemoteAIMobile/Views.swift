@@ -180,7 +180,7 @@ struct InstanceView: View {
                     Text("普通对话与 Projects 分开显示，不会混在一起。")
                 }
                 Section("普通聊天") {
-                    ForEach(store.sessions.filter { $0.instanceId == instance.id && $0.projectAlias == nil }.sorted { $0.updatedAt > $1.updatedAt }) { session in
+                    ForEach(store.sessions.filter { $0.instanceId == instance.id && $0.projectAlias == nil }.sorted { $0.orderingDate > $1.orderingDate }) { session in
                         NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
                     }
                 }
@@ -227,7 +227,7 @@ struct InstanceView: View {
                     }
                 }
                 Section("历史会话") {
-                    ForEach(store.sessions.filter { $0.instanceId == instance.id }.sorted { $0.updatedAt > $1.updatedAt }) { session in
+                    ForEach(store.sessions.filter { $0.instanceId == instance.id }.sorted { $0.orderingDate > $1.orderingDate }) { session in
                         NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
                     }
                 }
@@ -274,7 +274,8 @@ struct SessionRow: View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
                 Text(session.title)
-                FixedTimestamp(date: session.updatedAt)
+                FixedTimestamp(date: session.updatedAt, prefix: "最后更新")
+                FixedTimestamp(date: session.lastActivityAt ?? session.updatedAt, prefix: "最后进行")
             }
             Spacer()
             Text(session.state.rawValue).font(.caption).foregroundColor(session.state == .error ? .red : .secondary)
@@ -304,8 +305,9 @@ struct WebProjectView: View {
                     .padding(.vertical, 4)
                 }
                 ForEach(rows) { conversation in
-                    NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: conversation.session)) {
-                        SessionRow(session: conversation.session)
+                    let resolvedSession = store.sessions.first(where: { $0.id == conversation.localConversationId }) ?? conversation.session
+                    NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: resolvedSession)) {
+                        SessionRow(session: resolvedSession)
                     }
                 }
                 if store.projectHasMoreByAlias[project.projectAlias] == true {

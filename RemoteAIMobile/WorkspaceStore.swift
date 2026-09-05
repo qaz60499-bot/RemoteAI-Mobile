@@ -590,7 +590,7 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, revision == sessionRevisions[instance.id, default: 0], machine.state == .online, !isSuspended else { return }
             sessions.removeAll { $0.instanceId == instance.id }
             sessions.append(contentsOf: remote)
-            sessions.sort { $0.updatedAt > $1.updatedAt }
+            sessions.sort { $0.orderingDate > $1.orderingDate }
             await persistMetadata()
             errors["instance.\(instance.id)"] = nil
         } catch {
@@ -1280,7 +1280,7 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
             if let resolved = remote.first(where: { $0.id == sessionId }) {
                 sessions.append(resolved)
-                sessions.sort { $0.updatedAt > $1.updatedAt }
+                sessions.sort { $0.orderingDate > $1.orderingDate }
                 await persistMetadata()
             }
         } catch {
@@ -1296,9 +1296,17 @@ final class WorkspaceStore: ObservableObject {
             instanceId: instanceId,
             title: "ChatGPT Conversation",
             state: .idle,
-            updatedAt: updatedAt
+            updatedAt: updatedAt,
+            lastActivityAt: updatedAt
         ))
-        sessions.sort { $0.updatedAt > $1.updatedAt }
+        sessions.sort { $0.orderingDate > $1.orderingDate }
+    }
+
+    private func markSessionActivity(_ sessionId: String, at: Date) {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        if let current = sessions[index].lastActivityAt, current >= at { return }
+        sessions[index].lastActivityAt = at
+        sessions.sort { $0.orderingDate > $1.orderingDate }
     }
 
     private func loadCachedFirst() async {
@@ -1441,11 +1449,20 @@ final class WorkspaceStore: ObservableObject {
 
     private func mergeProjectSessions(_ items: [WebConversationDescriptor]) {
         for item in items {
-            let session = item.session
+            var session = item.session
+            if let existing = sessions.first(where: { $0.id == session.id }) {
+                // Project discovery is a navigation snapshot, not a run-state authority.
+                // Do not let a sidebar refresh erase a live busy/error state or a newer
+                // process timestamp that arrived through the event stream.
+                session.state = existing.state
+                let existingActivity = existing.lastActivityAt ?? existing.updatedAt
+                let incomingActivity = session.lastActivityAt ?? session.updatedAt
+                session.lastActivityAt = max(existingActivity, incomingActivity)
+            }
             sessions.removeAll { $0.id == session.id }
             sessions.append(session)
         }
-        sessions.sort { $0.updatedAt > $1.updatedAt }
+        sessions.sort { $0.orderingDate > $1.orderingDate }
     }
 
     private func persistMetadata() async {
@@ -1558,6 +1575,7 @@ final class WorkspaceStore: ObservableObject {
             // immediately; a later authoritative listSessions refresh replaces its
             // generic title rather than losing the run state entirely.
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: event.instanceId, updatedAt: event.createdAt)
+            markSessionActivity(sessionId, at: event.createdAt)
         }
 
         switch event.type {
@@ -1612,11 +1630,18 @@ final class WorkspaceStore: ObservableObject {
                 } else {
                     displayDetail = "ChatGPT 正在处理…"
                 }
+                // Preserve each distinct browser process transition instead of mutating
+                // one stable row forever. Mark the previous ChatGPT Web status complete
+                // first so only the newest step is shown as Running while the historical
+                // steps remain visible like the desktop process/tool timeline.
+                await settleRunningToolRows(sessionId: sessionId, toolName: "ChatGPT Web")
             } else {
                 displayDetail = detail
             }
             let stableToolId = toolObject?["id"]?.stringValue
-            let messageId = stableToolId.map { "tool-\(sessionId)-\($0)" } ?? event.eventId.uuidString
+            let messageId = rawToolName == "ChatGPT Web"
+                ? "tool-\(event.eventId.uuidString.lowercased())"
+                : (stableToolId.map { "tool-\(sessionId)-\($0)" } ?? event.eventId.uuidString)
             let message = ChatMessage(id: messageId, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: displayDetail, createdAt: event.createdAt)
             merge([message], into: sessionId)
             try? await cache.upsertMessages([message])
@@ -1771,10 +1796,12 @@ final class WorkspaceStore: ObservableObject {
         await settleRunningToolRows(sessionId: sessionId)
     }
 
-    private func settleRunningToolRows(sessionId: String) async {
+    private func settleRunningToolRows(sessionId: String, toolName: String? = nil) async {
         var changed: [ChatMessage] = []
         if var local = messagesBySession[sessionId] {
-            for index in local.indices where local[index].kind == .toolEvent && local[index].toolStatus == "Running" {
+            for index in local.indices where local[index].kind == .toolEvent
+                && local[index].toolStatus == "Running"
+                && (toolName == nil || local[index].toolName == toolName) {
                 local[index].toolStatus = "Completed"
                 changed.append(local[index])
             }

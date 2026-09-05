@@ -1220,6 +1220,81 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testWebProcessTransitionsRemainVisibleAndAdvanceLastActivityTime() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1251,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]),
+                "summary": .string("Thinking")
+            ],
+            createdAt: now
+        ), deliverLive: true)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1252,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]),
+                "summary": .string("Reading sources")
+            ],
+            createdAt: now.addingTimeInterval(2)
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            let rows = store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" }
+            if rows.count >= 2 { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let rows = store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" }
+        XCTAssertEqual(rows.count, 2, "Distinct desktop process transitions should remain visible instead of overwriting one stable row")
+        XCTAssertTrue(rows.contains { $0.detail == "思考中…" })
+        XCTAssertTrue(rows.contains { $0.detail == "正在读取网页内容…" })
+        XCTAssertEqual(rows.filter { $0.toolStatus == "Running" }.count, 1, "Only the newest process step should remain Running")
+        let activity = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.lastActivityAt)
+        XCTAssertGreaterThanOrEqual(activity, now.addingTimeInterval(2))
+        await store.suspend()
+    }
+
+    func testServerSessionDescriptorKeepsUpdatedAndActivityTimesSeparate() throws {
+        let updated = Date(timeIntervalSince1970: 1_788_596_000)
+        let activity = updated.addingTimeInterval(45)
+        let server = ServerSession(
+            sessionId: "activity-session",
+            runtimeId: "runtime.web",
+            instanceId: "web.chatgpt",
+            externalId: nil,
+            title: "Activity Session",
+            canonicalUrl: "https://chatgpt.com/c/activity-session",
+            status: "generating",
+            metadata: ["lastActivityAt": .string(RemoteAIDate.string(activity))],
+            createdAt: updated.addingTimeInterval(-120),
+            updatedAt: updated,
+            lastVisited: updated.addingTimeInterval(-30)
+        )
+        XCTAssertEqual(server.descriptor.updatedAt, updated)
+        XCTAssertEqual(server.descriptor.lastActivityAt, activity)
+        XCTAssertEqual(server.descriptor.orderingDate, activity)
+    }
+
+    @MainActor
     func testFailedGenerationDiscardsStreamingPrefixAndShowsProviderError() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
