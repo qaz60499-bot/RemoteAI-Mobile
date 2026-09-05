@@ -127,31 +127,27 @@ jobs:
           print(result.stdout, end="")
           PY
           }
-          validate_runtime() {
-            simctl_bounded list runtimes -j | python3 -c 'import json,sys; target=sys.argv[1]; runtimes=json.load(sys.stdin)["runtimes"]; ok=any(x.get("identifier")==target and x.get("isAvailable") for x in runtimes); raise SystemExit(0 if ok else 1)' "$IOS_SIM_RUNTIME"
-          }
           recycle_core_simulator() {
             killall -9 com.apple.CoreSimulator.CoreSimulatorService 2>/dev/null || true
-            sleep 3
+            sleep "$1"
           }
           create_simulator() {
             simctl_bounded create "$1" com.apple.CoreSimulator.SimDeviceType.iPhone-13-Pro "$IOS_SIM_RUNTIME"
           }
 
-          if ! validate_runtime; then
-            echo "CoreSimulator runtime probe failed or timed out; recycling CoreSimulatorService once."
-            recycle_core_simulator
-            validate_runtime
-          fi
+          # The selected Xcode/runtime pair is pinned and verified by the build itself.
+          # Avoid `simctl list runtimes`: on a degraded self-hosted runner that read-only
+          # probe can hang before any actual simulator work. Reset the per-user service
+          # first, then make the create operation itself the bounded health check.
+          recycle_core_simulator 8
           if ! UDID=$(create_simulator RemoteAI-iPhone13Pro); then
-            echo "Initial CoreSimulator create failed or timed out; recycling CoreSimulatorService once."
-            recycle_core_simulator
-            validate_runtime
+            echo "Initial CoreSimulator create failed or timed out; recycling CoreSimulatorService and retrying once."
+            recycle_core_simulator 12
             UDID=$(create_simulator RemoteAI-iPhone13Pro)
           fi
           [[ "$UDID" =~ ^[0-9A-Fa-f-]{36}$ ]]
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
-          simctl_bounded list devices | grep -F "$UDID"
+          echo "Created pinned simulator: $UDID"
 
       - name: Protocol Security / Fuzz
         shell: bash
