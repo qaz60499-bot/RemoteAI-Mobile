@@ -654,7 +654,10 @@ final class WorkspaceStore: ObservableObject {
             messagesBySession[sessionId] = local
         }
         let cachedMessages = messagesBySession[sessionId, default: []]
-        await reconcilePendingUnknownCommands(with: cachedMessages, sessionId: sessionId)
+        // Never let a cached optimistic user bubble prove its own delivery. Unknown
+        // sends are resolved only against a fresh authoritative remote history page
+        // below; otherwise a frame that died before reaching the Agent can be marked
+        // completed solely because the phone still has its local optimistic row.
         // A cached final assistant after the latest user turn is enough to clear a
         // stale .error/.busy navigation snapshot immediately. Do not make the user
         // wait for the network read just to discover that the conversation already
