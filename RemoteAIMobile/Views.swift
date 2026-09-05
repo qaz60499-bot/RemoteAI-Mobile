@@ -241,7 +241,7 @@ struct InstanceView: View {
             if isChatGPTWeb {
                 // Projects are the primary navigation surface here. Refresh them first
                 // instead of waiting for the ordinary-chat history request to finish.
-                await store.refreshWebProjects()
+                await store.refreshWebProjects(force: false)
                 await store.refreshSessions(runtime: runtime, instance: instance)
             } else {
                 await store.refreshSessions(runtime: runtime, instance: instance)
@@ -249,7 +249,7 @@ struct InstanceView: View {
         }
         .refreshable {
             if isChatGPTWeb {
-                await store.refreshWebProjects()
+                await store.refreshWebProjects(force: true)
                 await store.refreshSessions(runtime: runtime, instance: instance)
             } else {
                 await store.refreshSessions(runtime: runtime, instance: instance)

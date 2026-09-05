@@ -44,6 +44,8 @@ final class WorkspaceStore: ObservableObject {
     // awaiting I/O. Keep per-operation gates at the Store boundary, not only in Views.
     private var refreshWebProjectsInFlight = false
     private var refreshWebProjectsQueued = false
+    private var lastWebProjectsRefreshAt: Date?
+    private static let webProjectsAutomaticRefreshMinimumInterval: TimeInterval = 20
     private var projectConversationRefreshes = Set<String>()
     private var projectConversationRefreshQueued = Set<String>()
     private var projectConversationPageLoads = Set<String>()
@@ -146,6 +148,7 @@ final class WorkspaceStore: ObservableObject {
             liveRunStatusBySession.removeAll()
             webProjectsSnapshotId = nil
             projectConversationSnapshotIds.removeAll()
+            lastWebProjectsRefreshAt = nil
             hasLoadedWebProjects = false
             attachmentTransferBySession.removeAll()
             hasMoreBySession.removeAll()
@@ -224,17 +227,37 @@ final class WorkspaceStore: ObservableObject {
         await start()
     }
 
-    func refreshWebProjects() async {
+    func refreshWebProjects(force: Bool = true) async {
         if refreshWebProjectsInFlight {
             refreshWebProjectsQueued = true
             return
+        }
+        if !force {
+            let webRunActive = sessions.contains { session in
+                session.instanceId == "web.chatgpt" && (session.state == .busy || session.state == .waiting)
+            } || liveRunStatusBySession.keys.contains { sessionId in
+                sessions.contains { $0.id == sessionId && $0.instanceId == "web.chatgpt" }
+            }
+            if webRunActive {
+                DiagnosticsLog.shared.record("projects_refresh_deferred_active_chat", fields: ["cachedCount": String(webProjects.count)])
+                return
+            }
+            if let lastWebProjectsRefreshAt,
+               Date().timeIntervalSince(lastWebProjectsRefreshAt) < Self.webProjectsAutomaticRefreshMinimumInterval,
+               webProjectsSnapshotState == .authoritativeLiveDOM {
+                DiagnosticsLog.shared.record("projects_refresh_skipped_fresh", fields: ["cachedCount": String(webProjects.count)])
+                return
+            }
         }
         refreshWebProjectsInFlight = true
         defer {
             refreshWebProjectsInFlight = false
             if refreshWebProjectsQueued {
                 refreshWebProjectsQueued = false
-                Task { @MainActor [weak self] in await self?.refreshWebProjects() }
+                // Preserve the prior coalescing contract: a request that arrived while
+                // discovery was in flight gets one authoritative rerun even if the first
+                // request just refreshed the TTL.
+                Task { @MainActor [weak self] in await self?.refreshWebProjects(force: true) }
             }
         }
         let generation = lifecycleGeneration
@@ -286,6 +309,7 @@ final class WorkspaceStore: ObservableObject {
             webProjects = response.items
             webProjectsSnapshotState = .authoritativeLiveDOM
             webProjectsSnapshotId = response.snapshotId
+            lastWebProjectsRefreshAt = Date()
             hasLoadedWebProjects = true
             try? await cache.put(webProjects, key: "web.projects")
             guard generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended else { return }
@@ -956,6 +980,7 @@ final class WorkspaceStore: ObservableObject {
         liveRunStatusBySession.removeAll()
         webProjectsSnapshotId = nil
         projectConversationSnapshotIds.removeAll()
+        lastWebProjectsRefreshAt = nil
         hasLoadedWebProjects = false
         attachmentTransferBySession.removeAll()
         hasMoreBySession.removeAll()
@@ -1528,13 +1553,31 @@ final class WorkspaceStore: ObservableObject {
             let detail = event.payload["summary"]?.stringValue
                 ?? toolObject?["summary"]?.stringValue
                 ?? event.payload["provider"]?.stringValue
+            let displayDetail: String?
+            if rawToolName == "ChatGPT Web" {
+                if completed {
+                    displayDetail = "回答已生成"
+                } else if let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    displayDetail = webProcessStatusLabel(detail)
+                } else {
+                    displayDetail = "ChatGPT 正在处理…"
+                }
+            } else {
+                displayDetail = detail
+            }
             let stableToolId = toolObject?["id"]?.stringValue
             let messageId = stableToolId.map { "tool-\(sessionId)-\($0)" } ?? event.eventId.uuidString
-            let message = ChatMessage(id: messageId, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: detail, createdAt: event.createdAt)
+            let message = ChatMessage(id: messageId, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: displayDetail, createdAt: event.createdAt)
             merge([message], into: sessionId)
             try? await cache.upsertMessages([message])
-            if rawToolName == "ChatGPT Web", let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                liveRunStatusBySession[sessionId] = completed ? "ChatGPT Web 已完成" : detail
+            if rawToolName == "ChatGPT Web" {
+                if completed {
+                    liveRunStatusBySession[sessionId] = "回答已生成，正在确认同步…"
+                } else if let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    liveRunStatusBySession[sessionId] = webProcessStatusLabel(detail)
+                } else {
+                    liveRunStatusBySession[sessionId] = "ChatGPT 正在处理…"
+                }
             } else {
                 liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
             }
@@ -1588,6 +1631,18 @@ final class WorkspaceStore: ObservableObject {
         if lower.contains("reading") && trimmed.count < 120 { return trimmed }
         if !trimmed.contains("\n"), trimmed.count <= 80 { return trimmed }
         return "正在生成回答…"
+    }
+
+    private func webProcessStatusLabel(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "ChatGPT 正在处理…" }
+        let lower = trimmed.lowercased()
+        if lower == "thinking" || lower.hasPrefix("thinking ") { return "思考中…" }
+        if lower.contains("searching") || lower.contains("search the web") { return "正在搜索网页…" }
+        if lower.contains("reading") || lower.contains("browsing") { return "正在读取网页内容…" }
+        if lower.contains("analyzing image") || lower.contains("analysing image") { return "正在分析图片…" }
+        if lower.contains("writing") || lower.contains("generating") { return "正在生成回答…" }
+        return trimmed
     }
 
     private func setSessionState(_ sessionId: String, _ state: SessionState) {

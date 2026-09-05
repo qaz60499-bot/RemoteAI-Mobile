@@ -515,6 +515,35 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testAutomaticProjectRefreshUsesFreshnessBudgetAndYieldsToActiveWebChat() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+
+        let baseline = await mock.actionAttemptCount("listProjects")
+        await store.refreshWebProjects(force: false)
+        let afterFirstAutomatic = await mock.actionAttemptCount("listProjects")
+        XCTAssertEqual(afterFirstAutomatic, baseline + 1)
+
+        await store.refreshWebProjects(force: false)
+        let afterSecondAutomatic = await mock.actionAttemptCount("listProjects")
+        XCTAssertEqual(afterSecondAutomatic, afterFirstAutomatic, "A fresh automatic Project refresh must not immediately rescan ChatGPT DOM")
+
+        await store.refreshWebProjects(force: true)
+        let afterForcedRefresh = await mock.actionAttemptCount("listProjects")
+        XCTAssertEqual(afterForcedRefresh, afterFirstAutomatic + 1, "Explicit pull-to-refresh must bypass the automatic freshness budget")
+
+        let activeSession = SessionDescriptor(id: "web-active", instanceId: "web.chatgpt", title: "Active Web Chat", state: .busy, updatedAt: Date())
+        store.sessions.append(activeSession)
+        let beforeActiveAutomatic = await mock.actionAttemptCount("listProjects")
+        await store.refreshWebProjects(force: false)
+        let afterActiveAutomatic = await mock.actionAttemptCount("listProjects")
+        XCTAssertEqual(afterActiveAutomatic, beforeActiveAutomatic, "Automatic Project discovery must yield while a ChatGPT Web conversation is active")
+
+        await store.suspend()
+    }
+
+    @MainActor
     func testWorkspaceCoalescesRefreshAndDoubleCreateWithFinalServerState() async throws {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
@@ -1151,11 +1180,20 @@ final class RemoteAIMobileTests: XCTestCase {
         await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1203, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "TOOL_STARTED", payload: ["tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]), "summary": .string("Thinking")], createdAt: now.addingTimeInterval(0.015)), deliverLive: true)
         try await Task.sleep(nanoseconds: 180_000_000)
         XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.role == .assistant && $0.toolStatus == "Streaming" && $0.text == "REMOTEAI_PARTIAL_" })
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "思考中…")
+        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" && $0.detail == "思考中…" })
+
+        await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1204, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "TOOL_FINISHED", payload: ["tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]), "summary": .string("Generation finished")], createdAt: now.addingTimeInterval(0.018)), deliverLive: true)
+        for _ in 0..<80 {
+            if store.liveRunStatusBySession["photo-upload"] == "回答已生成，正在确认同步…" { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "回答已生成，正在确认同步…")
 
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
             eventId: UUID(),
-            sequence: 1204,
+            sequence: 1205,
             machineId: "my-pc",
             runtimeId: "runtime.web",
             instanceId: "photo",
