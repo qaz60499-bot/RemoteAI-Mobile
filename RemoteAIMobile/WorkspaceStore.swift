@@ -26,6 +26,9 @@ final class WorkspaceStore: ObservableObject {
     @Published var pairingStage: PairingStage?
     @Published var connectionPhase: ConnectionDiagnosticPhase = .relayConnecting
     @Published var recentSystemNotice: String?
+    @Published var desktopBrowserConnected: Bool?
+    @Published var desktopRelayConnected: Bool?
+    @Published var desktopStatusUpdatedAt: Date?
 
     static let connectingStateMaxDuration: TimeInterval = 45
 
@@ -58,11 +61,12 @@ final class WorkspaceStore: ObservableObject {
     private var sessionRefreshes = Set<String>()
     private var sessionLoads = Set<String>()
     private var visibleSessionSyncAt: [String: Date] = [:]
+    private var visibleSessionHistorySyncAt: [String: Date] = [:]
     private var systemTransportOfflineChannels = Set<String>()
     private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 1.5
     private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 6
     private static let connectionMonitorIntervalNanoseconds: UInt64 = 500_000_000
-    private static let sendRecoveryBackoffNanoseconds: [UInt64] = [0, 250_000_000, 750_000_000]
+    private static let sendRecoveryBackoffNanoseconds: [UInt64] = [0, 500_000_000, 1_500_000_000]
     private var olderMessageLoads = Set<String>()
     private var creatingWebProjects = Set<String>()
     private var creatingWebConversations = Set<String>()
@@ -98,6 +102,12 @@ final class WorkspaceStore: ObservableObject {
             for (key, value) in transportError.diagnosticFields { fields[key] = value }
         }
         return fields
+    }
+
+    private static func isRecoverableCommandTransportError(_ error: TransportError) -> Bool {
+        if error == .disconnected || error == .timeout || error == .offline { return true }
+        if case .remote(let code, _) = error { return code == "ALREADY_EXECUTED" }
+        return false
     }
 
     init(transport: Transport, cache: SQLiteStore) {
@@ -186,7 +196,9 @@ final class WorkspaceStore: ObservableObject {
             // Relay connectivity alone is not enough to call the PC online. Require one
             // authenticated encrypted command to round-trip through the Windows Agent.
             connectionPhase = .authenticating
-            let authenticatedSequence = try await activeTransport.latestSequence(machineId: machine.id)
+            let agentStatus = try await activeTransport.agentStatusSnapshot(machineId: machine.id)
+            let authenticatedSequence = agentStatus.latestSequence
+            applyAgentStatusSnapshot(agentStatus)
             guard generation == lifecycleGeneration, !isSuspended, transport === activeTransport else {
                 await activeTransport.disconnect()
                 return
@@ -700,6 +712,59 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    private func refreshVisibleSessionStatus(_ sessionId: String) async -> RemoteSessionStatusSnapshot? {
+        guard let route = routeForSession(sessionId), machine.state == .online, !isSuspended else { return nil }
+        do {
+            let snapshot = try await transport.sessionStatus(
+                machineId: machine.id,
+                runtimeId: route.runtimeId,
+                instanceId: route.instanceId,
+                sessionId: sessionId
+            )
+            guard machine.state == .online, !isSuspended else { return nil }
+            if let index = sessions.firstIndex(where: { $0.id == sessionId }) {
+                sessions[index].state = snapshot.state
+                if let activity = snapshot.lastActivityAt {
+                    sessions[index].lastActivityAt = max(sessions[index].lastActivityAt ?? sessions[index].updatedAt, activity)
+                }
+                sessions[index].lastProgressStatus = snapshot.lastProgressStatus
+                sessions[index].lastProgressAt = snapshot.lastProgressAt
+            }
+            if route.runtimeId == "runtime.web", let browserConnected = snapshot.browserConnected {
+                let previous = desktopBrowserConnected
+                desktopBrowserConnected = browserConnected
+                desktopStatusUpdatedAt = Date()
+                if !browserConnected {
+                    systemTransportOfflineChannels.insert("browser-bridge")
+                    recentSystemNotice = "电脑端 Agent 在线，但 Browser Bridge 已断开；RemoteAI 正在等待浏览器控制恢复。"
+                } else {
+                    let recovered = systemTransportOfflineChannels.remove("browser-bridge") != nil || previous == false
+                    if recovered { recentSystemNotice = "电脑端 Browser Bridge 已恢复，当前会话正在补同步。" }
+                }
+            }
+            if snapshot.state == .busy || snapshot.state == .waiting {
+                markLiveRunActivity(sessionId: sessionId, at: snapshot.lastProgressAt ?? snapshot.lastActivityAt ?? Date())
+                if let raw = snapshot.lastProgressStatus, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    liveRunStatusBySession[sessionId] = route.runtimeId == "runtime.web" ? webProcessStatusLabel(raw) : processStatusLabel(for: raw)
+                } else if liveRunStatusBySession[sessionId] == nil {
+                    liveRunStatusBySession[sessionId] = route.runtimeId == "runtime.web"
+                        ? "电脑端 ChatGPT 仍在运行…"
+                        : "电脑端任务仍在运行…"
+                }
+            } else if snapshot.state == .idle {
+                liveRunStatusBySession.removeValue(forKey: sessionId)
+                liveRunActivityAtBySession.removeValue(forKey: sessionId)
+            }
+            return snapshot
+        } catch let error as TransportError where error == .disconnected || error == .timeout || error == .offline {
+            DiagnosticsLog.shared.record("session_status_deferred", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
+            return nil
+        } catch {
+            DiagnosticsLog.shared.record("session_status_failed", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
+            return nil
+        }
+    }
+
     /// Catch up a conversation that is currently visible on the phone. Websocket push
     /// remains the fast path; this bounded reconciliation is the safety net for a live
     /// event that was lost while the relay socket still looked connected. Active runs
@@ -724,7 +789,21 @@ final class WorkspaceStore: ObservableObject {
 
         await recoverDelta()
         guard machine.state == .online, !isSuspended else { return }
-        await loadSession(sessionId)
+        let remoteStatus = await refreshVisibleSessionStatus(sessionId)
+        guard machine.state == .online, !isSuspended else { return }
+
+        // During a proven active run, delta + getSessionStatus are enough for fast
+        // progress. A full DOM/history reconciliation remains a slower fail-safe so the
+        // mobile client does not hammer the Relay every 1.5s while ChatGPT is thinking.
+        let stillActive = remoteStatus.map { $0.state == .busy || $0.state == .waiting } ?? active
+        let historyNow = Date()
+        let historyDue = force
+            || !stillActive
+            || visibleSessionHistorySyncAt[sessionId].map { historyNow.timeIntervalSince($0) >= 6 } != false
+        if historyDue {
+            visibleSessionHistorySyncAt[sessionId] = historyNow
+            await loadSession(sessionId)
+        }
     }
 
     func loadMessageAttachmentData(sessionId: String, attachment: MessageAttachment) async -> Data? {
@@ -880,7 +959,7 @@ final class WorkspaceStore: ObservableObject {
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
             errors[sessionId] = "Attachment upload cancelled before message delivery. The composer keeps your local text/files so you can send again."
             return false
-        } catch let error as TransportError where error == .disconnected || error == .timeout {
+        } catch let error as TransportError where Self.isRecoverableCommandTransportError(error) {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             attachmentTransferBySession.removeValue(forKey: sessionId)
             commandStates[commandId] = .unknown
@@ -920,7 +999,7 @@ final class WorkspaceStore: ObservableObject {
                         }
                         DiagnosticsLog.shared.record("send_recovered_after_disconnect", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)])
                         return true
-                    } catch let retryError as TransportError where retryError == .disconnected || retryError == .timeout || retryError == .offline {
+                    } catch let retryError as TransportError where Self.isRecoverableCommandTransportError(retryError) {
                         DiagnosticsLog.shared.record("send_reconnect_retry", fields: Self.diagnosticFields(for: retryError, adding: ["session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)]), level: "WARN")
                         continue
                     } catch {
@@ -1060,10 +1139,10 @@ final class WorkspaceStore: ObservableObject {
             // itself may not re-emit the original MESSAGE_ADDED event. Re-read the
             // authoritative session so optimistic UI/cache state converges as well.
             await loadSession(message.sessionId)
-        } catch let error as TransportError where error == .disconnected || error == .timeout {
+        } catch let error as TransportError where Self.isRecoverableCommandTransportError(error) {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
             commandStates[commandId] = .unknown
-            errors[message.sessionId] = "Delivery is still unknown. Retry will continue to use the same command ID."
+            errors[message.sessionId] = "Windows 已接收或连接刚发生切换，RemoteAI 会继续使用同一个 command ID 查询最终结果，不会重复发送到 ChatGPT。"
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
             commandStates[commandId] = .failed
@@ -1338,7 +1417,9 @@ final class WorkspaceStore: ObservableObject {
                             break
                         }
                         self.connectionPhase = .authenticating
-                        let authenticatedSequence = try await monitoredTransport.latestSequence(machineId: self.machine.id)
+                        let agentStatus = try await monitoredTransport.agentStatusSnapshot(machineId: self.machine.id)
+                        let authenticatedSequence = agentStatus.latestSequence
+                        self.applyAgentStatusSnapshot(agentStatus)
                         guard generation == self.lifecycleGeneration,
                               !self.isSuspended,
                               self.transport === monitoredTransport else {
@@ -1653,6 +1734,8 @@ final class WorkspaceStore: ObservableObject {
                 let existingActivity = existing.lastActivityAt ?? existing.updatedAt
                 let incomingActivity = session.lastActivityAt ?? session.updatedAt
                 session.lastActivityAt = max(existingActivity, incomingActivity)
+                if session.lastProgressStatus == nil { session.lastProgressStatus = existing.lastProgressStatus }
+                if session.lastProgressAt == nil { session.lastProgressAt = existing.lastProgressAt }
             }
             sessions.removeAll { $0.id == session.id }
             sessions.append(session)
@@ -1908,6 +1991,23 @@ final class WorkspaceStore: ObservableObject {
 
     func clearRecentSystemNotice() {
         recentSystemNotice = nil
+    }
+
+    private func applyAgentStatusSnapshot(_ snapshot: AgentStatusSnapshot) {
+        let previousBrowser = desktopBrowserConnected
+        desktopBrowserConnected = snapshot.browserConnected
+        desktopRelayConnected = snapshot.relayOnline
+        desktopStatusUpdatedAt = Date()
+
+        if snapshot.browserConnected == false {
+            systemTransportOfflineChannels.insert("browser-bridge")
+            recentSystemNotice = "电脑端 Agent 已连接，但 Browser Bridge 当前离线；手机仍会保持连接并等待浏览器控制恢复。"
+        } else if snapshot.browserConnected == true {
+            let hadOfflineMarker = systemTransportOfflineChannels.remove("browser-bridge") != nil
+            if previousBrowser == false || hadOfflineMarker {
+                recentSystemNotice = "电脑端 Browser Bridge 已恢复，当前会话正在补同步。"
+            }
+        }
     }
 
     private func applyTransportStatusEvent(_ event: RemoteEvent) {

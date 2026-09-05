@@ -362,8 +362,17 @@ struct ChatView: View {
 
     var messages: [ChatMessage] { store.messagesBySession[session.id, default: []] }
     private var codexModels: [CodexModelOption] { instance.codexCatalog?.models ?? [] }
-    private var currentSessionState: SessionState {
-        store.sessions.first(where: { $0.id == session.id })?.state ?? session.state
+    private var currentSession: SessionDescriptor {
+        store.sessions.first(where: { $0.id == session.id }) ?? session
+    }
+    private var currentSessionState: SessionState { currentSession.state }
+    private var generationStatusText: String {
+        store.liveRunStatusBySession[session.id]
+            ?? currentSession.lastProgressStatus
+            ?? (runtime.kind == .web ? "电脑端 ChatGPT 正在处理…" : "电脑端任务正在处理…")
+    }
+    private var generationProgressAt: Date? {
+        currentSession.lastProgressAt ?? currentSession.lastActivityAt
     }
     private var isGenerating: Bool {
         currentSessionState == .busy
@@ -490,12 +499,22 @@ struct ChatView: View {
                         ProgressView()
                             .scaleEffect(0.8)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(store.liveRunStatusBySession[session.id] ?? "正在处理…")
+                            Text(generationStatusText)
                                 .font(.caption.weight(.medium))
                                 .lineLimit(2)
-                            Text("可以直接输入新的指令并发送来纠正方向；也可以先停止。")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                            if store.desktopBrowserConnected == false, runtime.kind == .web {
+                                Text("电脑端 Browser Bridge 已断开，正在等待恢复；当前进度可能暂停。")
+                                    .font(.caption2)
+                                    .foregroundColor(.orange)
+                            } else if let progressAt = generationProgressAt {
+                                Text("电脑端进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 可直接发送新指令纠正方向")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text("可直接发送新指令纠正方向；也可以先停止。")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
                         }
                         Spacer()
                         Button {

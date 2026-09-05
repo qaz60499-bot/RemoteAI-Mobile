@@ -3,7 +3,7 @@ import Foundation
 enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
-    case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, deltaOnlySend
+    case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, alreadyExecutedThenSuccess, deltaOnlySend
     case duplicateEvent, sequenceGap, partialWebCatalog, staleWebCatalog, unclassifiedWebCatalog, offline
 }
 
@@ -164,6 +164,9 @@ actor MockTransport: Transport {
             let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "PROVIDER_UNAVAILABLE", message: "Mock provider unavailable", retryable: true, details: nil), idempotentReplay: nil)
             processedCommands[command.commandId] = response
             return response
+        }
+        if command.action == "sendMessage", scenario == .alreadyExecutedThenSuccess, commandAttempts[command.action] == 1 {
+            return CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "ALREADY_EXECUTED", message: "Mock command is still executing", retryable: true, details: nil), idempotentReplay: true)
         }
         if command.action == "sendMessage", scenario == .webSendNotAccepted {
             let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SEND_NOT_ACCEPTED", message: "Mock page kept the original composer text", retryable: true, details: nil), idempotentReplay: nil)
@@ -354,7 +357,25 @@ actor MockTransport: Transport {
             if let alias { webProjectConversations[alias, default: []].insert(created, at: 0) }
             sessions.append(ServerSession(sessionId: id, runtimeId: "runtime.web", instanceId: "web.chatgpt", externalId: nil, title: created.displayTitle, canonicalUrl: created.canonicalUrl, status: "idle", metadata: alias.map { ["projectAlias": .string($0)] } ?? [:], createdAt: now, updatedAt: now, lastVisited: now))
             response = try success(created)
-        case "resumeSession", "getSessionStatus", "openConversation", "focusConversation", "registerCurrentPage", "unregisterConversation":
+        case "getSessionStatus":
+            let sessionId = command.sessionId ?? ""
+            let stored = sessions.first(where: { $0.sessionId == sessionId })
+            let last = history[sessionId, default: []].last
+            let active = last?.role == "user"
+            var metadata = stored?.metadata ?? [:]
+            if active {
+                let now = Date()
+                metadata["lastActivityAt"] = .string(RemoteAIDate.string(now))
+                metadata["lastProgressStatus"] = .string("Thinking")
+                metadata["lastProgressAt"] = .string(RemoteAIDate.string(now))
+            }
+            response = success([
+                "sessionId": .string(sessionId),
+                "status": .string(active ? "generating" : (stored?.status ?? "idle")),
+                "browserConnected": .bool(true),
+                "metadata": .object(metadata)
+            ])
+        case "resumeSession", "openConversation", "focusConversation", "registerCurrentPage", "unregisterConversation":
             response = success(["ok": .bool(true)])
         default:
             response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "INVALID_COMMAND", message: "Unsupported mock action", retryable: false, details: nil), idempotentReplay: nil)

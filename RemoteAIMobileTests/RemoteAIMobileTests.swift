@@ -1016,6 +1016,27 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testAlreadyExecutedIsRecoveredAsSameCommandInsteadOfRollingBackComposer() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .alreadyExecutedThenSuccess, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let commandId = UUID()
+
+        let sent = await store.send(text: "running-replay", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
+
+        XCTAssertTrue(sent, "ALREADY_EXECUTED is a transient idempotent state and must be resolved with the same command ID")
+        XCTAssertEqual(store.commandStates[commandId], .completed)
+        XCTAssertEqual(await mock.actionAttemptCount("sendMessage"), 2)
+        XCTAssertEqual(await mock.userMessageCount(sessionId: "photo-upload", text: "running-replay"), 1)
+        let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertNil(pending)
+        let draft = await store.draft(sessionId: "photo-upload")
+        XCTAssertEqual(draft, "")
+        await store.suspend()
+    }
+
+    @MainActor
     func testRestartReconcilesUnknownDeliveryFromAuthoritativeServerState() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
         defer { try? FileManager.default.removeItem(at: url) }

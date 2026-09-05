@@ -9,6 +9,9 @@ actor CloudflareTransport: Transport {
     private let commandTimeoutNanoseconds: UInt64 = 30_000_000_000
     private let connectionTimeoutSeconds: TimeInterval = 8
     private let sendTimeoutSeconds: TimeInterval = 10
+    private let heartbeatIntervalNanoseconds: UInt64 = 12_000_000_000
+    private let heartbeatTimeoutNanoseconds: UInt64 = 8_000_000_000
+    private let agentOfflineGraceNanoseconds: UInt64 = 2_500_000_000
 
     private var socket: URLSessionWebSocketTask?
     private var connected = false
@@ -22,6 +25,10 @@ actor CloudflareTransport: Transport {
     private var orphanedResponses: [UUID: CommandResponseEnvelope] = [:]
     private var orphanedResponseOrder: [UUID] = []
     private let orphanedResponseLimit = 256
+    private var heartbeatTask: Task<Void, Never>?
+    private var agentOfflineTask: Task<Void, Never>?
+    private var awaitingPongMessageId: String?
+    private var agentOnline = true
 
     init(config: RemoteAIConfig, session: URLSession = .shared, keychain: KeychainStore = .shared) {
         self.config = config
@@ -57,12 +64,16 @@ actor CloudflareTransport: Transport {
             try await waitForRelayReady(task, deviceId: deviceId)
             guard socket === task else { throw TransportError.disconnected }
             connected = true
+            agentOnline = true
+            agentOfflineTask?.cancel()
+            agentOfflineTask = nil
             connecting = false
             finishConnectionWaiters()
             Task { [weak self, weak task] in
                 guard let self, let task else { return }
                 await self.receiveLoop(task)
             }
+            startHeartbeat(task)
         } catch {
             if let attemptedSocket, socket === attemptedSocket {
                 socket = nil
@@ -76,6 +87,12 @@ actor CloudflareTransport: Transport {
 
     func disconnect() async {
         connected = false
+        agentOnline = false
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        agentOfflineTask?.cancel()
+        agentOfflineTask = nil
+        awaitingPongMessageId = nil
         let active = socket
         socket = nil
         active?.cancel(with: .goingAway, reason: nil)
@@ -136,13 +153,10 @@ actor CloudflareTransport: Transport {
                 try await handle(frame)
             } catch {
                 if socket === activeSocket {
-                    connected = false
-                    socket = nil
-                    activeSocket.cancel(with: .goingAway, reason: nil)
                     if (error as? TransportError) == .pairingRequired {
-                        failAllPending(with: TransportError.pairingRequired)
+                        closeActiveSocket(activeSocket, pendingError: TransportError.pairingRequired)
                     } else {
-                        failAllPending(with: TransportError.disconnected)
+                        closeActiveSocket(activeSocket, pendingError: TransportError.disconnected)
                     }
                 }
                 break
@@ -163,11 +177,27 @@ actor CloudflareTransport: Transport {
                 }
                 throw TransportError.remote(code, message)
             }
+            if let relayState = frame.body["relay"]?.stringValue {
+                if relayState == "agent-online" {
+                    agentOnline = true
+                    agentOfflineTask?.cancel()
+                    agentOfflineTask = nil
+                    DiagnosticsLog.shared.record("relay_agent_online")
+                } else if relayState == "agent-offline" {
+                    agentOnline = false
+                    DiagnosticsLog.shared.record("relay_agent_offline", level: "WARN")
+                    scheduleAgentOfflineConfirmation()
+                }
+            }
             return
         }
         try ProtocolSecurity.validate(frame, expectedMachineId: config.machineId, expectedDeviceId: deviceId)
         if frame.kind == "PING" {
-            try await sendFrame(RelayFrame(v: 1, kind: "PONG", machineId: config.machineId, deviceId: deviceId, messageId: UUID().uuidString, body: ["at": .number(Date().timeIntervalSince1970 * 1000)]))
+            try await sendFrame(RelayFrame(v: 1, kind: "PONG", machineId: config.machineId, deviceId: deviceId, messageId: frame.messageId, body: ["at": .number(Date().timeIntervalSince1970 * 1000)]))
+            return
+        }
+        if frame.kind == "PONG" {
+            if awaitingPongMessageId == frame.messageId { awaitingPongMessageId = nil }
             return
         }
         guard frame.kind == "ENCRYPTED", let key = PairingKeyStore.sharedKey(machineId: config.machineId, keychain: keychain) else { return }
@@ -198,6 +228,76 @@ actor CloudflareTransport: Transport {
         if payload.kind == "error", let error = payload.error {
             failAllPending(with: TransportError.remote(error.code, error.message))
         }
+    }
+
+    private func startHeartbeat(_ activeSocket: URLSessionWebSocketTask) {
+        heartbeatTask?.cancel()
+        heartbeatTask = Task { [weak self, weak activeSocket] in
+            guard let self, let activeSocket else { return }
+            await self.heartbeatLoop(activeSocket)
+        }
+    }
+
+    private func heartbeatLoop(_ activeSocket: URLSessionWebSocketTask) async {
+        while connected, socket === activeSocket, !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: heartbeatIntervalNanoseconds)
+            guard !Task.isCancelled, connected, socket === activeSocket else { return }
+            do {
+                let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
+                let messageId = UUID().uuidString
+                awaitingPongMessageId = messageId
+                try await sendFrame(RelayFrame(
+                    v: 1,
+                    kind: "PING",
+                    machineId: config.machineId,
+                    deviceId: deviceId,
+                    messageId: messageId,
+                    body: ["at": .number(Date().timeIntervalSince1970 * 1000)]
+                ))
+                try? await Task.sleep(nanoseconds: heartbeatTimeoutNanoseconds)
+                guard !Task.isCancelled, connected, socket === activeSocket else { return }
+                if awaitingPongMessageId == messageId {
+                    DiagnosticsLog.shared.record("relay_heartbeat_timeout", fields: ["messageId": messageId], level: "WARN")
+                    closeActiveSocket(activeSocket, pendingError: TransportError.disconnected)
+                    return
+                }
+            } catch {
+                guard connected, socket === activeSocket else { return }
+                DiagnosticsLog.shared.record("relay_heartbeat_send_failed", fields: ["errorType": String(describing: type(of: error))], level: "WARN")
+                closeActiveSocket(activeSocket, pendingError: TransportError.disconnected)
+                return
+            }
+        }
+    }
+
+    private func scheduleAgentOfflineConfirmation() {
+        agentOfflineTask?.cancel()
+        guard let activeSocket = socket else { return }
+        agentOfflineTask = Task { [weak self, weak activeSocket] in
+            try? await Task.sleep(nanoseconds: self?.agentOfflineGraceNanoseconds ?? 2_500_000_000)
+            guard !Task.isCancelled, let self, let activeSocket else { return }
+            await self.confirmAgentOffline(activeSocket)
+        }
+    }
+
+    private func confirmAgentOffline(_ activeSocket: URLSessionWebSocketTask) {
+        agentOfflineTask = nil
+        guard !agentOnline, connected, socket === activeSocket else { return }
+        DiagnosticsLog.shared.record("relay_agent_offline_confirmed", level: "WARN")
+        closeActiveSocket(activeSocket, pendingError: TransportError.offline)
+    }
+
+    private func closeActiveSocket(_ activeSocket: URLSessionWebSocketTask, pendingError: Error) {
+        guard socket === activeSocket else { return }
+        connected = false
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        agentOfflineTask?.cancel()
+        agentOfflineTask = nil
+        awaitingPongMessageId = nil
+        socket = nil
+        activeSocket.cancel(with: .goingAway, reason: nil)
+        failAllPending(with: pendingError)
     }
 
     private func sendFrame(_ frame: RelayFrame) async throws {

@@ -84,6 +84,8 @@ struct SessionDescriptor: Codable, Identifiable, Hashable {
     var projectAlias: String? = nil
     var canonicalUrl: String? = nil
     var lastActivityAt: Date? = nil
+    var lastProgressStatus: String? = nil
+    var lastProgressAt: Date? = nil
 
     var orderingDate: Date { max(updatedAt, lastActivityAt ?? updatedAt) }
 }
@@ -556,7 +558,9 @@ extension ServerSession {
             updatedAt: updatedAt,
             projectAlias: metadata["projectAlias"]?.stringValue,
             canonicalUrl: canonicalUrl,
-            lastActivityAt: persistedActivity ?? lastVisited
+            lastActivityAt: persistedActivity ?? lastVisited,
+            lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
+            lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse)
         )
     }
 }

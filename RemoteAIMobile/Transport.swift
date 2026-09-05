@@ -52,6 +52,23 @@ protocol Transport: AnyObject {
     func eventStream() async -> AsyncStream<RemoteEvent>
 }
 
+struct AgentStatusSnapshot: Equatable {
+    let latestSequence: Int64
+    let browserConnected: Bool?
+    let relayOnline: Bool?
+    let relayLastConnectedAt: Date?
+    let relayLastDisconnectedAt: Date?
+}
+
+struct RemoteSessionStatusSnapshot: Equatable {
+    let sessionId: String
+    let state: SessionState
+    let browserConnected: Bool?
+    let lastActivityAt: Date?
+    let lastProgressStatus: String?
+    let lastProgressAt: Date?
+}
+
 enum TransportError: LocalizedError, Equatable {
     case offline
     case badResponse(Int)
@@ -122,11 +139,24 @@ extension Transport {
         return .failed
     }
 
-    func latestSequence(machineId: String) async throws -> Int64 {
+    func agentStatusSnapshot(machineId: String) async throws -> AgentStatusSnapshot {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "getStatus")
         let response = try await requireSuccess(execute(command))
-        guard let sequence = response.objectValue?["latestSequence"]?.intValue else { throw TransportError.malformedData }
-        return max(0, sequence)
+        guard let object = response.objectValue,
+              let sequence = object["latestSequence"]?.intValue else { throw TransportError.malformedData }
+        let browser = object["browser"]?.objectValue
+        let relay = object["relay"]?.objectValue
+        return AgentStatusSnapshot(
+            latestSequence: max(0, sequence),
+            browserConnected: browser?["connected"]?.boolValue,
+            relayOnline: relay?["online"]?.boolValue,
+            relayLastConnectedAt: relay?["lastConnectedAt"]?.stringValue.flatMap(RemoteAIDate.parse),
+            relayLastDisconnectedAt: relay?["lastDisconnectedAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+        )
+    }
+
+    func latestSequence(machineId: String) async throws -> Int64 {
+        try await agentStatusSnapshot(machineId: machineId).latestSequence
     }
 
     func listRuntimes(machineId: String) async throws -> [RuntimeDescriptor] {
@@ -148,6 +178,23 @@ extension Transport {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, action: "listSessions")
         let response = try await requireSuccess(execute(command))
         return try response.decode([ServerSession].self).map(\.descriptor)
+    }
+
+    func sessionStatus(machineId: String, runtimeId: String, instanceId: String, sessionId: String) async throws -> RemoteSessionStatusSnapshot {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "getSessionStatus")
+        let response = try await requireSuccess(execute(command))
+        guard let object = response.objectValue,
+              object["sessionId"]?.stringValue == sessionId,
+              let status = object["status"]?.stringValue else { throw TransportError.malformedData }
+        let metadata = object["metadata"]?.objectValue ?? [:]
+        return RemoteSessionStatusSnapshot(
+            sessionId: sessionId,
+            state: .server(status),
+            browserConnected: object["browserConnected"]?.boolValue,
+            lastActivityAt: metadata["lastActivityAt"]?.stringValue.flatMap(RemoteAIDate.parse),
+            lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
+            lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+        )
     }
 
     func createSession(machineId: String, runtimeId: String, instanceId: String, payload: [String: JSONValue], commandId: UUID = UUID()) async throws -> SessionDescriptor? {
