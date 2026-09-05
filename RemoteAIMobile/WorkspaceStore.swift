@@ -78,6 +78,15 @@ final class WorkspaceStore: ObservableObject {
         pendingCommandPrefix(machineId: machineId) + id.uuidString.lowercased()
     }
 
+    private static func diagnosticFields(for error: Error, adding extra: [String: String] = [:]) -> [String: String] {
+        var fields = extra
+        fields["errorType"] = String(describing: type(of: error))
+        if let transportError = error as? TransportError {
+            for (key, value) in transportError.diagnosticFields { fields[key] = value }
+        }
+        return fields
+    }
+
     init(transport: Transport, cache: SQLiteStore) {
         self.transport = transport
         self.cache = cache
@@ -287,7 +296,7 @@ final class WorkspaceStore: ObservableObject {
                 webProjectsSnapshotState = .providerUnavailable
                 hasLoadedWebProjects = !webProjects.isEmpty
                 errors["web.projects"] = error.localizedDescription
-                DiagnosticsLog.shared.record("projects_refresh_failed", fields: ["errorType": String(describing: type(of: error))], level: "ERROR")
+                DiagnosticsLog.shared.record("projects_refresh_failed", fields: Self.diagnosticFields(for: error), level: "ERROR")
             }
         }
     }
@@ -437,7 +446,7 @@ final class WorkspaceStore: ObservableObject {
             if generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended {
                 projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
                 errors["web.project.\(projectAlias)"] = error.localizedDescription
-                DiagnosticsLog.shared.record("project_load_failed", fields: ["project": projectAlias, "errorType": String(describing: type(of: error))], level: "ERROR")
+                DiagnosticsLog.shared.record("project_load_failed", fields: Self.diagnosticFields(for: error, adding: ["project": projectAlias]), level: "ERROR")
             }
         }
     }
@@ -724,15 +733,15 @@ final class WorkspaceStore: ObservableObject {
             errors[sessionId] = messageCommandPersisted
                 ? "Delivery is unknown after a disconnect/timeout. Use Retry on this message; it replays the exact same command ID and payload."
                 : "Attachment transfer was interrupted before message delivery was attempted. Retry from the composer reuses the same operation ID."
-            DiagnosticsLog.shared.record("send_unknown_delivery", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "persisted": String(messageCommandPersisted)], level: "WARN")
+            DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "persisted": String(messageCommandPersisted)]), level: "WARN")
             return false
         } catch let error as TransportError {
-            if case .remote(let code, let message) = error, code == "WEB_SEND_DELIVERY_UNKNOWN" {
+            if case .remote(let code, _) = error, code == "WEB_SEND_DELIVERY_UNKNOWN" {
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
                 attachmentTransferBySession.removeValue(forKey: sessionId)
                 commandStates[commandId] = .unknown
                 errors[sessionId] = "Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."
-                DiagnosticsLog.shared.record("send_unknown_delivery", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "remoteCode": code, "message": message], level: "WARN")
+                DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "remoteCode": code]), level: "WARN")
                 await recoverDelta()
                 return false
             }
@@ -742,7 +751,7 @@ final class WorkspaceStore: ObservableObject {
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
             if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
             errors[sessionId] = error.localizedDescription
-            DiagnosticsLog.shared.record("send_failed", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "errorType": String(describing: type(of: error))], level: "ERROR")
+            DiagnosticsLog.shared.record("send_failed", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString]), level: "ERROR")
             return false
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
@@ -752,7 +761,7 @@ final class WorkspaceStore: ObservableObject {
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
             if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
             errors[sessionId] = error.localizedDescription
-            DiagnosticsLog.shared.record("send_failed", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "errorType": String(describing: type(of: error))], level: "ERROR")
+            DiagnosticsLog.shared.record("send_failed", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString]), level: "ERROR")
             return false
         }
     }
@@ -1093,7 +1102,7 @@ final class WorkspaceStore: ObservableObject {
 
     private func applyConnectionFailure(_ error: Error) {
         machine.state = .offline
-        DiagnosticsLog.shared.record("connection_failure", fields: ["errorType": String(describing: type(of: error))], level: "ERROR")
+        DiagnosticsLog.shared.record("connection_failure", fields: Self.diagnosticFields(for: error), level: "ERROR")
         if let transportError = error as? TransportError {
             switch transportError {
             case .pairingRequired:

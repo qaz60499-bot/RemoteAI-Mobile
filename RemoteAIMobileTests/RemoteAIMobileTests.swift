@@ -673,6 +673,15 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.suspend()
     }
 
+    func testTransportErrorDiagnosticFieldsExposeCauseWithoutRemoteMessageText() {
+        XCTAssertEqual(TransportError.timeout.diagnosticFields, ["transportKind": "timeout"])
+        XCTAssertEqual(TransportError.badResponse(503).diagnosticFields, ["transportKind": "badResponse", "httpStatus": "503"])
+        let remote = TransportError.remote("BROWSER_BINDING_MISSING", "sensitive provider text").diagnosticFields
+        XCTAssertEqual(remote["transportKind"], "remote")
+        XCTAssertEqual(remote["remoteCode"], "BROWSER_BINDING_MISSING")
+        XCTAssertFalse(remote.values.contains("sensitive provider text"))
+    }
+
     @MainActor
     func testDiagnosticsLogFiltersSensitiveFieldsAndKeepsSafeOperationalMetadata() throws {
         let log = DiagnosticsLog.shared

@@ -78,6 +78,21 @@ enum TransportError: LocalizedError, Equatable {
         case .remote(let code, let message): return "\(code): \(message)"
         }
     }
+
+    var diagnosticFields: [String: String] {
+        switch self {
+        case .offline: return ["transportKind": "offline"]
+        case .badResponse(let status): return ["transportKind": "badResponse", "httpStatus": String(status)]
+        case .malformedData: return ["transportKind": "malformedData"]
+        case .pairingRequired: return ["transportKind": "pairingRequired"]
+        case .disconnected: return ["transportKind": "disconnected"]
+        case .timeout: return ["transportKind": "timeout"]
+        case .insecureRelay: return ["transportKind": "insecureRelay"]
+        case .frameTooLarge: return ["transportKind": "frameTooLarge"]
+        case .replayDetected: return ["transportKind": "replayDetected"]
+        case .remote(let code, _): return ["transportKind": "remote", "remoteCode": code]
+        }
+    }
 }
 
 extension RemoteCommand {
