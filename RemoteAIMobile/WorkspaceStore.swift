@@ -1883,8 +1883,17 @@ final class WorkspaceStore: ObservableObject {
             }
             while true {
                 guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+                let requestedCursor = cursor
                 let result = try await transport.delta(machineId: machine.id, after: cursor)
                 guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+                if !result.events.isEmpty {
+                    DiagnosticsLog.shared.record("delta_recovery_batch", fields: [
+                        "cursor": String(requestedCursor),
+                        "count": String(result.events.count),
+                        "firstSequence": String(result.events.first?.sequence ?? requestedCursor),
+                        "lastSequence": String(result.events.last?.sequence ?? requestedCursor),
+                    ])
+                }
                 for event in result.events where event.sequence > cursor {
                     try ProtocolSecurity.validate(event, expectedMachineId: machine.id)
                     guard eventReplayGuard.accept(event.eventId.uuidString.lowercased()) else { throw TransportError.replayDetected }
@@ -1898,7 +1907,10 @@ final class WorkspaceStore: ObservableObject {
             }
             tracker = SequenceTracker(lastSequence: cursor)
         } catch {
-            if generation == lifecycleGeneration, !isSuspended { errors["sync"] = error.localizedDescription }
+            if generation == lifecycleGeneration, !isSuspended {
+                errors["sync"] = error.localizedDescription
+                DiagnosticsLog.shared.record("delta_recovery_failed", fields: Self.diagnosticFields(for: error), level: "ERROR")
+            }
         }
     }
 
@@ -2170,6 +2182,8 @@ final class WorkspaceStore: ObservableObject {
         let lower = trimmed.lowercased()
         if lower == "thinking" || lower.hasPrefix("thinking ") { return "思考中…" }
         if lower.contains("analyzing image") || lower.contains("analysing image") { return "正在分析图片…" }
+        if lower.contains("generated image ready") || lower.contains("image ready") { return "图片已生成，正在同步…" }
+        if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return "正在生成图片…" }
         if lower.contains("searching the web") || lower == "searching" { return "正在搜索网页…" }
         if lower.contains("reading") && trimmed.count < 120 { return trimmed }
         if !trimmed.contains("\n"), trimmed.count <= 80 { return trimmed }
@@ -2184,6 +2198,8 @@ final class WorkspaceStore: ObservableObject {
         if lower.contains("searching") || lower.contains("search the web") { return "正在搜索网页…" }
         if lower.contains("reading") || lower.contains("browsing") { return "正在读取网页内容…" }
         if lower.contains("analyzing image") || lower.contains("analysing image") { return "正在分析图片…" }
+        if lower.contains("generated image ready") || lower.contains("image ready") { return "图片已生成，正在同步…" }
+        if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return "正在生成图片…" }
         if lower.contains("writing") || lower.contains("generating") { return "正在生成回答…" }
         return trimmed
     }

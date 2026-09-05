@@ -37,6 +37,19 @@ actor CloudflareTransport: Transport {
         self.config = config
         self.session = session
         self.keychain = keychain
+
+        // Relay may deliver a durable encrypted event immediately after the socket is
+        // accepted. Build the streams before connect() can ever ACK such a frame; a
+        // lazily-created continuation creates a race where handle() validates+ACKs an
+        // event while continuation is still nil, permanently removing it from Relay
+        // without WorkspaceStore ever seeing it.
+        let eventPipe = AsyncStream<RemoteEvent>.makeStream()
+        self.continuation = eventPipe.continuation
+        self.stream = eventPipe.stream
+
+        let healthPipe = AsyncStream<TransportHealthEvent>.makeStream()
+        self.healthContinuation = healthPipe.continuation
+        self.healthEventStream = healthPipe.stream
     }
 
     var isConnected: Bool { connected }
@@ -111,21 +124,13 @@ actor CloudflareTransport: Transport {
     }
 
     func eventStream() async -> AsyncStream<RemoteEvent> {
-        if let stream { return stream }
-        var captured: AsyncStream<RemoteEvent>.Continuation?
-        let created = AsyncStream<RemoteEvent> { captured = $0 }
-        continuation = captured
-        stream = created
-        return created
+        guard let stream else { return AsyncStream { $0.finish() } }
+        return stream
     }
 
     func healthStream() async -> AsyncStream<TransportHealthEvent> {
-        if let healthEventStream { return healthEventStream }
-        var captured: AsyncStream<TransportHealthEvent>.Continuation?
-        let created = AsyncStream<TransportHealthEvent> { captured = $0 }
-        healthContinuation = captured
-        healthEventStream = created
-        return created
+        guard let healthEventStream else { return AsyncStream { $0.finish() } }
+        return healthEventStream
     }
 
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {

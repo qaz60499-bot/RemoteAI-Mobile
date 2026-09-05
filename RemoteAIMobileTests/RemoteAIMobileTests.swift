@@ -1630,6 +1630,59 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testGeneratedImageReadyProgressIsLocalizedAndRemainsVisibleUntilTerminalEvent() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]),
+                "summary": .string("Generated image ready: Cozy Pour-Over Coffee Timer Scene.")
+            ],
+            createdAt: now
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.liveRunStatusBySession["photo-upload"] != nil { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "图片已生成，正在同步…")
+        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains {
+            $0.kind == .toolEvent && $0.detail == "图片已生成，正在同步…" && $0.toolStatus == "Running"
+        })
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1202,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STOPPED",
+            payload: ["ok": .bool(true)],
+            createdAt: now.addingTimeInterval(1)
+        ), deliverLive: true)
+        for _ in 0..<80 {
+            if store.liveRunStatusBySession["photo-upload"] == nil { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        await store.suspend()
+    }
+
+    @MainActor
     func testGranularDesktopProcessLabelsRemainVisibleAsSeparateMobileTimelineRows() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
