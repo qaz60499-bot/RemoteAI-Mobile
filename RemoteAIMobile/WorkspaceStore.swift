@@ -2078,6 +2078,12 @@ final class WorkspaceStore: ObservableObject {
                 if machine.state != .online {
                     machine.state = .connecting
                     connectionPhase = .authenticating
+                } else {
+                    // A short 1006 recovered inside the grace window. The phone never
+                    // left the durable Relay path, so restore the normal phase without
+                    // forcing a second authentication/reconnect cycle.
+                    connectionPhase = .online
+                    errors["connection"] = nil
                 }
                 if recovered {
                     recentSystemNotice = "Windows Agent 已重新连上 Relay，正在补同步当前会话。"
@@ -2085,7 +2091,7 @@ final class WorkspaceStore: ObservableObject {
             case .connecting, .reconnecting:
                 desktopAgentConnected = false
                 systemTransportOfflineChannels.insert("windows-agent")
-                machine.state = .connecting
+                if machine.state != .online { machine.state = .connecting }
                 connectionPhase = .windowsReconnecting
                 errors["connection"] = "Windows Agent 正在重新连接 Relay；手机到 Relay 本身仍保持连接。"
                 recentSystemNotice = "Windows Agent 暂时离线，RemoteAI 正在等待它重新上线；不会把这次状态误报成 Relay 断线。"

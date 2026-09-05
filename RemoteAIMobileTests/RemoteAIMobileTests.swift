@@ -558,10 +558,11 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertEqual(store.connectionPhase, .windowsReconnecting)
-        XCTAssertEqual(store.machine.state, .connecting)
+        XCTAssertEqual(store.machine.state, .online, "Short Agent reconnects stay command-capable through the durable Relay grace window")
         XCTAssertEqual(store.desktopRelayConnected, true, "Agent loss must not be represented as Relay loss")
         XCTAssertEqual(store.desktopAgentConnected, false)
-        XCTAssertEqual(try await cache.lastSequence(), initialSequence, "Raw Relay health must not pollute the durable RemoteEvent cursor")
+        let sequenceDuringAgentReconnect = try await cache.lastSequence()
+        XCTAssertEqual(sequenceDuringAgentReconnect, initialSequence, "Raw Relay health must not pollute the durable RemoteEvent cursor")
 
         await mock.injectHealth(TransportHealthEvent(channel: .agent, state: .offline, at: now.addingTimeInterval(3), detail: "confirmed offline"))
         for _ in 0..<40 where store.connectionPhase != .windowsOffline {
@@ -579,7 +580,8 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.connectionPhase, .online)
         XCTAssertEqual(store.desktopAgentConnected, true)
         XCTAssertEqual(store.desktopRelayConnected, true)
-        XCTAssertEqual(try await cache.lastSequence(), initialSequence)
+        let sequenceAfterAgentRecovery = try await cache.lastSequence()
+        XCTAssertEqual(sequenceAfterAgentRecovery, initialSequence)
         await store.suspend()
     }
 
@@ -597,14 +599,16 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.lastProgressStatus, "Thinking")
         XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"], "Authoritative getSessionStatus must recover progress even when websocket progress events were missed")
-        XCTAssertEqual(try await cache.lastSequence(), initialSequence, "Status polling is reconciliation, not a synthetic RemoteEvent")
+        let sequenceAfterProgressPolling = try await cache.lastSequence()
+        XCTAssertEqual(sequenceAfterProgressPolling, initialSequence, "Status polling is reconciliation, not a synthetic RemoteEvent")
 
         await mock.appendHistoryMessage(ServerMessage(messageId: "poll-final", sessionId: "photo-upload", role: "assistant", content: "final recovered by polling", externalId: nil, createdAt: now.addingTimeInterval(1)))
         await store.synchronizeVisibleSession("photo-upload", force: true)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "poll-final" }.count, 1)
-        XCTAssertEqual(try await cache.lastSequence(), initialSequence)
+        let sequenceAfterFinalPolling = try await cache.lastSequence()
+        XCTAssertEqual(sequenceAfterFinalPolling, initialSequence)
         await store.suspend()
     }
 

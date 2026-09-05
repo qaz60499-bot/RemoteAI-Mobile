@@ -31,6 +31,7 @@ actor CloudflareTransport: Transport {
     private var agentOfflineTask: Task<Void, Never>?
     private var awaitingPongMessageId: String?
     private var agentOnline = false
+    private var agentReconnectPending = false
 
     init(config: RemoteAIConfig, session: URLSession = .shared, keychain: KeychainStore = .shared) {
         self.config = config
@@ -68,6 +69,7 @@ actor CloudflareTransport: Transport {
             guard socket === task else { throw TransportError.disconnected }
             connected = true
             agentOnline = relayAgentOnline
+            agentReconnectPending = false
             agentOfflineTask?.cancel()
             agentOfflineTask = nil
             connecting = false
@@ -96,6 +98,7 @@ actor CloudflareTransport: Transport {
     func disconnect() async {
         connected = false
         agentOnline = false
+        agentReconnectPending = false
         heartbeatTask?.cancel()
         heartbeatTask = nil
         agentOfflineTask?.cancel()
@@ -198,12 +201,17 @@ actor CloudflareTransport: Transport {
             if let relayState = frame.body["relay"]?.stringValue {
                 if relayState == "agent-online" {
                     agentOnline = true
+                    agentReconnectPending = false
                     agentOfflineTask?.cancel()
                     agentOfflineTask = nil
                     publishHealth(channel: .agent, state: .online, detail: nil)
                     await recordDiagnostic("relay_agent_online")
                 } else if relayState == "agent-offline" {
-                    agentOnline = false
+                    // Keep the transport command-capable during the short reconnect
+                    // grace. The Durable Object has a reliable to-Agent queue, so a
+                    // command sent during a typical 1006 can wait there and replay to
+                    // the same commandId when Windows reconnects.
+                    agentReconnectPending = true
                     publishHealth(channel: .agent, state: .reconnecting, detail: "Windows Agent disconnected from Relay")
                     await recordDiagnostic("relay_agent_offline", level: "WARN")
                     scheduleAgentOfflineConfirmation()
@@ -302,10 +310,12 @@ actor CloudflareTransport: Transport {
 
     private func confirmAgentOffline(_ activeSocket: URLSessionWebSocketTask) async {
         agentOfflineTask = nil
-        guard !agentOnline, connected, socket === activeSocket else { return }
+        guard agentReconnectPending, connected, socket === activeSocket else { return }
         // The phone-to-Relay websocket is still healthy. Keep it open so Relay can
         // announce agent-online immediately when Windows returns; do not turn one
         // Windows outage into a second Relay reconnect loop.
+        agentReconnectPending = false
+        agentOnline = false
         publishHealth(channel: .agent, state: .offline, detail: "Windows Agent remained offline after reconnect grace")
         await recordDiagnostic("relay_agent_offline_confirmed", level: "WARN")
         failAllPending(with: TransportError.offline)
@@ -321,6 +331,7 @@ actor CloudflareTransport: Transport {
         guard socket === activeSocket else { return }
         connected = false
         agentOnline = false
+        agentReconnectPending = false
         heartbeatTask?.cancel()
         heartbeatTask = nil
         agentOfflineTask?.cancel()
