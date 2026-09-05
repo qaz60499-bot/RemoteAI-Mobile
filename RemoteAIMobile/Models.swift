@@ -130,6 +130,44 @@ struct RemoteAttachmentDescriptor: Codable, Identifiable, Hashable {
     let sha256: String
 }
 
+struct DownloadedMessageAttachment: Hashable {
+    let attachmentId: String
+    let name: String
+    let contentType: String
+    let data: Data
+}
+
+struct MessageAttachmentChunk: Codable, Hashable {
+    let attachmentId: String
+    let name: String
+    let contentType: String
+    let sizeBytes: Int
+    let sha256: String?
+    let index: Int
+    let chunkBytes: Int
+    let dataBase64: String
+    let hasMore: Bool
+}
+
+struct MessageAttachment: Codable, Identifiable, Hashable {
+    let attachmentId: String?
+    let name: String
+    let contentType: String?
+    let sizeBytes: Int?
+    let previewURL: String?
+    let downloadURL: String?
+
+    var id: String {
+        attachmentId ?? "\(name)|\(previewURL ?? downloadURL ?? "")"
+    }
+
+    var isImage: Bool {
+        if contentType?.lowercased().hasPrefix("image/") == true { return true }
+        let lower = name.lowercased()
+        return [".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic"].contains { lower.hasSuffix($0) }
+    }
+}
+
 struct WebProjectDescriptor: Codable, Identifiable, Hashable {
     var id: String { projectAlias }
     let projectAlias: String
@@ -242,9 +280,60 @@ struct ChatMessage: Codable, Identifiable, Hashable {
     var toolName: String?
     var toolStatus: String?
     var detail: String?
+    var attachments: [MessageAttachment]? = nil
     let createdAt: Date
 
     var cursor: MessageCursor { MessageCursor(createdAt: createdAt, messageId: id) }
+
+    var resolvedAttachments: [MessageAttachment] {
+        if let attachments, !attachments.isEmpty {
+            return Self.deduplicatedAttachments(attachments)
+        }
+        return Self.legacyAttachments(in: text)
+    }
+
+    var displayText: String {
+        guard !resolvedAttachments.isEmpty else { return text }
+        return Self.strippingLegacyAttachmentMarkers(from: text)
+    }
+
+    private static func legacyAttachments(in text: String) -> [MessageAttachment] {
+        guard let regex = try? NSRegularExpression(pattern: #"(?is)\[Attachments:\s*([^\]]+)\]"#) else { return [] }
+        let nsText = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+        var attachments: [MessageAttachment] = []
+        for match in matches where match.numberOfRanges > 1 {
+            let raw = nsText.substring(with: match.range(at: 1))
+            for part in raw.split(separator: ",") {
+                let name = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { continue }
+                attachments.append(MessageAttachment(
+                    attachmentId: nil,
+                    name: name,
+                    contentType: nil,
+                    sizeBytes: nil,
+                    previewURL: nil,
+                    downloadURL: nil
+                ))
+            }
+        }
+        return deduplicatedAttachments(attachments)
+    }
+
+    private static func strippingLegacyAttachmentMarkers(from text: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: #"(?is)\s*\[Attachments:\s*[^\]]+\]"#) else { return text }
+        let range = NSRange(location: 0, length: (text as NSString).length)
+        return regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func deduplicatedAttachments(_ attachments: [MessageAttachment]) -> [MessageAttachment] {
+        var seen = Set<String>()
+        return attachments.filter { attachment in
+            let key = "\(attachment.attachmentId ?? "")|\(attachment.name.lowercased())|\(attachment.previewURL ?? "")|\(attachment.downloadURL ?? "")"
+            return seen.insert(key).inserted
+        }
+    }
 }
 
 enum JSONValue: Codable, Hashable {
@@ -426,6 +515,7 @@ struct ServerMessage: Codable {
     let role: String
     let content: String
     let externalId: String?
+    var attachments: [MessageAttachment]? = nil
     let createdAt: Date
 }
 
@@ -474,6 +564,6 @@ extension ServerSession {
 extension ServerMessage {
     var chatMessage: ChatMessage {
         let mappedRole = MessageRole(rawValue: role.lowercased()) ?? .system
-        return ChatMessage(id: messageId, sessionId: sessionId, sequence: nil, role: mappedRole, kind: .text, text: content, toolName: nil, toolStatus: nil, detail: nil, createdAt: createdAt)
+        return ChatMessage(id: messageId, sessionId: sessionId, sequence: nil, role: mappedRole, kind: .text, text: content, toolName: nil, toolStatus: nil, detail: nil, attachments: attachments, createdAt: createdAt)
     }
 }

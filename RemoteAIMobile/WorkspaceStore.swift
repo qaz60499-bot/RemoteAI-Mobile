@@ -16,6 +16,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var projectConversationSnapshotStateByAlias: [String: WebSnapshotState] = [:]
     @Published var projectConversationLoadingByAlias: [String: Bool] = [:]
     @Published var liveRunStatusBySession: [String: String] = [:]
+    private var liveRunActivityAtBySession: [String: Date] = [:]
     @Published var hasLoadedWebProjects = false
     @Published var attachmentTransferBySession: [String: AttachmentTransferProgress] = [:]
     @Published var commandStates: [UUID: CommandState] = [:]
@@ -34,7 +35,8 @@ final class WorkspaceStore: ObservableObject {
     private var eventReplayGuard = BoundedReplayGuard(capacity: 8192)
     private var eventTask: Task<Void, Never>?
     private var connectionMonitorTask: Task<Void, Never>?
-    private var streamingBuffers: [String: (id: String, text: String, sequence: Int64)] = [:]
+    private var streamingBuffers: [String: (id: String, text: String, sequence: Int64, attachments: [MessageAttachment])] = [:]
+    private let messageAttachmentCache = NSCache<NSString, NSData>()
     private var flushTask: Task<Void, Never>?
     private var startInProgress = false
     private var restartAfterStart = false
@@ -153,6 +155,7 @@ final class WorkspaceStore: ObservableObject {
             projectConversationSnapshotStateByAlias.removeAll()
             projectConversationLoadingByAlias.removeAll()
             liveRunStatusBySession.removeAll()
+            liveRunActivityAtBySession.removeAll()
             webProjectsSnapshotId = nil
             projectConversationSnapshotIds.removeAll()
             lastWebProjectsRefreshAt = nil
@@ -719,6 +722,33 @@ final class WorkspaceStore: ObservableObject {
         await loadSession(sessionId)
     }
 
+    func loadMessageAttachmentData(sessionId: String, attachment: MessageAttachment) async -> Data? {
+        guard let attachmentId = attachment.attachmentId, attachmentId.hasPrefix("webasset-") else { return nil }
+        let cacheKey = "\(sessionId)|\(attachmentId)" as NSString
+        if let cached = messageAttachmentCache.object(forKey: cacheKey) { return cached as Data }
+        guard machine.state == .online, !isSuspended, let route = routeForSession(sessionId) else { return nil }
+        do {
+            let downloaded = try await transport.downloadMessageAttachment(
+                machineId: machine.id,
+                runtimeId: route.runtimeId,
+                instanceId: route.instanceId,
+                sessionId: sessionId,
+                attachmentId: attachmentId
+            )
+            guard downloaded.data.count <= 20 * 1024 * 1024 else { return nil }
+            messageAttachmentCache.setObject(downloaded.data as NSData, forKey: cacheKey, cost: downloaded.data.count)
+            messageAttachmentCache.totalCostLimit = 40 * 1024 * 1024
+            return downloaded.data
+        } catch {
+            DiagnosticsLog.shared.record("attachment_preview_failed", fields: [
+                "session": sessionId,
+                "attachmentId": attachmentId,
+                "errorType": String(describing: type(of: error)),
+            ], level: "WARN")
+            return nil
+        }
+    }
+
     func loadOlder(_ sessionId: String) async {
         guard olderMessageLoads.insert(sessionId).inserted else { return }
         defer { olderMessageLoads.remove(sessionId) }
@@ -792,9 +822,17 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { throw CancellationError() }
             attachmentTransferBySession.removeValue(forKey: sessionId)
 
-            let names = remoteAttachments.map(\.name).joined(separator: ", ")
-            let displayText = "\(trimmed)\(!names.isEmpty ? "\(trimmed.isEmpty ? "" : "\n\n")[Attachments: \(names)]" : "")"
-            let optimistic = ChatMessage(id: commandId.uuidString, sessionId: sessionId, sequence: nil, role: .user, kind: .text, text: displayText, toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
+            let optimisticAttachments = remoteAttachments.map {
+                MessageAttachment(
+                    attachmentId: $0.attachmentId,
+                    name: $0.name,
+                    contentType: $0.contentType,
+                    sizeBytes: $0.sizeBytes,
+                    previewURL: nil,
+                    downloadURL: nil
+                )
+            }
+            let optimistic = ChatMessage(id: commandId.uuidString, sessionId: sessionId, sequence: nil, role: .user, kind: .text, text: trimmed, toolName: nil, toolStatus: nil, detail: nil, attachments: optimisticAttachments, createdAt: Date())
             merge([optimistic], into: sessionId)
             try? await cache.upsertMessages([optimistic])
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
@@ -815,6 +853,7 @@ final class WorkspaceStore: ObservableObject {
             // can be lost during a ChatGPT SPA document replacement even though Send was
             // accepted. The next authoritative final/delta will settle this state.
             setSessionState(sessionId, .busy)
+            markLiveRunActivity(sessionId: sessionId, at: Date())
             liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
                 ? "已发送，等待 ChatGPT 响应…"
                 : "已发送，等待远端响应…"
@@ -1064,6 +1103,7 @@ final class WorkspaceStore: ObservableObject {
         projectConversationSnapshotStateByAlias.removeAll()
         projectConversationLoadingByAlias.removeAll()
         liveRunStatusBySession.removeAll()
+        liveRunActivityAtBySession.removeAll()
         webProjectsSnapshotId = nil
         projectConversationSnapshotIds.removeAll()
         lastWebProjectsRefreshAt = nil
@@ -1609,7 +1649,15 @@ final class WorkspaceStore: ObservableObject {
         }
 
         sessionRouteHints[sessionId] = (event.machineId, event.runtimeId, event.instanceId)
-        if ["MESSAGE_UPDATED", "MESSAGE_ADDED", "TOOL_STARTED", "TOOL_FINISHED", "GENERATION_STARTED", "GENERATION_STOPPED"].contains(event.type) {
+        let runEventTypes = ["MESSAGE_UPDATED", "MESSAGE_ADDED", "TOOL_STARTED", "TOOL_FINISHED", "GENERATION_STARTED", "GENERATION_STOPPED"]
+        if runEventTypes.contains(event.type) {
+            DiagnosticsLog.shared.record("event_applied", fields: [
+                "type": event.type,
+                "sequence": String(event.sequence),
+                "session": sessionId,
+            ])
+        }
+        if runEventTypes.contains(event.type) {
             // Live delivery can legitimately beat lazy instance/session catalog loading.
             // Materialize one in-memory row so busy/error/idle transitions are visible
             // immediately; a later authoritative listSessions refresh replaces its
@@ -1621,9 +1669,11 @@ final class WorkspaceStore: ObservableObject {
         switch event.type {
         case "MESSAGE_UPDATED":
             let content = event.payload["content"]?.stringValue ?? ""
+            let attachments = (try? event.payload["attachments"]?.decode([MessageAttachment].self)) ?? []
             let id = event.payload["messageId"]?.stringValue ?? streamingBuffers[sessionId]?.id ?? "stream-\(sessionId)"
-            bufferStreaming(sessionId: sessionId, id: id, content: content, sequence: event.sequence)
+            bufferStreaming(sessionId: sessionId, id: id, content: content, attachments: attachments, sequence: event.sequence)
             if event.payload["partial"]?.boolValue != false {
+                markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
                 // A transient event can arrive even when GENERATION_STARTED was lost in
                 // transit. Treat streaming content itself as proof that the run is busy
                 // so the progress strip remains visible on the phone.
@@ -1639,13 +1689,15 @@ final class WorkspaceStore: ObservableObject {
                     // run state even if the following GENERATION_STOPPED event is lost.
                     setSessionState(sessionId, .idle)
                     liveRunStatusBySession.removeValue(forKey: sessionId)
+                    clearLiveRunActivity(sessionId: sessionId)
                 }
                 if base.role == .user { await reconcileOptimisticUserEcho(base, sessionId: sessionId) }
-                let message = ChatMessage(id: base.id, sessionId: base.sessionId, sequence: event.sequence, role: base.role, kind: base.kind, text: base.text, toolName: nil, toolStatus: nil, detail: nil, createdAt: base.createdAt)
+                let message = ChatMessage(id: base.id, sessionId: base.sessionId, sequence: event.sequence, role: base.role, kind: base.kind, text: base.text, toolName: nil, toolStatus: nil, detail: nil, attachments: base.attachments, createdAt: base.createdAt)
                 merge([message], into: sessionId)
                 try? await cache.upsertMessages([message])
             }
         case "TOOL_STARTED", "TOOL_FINISHED":
+            markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             let completed = event.type == "TOOL_FINISHED"
             if !completed { setSessionState(sessionId, .busy) }
             let toolValue = event.payload["tool"]
@@ -1697,6 +1749,7 @@ final class WorkspaceStore: ObservableObject {
                 liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
             }
         case "GENERATION_STARTED":
+            markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             setSessionState(sessionId, .busy)
             liveRunStatusBySession[sessionId] = "ChatGPT 正在处理…"
         case "GENERATION_STOPPED":
@@ -1710,6 +1763,7 @@ final class WorkspaceStore: ObservableObject {
                 await settleRunningToolRows(sessionId: sessionId)
                 setSessionState(sessionId, .error)
                 liveRunStatusBySession.removeValue(forKey: sessionId)
+                clearLiveRunActivity(sessionId: sessionId)
                 let code = event.payload["errorCode"]?.stringValue ?? "PROVIDER_UNAVAILABLE"
                 let message = event.payload["errorMessage"]?.stringValue
                 if let message, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1723,6 +1777,7 @@ final class WorkspaceStore: ObservableObject {
                 flushStreaming(sessionId: sessionId)
                 setSessionState(sessionId, .idle)
                 liveRunStatusBySession.removeValue(forKey: sessionId)
+                clearLiveRunActivity(sessionId: sessionId)
                 errors[sessionId] = nil
             }
         case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED":
@@ -1790,8 +1845,17 @@ final class WorkspaceStore: ObservableObject {
         if let index = sessions.firstIndex(where: { $0.id == sessionId }) { sessions[index].state = state }
     }
 
-    private func bufferStreaming(sessionId: String, id: String, content: String, sequence: Int64) {
-        streamingBuffers[sessionId] = (id, content, sequence)
+    private func markLiveRunActivity(sessionId: String, at: Date) {
+        if let current = liveRunActivityAtBySession[sessionId], current >= at { return }
+        liveRunActivityAtBySession[sessionId] = at
+    }
+
+    private func clearLiveRunActivity(sessionId: String) {
+        liveRunActivityAtBySession.removeValue(forKey: sessionId)
+    }
+
+    private func bufferStreaming(sessionId: String, id: String, content: String, attachments: [MessageAttachment], sequence: Int64) {
+        streamingBuffers[sessionId] = (id, content, sequence, attachments)
         if flushTask == nil {
             flushTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 90_000_000)
@@ -1805,8 +1869,9 @@ final class WorkspaceStore: ObservableObject {
         var list = messagesBySession[sessionId, default: []]
         if let index = list.firstIndex(where: { $0.id == item.id }) {
             list[index].text = item.text
+            list[index].attachments = item.attachments
         } else {
-            list.append(ChatMessage(id: item.id, sessionId: sessionId, sequence: item.sequence, role: .assistant, kind: .text, text: item.text, toolName: nil, toolStatus: "Streaming", detail: nil, createdAt: Date()))
+            list.append(ChatMessage(id: item.id, sessionId: sessionId, sequence: item.sequence, role: .assistant, kind: .text, text: item.text, toolName: nil, toolStatus: "Streaming", detail: nil, attachments: item.attachments, createdAt: Date()))
         }
         messagesBySession[sessionId] = sortedMessages(list)
     }
@@ -1826,11 +1891,24 @@ final class WorkspaceStore: ObservableObject {
     private func settleRunStateIfAuthoritativeFinalExists(_ remote: [ChatMessage], sessionId: String) async {
         guard let latestUserIndex = remote.lastIndex(where: { $0.role == .user }) else { return }
         let suffixStart = remote.index(after: latestUserIndex)
-        guard suffixStart < remote.endIndex,
-              remote[suffixStart...].contains(where: { $0.role == .assistant && $0.kind == .text && $0.toolStatus != "Streaming" }) else { return }
+        guard suffixStart < remote.endIndex else { return }
+        let authoritativeFinal = remote[suffixStart...]
+            .filter { $0.role == .assistant && $0.kind == .text && $0.toolStatus != "Streaming" }
+            .max(by: { $0.createdAt < $1.createdAt })
+        guard let authoritativeFinal else { return }
+
+        if let liveActivityAt = liveRunActivityAtBySession[sessionId], authoritativeFinal.createdAt < liveActivityAt {
+            DiagnosticsLog.shared.record("stale_final_ignored", fields: [
+                "session": sessionId,
+                "finalAt": authoritativeFinal.createdAt.ISO8601Format(),
+                "liveActivityAt": liveActivityAt.ISO8601Format(),
+            ], level: "WARN")
+            return
+        }
 
         discardStreamingPlaceholder(sessionId: sessionId)
         liveRunStatusBySession.removeValue(forKey: sessionId)
+        clearLiveRunActivity(sessionId: sessionId)
         setSessionState(sessionId, .idle)
         errors[sessionId] = nil
 

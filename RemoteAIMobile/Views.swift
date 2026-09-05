@@ -921,7 +921,9 @@ struct MessageRow: View {
     @State private var selectionText = ""
     @State private var selectionMonospaced = false
     @State private var showingTextSelection = false
-    private var contentSegments: [MessageContentSegment] { MessageContentSegment.parse(message.text) }
+    private var displayText: String { message.displayText }
+    private var displayAttachments: [MessageAttachment] { message.resolvedAttachments }
+    private var contentSegments: [MessageContentSegment] { MessageContentSegment.parse(displayText) }
 
     var body: some View {
         Group {
@@ -986,9 +988,16 @@ struct MessageRow: View {
                                 Text(segment.text).textSelection(.enabled)
                             }
                         }
-                        if !message.text.isEmpty {
+                        if !displayAttachments.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(displayAttachments) { attachment in
+                                    MessageAttachmentView(sessionId: message.sessionId, attachment: attachment)
+                                }
+                            }
+                        }
+                        if !displayText.isEmpty {
                             Button {
-                                selectionText = message.text
+                                selectionText = displayText
                                 selectionMonospaced = false
                                 showingTextSelection = true
                             } label: {
@@ -1012,6 +1021,96 @@ struct MessageRow: View {
         .sheet(isPresented: $showingTextSelection) {
             TextSelectionSheet(text: selectionText, monospaced: selectionMonospaced)
         }
+    }
+}
+
+private struct MessageAttachmentView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    let sessionId: String
+    let attachment: MessageAttachment
+    @State private var cachedImage: UIImage?
+    @State private var cacheLoadFinished = false
+
+    private var targetURL: URL? {
+        if let downloadURL = attachment.downloadURL, let url = URL(string: downloadURL) { return url }
+        if let previewURL = attachment.previewURL, let url = URL(string: previewURL) { return url }
+        return nil
+    }
+
+    private var metadataText: String {
+        var parts: [String] = []
+        if let contentType = attachment.contentType, !contentType.isEmpty { parts.append(contentType) }
+        if let sizeBytes = attachment.sizeBytes {
+            parts.append(ByteCountFormatter.string(fromByteCount: Int64(sizeBytes), countStyle: .file))
+        }
+        return parts.isEmpty ? (attachment.isImage ? "图片" : "文件") : parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        Group {
+            if let targetURL {
+                Link(destination: targetURL) { cardContent }
+                    .buttonStyle(.plain)
+            } else {
+                cardContent
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("附件 \(attachment.name)")
+    }
+
+    private var cardContent: some View {
+        HStack(spacing: 10) {
+            if attachment.isImage, attachment.attachmentId?.hasPrefix("webasset-") == true {
+                Group {
+                    if let cachedImage {
+                        Image(uiImage: cachedImage).resizable().scaledToFill()
+                    } else if cacheLoadFinished {
+                        Image(systemName: "photo").font(.title3).foregroundColor(.secondary)
+                    } else {
+                        ProgressView().scaleEffect(0.75)
+                    }
+                }
+                .frame(width: 58, height: 58)
+                .background(Color(.tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+                .task(id: attachment.id) {
+                    guard cachedImage == nil, !cacheLoadFinished else { return }
+                    if let data = await store.loadMessageAttachmentData(sessionId: sessionId, attachment: attachment) {
+                        cachedImage = UIImage(data: data)
+                    }
+                    cacheLoadFinished = true
+                }
+            } else if attachment.isImage, let previewURL = attachment.previewURL, let url = URL(string: previewURL) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let image): image.resizable().scaledToFill()
+                    case .empty: ProgressView().scaleEffect(0.75)
+                    default: Image(systemName: "photo").font(.title3).foregroundColor(.secondary)
+                    }
+                }
+                .frame(width: 58, height: 58)
+                .background(Color(.tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+            } else {
+                Image(systemName: attachment.isImage ? "photo" : "doc.fill")
+                    .font(.title3)
+                    .frame(width: 34, height: 34)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color(.tertiarySystemGroupedBackground)))
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(attachment.name)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(2)
+                Text(metadataText)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            Spacer(minLength: 4)
+            if targetURL != nil { Image(systemName: "arrow.up.right.square").font(.caption).foregroundColor(.secondary) }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground).opacity(0.7)))
     }
 }
 

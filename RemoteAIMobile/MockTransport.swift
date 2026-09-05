@@ -280,6 +280,29 @@ actor MockTransport: Transport {
         case "discardAttachmentUpload":
             if let uploadId = command.payload["uploadId"]?.stringValue { attachmentUploads.removeValue(forKey: uploadId) }
             response = success(["discarded": .bool(true)])
+        case "readMessageAttachmentChunk":
+            let attachmentId = command.payload["attachmentId"]?.stringValue ?? ""
+            let index = Int(command.payload["index"]?.intValue ?? 0)
+            let data = finishedAttachmentData[attachmentId] ?? Data("mock message attachment".utf8)
+            let chunkBytes = 64 * 1024
+            let offset = index * chunkBytes
+            guard offset <= data.count else {
+                response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "PAGINATION_CURSOR_INVALID", message: "Invalid mock message attachment chunk", retryable: false, details: nil), idempotentReplay: nil)
+                break
+            }
+            let end = min(data.count, offset + chunkBytes)
+            let chunkData = data.subdata(in: offset..<end)
+            response = try success(MessageAttachmentChunk(
+                attachmentId: attachmentId,
+                name: "mock-image.png",
+                contentType: "image/png",
+                sizeBytes: data.count,
+                sha256: nil,
+                index: index,
+                chunkBytes: chunkBytes,
+                dataBase64: chunkData.base64EncodedString(),
+                hasMore: end < data.count
+            ))
         case "getChangesAfterCursor":
             let cursor = command.payload["cursor"]?.intValue ?? 0
             let limit = Int(command.payload["limit"]?.intValue ?? 500)

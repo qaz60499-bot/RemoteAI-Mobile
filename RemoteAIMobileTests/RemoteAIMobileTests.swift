@@ -1188,6 +1188,209 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.suspend()
     }
 
+    func testServerMessageAttachmentsMapIntoChatMessageAndLegacyDecodeRemainsCompatible() throws {
+        let attachment = MessageAttachment(
+            attachmentId: "webasset-a1b2c3d4-20",
+            name: "diagnostics.zip",
+            contentType: "application/zip",
+            sizeBytes: 1234,
+            previewURL: nil,
+            downloadURL: "https://chatgpt.com/file/diagnostics.zip"
+        )
+        let server = ServerMessage(
+            messageId: "attachment-message",
+            sessionId: "photo-upload",
+            role: "user",
+            content: "see file",
+            externalId: nil,
+            attachments: [attachment],
+            createdAt: Date()
+        )
+        XCTAssertEqual(server.chatMessage.attachments, [attachment])
+        XCTAssertEqual(server.chatMessage.resolvedAttachments.first?.name, "diagnostics.zip")
+
+        let legacyJSON = #"{"messageId":"legacy","sessionId":"photo-upload","role":"assistant","content":"old reply","externalId":null,"createdAt":"2026-09-05T00:00:00.000Z"}"#.data(using: .utf8)!
+        let decoded = try JSONDecoder.remoteAI.decode(ServerMessage.self, from: legacyJSON)
+        XCTAssertNil(decoded.attachments)
+        XCTAssertEqual(decoded.chatMessage.resolvedAttachments, [])
+    }
+
+    func testLegacyAttachmentMarkerFallbackCreatesCardsAndStructuredMetadataDoesNotDuplicateMarker() {
+        let legacy = ChatMessage(
+            id: "legacy-attachments",
+            sessionId: "photo-upload",
+            sequence: nil,
+            role: .user,
+            kind: .text,
+            text: "inspect this\n\n[Attachments: diagnostics.zip, photo.png]",
+            toolName: nil,
+            toolStatus: nil,
+            detail: nil,
+            createdAt: Date()
+        )
+        XCTAssertEqual(legacy.resolvedAttachments.map(\.name), ["diagnostics.zip", "photo.png"])
+        XCTAssertEqual(legacy.displayText, "inspect this")
+        XCTAssertFalse(legacy.resolvedAttachments[0].isImage)
+        XCTAssertTrue(legacy.resolvedAttachments[1].isImage)
+
+        let structured = MessageAttachment(attachmentId: "webasset-12345678-10", name: "photo.png", contentType: "image/png", sizeBytes: 512, previewURL: nil, downloadURL: nil)
+        let modern = ChatMessage(
+            id: "structured-attachments",
+            sessionId: "photo-upload",
+            sequence: nil,
+            role: .assistant,
+            kind: .text,
+            text: "caption\n\n[Attachments: photo.png]",
+            toolName: nil,
+            toolStatus: nil,
+            detail: nil,
+            attachments: [structured],
+            createdAt: Date()
+        )
+        XCTAssertEqual(modern.resolvedAttachments, [structured], "Structured metadata must win over legacy marker parsing")
+        XCTAssertEqual(modern.displayText, "caption", "The legacy marker should be hidden once an attachment card is rendered")
+    }
+
+    func testLegacyCachedChatMessageWithoutAttachmentsFieldStillDecodes() throws {
+        let json = #"{"id":"cached-old","sessionId":"photo-upload","sequence":42,"role":"assistant","kind":"text","text":"cached reply","toolName":null,"toolStatus":null,"detail":null,"createdAt":"2026-09-05T00:00:00.000Z"}"#.data(using: .utf8)!
+        let decoded = try JSONDecoder.remoteAI.decode(ChatMessage.self, from: json)
+        XCTAssertEqual(decoded.id, "cached-old")
+        XCTAssertNil(decoded.attachments)
+        XCTAssertEqual(decoded.resolvedAttachments, [])
+    }
+
+    func testMessageAttachmentImageMetadataRecognizesContentTypeAndExtension() {
+        XCTAssertTrue(MessageAttachment(attachmentId: nil, name: "generated.bin", contentType: "image/webp", sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
+        XCTAssertTrue(MessageAttachment(attachmentId: nil, name: "photo.JPG", contentType: nil, sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
+        XCTAssertFalse(MessageAttachment(attachmentId: nil, name: "archive.zip", contentType: "application/zip", sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
+    }
+
+    func testPrivateMessageAttachmentDownloadUsesBoundedRelayChunks() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let downloaded = try await mock.downloadMessageAttachment(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            attachmentId: "webasset-feedface-10"
+        )
+        XCTAssertEqual(downloaded.attachmentId, "webasset-feedface-10")
+        XCTAssertEqual(downloaded.name, "mock-image.png")
+        XCTAssertEqual(downloaded.contentType, "image/png")
+        XCTAssertEqual(downloaded.data, Data("mock message attachment".utf8))
+        XCTAssertTrue(ProtocolSecurity.commandActions.contains("readMessageAttachmentChunk"))
+    }
+
+    @MainActor
+    func testStaleHistoryFinalCannotClearNewerRecoveredToolRun() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+        await mock.appendHistoryMessage(ServerMessage(messageId: "old-user", sessionId: "photo-upload", role: "user", content: "previous turn", externalId: nil, createdAt: now.addingTimeInterval(-20)))
+        await mock.appendHistoryMessage(ServerMessage(messageId: "old-final", sessionId: "photo-upload", role: "assistant", content: "previous final", externalId: nil, createdAt: now.addingTimeInterval(-19)))
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]),
+                "summary": .string("Searching github.com")
+            ],
+            createdAt: now
+        ), deliverLive: false)
+
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"], "The recovered newer tool run must survive an older history final")
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.kind == .toolEvent && $0.toolStatus == "Running" })
+
+        await mock.appendHistoryMessage(ServerMessage(messageId: "current-final", sessionId: "photo-upload", role: "assistant", content: "current final", externalId: nil, createdAt: now.addingTimeInterval(1)))
+        await store.loadSession("photo-upload")
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "A final newer than the current run boundary must settle progress")
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testReconnectDeltaRecoversToolEventExactlyOnce() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await store.suspend()
+        let event = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("reconnect-tool"), "name": .string("web_search")]),
+                "summary": .string("Searching github.com")
+            ],
+            createdAt: Date()
+        )
+        await mock.injectEvent(event, deliverLive: false)
+
+        await store.resumeFromForeground()
+        for _ in 0..<80 {
+            if store.messagesBySession["photo-upload", default: []].contains(where: { $0.kind == .toolEvent }) { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "Web Search" }.count, 1)
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
+
+        await store.suspend()
+        await store.resumeFromForeground()
+        try await Task.sleep(nanoseconds: 120_000_000)
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "Web Search" }.count, 1, "Replaying from the durable cursor must not duplicate a recovered tool event")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testStreamingMessageUpdatePreservesImageAttachmentMetadata() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let attachment = MessageAttachment(attachmentId: "webasset-feedface-10", name: "generated.png", contentType: "image/png", sizeBytes: nil, previewURL: nil, downloadURL: nil)
+        let attachmentValue = try JSONValue.encode([attachment])
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_UPDATED",
+            payload: [
+                "messageId": .string("stream-image"),
+                "role": .string("assistant"),
+                "content": .string(""),
+                "attachments": attachmentValue,
+                "partial": .bool(true)
+            ],
+            createdAt: Date()
+        ), deliverLive: true)
+        try await Task.sleep(nanoseconds: 180_000_000)
+        let streaming = try XCTUnwrap(store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "stream-image" }))
+        XCTAssertEqual(streaming.attachments, [attachment])
+        XCTAssertEqual(streaming.toolStatus, "Streaming")
+        await store.suspend()
+    }
+
     @MainActor
     func testWorkspaceStoreExposesLiveRunStatusUntilGenerationStops() async throws {
         let cache = try SQLiteStore.inMemory()

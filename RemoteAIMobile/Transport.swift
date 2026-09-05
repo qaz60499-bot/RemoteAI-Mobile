@@ -275,6 +275,50 @@ extension Transport {
         }
     }
 
+    func downloadMessageAttachment(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachmentId: String) async throws -> DownloadedMessageAttachment {
+        try ProtocolSecurity.validateIdentifier(attachmentId)
+        var chunks = Data()
+        var index = 0
+        var expectedSize: Int?
+        var resolvedName = "attachment"
+        var resolvedContentType = "application/octet-stream"
+        while true {
+            let command = RemoteCommand.make(
+                machineId: machineId,
+                runtimeId: runtimeId,
+                instanceId: instanceId,
+                sessionId: sessionId,
+                action: "readMessageAttachmentChunk",
+                payload: [
+                    "attachmentId": .string(attachmentId),
+                    "index": .number(Double(index))
+                ]
+            )
+            let chunk = try await requireSuccess(execute(command)).decode(MessageAttachmentChunk.self)
+            guard chunk.attachmentId == attachmentId,
+                  chunk.index == index,
+                  chunk.sizeBytes > 0,
+                  chunk.sizeBytes <= 20 * 1024 * 1024,
+                  chunk.chunkBytes >= 16 * 1024,
+                  chunk.chunkBytes <= 96 * 1024,
+                  let data = Data(base64Encoded: chunk.dataBase64),
+                  data.count <= chunk.chunkBytes else { throw TransportError.malformedData }
+            if let expectedSize, expectedSize != chunk.sizeBytes { throw TransportError.malformedData }
+            expectedSize = chunk.sizeBytes
+            resolvedName = chunk.name
+            resolvedContentType = chunk.contentType
+            chunks.append(data)
+            guard chunks.count <= chunk.sizeBytes else { throw TransportError.malformedData }
+            if !chunk.hasMore {
+                guard chunks.count == chunk.sizeBytes else { throw TransportError.malformedData }
+                break
+            }
+            index += 1
+            guard index <= 400 else { throw TransportError.frameTooLarge }
+        }
+        return DownloadedMessageAttachment(attachmentId: attachmentId, name: resolvedName, contentType: resolvedContentType, data: chunks)
+    }
+
     func loadRecent(machineId: String, runtimeId: String, instanceId: String, sessionId: String, limit: Int) async throws -> Page<ChatMessage> {
         let safeLimit = max(1, min(limit, 100))
         let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "loadRecentMessages", payload: ["limit": .number(Double(safeLimit))])
