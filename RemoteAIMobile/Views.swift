@@ -350,6 +350,9 @@ struct ChatView: View {
     @State private var composerCommandId: UUID?
     @State private var selectedCodexModel = ""
     @State private var voiceBaseText = ""
+    @State private var isAtBottom = true
+    @State private var didInitialScrollToBottom = false
+    @State private var userBrowsingHistory = false
     @StateObject private var speechInput = SpeechInputController()
     @FocusState private var focused: Bool
 
@@ -385,21 +388,75 @@ struct ChatView: View {
             if let attachmentError { ErrorBanner(text: attachmentError) { self.attachmentError = nil } }
             if let voiceError = speechInput.errorMessage { ErrorBanner(text: voiceError) { speechInput.dismissError() } }
             ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 12) {
-                        Color.clear.frame(height: 1).id("top").onAppear { guard !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
-                        if loadingOlder { ProgressView().padding(.vertical, 6) }
-                        ForEach(messages) { message in
-                            let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
-                            // Definite failures restore the composer and use a new operation.
-                            // Only unknown delivery is replayed with the original command ID.
-                            let retryable = message.kind == .error || commandState == .unknown
-                            MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil).id(message.id)
+                ZStack(alignment: .bottomTrailing) {
+                    ScrollView {
+                        LazyVStack(spacing: 12) {
+                            Color.clear.frame(height: 1).id("top").onAppear { guard didInitialScrollToBottom, !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
+                            if loadingOlder { ProgressView().padding(.vertical, 6) }
+                            ForEach(messages) { message in
+                                let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
+                                // Definite failures restore the composer and use a new operation.
+                                // Only unknown delivery is replayed with the original command ID.
+                                let retryable = message.kind == .error || commandState == .unknown
+                                MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil).id(message.id)
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id("bottom")
+                                .onAppear {
+                                    isAtBottom = true
+                                    userBrowsingHistory = false
+                                }
+                                .onDisappear { isAtBottom = false }
                         }
-                    }.padding(.horizontal, 12).padding(.vertical, 10)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .background(Color(.systemGroupedBackground))
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 8)
+                            .onChanged { _ in userBrowsingHistory = true }
+                    )
+                    .onAppear {
+                        guard !didInitialScrollToBottom, !messages.isEmpty else { return }
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("bottom", anchor: .bottom)
+                            didInitialScrollToBottom = true
+                        }
+                    }
+                    .onChange(of: messages.last?.id) { _ in
+                        guard !loadingOlder, !messages.isEmpty else { return }
+                        if !didInitialScrollToBottom {
+                            DispatchQueue.main.async {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                                didInitialScrollToBottom = true
+                            }
+                        } else if !userBrowsingHistory {
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                            }
+                        }
+                    }
+
+                    if didInitialScrollToBottom, !isAtBottom, !messages.isEmpty {
+                        Button {
+                            userBrowsingHistory = false
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                            }
+                        } label: {
+                            Image(systemName: "arrow.down")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(width: 36, height: 36)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .shadow(radius: 2, y: 1)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("回到最新消息")
+                        .padding(.trailing, 16)
+                        .padding(.bottom, 12)
+                    }
                 }
-                .background(Color(.systemGroupedBackground))
-                .onChange(of: messages.last?.id) { _ in if !loadingOlder, let id = messages.last?.id { withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(id, anchor: .bottom) } } }
             }
         }
         .remoteAITopBreathingRoom()
