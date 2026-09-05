@@ -948,7 +948,40 @@ final class WorkspaceStore: ObservableObject {
                 // and marks this exact command completed without another send side effect.
                 await recoverDelta()
                 for attempt in 0..<3 where commandStates[commandId] == .unknown {
-                    await loadSession(sessionId)
+                    do {
+                        // The send path already knows the authoritative runtime/instance route.
+                        // Do not depend on lazy session-route hydration here: a fresh phone can
+                        // receive WEB_SEND_DELIVERY_UNKNOWN before that catalog has ever been
+                        // expanded, and loadSession() would then return without issuing a remote
+                        // history read. Read the exact session directly and reconcile only against
+                        // that authoritative page, so a local optimistic bubble still cannot prove
+                        // its own delivery.
+                        let page = try await activeTransport.loadRecent(
+                            machineId: activeMachineId,
+                            runtimeId: runtimeId,
+                            instanceId: instanceId,
+                            sessionId: sessionId,
+                            limit: 50
+                        )
+                        guard generation == lifecycleGeneration,
+                              transport === activeTransport,
+                              machine.id == activeMachineId,
+                              !isSuspended else { return false }
+                        await reconcilePendingUnknownCommands(with: page.items, sessionId: sessionId)
+                        for remoteUser in page.items where remoteUser.role == .user {
+                            await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+                        }
+                        try? await cache.upsertMessages(page.items)
+                        merge(page.items, into: sessionId)
+                        ensureSessionDescriptorExists(sessionId: sessionId, instanceId: instanceId, updatedAt: page.items.last?.createdAt ?? Date())
+                        await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
+                        hasMoreBySession[sessionId] = page.hasMore
+                    } catch let reconcileError as TransportError where reconcileError == .disconnected || reconcileError == .timeout || reconcileError == .offline {
+                        DiagnosticsLog.shared.record("send_reconcile_retry", fields: Self.diagnosticFields(for: reconcileError, adding: ["session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)]), level: "WARN")
+                    } catch {
+                        DiagnosticsLog.shared.record("send_reconcile_abort", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)]), level: "WARN")
+                        break
+                    }
                     if commandStates[commandId] == .completed { break }
                     if attempt < 2 { try? await Task.sleep(nanoseconds: 400_000_000) }
                 }
