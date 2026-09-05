@@ -1522,6 +1522,46 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.suspend()
     }
 
+    @MainActor
+    func testGranularDesktopProcessLabelsRemainVisibleAsSeparateMobileTimelineRows() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let labels = ["Filtering results", "Executing tests", "Add tests", "Code Tool", "Exit process"]
+        let now = Date()
+
+        for (offset, label) in labels.enumerated() {
+            await mock.injectEvent(RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: Int64(1300 + offset),
+                machineId: "my-pc",
+                runtimeId: "runtime.web",
+                instanceId: "photo",
+                sessionId: "photo-upload",
+                type: "TOOL_STARTED",
+                payload: [
+                    "tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]),
+                    "summary": .string(label)
+                ],
+                createdAt: now.addingTimeInterval(Double(offset))
+            ), deliverLive: true)
+        }
+
+        for _ in 0..<80 {
+            let rows = store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" }
+            if rows.count >= labels.count { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let rows = store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" }
+        XCTAssertEqual(rows.count, labels.count)
+        XCTAssertEqual(Set(rows.compactMap(\.detail)), Set(labels), "Desktop process labels must remain visible instead of collapsing into one generic progress row")
+        XCTAssertEqual(rows.filter { $0.toolStatus == "Running" }.count, 1)
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "Exit process")
+        await store.suspend()
+    }
+
     func testServerSessionDescriptorKeepsUpdatedAndActivityTimesSeparate() throws {
         let updated = Date(timeIntervalSince1970: 1_788_596_000)
         let activity = updated.addingTimeInterval(45)
