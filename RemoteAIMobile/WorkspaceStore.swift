@@ -82,6 +82,7 @@ final class WorkspaceStore: ObservableObject {
     private var deltaRecoveryFailureCount = 0
     private var deltaRecoveryRetryNotBefore: Date?
     private static let deltaRecoveryFailureBackoffSeconds: [TimeInterval] = [1, 2, 4, 8]
+    private static let maxHistoricalDeltaReplayEvents: Int64 = 2_000
     private var webProjectsRevision: UInt64 = 0
     private var webProjectsSnapshotId: String?
     private var projectConversationRevisions: [String: UInt64] = [:]
@@ -1876,6 +1877,23 @@ final class WorkspaceStore: ObservableObject {
 
         var cursor = (try? await cache.lastSequence()) ?? 0
         do {
+            if let freshLatestSequence, cursor > 0 {
+                let lag = freshLatestSequence - cursor
+                if lag < 0 || lag > Self.maxHistoricalDeltaReplayEvents {
+                    let previousCursor = cursor
+                    cursor = max(0, freshLatestSequence)
+                    try? await cache.setLastSequence(cursor)
+                    tracker = SequenceTracker(lastSequence: cursor)
+                    deltaRecoveryFailureCount = 0
+                    deltaRecoveryRetryNotBefore = nil
+                    DiagnosticsLog.shared.record("delta_recovery_fast_forward", fields: [
+                        "cursor": String(previousCursor),
+                        "latestSequence": String(freshLatestSequence),
+                        "skippedEvents": String(max(0, lag)),
+                    ], level: "WARN")
+                    return
+                }
+            }
             if cursor == 0 && instances.isEmpty && sessions.isEmpty && webProjects.isEmpty {
                 // A fresh install has no local state to reconcile. Reuse the authenticated
                 // getStatus sequence when startup/reconnect already fetched it, so one

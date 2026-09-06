@@ -86,6 +86,7 @@ actor MockTransport: Transport {
 
     var isConnected: Bool { connected }
     func setScenario(_ value: MockScenario) { scenario = value }
+    func setSequence(_ value: Int64) { sequence = max(0, value) }
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
     func setRequestDelay(action: String, nanoseconds: UInt64) { requestDelayNanoseconds[action] = nanoseconds }
     func setResponseDelay(action: String, nanoseconds: UInt64) { responseDelayNanoseconds[action] = nanoseconds }

@@ -446,6 +446,23 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testStartupFastForwardsVeryStaleDeltaCursorInsteadOfReplayingHistoricalStorm() async throws {
+        let cache = try SQLiteStore.inMemory()
+        try await cache.setLastSequence(853)
+        let mock = MockTransport(historyCount: 1)
+        await mock.setSequence(27_295)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+
+        await store.start()
+
+        XCTAssertEqual(try await cache.lastSequence(), 27_295)
+        XCTAssertEqual(await mock.actionAttemptCount("getChangesAfterCursor"), 0, "A huge authenticated sequence gap should be reconciled by metadata/history, not by replaying tens of thousands of stale events")
+        XCTAssertFalse(store.runtimes.isEmpty, "Fast-forward must still continue into authoritative metadata refresh")
+        XCTAssertEqual(store.machine.state, .online)
+        await store.suspend()
+    }
+
+    @MainActor
     func testDeltaRecoveryRejectsWrongMachineEventBeforeApplyingReplay() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 1)
