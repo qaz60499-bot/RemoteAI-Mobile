@@ -1436,7 +1436,9 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.synchronizeVisibleSession("photo-upload", force: true)
         XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"], "The recovered newer tool run must survive an older history final")
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
-        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.kind == .toolEvent && $0.toolStatus == "Running" })
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains {
+            $0.kind == .toolEvent && $0.toolName == "ChatGPT Web"
+        }, "Recovered generic ChatGPT Web search/thinking status must stay transient instead of creating transcript rows")
 
         await mock.appendHistoryMessage(ServerMessage(messageId: "current-final", sessionId: "photo-upload", role: "assistant", content: "current final", externalId: nil, createdAt: now.addingTimeInterval(1)))
         await store.loadSession("photo-upload")
