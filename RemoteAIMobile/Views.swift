@@ -3,6 +3,7 @@ import AVFoundation
 import PhotosUI
 import UniformTypeIdentifiers
 import UIKit
+import QuickLook
 
 private enum MobileLayout {
     static let extraTopBreathingRoom: CGFloat = 8
@@ -914,6 +915,12 @@ struct SelectableTextEditor: UIViewRepresentable {
     }
 }
 
+private struct TextSelectionRequest: Identifiable {
+    let id = UUID()
+    let text: String
+    let monospaced: Bool
+}
+
 struct TextSelectionSheet: View {
     @Environment(\.dismiss) private var dismiss
     let text: String
@@ -922,6 +929,8 @@ struct TextSelectionSheet: View {
     var body: some View {
         NavigationView {
             SelectableTextEditor(text: text, monospaced: monospaced)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(.systemBackground))
                 .navigationTitle("选择文字")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -941,9 +950,7 @@ struct MessageRow: View {
     let commandState: CommandState?
     let retry: (() -> Void)?
     @State private var toolExpanded = true
-    @State private var selectionText = ""
-    @State private var selectionMonospaced = false
-    @State private var showingTextSelection = false
+    @State private var selectionRequest: TextSelectionRequest?
     private var displayText: String { message.displayText }
     private var displayAttachments: [MessageAttachment] { message.resolvedAttachments }
     private var contentSegments: [MessageContentSegment] { MessageContentSegment.parse(displayText) }
@@ -960,9 +967,7 @@ struct MessageRow: View {
                                 .textSelection(.enabled)
                             HStack(spacing: 12) {
                                 Button("选择部分") {
-                                    selectionText = detail
-                                    selectionMonospaced = true
-                                    showingTextSelection = true
+                                    selectionRequest = TextSelectionRequest(text: detail, monospaced: true)
                                 }
                                 Button("复制") { UIPasteboard.general.string = detail }
                             }
@@ -987,9 +992,7 @@ struct MessageRow: View {
                                             .foregroundColor(.secondary)
                                         Spacer()
                                         Button("选择部分") {
-                                            selectionText = segment.text
-                                            selectionMonospaced = true
-                                            showingTextSelection = true
+                                            selectionRequest = TextSelectionRequest(text: segment.text, monospaced: true)
                                         }
                                         .font(.caption2)
                                         .buttonStyle(.borderless)
@@ -1020,9 +1023,7 @@ struct MessageRow: View {
                         }
                         if !displayText.isEmpty {
                             Button {
-                                selectionText = displayText
-                                selectionMonospaced = false
-                                showingTextSelection = true
+                                selectionRequest = TextSelectionRequest(text: displayText, monospaced: false)
                             } label: {
                                 Label("选择文字", systemImage: "text.cursor")
                                     .font(.caption2)
@@ -1041,9 +1042,36 @@ struct MessageRow: View {
                 }
             }
         }
-        .sheet(isPresented: $showingTextSelection) {
-            TextSelectionSheet(text: selectionText, monospaced: selectionMonospaced)
+        .sheet(item: $selectionRequest) { request in
+            TextSelectionSheet(text: request.text, monospaced: request.monospaced)
         }
+    }
+}
+
+private struct AttachmentPreviewItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+private struct QuickLookPreview: UIViewControllerRepresentable {
+    let url: URL
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        var url: URL
+        init(url: URL) { self.url = url }
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem { url as NSURL }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(url: url) }
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+    func updateUIViewController(_ uiViewController: QLPreviewController, context: Context) {
+        context.coordinator.url = url
+        uiViewController.reloadData()
     }
 }
 
@@ -1053,6 +1081,13 @@ private struct MessageAttachmentView: View {
     let attachment: MessageAttachment
     @State private var cachedImage: UIImage?
     @State private var cacheLoadFinished = false
+    @State private var previewItem: AttachmentPreviewItem?
+    @State private var previewError: String?
+    @State private var isOpeningPreview = false
+
+    private var canOpenFromAgent: Bool {
+        attachment.attachmentId?.hasPrefix("webasset-") == true
+    }
 
     private var targetURL: URL? {
         if let downloadURL = attachment.downloadURL, let url = URL(string: downloadURL) { return url }
@@ -1071,15 +1106,32 @@ private struct MessageAttachmentView: View {
 
     var body: some View {
         Group {
-            if let targetURL {
+            if canOpenFromAgent {
+                Button(action: openFromAgent) { cardContent }
+                    .buttonStyle(.plain)
+                    .disabled(isOpeningPreview)
+            } else if let targetURL {
                 Link(destination: targetURL) { cardContent }
                     .buttonStyle(.plain)
             } else {
                 cardContent
             }
         }
+        .sheet(item: $previewItem) { item in
+            QuickLookPreview(url: item.url)
+                .ignoresSafeArea()
+        }
+        .alert("无法打开附件", isPresented: Binding(
+            get: { previewError != nil },
+            set: { if !$0 { previewError = nil } }
+        )) {
+            Button("确定", role: .cancel) { previewError = nil }
+        } message: {
+            Text(previewError ?? "附件暂时不可用。")
+        }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("附件 \(attachment.name)")
+        .accessibilityHint(canOpenFromAgent ? "双击预览附件" : "")
     }
 
     private var cardContent: some View {
@@ -1130,10 +1182,89 @@ private struct MessageAttachmentView: View {
                     .foregroundColor(.secondary)
             }
             Spacer(minLength: 4)
-            if targetURL != nil { Image(systemName: "arrow.up.right.square").font(.caption).foregroundColor(.secondary) }
+            if isOpeningPreview {
+                ProgressView().scaleEffect(0.7)
+            } else if canOpenFromAgent {
+                Image(systemName: "doc.text.magnifyingglass").font(.caption).foregroundColor(.secondary)
+            } else if targetURL != nil {
+                Image(systemName: "arrow.up.right.square").font(.caption).foregroundColor(.secondary)
+            }
         }
         .padding(8)
+        .contentShape(Rectangle())
         .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground).opacity(0.7)))
+    }
+
+    private func openFromAgent() {
+        guard !isOpeningPreview else { return }
+        isOpeningPreview = true
+        Task { @MainActor in
+            defer { isOpeningPreview = false }
+            guard let data = await store.loadMessageAttachmentData(sessionId: sessionId, attachment: attachment) else {
+                previewError = "无法从当前网页会话读取这个附件。请确认电脑端 ChatGPT 页面仍能访问该文件。"
+                return
+            }
+            do {
+                let safeName = preferredPreviewFilename(data: data)
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent("RemoteAI-Previews", isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let url = directory.appendingPathComponent("\(UUID().uuidString)-\(safeName)")
+                try data.write(to: url, options: .atomic)
+                previewItem = AttachmentPreviewItem(url: url)
+            } catch {
+                previewError = "附件已下载，但无法创建本地预览文件。"
+            }
+        }
+    }
+
+    private func preferredPreviewFilename(data: Data) -> String {
+        let raw = URL(fileURLWithPath: attachment.name).lastPathComponent
+        let forbidden = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/\\:"))
+        let sanitized = raw
+            .components(separatedBy: forbidden)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+        var name = sanitized.isEmpty ? "attachment" : String(sanitized.prefix(180))
+        guard (name as NSString).pathExtension.isEmpty else { return name }
+
+        let sourceExtension = [attachment.downloadURL, attachment.previewURL]
+            .compactMap { $0 }
+            .compactMap { URL(string: $0) }
+            .map { $0.pathExtension }
+            .first { !$0.isEmpty }
+        if let sourceExtension {
+            return name + "." + sourceExtension
+        }
+
+        if let contentType = attachment.contentType,
+           !contentType.contains("*"),
+           let type = UTType(mimeType: contentType),
+           let fileExtension = type.preferredFilenameExtension,
+           !fileExtension.isEmpty {
+            return name + "." + fileExtension
+        }
+
+        let bytes = [UInt8](data.prefix(12))
+        let inferred: String?
+        if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+            inferred = "png"
+        } else if bytes.starts(with: [0xFF, 0xD8, 0xFF]) {
+            inferred = "jpg"
+        } else if bytes.starts(with: Array("GIF8".utf8)) {
+            inferred = "gif"
+        } else if bytes.count >= 12,
+                  Array(bytes[0..<4]) == Array("RIFF".utf8),
+                  Array(bytes[8..<12]) == Array("WEBP".utf8) {
+            inferred = "webp"
+        } else if bytes.starts(with: Array("%PDF".utf8)) {
+            inferred = "pdf"
+        } else if bytes.starts(with: [0x50, 0x4B, 0x03, 0x04]) {
+            inferred = "zip"
+        } else {
+            inferred = nil
+        }
+        if let inferred { name += "." + inferred }
+        return name
     }
 }
 

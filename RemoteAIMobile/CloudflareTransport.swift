@@ -11,7 +11,7 @@ actor CloudflareTransport: Transport {
     private let sendTimeoutSeconds: TimeInterval = 10
     private let heartbeatIntervalNanoseconds: UInt64 = 12_000_000_000
     private let heartbeatTimeoutNanoseconds: UInt64 = 8_000_000_000
-    private let agentOfflineGraceNanoseconds: UInt64 = 2_500_000_000
+    private let agentOfflineGraceNanoseconds: UInt64 = 5_000_000_000
 
     private var socket: URLSessionWebSocketTask?
     private var connected = false
@@ -218,7 +218,7 @@ actor CloudflareTransport: Transport {
                     // the same commandId when Windows reconnects.
                     agentReconnectPending = true
                     publishHealth(channel: .agent, state: .reconnecting, detail: "Windows Agent disconnected from Relay")
-                    await recordDiagnostic("relay_agent_offline", level: "WARN")
+                    await recordDiagnostic("relay_agent_reconnecting", fields: ["graceSeconds": "5"])
                     scheduleAgentOfflineConfirmation()
                 }
             }
@@ -307,7 +307,7 @@ actor CloudflareTransport: Transport {
         agentOfflineTask?.cancel()
         guard let activeSocket = socket else { return }
         agentOfflineTask = Task { [weak self, weak activeSocket] in
-            try? await Task.sleep(nanoseconds: self?.agentOfflineGraceNanoseconds ?? 2_500_000_000)
+            try? await Task.sleep(nanoseconds: self?.agentOfflineGraceNanoseconds ?? 5_000_000_000)
             guard !Task.isCancelled, let self, let activeSocket else { return }
             await self.confirmAgentOffline(activeSocket)
         }

@@ -480,4 +480,23 @@ final class ProtocolSecurityTests: XCTestCase {
         )
         print("PROTOCOL_FUZZ_RECOVERY rapidReconnect=25 duplicateRecovery=PASS")
     }
+
+    func testDecodeDeltaAcceptsAndValidatesEchoedCursor() throws {
+        let e = event(sequence: 11)
+        let value: JSONValue = .object([
+            "cursor": .number(10),
+            "events": .array([try JSONValue.encode(e)]),
+            "nextCursor": .number(11),
+            "hasMore": .bool(false),
+        ])
+        let decoded = try ProtocolSecurity.decodeDelta(value, after: 10, expectedMachineId: "my-pc")
+        XCTAssertEqual(decoded.events.map(\.sequence), [11])
+        XCTAssertEqual(decoded.nextCursor, 11)
+
+        var wrongCursor = value.objectValue!
+        wrongCursor["cursor"] = .number(9)
+        XCTAssertThrowsError(
+            try ProtocolSecurity.decodeDelta(.object(wrongCursor), after: 10, expectedMachineId: "my-pc")
+        )
+    }
 }

@@ -79,6 +79,9 @@ final class WorkspaceStore: ObservableObject {
     private var metadataRefreshQueued = false
     private var deltaRecoveryInFlight = false
     private var deltaRecoveryQueued = false
+    private var deltaRecoveryFailureCount = 0
+    private var deltaRecoveryRetryNotBefore: Date?
+    private static let deltaRecoveryFailureBackoffSeconds: [TimeInterval] = [1, 2, 4, 8]
     private var webProjectsRevision: UInt64 = 0
     private var webProjectsSnapshotId: String?
     private var projectConversationRevisions: [String: UInt64] = [:]
@@ -1843,6 +1846,11 @@ final class WorkspaceStore: ObservableObject {
 
     private func recoverDelta(freshLatestSequence: Int64? = nil) async {
         guard machine.state == .online else { return }
+        if freshLatestSequence == nil,
+           let retryNotBefore = deltaRecoveryRetryNotBefore,
+           Date() < retryNotBefore {
+            return
+        }
         if deltaRecoveryInFlight {
             // Event ingestion and the reconnect monitor can both notice the same gap
             // while MainActor is suspended in network I/O. Coalesce them instead of
@@ -1906,10 +1914,18 @@ final class WorkspaceStore: ObservableObject {
                 if !result.hasMore { break }
             }
             tracker = SequenceTracker(lastSequence: cursor)
+            deltaRecoveryFailureCount = 0
+            deltaRecoveryRetryNotBefore = nil
         } catch {
             if generation == lifecycleGeneration, !isSuspended {
+                let index = min(deltaRecoveryFailureCount, Self.deltaRecoveryFailureBackoffSeconds.count - 1)
+                let delay = Self.deltaRecoveryFailureBackoffSeconds[index]
+                deltaRecoveryFailureCount += 1
+                deltaRecoveryRetryNotBefore = Date().addingTimeInterval(delay)
                 errors["sync"] = error.localizedDescription
-                DiagnosticsLog.shared.record("delta_recovery_failed", fields: Self.diagnosticFields(for: error), level: "ERROR")
+                var fields = Self.diagnosticFields(for: error)
+                fields["retryAfterSeconds"] = String(Int(delay))
+                DiagnosticsLog.shared.record("delta_recovery_failed", fields: fields, level: "ERROR")
             }
         }
     }

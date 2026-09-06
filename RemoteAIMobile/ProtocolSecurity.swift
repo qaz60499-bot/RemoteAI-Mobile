@@ -49,7 +49,8 @@ enum ProtocolSecurity {
         "WEB_SELECTOR_FAILED", "WEB_SEND_NOT_ACCEPTED", "WEB_SEND_DELIVERY_UNKNOWN", "PROVIDER_RATE_LIMITED", "PROVIDER_UNAVAILABLE", "SESSION_UNAVAILABLE", "PAGINATION_CURSOR_INVALID",
         "TRANSPORT_OFFLINE", "INTERNAL_ERROR"
     ]
-    private static let deltaKeys: Set<String> = ["events", "nextCursor", "hasMore"]
+    private static let deltaAllowedKeys: Set<String> = ["cursor", "events", "nextCursor", "hasMore"]
+    private static let deltaRequiredKeys: Set<String> = ["events", "nextCursor", "hasMore"]
 
     static func isValidIdentifier(_ value: String) -> Bool {
         let bytes = Array(value.utf8)
@@ -201,7 +202,10 @@ enum ProtocolSecurity {
         guard cursor >= 0, value.objectValue != nil else { throw TransportError.malformedData }
         let rawData = try JSONEncoder.remoteAI.encode(value)
         let rawObject = try objectDictionary(rawData)
-        try requireKeys(rawObject, allowed: deltaKeys, required: deltaKeys)
+        try requireKeys(rawObject, allowed: deltaAllowedKeys, required: deltaRequiredKeys)
+        if let echoedCursor = value.objectValue?["cursor"] {
+            guard let echoedValue = echoedCursor.intValue, echoedValue == cursor else { throw TransportError.malformedData }
+        }
         if let rawEvents = rawObject["events"] as? [[String: Any]] {
             for rawEvent in rawEvents { try requireKeys(rawEvent, allowed: eventKeys, required: eventKeys) }
         } else {
