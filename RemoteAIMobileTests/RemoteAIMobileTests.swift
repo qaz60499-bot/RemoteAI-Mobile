@@ -1391,6 +1391,21 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(MessageAttachment(attachmentId: nil, name: "archive.zip", contentType: "application/zip", sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
     }
 
+    func testAttachmentPreviewDownwardDismissRequiresStrongVerticalIntent() {
+        XCTAssertTrue(AttachmentPreviewPolicy.shouldDismiss(
+            translation: CGSize(width: 8, height: 140),
+            predictedEndTranslation: CGSize(width: 10, height: 210)
+        ))
+        XCTAssertFalse(AttachmentPreviewPolicy.shouldDismiss(
+            translation: CGSize(width: 120, height: 125),
+            predictedEndTranslation: CGSize(width: 150, height: 210)
+        ), "Horizontal image panning must not accidentally dismiss the preview")
+        XCTAssertFalse(AttachmentPreviewPolicy.shouldDismiss(
+            translation: CGSize(width: 4, height: 70),
+            predictedEndTranslation: CGSize(width: 6, height: 95)
+        ), "Small image movements must not dismiss the preview")
+    }
+
     func testPrivateMessageAttachmentDownloadUsesBoundedRelayChunks() async throws {
         let mock = MockTransport(historyCount: 0)
         try await mock.connect()

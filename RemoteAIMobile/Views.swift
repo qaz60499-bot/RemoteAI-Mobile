@@ -1053,6 +1053,88 @@ private struct AttachmentPreviewItem: Identifiable {
     let url: URL
 }
 
+private struct SystemActivitySheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+private struct DocumentExportPicker: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        UIDocumentPickerViewController(forExporting: [url], asCopy: true)
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+}
+
+enum AttachmentPreviewPolicy {
+    static func shouldDismiss(translation: CGSize, predictedEndTranslation: CGSize) -> Bool {
+        let vertical = translation.height
+        let horizontal = abs(translation.width)
+        return vertical > 110
+            && vertical > horizontal * 1.35
+            && predictedEndTranslation.height > 150
+    }
+}
+
+private struct AttachmentPreviewSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let item: AttachmentPreviewItem
+    @State private var showingShare = false
+    @State private var showingExport = false
+
+    var body: some View {
+        NavigationView {
+            QuickLookPreview(url: item.url)
+                .navigationTitle(item.url.lastPathComponent)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button { dismiss() } label: {
+                            Image(systemName: "xmark")
+                        }
+                        .accessibilityLabel("关闭预览")
+                    }
+                    ToolbarItemGroup(placement: .navigationBarTrailing) {
+                        Button { showingExport = true } label: {
+                            Image(systemName: "arrow.down.to.line")
+                        }
+                        .accessibilityLabel("下载到文件")
+                        Button { showingShare = true } label: {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                        .accessibilityLabel("分享附件")
+                    }
+                }
+        }
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 24)
+                .onEnded { value in
+                    if AttachmentPreviewPolicy.shouldDismiss(
+                        translation: value.translation,
+                        predictedEndTranslation: value.predictedEndTranslation
+                    ) {
+                        dismiss()
+                    }
+                }
+        )
+        .interactiveDismissDisabled(false)
+        .sheet(isPresented: $showingExport) {
+            DocumentExportPicker(url: item.url)
+        }
+        .sheet(isPresented: $showingShare) {
+            SystemActivitySheet(url: item.url)
+        }
+    }
+}
+
 private struct QuickLookPreview: UIViewControllerRepresentable {
     let url: URL
 
@@ -1118,8 +1200,7 @@ private struct MessageAttachmentView: View {
             }
         }
         .sheet(item: $previewItem) { item in
-            QuickLookPreview(url: item.url)
-                .ignoresSafeArea()
+            AttachmentPreviewSheet(item: item)
         }
         .alert("无法打开附件", isPresented: Binding(
             get: { previewError != nil },
