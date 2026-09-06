@@ -28,6 +28,8 @@ actor MockTransport: Transport {
     private var requestDelayNanoseconds: [String: UInt64] = [:]
     private var responseDelayNanoseconds: [String: UInt64] = [:]
     private var finishedAttachmentData: [String: Data] = [:]
+    private var activeMessageAttachmentReads = 0
+    private var peakMessageAttachmentReads = 0
 
     private let machineId = "my-pc"
     private let runtimes: [ServerRuntime]
@@ -141,6 +143,7 @@ actor MockTransport: Transport {
     func attachmentData(id: String) -> Data? { finishedAttachmentData[id] }
     func finishedAttachmentCount() -> Int { finishedAttachmentData.count }
     func finishedAttachmentPayloads() -> [Data] { Array(finishedAttachmentData.values) }
+    func peakConcurrentMessageAttachmentReads() -> Int { peakMessageAttachmentReads }
     func connect() async throws {
         connectAttempts += 1
         guard scenario != .offline else { throw TransportError.offline }
@@ -169,6 +172,14 @@ actor MockTransport: Transport {
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
         try ProtocolSecurity.validate(command, expectedMachineId: machineId)
         commandAttempts[command.action, default: 0] += 1
+        let tracksMessageAttachmentRead = command.action == "readMessageAttachmentChunk"
+        if tracksMessageAttachmentRead {
+            activeMessageAttachmentReads += 1
+            peakMessageAttachmentReads = max(peakMessageAttachmentReads, activeMessageAttachmentReads)
+        }
+        defer {
+            if tracksMessageAttachmentRead { activeMessageAttachmentReads -= 1 }
+        }
         if let delay = requestDelayNanoseconds[command.action], delay > 0 { try? await Task.sleep(nanoseconds: delay) }
         if executionDelayNanoseconds > 0 { try? await Task.sleep(nanoseconds: executionDelayNanoseconds) }
         if let prior = processedCommands[command.commandId] {

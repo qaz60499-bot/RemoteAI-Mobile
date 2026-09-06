@@ -348,46 +348,121 @@ extension Transport {
 
     func downloadMessageAttachment(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachmentId: String) async throws -> DownloadedMessageAttachment {
         try ProtocolSecurity.validateIdentifier(attachmentId)
-        var chunks = Data()
-        var index = 0
-        var expectedSize: Int?
-        var resolvedName = "attachment"
-        var resolvedContentType = "application/octet-stream"
-        while true {
-            let command = RemoteCommand.make(
-                machineId: machineId,
-                runtimeId: runtimeId,
-                instanceId: instanceId,
-                sessionId: sessionId,
-                action: "readMessageAttachmentChunk",
-                payload: [
-                    "attachmentId": .string(attachmentId),
-                    "index": .number(Double(index))
-                ]
+
+        let first = try await readMessageAttachmentChunk(
+            machineId: machineId,
+            runtimeId: runtimeId,
+            instanceId: instanceId,
+            sessionId: sessionId,
+            attachmentId: attachmentId,
+            index: 0
+        )
+        let totalChunks = (first.chunk.sizeBytes + first.chunk.chunkBytes - 1) / first.chunk.chunkBytes
+        guard totalChunks >= 1, totalChunks <= 400 else { throw TransportError.frameTooLarge }
+        if totalChunks == 1 {
+            return DownloadedMessageAttachment(
+                attachmentId: attachmentId,
+                name: first.chunk.name,
+                contentType: first.chunk.contentType,
+                data: first.data
             )
-            let chunk = try await requireSuccess(execute(command)).decode(MessageAttachmentChunk.self)
-            guard chunk.attachmentId == attachmentId,
-                  chunk.index == index,
-                  chunk.sizeBytes > 0,
-                  chunk.sizeBytes <= 20 * 1024 * 1024,
-                  chunk.chunkBytes >= 16 * 1024,
-                  chunk.chunkBytes <= 96 * 1024,
-                  let data = Data(base64Encoded: chunk.dataBase64),
-                  data.count <= chunk.chunkBytes else { throw TransportError.malformedData }
-            if let expectedSize, expectedSize != chunk.sizeBytes { throw TransportError.malformedData }
-            expectedSize = chunk.sizeBytes
-            resolvedName = chunk.name
-            resolvedContentType = chunk.contentType
-            chunks.append(data)
-            guard chunks.count <= chunk.sizeBytes else { throw TransportError.malformedData }
-            if !chunk.hasMore {
-                guard chunks.count == chunk.sizeBytes else { throw TransportError.malformedData }
-                break
-            }
-            index += 1
-            guard index <= 400 else { throw TransportError.frameTooLarge }
         }
-        return DownloadedMessageAttachment(attachmentId: attachmentId, name: resolvedName, contentType: resolvedContentType, data: chunks)
+
+        let expectedSize = first.chunk.sizeBytes
+        let expectedChunkBytes = first.chunk.chunkBytes
+        let expectedName = first.chunk.name
+        let expectedContentType = first.chunk.contentType
+        var parts = Array<Data?>(repeating: nil, count: totalChunks)
+        parts[0] = first.data
+
+        // Relay responses are independent protocol frames, so several read-only chunks can
+        // safely be in flight together. Keep the window deliberately small to reduce a
+        // multi-megabyte image from dozens of serial relay round-trips without flooding the
+        // WebSocket/Durable Object or increasing any individual frame beyond its existing cap.
+        let maxConcurrentChunks = 6
+        try await withThrowingTaskGroup(of: (Int, Data).self) { group in
+            var nextIndex = 1
+            for _ in 0..<min(maxConcurrentChunks, totalChunks - 1) {
+                let index = nextIndex
+                nextIndex += 1
+                group.addTask {
+                    let item = try await self.readMessageAttachmentChunk(
+                        machineId: machineId,
+                        runtimeId: runtimeId,
+                        instanceId: instanceId,
+                        sessionId: sessionId,
+                        attachmentId: attachmentId,
+                        index: index
+                    )
+                    guard item.chunk.sizeBytes == expectedSize,
+                          item.chunk.chunkBytes == expectedChunkBytes,
+                          item.chunk.name == expectedName,
+                          item.chunk.contentType == expectedContentType else { throw TransportError.malformedData }
+                    return (index, item.data)
+                }
+            }
+
+            while let (index, data) = try await group.next() {
+                parts[index] = data
+                if nextIndex < totalChunks {
+                    let index = nextIndex
+                    nextIndex += 1
+                    group.addTask {
+                        let item = try await self.readMessageAttachmentChunk(
+                            machineId: machineId,
+                            runtimeId: runtimeId,
+                            instanceId: instanceId,
+                            sessionId: sessionId,
+                            attachmentId: attachmentId,
+                            index: index
+                        )
+                        guard item.chunk.sizeBytes == expectedSize,
+                              item.chunk.chunkBytes == expectedChunkBytes,
+                              item.chunk.name == expectedName,
+                              item.chunk.contentType == expectedContentType else { throw TransportError.malformedData }
+                        return (index, item.data)
+                    }
+                }
+            }
+        }
+
+        var data = Data()
+        data.reserveCapacity(expectedSize)
+        for part in parts {
+            guard let part else { throw TransportError.malformedData }
+            data.append(part)
+        }
+        guard data.count == expectedSize else { throw TransportError.malformedData }
+        return DownloadedMessageAttachment(attachmentId: attachmentId, name: expectedName, contentType: expectedContentType, data: data)
+    }
+
+    private func readMessageAttachmentChunk(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachmentId: String, index: Int) async throws -> (chunk: MessageAttachmentChunk, data: Data) {
+        guard index >= 0 && index <= 400 else { throw TransportError.frameTooLarge }
+        let command = RemoteCommand.make(
+            machineId: machineId,
+            runtimeId: runtimeId,
+            instanceId: instanceId,
+            sessionId: sessionId,
+            action: "readMessageAttachmentChunk",
+            payload: [
+                "attachmentId": .string(attachmentId),
+                "index": .number(Double(index))
+            ]
+        )
+        let chunk = try await requireSuccess(execute(command)).decode(MessageAttachmentChunk.self)
+        guard chunk.attachmentId == attachmentId,
+              chunk.index == index,
+              chunk.sizeBytes > 0,
+              chunk.sizeBytes <= 20 * 1024 * 1024,
+              chunk.chunkBytes >= 16 * 1024,
+              chunk.chunkBytes <= 96 * 1024,
+              let data = Data(base64Encoded: chunk.dataBase64) else { throw TransportError.malformedData }
+        let offset = index * chunk.chunkBytes
+        guard offset < chunk.sizeBytes else { throw TransportError.malformedData }
+        let expectedLength = min(chunk.chunkBytes, chunk.sizeBytes - offset)
+        guard data.count == expectedLength,
+              chunk.hasMore == (offset + data.count < chunk.sizeBytes) else { throw TransportError.malformedData }
+        return (chunk, data)
     }
 
     func loadRecent(machineId: String, runtimeId: String, instanceId: String, sessionId: String, limit: Int) async throws -> Page<ChatMessage> {

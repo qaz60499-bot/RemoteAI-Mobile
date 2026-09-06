@@ -1408,6 +1408,33 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertTrue(ProtocolSecurity.commandActions.contains("readMessageAttachmentChunk"))
     }
 
+    func testLargePrivateMessageAttachmentDownloadsRemainingChunksConcurrentlyAndReassemblesInOrder() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let source = Data((0..<(512 * 1024 + 137)).map { UInt8($0 % 251) })
+        let uploaded = try await mock.uploadAttachment(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            attachment: PendingAttachment(name: "large.png", contentType: "image/png", data: source)
+        )
+        await mock.setRequestDelay(action: "readMessageAttachmentChunk", nanoseconds: 40_000_000)
+
+        let downloaded = try await mock.downloadMessageAttachment(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            attachmentId: uploaded.attachmentId
+        )
+
+        XCTAssertEqual(downloaded.data, source, "Out-of-order relay responses must be reassembled by chunk index")
+        let peak = await mock.peakConcurrentMessageAttachmentReads()
+        XCTAssertGreaterThan(peak, 1, "Large attachments should not pay one full relay round-trip per chunk")
+        XCTAssertLessThanOrEqual(peak, 6, "The attachment downloader must keep a bounded relay concurrency window")
+    }
+
     @MainActor
     func testStaleHistoryFinalCannotClearNewerRecoveredToolRun() async throws {
         let cache = try SQLiteStore.inMemory()
