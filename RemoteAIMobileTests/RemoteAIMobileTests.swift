@@ -1634,15 +1634,12 @@ final class RemoteAIMobileTests: XCTestCase {
         ), deliverLive: true)
 
         for _ in 0..<80 {
-            let rows = store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" }
-            if rows.count >= 2 { break }
+            if store.liveRunStatusBySession["photo-upload"] == "正在读取网页内容…" { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         let rows = store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" }
-        XCTAssertEqual(rows.count, 2, "Distinct desktop process transitions should remain visible instead of overwriting one stable row")
-        XCTAssertTrue(rows.contains { $0.detail == "思考中…" })
-        XCTAssertTrue(rows.contains { $0.detail == "正在读取网页内容…" })
-        XCTAssertEqual(rows.filter { $0.toolStatus == "Running" }.count, 1, "Only the newest process step should remain Running")
+        XCTAssertTrue(rows.isEmpty, "Generic ChatGPT Web process transitions must stay out of the conversation transcript")
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "正在读取网页内容…")
         let activity = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.lastActivityAt)
         XCTAssertGreaterThanOrEqual(activity, now.addingTimeInterval(2))
         await store.suspend()
@@ -1677,9 +1674,9 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "图片已生成，正在同步…")
-        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains {
-            $0.kind == .toolEvent && $0.detail == "图片已生成，正在同步…" && $0.toolStatus == "Running"
-        })
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains {
+            $0.kind == .toolEvent && $0.toolName == "ChatGPT Web"
+        }, "Generated-image browser status should remain a single transient status line")
 
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
@@ -1734,8 +1731,8 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         let rows = store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" }
-        XCTAssertEqual(rows.count, labels.count)
-        XCTAssertEqual(Set(rows.compactMap(\.detail)), Set(labels), "Desktop process labels must remain visible instead of collapsing into one generic progress row")
+        XCTAssertEqual(rows.count, labels.count, "Substantive desktop execution stages should remain visible on mobile")
+        XCTAssertEqual(Set(rows.compactMap(\.detail)), Set(labels))
         XCTAssertEqual(rows.filter { $0.toolStatus == "Running" }.count, 1)
         XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "Exit process")
         await store.suspend()
@@ -1776,7 +1773,7 @@ final class RemoteAIMobileTests: XCTestCase {
         try await Task.sleep(nanoseconds: 180_000_000)
         XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.role == .assistant && $0.toolStatus == "Streaming" && $0.text == "REMOTEAI_PARTIAL_" })
         XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "思考中…")
-        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" && $0.detail == "思考中…" })
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" })
 
         await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1204, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "TOOL_FINISHED", payload: ["tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]), "summary": .string("Generation finished")], createdAt: now.addingTimeInterval(0.018)), deliverLive: true)
         for _ in 0..<80 {

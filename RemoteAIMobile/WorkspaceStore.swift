@@ -663,6 +663,15 @@ final class WorkspaceStore: ObservableObject {
 
         if messagesBySession[sessionId] == nil {
             var local = (try? await cache.recentMessages(sessionId: sessionId, limit: 50)) ?? []
+            // ChatGPT Web process transitions are transient status signals, not transcript
+            // messages. Older builds persisted every Thinking/Reading/Generating transition
+            // as a tool row, which can flood the conversation after an upgrade. Hide those
+            // legacy rows while preserving real external tool rows such as DevSpace/MCP.
+            local.removeAll {
+                $0.kind == .toolEvent
+                    && $0.toolName == "ChatGPT Web"
+                    && isTransientWebProcessDetail($0.detail)
+            }
             if sessions.first(where: { $0.id == sessionId })?.state != .busy {
                 var changed = false
                 for index in local.indices where local[index].kind == .toolEvent && local[index].toolStatus == "Running" {
@@ -851,11 +860,15 @@ final class WorkspaceStore: ObservableObject {
             messageAttachmentCache.totalCostLimit = 40 * 1024 * 1024
             return downloaded.data
         } catch {
-            DiagnosticsLog.shared.record("attachment_preview_failed", fields: [
+            var fields: [String: String] = [
                 "session": sessionId,
                 "attachmentId": attachmentId,
                 "errorType": String(describing: type(of: error)),
-            ], level: "WARN")
+            ]
+            if let transportError = error as? TransportError {
+                fields.merge(transportError.diagnosticFields) { _, new in new }
+            }
+            DiagnosticsLog.shared.record("attachment_preview_failed", fields: fields, level: "WARN")
             return nil
         }
     }
@@ -2025,41 +2038,54 @@ final class WorkspaceStore: ObservableObject {
             let detail = event.payload["summary"]?.stringValue
                 ?? toolObject?["summary"]?.stringValue
                 ?? event.payload["provider"]?.stringValue
-            let displayDetail: String?
             if rawToolName == "ChatGPT Web" {
-                if completed {
-                    displayDetail = "回答已生成"
-                } else if let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    displayDetail = webProcessStatusLabel(detail)
-                } else {
-                    displayDetail = "ChatGPT 正在处理…"
+                // Browser animation/status noise (Thinking, Reading, Generating...) is a
+                // single live line. Substantive execution stages such as Executing tests,
+                // Code Tool, DevSpace-style work, etc. remain visible as compact timeline
+                // rows so the phone still mirrors real desktop work without flooding chat.
+                let displayDetail = completed
+                    ? "回答已生成"
+                    : detail.map(webProcessStatusLabel) ?? "ChatGPT 正在处理…"
+                liveRunStatusBySession[sessionId] = completed
+                    ? "回答已生成，正在确认同步…"
+                    : displayDetail
+
+                if completed || isTransientWebProcessDetail(detail) {
+                    await settleRunningToolRows(sessionId: sessionId, toolName: "ChatGPT Web")
+                    return
                 }
-                // Preserve each distinct browser process transition instead of mutating
-                // one stable row forever. Mark the previous ChatGPT Web status complete
-                // first so only the newest step is shown as Running while the historical
-                // steps remain visible like the desktop process/tool timeline.
+                if messagesBySession[sessionId, default: []].contains(where: {
+                    $0.kind == .toolEvent
+                        && $0.toolName == "ChatGPT Web"
+                        && $0.toolStatus == "Running"
+                        && $0.detail == displayDetail
+                }) {
+                    return
+                }
                 await settleRunningToolRows(sessionId: sessionId, toolName: "ChatGPT Web")
-            } else {
-                displayDetail = detail
+                let message = ChatMessage(
+                    id: "tool-\(event.eventId.uuidString.lowercased())",
+                    sessionId: sessionId,
+                    sequence: event.sequence,
+                    role: .tool,
+                    kind: .toolEvent,
+                    text: "",
+                    toolName: "ChatGPT Web",
+                    toolStatus: "Running",
+                    detail: displayDetail,
+                    createdAt: event.createdAt
+                )
+                merge([message], into: sessionId)
+                try? await cache.upsertMessages([message])
+                return
             }
+            let displayDetail = detail
             let stableToolId = toolObject?["id"]?.stringValue
-            let messageId = rawToolName == "ChatGPT Web"
-                ? "tool-\(event.eventId.uuidString.lowercased())"
-                : (stableToolId.map { "tool-\(sessionId)-\($0)" } ?? event.eventId.uuidString)
+            let messageId = stableToolId.map { "tool-\(sessionId)-\($0)" } ?? event.eventId.uuidString
             let message = ChatMessage(id: messageId, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: displayDetail, createdAt: event.createdAt)
             merge([message], into: sessionId)
             try? await cache.upsertMessages([message])
-            if rawToolName == "ChatGPT Web" {
-                if completed {
-                    liveRunStatusBySession[sessionId] = "回答已生成，正在确认同步…"
-                } else if let detail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    liveRunStatusBySession[sessionId] = webProcessStatusLabel(detail)
-                } else {
-                    liveRunStatusBySession[sessionId] = "ChatGPT 正在处理…"
-                }
-            } else {
-                liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
-            }
+            liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
         case "GENERATION_STARTED":
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             setSessionState(sessionId, .busy)
@@ -2238,6 +2264,33 @@ final class WorkspaceStore: ObservableObject {
         return trimmed
     }
 
+    private func isTransientWebProcessDetail(_ raw: String?) -> Bool {
+        guard let raw else { return true }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        let lower = trimmed.lowercased()
+        if lower == "thinking" || lower.hasPrefix("thinking ") { return true }
+        if lower.contains("searching") || lower.contains("search the web") { return true }
+        if lower.contains("reading") || lower.contains("browsing") { return true }
+        if lower.contains("analyzing image") || lower.contains("analysing image") { return true }
+        if lower.contains("generated image ready") || lower.contains("image ready") { return true }
+        if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return true }
+        if lower == "generation finished" || lower == "generation complete" { return true }
+        if lower.contains("writing") || lower == "generating" || lower.hasPrefix("generating answer") { return true }
+        if trimmed.hasPrefix("思考中")
+            || trimmed.hasPrefix("正在搜索网页")
+            || trimmed.hasPrefix("正在读取网页内容")
+            || trimmed.hasPrefix("正在分析图片")
+            || trimmed.hasPrefix("图片已生成，正在同步")
+            || trimmed.hasPrefix("正在生成图片")
+            || trimmed.hasPrefix("正在生成回答")
+            || trimmed.hasPrefix("ChatGPT 正在处理")
+            || trimmed.hasPrefix("回答已生成") {
+            return true
+        }
+        return false
+    }
+
     private func setSessionState(_ sessionId: String, _ state: SessionState) {
         if let index = sessions.firstIndex(where: { $0.id == sessionId }) { sessions[index].state = state }
     }
@@ -2355,8 +2408,17 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func merge(_ incoming: [ChatMessage], into sessionId: String) {
-        var map = Dictionary(uniqueKeysWithValues: messagesBySession[sessionId, default: []].map { ($0.id, $0) })
-        for message in incoming { map[message.id] = message }
+        let visibleExisting = messagesBySession[sessionId, default: []].filter {
+            !($0.kind == .toolEvent
+                && $0.toolName == "ChatGPT Web"
+                && isTransientWebProcessDetail($0.detail))
+        }
+        var map = Dictionary(uniqueKeysWithValues: visibleExisting.map { ($0.id, $0) })
+        for message in incoming where !(message.kind == .toolEvent
+            && message.toolName == "ChatGPT Web"
+            && isTransientWebProcessDetail(message.detail)) {
+            map[message.id] = message
+        }
         messagesBySession[sessionId] = sortedMessages(Array(map.values))
     }
 
