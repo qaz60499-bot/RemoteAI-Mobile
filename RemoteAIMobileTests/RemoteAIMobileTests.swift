@@ -455,8 +455,10 @@ final class RemoteAIMobileTests: XCTestCase {
 
         await store.start()
 
-        XCTAssertEqual(try await cache.lastSequence(), 27_295)
-        XCTAssertEqual(await mock.actionAttemptCount("getChangesAfterCursor"), 0, "A huge authenticated sequence gap should be reconciled by metadata/history, not by replaying tens of thousands of stale events")
+        let persistedSequence = try await cache.lastSequence()
+        let deltaAttempts = await mock.actionAttemptCount("getChangesAfterCursor")
+        XCTAssertEqual(persistedSequence, 27_295)
+        XCTAssertEqual(deltaAttempts, 0, "A huge authenticated sequence gap should be reconciled by metadata/history, not by replaying tens of thousands of stale events")
         XCTAssertFalse(store.runtimes.isEmpty, "Fast-forward must still continue into authoritative metadata refresh")
         XCTAssertEqual(store.machine.state, .online)
         await store.suspend()
