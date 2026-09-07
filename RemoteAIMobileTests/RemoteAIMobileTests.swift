@@ -470,7 +470,8 @@ final class RemoteAIMobileTests: XCTestCase {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
-        XCTAssertEqual(try await cache.lastSequence(), 1200)
+        let initialSequence = try await cache.lastSequence()
+        XCTAssertEqual(initialSequence, 1200)
 
         let overlap = RemoteEvent(
             protocolVersion: 1,
@@ -492,7 +493,8 @@ final class RemoteAIMobileTests: XCTestCase {
             if await mock.actionAttemptCount("getChangesAfterCursor") > 0 { break }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
-        XCTAssertGreaterThan(await mock.actionAttemptCount("getChangesAfterCursor"), 0)
+        let deltaAttemptCount = await mock.actionAttemptCount("getChangesAfterCursor")
+        XCTAssertGreaterThan(deltaAttemptCount, 0)
 
         // The exact event reaches the live stream after the authenticated delta page
         // has already captured it but before that page returns to WorkspaceStore.
@@ -500,7 +502,8 @@ final class RemoteAIMobileTests: XCTestCase {
         await recovery.value
 
         XCTAssertNil(store.errors["sync"], "A legitimate live/delta overlap must not enter replay backoff")
-        XCTAssertEqual(try await cache.lastSequence(), 1201)
+        let recoveredSequence = try await cache.lastSequence()
+        XCTAssertEqual(recoveredSequence, 1201)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
         await store.suspend()
     }
