@@ -1068,7 +1068,10 @@ struct MessageRow: View {
                                 Button("选择部分") {
                                     selectionRequest = TextSelectionRequest(text: detail, monospaced: true)
                                 }
-                                Button("复制") { UIPasteboard.general.string = detail }
+                                Button("复制整块") { UIPasteboard.general.string = message.toolCardCopyText }
+                                Button("选择整块") {
+                                    selectionRequest = TextSelectionRequest(text: message.toolCardCopyText, monospaced: true)
+                                }
                             }
                             .font(.caption2)
                             .buttonStyle(.borderless)
@@ -1077,7 +1080,21 @@ struct MessageRow: View {
                     }
                 } label: {
                     HStack { Image(systemName: message.toolStatus == "Completed" ? "checkmark.circle.fill" : "gearshape.2"); VStack(alignment: .leading, spacing: 2) { Text(message.toolName ?? "Tool").font(.subheadline.weight(.semibold)); Text(message.toolStatus ?? "Running").font(.caption).foregroundColor(.secondary) }; Spacer() }
-                }.padding(12).background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = message.toolCardCopyText
+                    } label: {
+                        Label("复制整块", systemImage: "doc.on.doc")
+                    }
+                    Button {
+                        selectionRequest = TextSelectionRequest(text: message.toolCardCopyText, monospaced: true)
+                    } label: {
+                        Label("选择整块", systemImage: "text.cursor")
+                    }
+                }
             } else {
                 HStack(alignment: .bottom) {
                     if message.role == .user { Spacer(minLength: 44) }

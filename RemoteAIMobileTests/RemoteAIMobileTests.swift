@@ -888,6 +888,26 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(segments[2], MessageContentSegment(id: 2, text: "\nAfter", isCode: false, language: nil))
     }
 
+    func testToolCardCopyTextCopiesWholeVisibleEditCardInsteadOfOnlyDetail() {
+        let message = ChatMessage(
+            id: "tool-edit-1",
+            sessionId: "devspace-session",
+            sequence: 42,
+            role: .tool,
+            kind: .toolEvent,
+            text: "",
+            toolName: " Edit ",
+            toolStatus: "Completed",
+            detail: "RemoteAIMobile/Views.swift\nChanged 4 lines",
+            createdAt: Date(timeIntervalSince1970: 1)
+        )
+
+        XCTAssertEqual(
+            message.toolCardCopyText,
+            "Edit\nCompleted\nRemoteAIMobile/Views.swift\nChanged 4 lines"
+        )
+    }
+
     @MainActor
     func testCachedFinalClearsStaleConversationErrorBeforeRemoteRefreshCompletes() async throws {
         let mock = MockTransport(historyCount: 0)

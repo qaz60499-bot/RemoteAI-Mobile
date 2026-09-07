@@ -301,6 +301,18 @@ struct ChatMessage: Codable, Identifiable, Hashable {
         return Self.strippingLegacyAttachmentMarkers(from: text)
     }
 
+    var toolCardCopyText: String {
+        guard kind == .toolEvent else { return displayText }
+        var parts: [String] = []
+        let name = toolName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let status = toolStatus?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        parts.append(name.isEmpty ? "Tool" : name)
+        if !status.isEmpty { parts.append(status) }
+        if !detail.isEmpty { parts.append(detail) }
+        return parts.joined(separator: "\n")
+    }
+
     private static func legacyAttachments(in text: String) -> [MessageAttachment] {
         guard let regex = try? NSRegularExpression(pattern: #"(?is)\[Attachments:\s*([^\]]+)\]"#) else { return [] }
         let nsText = text as NSString
