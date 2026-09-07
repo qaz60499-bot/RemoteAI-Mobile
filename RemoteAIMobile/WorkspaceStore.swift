@@ -16,6 +16,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var projectConversationSnapshotStateByAlias: [String: WebSnapshotState] = [:]
     @Published var projectConversationLoadingByAlias: [String: Bool] = [:]
     @Published var liveRunStatusBySession: [String: String] = [:]
+    @Published private(set) var deltaRecoveryDisplayMessagesBySession: [String: [ChatMessage]]? = nil
     private var liveRunActivityAtBySession: [String: Date] = [:]
     @Published var hasLoadedWebProjects = false
     @Published var attachmentTransferBySession: [String: AttachmentTransferProgress] = [:]
@@ -65,8 +66,8 @@ final class WorkspaceStore: ObservableObject {
     private var visibleSessionSyncAt: [String: Date] = [:]
     private var visibleSessionHistorySyncAt: [String: Date] = [:]
     private var systemTransportOfflineChannels = Set<String>()
-    private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 1.5
-    private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 6
+    private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 2.5
+    private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 10
     private static let connectionMonitorIntervalNanoseconds: UInt64 = 500_000_000
     private static let sendRecoveryBackoffNanoseconds: [UInt64] = [0, 500_000_000, 1_500_000_000]
     private var olderMessageLoads = Set<String>()
@@ -77,6 +78,7 @@ final class WorkspaceStore: ObservableObject {
     private var commandSendsInFlight = Set<UUID>()
     private var metadataRefreshInFlight = false
     private var metadataRefreshQueued = false
+    private var metadataRefreshDeferredForDelta = false
     private var deltaRecoveryInFlight = false
     private var deltaRecoveryQueued = false
     private var deltaRecoveryFailureCount = 0
@@ -824,7 +826,7 @@ final class WorkspaceStore: ObservableObject {
         visibleSessionSyncAt[sessionId] = now
 
         await recoverDelta()
-        guard machine.state == .online, !isSuspended else { return }
+        guard machine.state == .online, !isSuspended, !deltaRecoveryInFlight else { return }
         let remoteStatus = await refreshVisibleSessionStatus(sessionId)
         guard machine.state == .online, !isSuspended else { return }
 
@@ -835,7 +837,7 @@ final class WorkspaceStore: ObservableObject {
         let historyNow = Date()
         let historyDue = force
             || !stillActive
-            || visibleSessionHistorySyncAt[sessionId].map { historyNow.timeIntervalSince($0) >= 6 } != false
+            || visibleSessionHistorySyncAt[sessionId].map { historyNow.timeIntervalSince($0) >= 10 } != false
         if historyDue {
             visibleSessionHistorySyncAt[sessionId] = historyNow
             await loadSession(sessionId)
@@ -1583,6 +1585,14 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    private func requestMetadataRefresh() async {
+        if deltaRecoveryInFlight {
+            metadataRefreshDeferredForDelta = true
+            return
+        }
+        await refreshMetadata()
+    }
+
     private func refreshMetadata() async {
         if metadataRefreshInFlight {
             metadataRefreshQueued = true
@@ -1877,14 +1887,25 @@ final class WorkspaceStore: ObservableObject {
         let generation = lifecycleGeneration
         defer {
             deltaRecoveryInFlight = false
-            if deltaRecoveryQueued,
-               generation == lifecycleGeneration,
-               machine.state == .online,
-               !isSuspended {
+            let shouldRunQueuedRecovery = deltaRecoveryQueued
+                && generation == lifecycleGeneration
+                && machine.state == .online
+                && !isSuspended
+            if shouldRunQueuedRecovery {
                 deltaRecoveryQueued = false
                 Task { [weak self] in await self?.recoverDelta() }
             } else {
                 deltaRecoveryQueued = false
+                deltaRecoveryDisplayMessagesBySession = nil
+                if metadataRefreshDeferredForDelta,
+                   generation == lifecycleGeneration,
+                   machine.state == .online,
+                   !isSuspended {
+                    metadataRefreshDeferredForDelta = false
+                    Task { [weak self] in await self?.refreshMetadata() }
+                } else {
+                    metadataRefreshDeferredForDelta = false
+                }
             }
         }
 
@@ -1926,6 +1947,14 @@ final class WorkspaceStore: ObservableObject {
                 let result = try await transport.delta(machineId: machine.id, after: cursor)
                 guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
                 if !result.events.isEmpty {
+                    if deltaRecoveryDisplayMessagesBySession == nil {
+                        // Delta replay repairs state in the background, but historical
+                        // TOOL/MESSAGE progress should not animate onto the screen one
+                        // event at a time. Freeze the visible transcript until the
+                        // recovery (including a queued follow-up pass) converges, then
+                        // publish the final merged state once.
+                        deltaRecoveryDisplayMessagesBySession = messagesBySession
+                    }
                     DiagnosticsLog.shared.record("delta_recovery_batch", fields: [
                         "cursor": String(requestedCursor),
                         "count": String(result.events.count),
@@ -1935,7 +1964,22 @@ final class WorkspaceStore: ObservableObject {
                 }
                 for event in result.events where event.sequence > cursor {
                     try ProtocolSecurity.validate(event, expectedMachineId: machine.id)
-                    guard eventReplayGuard.accept(event.eventId.uuidString.lowercased()) else { throw TransportError.replayDetected }
+                    let replayKey = event.eventId.uuidString.lowercased()
+                    if !eventReplayGuard.accept(replayKey) {
+                        // A live websocket event can legitimately arrive while an
+                        // authenticated delta request containing that same event is in
+                        // flight. Skip only when the sequence tracker proves this event
+                        // has already been observed live. Reusing an old event id at a
+                        // brand-new sequence remains a hard replay failure.
+                        guard event.sequence <= tracker.lastSequence else { throw TransportError.replayDetected }
+                        DiagnosticsLog.shared.record("delta_recovery_duplicate_skipped", fields: [
+                            "sequence": String(event.sequence),
+                            "eventId": replayKey,
+                        ])
+                        cursor = event.sequence
+                        try? await cache.setLastSequence(cursor)
+                        continue
+                    }
                     await applyEvent(event)
                     cursor = event.sequence
                     try? await cache.setLastSequence(cursor)
@@ -1947,6 +1991,7 @@ final class WorkspaceStore: ObservableObject {
             tracker = SequenceTracker(lastSequence: cursor)
             deltaRecoveryFailureCount = 0
             deltaRecoveryRetryNotBefore = nil
+            errors["sync"] = nil
         } catch {
             if generation == lifecycleGeneration, !isSuspended {
                 let index = min(deltaRecoveryFailureCount, Self.deltaRecoveryFailureBackoffSeconds.count - 1)
@@ -1968,7 +2013,7 @@ final class WorkspaceStore: ObservableObject {
         }
         guard let sessionId = event.sessionId else {
             if ["INSTANCE_UPDATED", "RUNTIME_STATUS", "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED"].contains(event.type) {
-                await refreshMetadata()
+                await requestMetadataRefresh()
             }
             return
         }
@@ -2119,7 +2164,7 @@ final class WorkspaceStore: ObservableObject {
                 errors[sessionId] = nil
             }
         case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED":
-            await refreshMetadata()
+            await requestMetadataRefresh()
         case "COMMAND_RESULT", "COMMAND_REJECTED":
             if let raw = event.payload["commandId"]?.stringValue, let commandId = UUID(uuidString: raw) {
                 commandStates[commandId] = event.type == "COMMAND_RESULT" ? .completed : .failed

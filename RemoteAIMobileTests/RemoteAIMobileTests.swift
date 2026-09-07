@@ -465,6 +465,47 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testDeltaRecoveryTreatsLiveAndDeltaOverlapAsIdempotent() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        XCTAssertEqual(try await cache.lastSequence(), 1200)
+
+        let overlap = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: Date()
+        )
+        await mock.injectEvent(overlap)
+        await mock.setResponseDelay(action: "getChangesAfterCursor", nanoseconds: 250_000_000)
+
+        let recovery = Task { await store.synchronizeVisibleSession("photo-upload", force: true) }
+        for _ in 0..<80 {
+            if await mock.actionAttemptCount("getChangesAfterCursor") > 0 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertGreaterThan(await mock.actionAttemptCount("getChangesAfterCursor"), 0)
+
+        // The exact event reaches the live stream after the authenticated delta page
+        // has already captured it but before that page returns to WorkspaceStore.
+        await mock.injectEvent(overlap, deliverLive: true)
+        await recovery.value
+
+        XCTAssertNil(store.errors["sync"], "A legitimate live/delta overlap must not enter replay backoff")
+        XCTAssertEqual(try await cache.lastSequence(), 1201)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        await store.suspend()
+    }
+
+    @MainActor
     func testDeltaRecoveryRejectsWrongMachineEventBeforeApplyingReplay() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 1)

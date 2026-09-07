@@ -157,6 +157,9 @@ struct InstanceView: View {
     @State private var newSession = false
     @State private var newProject = false
     @State private var projectSearch = ""
+    @State private var creatingWebChat = false
+    @State private var createdWebSession: SessionDescriptor?
+    @State private var openCreatedWebSession = false
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
     private var visibleProjects: [WebProjectDescriptor] {
         // Cache contains only previously accepted Project snapshots. Render it
@@ -173,18 +176,6 @@ struct InstanceView: View {
     var body: some View {
         List {
             if isChatGPTWeb {
-                Section {
-                    Button { Task { _ = await store.createWebConversation() } } label: {
-                        Label("新建普通 ChatGPT 对话", systemImage: "plus.circle.fill")
-                    }
-                } footer: {
-                    Text("普通对话与 Projects 分开显示，不会混在一起。")
-                }
-                Section("普通聊天") {
-                    ForEach(store.sessions.filter { $0.instanceId == instance.id && $0.projectAlias == nil }.sorted { $0.orderingDate > $1.orderingDate }) { session in
-                        NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
-                    }
-                }
                 Section {
                     Button { newProject = true } label: { Label("新建 ChatGPT Project", systemImage: "folder.badge.plus") }
                     TextField("搜索 Project", text: $projectSearch)
@@ -221,6 +212,33 @@ struct InstanceView: View {
                     Text("点进某个 Project 后才加载该 Project 的历史对话；不会启动时遍历全部历史。")
                 }
                 if let error = store.errors["web.projects"] { Section { ErrorBanner(text: error) { store.clearError(sessionId: "web.projects") } } }
+                Section {
+                    Button {
+                        guard !creatingWebChat else { return }
+                        creatingWebChat = true
+                        Task {
+                            let created = await store.createWebConversation()
+                            creatingWebChat = false
+                            if let created {
+                                createdWebSession = created
+                                openCreatedWebSession = true
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if creatingWebChat { ProgressView().controlSize(.small) }
+                            Label(creatingWebChat ? "正在新建对话…" : "新建普通 ChatGPT 对话", systemImage: "plus.circle.fill")
+                        }
+                    }
+                    .disabled(creatingWebChat || store.machine.state != .online)
+                    ForEach(store.sessions.filter { $0.instanceId == instance.id && $0.projectAlias == nil }.sorted { $0.orderingDate > $1.orderingDate }) { session in
+                        NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
+                    }
+                } header: {
+                    Text("Chats")
+                } footer: {
+                    Text("Projects 固定显示在 Chats 上方；普通对话与 Project 对话不会混在一起。")
+                }
             } else {
                 Section {
                     Button { newSession = true } label: {
@@ -236,6 +254,17 @@ struct InstanceView: View {
         }
         .remoteAITopBreathingRoom()
         .navigationTitle(instance.name).navigationBarTitleDisplayMode(.inline)
+        .background(
+            Group {
+                if let createdWebSession {
+                    NavigationLink(
+                        destination: ChatView(runtime: runtime, instance: instance, session: createdWebSession),
+                        isActive: $openCreatedWebSession
+                    ) { EmptyView() }
+                    .hidden()
+                }
+            }
+        )
         .sheet(isPresented: $newSession) { NewSessionView(runtime: runtime, instance: instance).environmentObject(store) }
         .sheet(isPresented: $newProject) { NewWebProjectView().environmentObject(store) }
         .task {
@@ -290,11 +319,34 @@ struct WebProjectView: View {
     let instance: InstanceDescriptor
     let project: WebProjectDescriptor
     @State private var loadingMore = false
+    @State private var creatingChat = false
+    @State private var createdSession: SessionDescriptor?
+    @State private var openCreatedSession = false
 
     private var rows: [WebConversationDescriptor] { store.projectConversationsByAlias[project.projectAlias, default: []] }
 
     var body: some View {
         List {
+            Section {
+                Button {
+                    guard !creatingChat else { return }
+                    creatingChat = true
+                    Task {
+                        let created = await store.createWebConversation(projectAlias: project.projectAlias)
+                        creatingChat = false
+                        if let created {
+                            createdSession = created
+                            openCreatedSession = true
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        if creatingChat { ProgressView().controlSize(.small) }
+                        Label(creatingChat ? "正在新建对话…" : "在此 Project 新建对话", systemImage: "plus.circle.fill")
+                    }
+                }
+                .disabled(creatingChat || store.machine.state != .online)
+            }
             Section("最近对话") {
                 if store.projectConversationLoadingByAlias[project.projectAlias] == true {
                     HStack(spacing: 10) {
@@ -323,12 +375,22 @@ struct WebProjectView: View {
                     }.disabled(loadingMore)
                 }
             }
-            Section { Button { Task { _ = await store.createWebConversation(projectAlias: project.projectAlias) } } label: { Label("在此 Project 新建对话", systemImage: "plus.circle.fill") } }
             if let error = store.errors["web.project.\(project.projectAlias)"] { Section { ErrorBanner(text: error) { store.clearError(sessionId: "web.project.\(project.projectAlias)") } } }
         }
         .remoteAITopBreathingRoom()
         .navigationTitle(project.displayName)
         .navigationBarTitleDisplayMode(.inline)
+        .background(
+            Group {
+                if let createdSession {
+                    NavigationLink(
+                        destination: ChatView(runtime: runtime, instance: instance, session: createdSession),
+                        isActive: $openCreatedSession
+                    ) { EmptyView() }
+                    .hidden()
+                }
+            }
+        )
         .task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: false) }
         .onChange(of: store.machine.state) { state in
             guard state == .online, rows.isEmpty else { return }
@@ -361,7 +423,10 @@ struct ChatView: View {
     @StateObject private var speechInput = SpeechInputController()
     @FocusState private var focused: Bool
 
-    var messages: [ChatMessage] { store.messagesBySession[session.id, default: []] }
+    var messages: [ChatMessage] {
+        store.deltaRecoveryDisplayMessagesBySession?[session.id]
+            ?? store.messagesBySession[session.id, default: []]
+    }
     private var codexModels: [CodexModelOption] { instance.codexCatalog?.models ?? [] }
     private var currentSession: SessionDescriptor {
         store.sessions.first(where: { $0.id == session.id }) ?? session
@@ -645,7 +710,7 @@ struct ChatView: View {
             // currently visible conversation at a bounded cadence so the final reply,
             // process state, or provider failure appears without leaving/reopening it.
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 900_000_000)
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
                 guard !Task.isCancelled else { break }
                 if scenePhase == .active {
                     await store.synchronizeVisibleSession(session.id)
@@ -1022,13 +1087,22 @@ struct MessageRow: View {
                             }
                         }
                         if !displayText.isEmpty {
-                            Button {
-                                selectionRequest = TextSelectionRequest(text: displayText, monospaced: false)
-                            } label: {
-                                Label("选择文字", systemImage: "text.cursor")
-                                    .font(.caption2)
+                            HStack(spacing: 12) {
+                                Button {
+                                    UIPasteboard.general.string = displayText
+                                } label: {
+                                    Label("复制全文", systemImage: "doc.on.doc")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.borderless)
+                                Button {
+                                    selectionRequest = TextSelectionRequest(text: displayText, monospaced: false)
+                                } label: {
+                                    Label("选择部分", systemImage: "text.cursor")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.borderless)
                             }
-                            .buttonStyle(.borderless)
                         }
                         if message.toolStatus == "Streaming" { ProgressView().scaleEffect(0.7) }
                         if message.role == .user, let commandState {
