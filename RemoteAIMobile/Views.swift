@@ -947,17 +947,62 @@ struct PhotoLibraryAttachmentPicker: UIViewControllerRepresentable {
 }
 
 struct MessageContentSegment: Identifiable, Equatable {
+    private static let editBlockMarker = "__REMOTEAI_EDIT_BLOCK__"
+
     let id: Int
     let text: String
     let isCode: Bool
     let language: String?
 
+    var isEditBlock: Bool { !isCode && language == Self.editBlockMarker }
+
     static func parse(_ value: String) -> [MessageContentSegment] {
-        let parts = value.components(separatedBy: "```")
-        guard parts.count > 1 else {
-            return [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)]
-        }
         var result: [MessageContentSegment] = []
+        let nsValue = value as NSString
+        let pattern = #"(^|\r?\n[ \t]*\r?\n)[ \t]*Edit[ \t]*\r?\n[ \t]*\r?\n"#
+        let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .anchorsMatchLines])
+        let allMatches = regex?.matches(in: value, range: NSRange(location: 0, length: nsValue.length)) ?? []
+        let matches = allMatches.filter { match in
+            let prefix = nsValue.substring(with: NSRange(location: 0, length: match.range.location))
+            let fenceCount = max(0, prefix.components(separatedBy: "```").count - 1)
+            return fenceCount % 2 == 0
+        }
+
+        if !matches.isEmpty {
+            var cursor = 0
+            for (index, match) in matches.enumerated() {
+                if match.range.location > cursor {
+                    appendMarkdownSegments(nsValue.substring(with: NSRange(location: cursor, length: match.range.location - cursor)), to: &result)
+                }
+                let bodyStart = NSMaxRange(match.range)
+                let bodyEnd = index + 1 < matches.count ? matches[index + 1].range.location : nsValue.length
+                if bodyEnd > bodyStart {
+                    let body = nsValue.substring(with: NSRange(location: bodyStart, length: bodyEnd - bodyStart))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !body.isEmpty {
+                        result.append(MessageContentSegment(id: result.count, text: body, isCode: false, language: editBlockMarker))
+                    }
+                }
+                cursor = bodyEnd
+            }
+            if cursor < nsValue.length {
+                appendMarkdownSegments(nsValue.substring(from: cursor), to: &result)
+            }
+            if !result.isEmpty { return result }
+        }
+
+        appendMarkdownSegments(value, to: &result)
+        return result.isEmpty ? [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)] : result
+    }
+
+    private static func appendMarkdownSegments(_ value: String, to result: inout [MessageContentSegment]) {
+        let parts = value.components(separatedBy: "```")
+        if parts.count == 1 {
+            if !value.isEmpty {
+                result.append(MessageContentSegment(id: result.count, text: value, isCode: false, language: nil))
+            }
+            return
+        }
         for (index, rawPart) in parts.enumerated() where !rawPart.isEmpty {
             let isCode = index % 2 == 1
             var text = rawPart
@@ -976,7 +1021,6 @@ struct MessageContentSegment: Identifiable, Equatable {
                 result.append(MessageContentSegment(id: result.count, text: cleaned, isCode: isCode, language: language))
             }
         }
-        return result.isEmpty ? [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)] : result
     }
 }
 
@@ -1100,7 +1144,44 @@ struct MessageRow: View {
                     if message.role == .user { Spacer(minLength: 44) }
                     VStack(alignment: .leading, spacing: 8) {
                         ForEach(contentSegments) { segment in
-                            if segment.isCode {
+                            if segment.isEditBlock {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack(spacing: 8) {
+                                        Label("Edit", systemImage: "square.and.pencil")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundColor(.secondary)
+                                        Spacer()
+                                        Button {
+                                            UIPasteboard.general.string = segment.text
+                                        } label: {
+                                            Label("复制整块", systemImage: "doc.on.doc")
+                                                .font(.caption2)
+                                        }
+                                        .buttonStyle(.borderless)
+                                        Button("选择部分") {
+                                            selectionRequest = TextSelectionRequest(text: segment.text, monospaced: false)
+                                        }
+                                        .font(.caption2)
+                                        .buttonStyle(.borderless)
+                                    }
+                                    Text(segment.text)
+                                        .textSelection(.enabled)
+                                }
+                                .padding(10)
+                                .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
+                                .contextMenu {
+                                    Button {
+                                        UIPasteboard.general.string = segment.text
+                                    } label: {
+                                        Label("复制整块", systemImage: "doc.on.doc")
+                                    }
+                                    Button {
+                                        selectionRequest = TextSelectionRequest(text: segment.text, monospaced: false)
+                                    } label: {
+                                        Label("选择部分", systemImage: "text.cursor")
+                                    }
+                                }
+                            } else if segment.isCode {
                                 VStack(alignment: .leading, spacing: 6) {
                                     HStack(spacing: 8) {
                                         Text(segment.language?.isEmpty == false ? segment.language! : "EDIT / Code")

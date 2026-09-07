@@ -888,6 +888,40 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(segments[2], MessageContentSegment(id: 2, text: "\nAfter", isCode: false, language: nil))
     }
 
+    func testFlattenedWritingEditBlockBecomesOneCopyableSegment() {
+        let text = """
+        下面是下一窗口的精确续跑提示词。
+
+        Edit
+
+        @DevSpace
+
+        请实际接管并继续执行项目：
+
+        D:\\wendangcodex\\boss-helper-low-risk
+
+        这是当前尚未完成的同一 BOSS Production Batch。
+        """
+        let segments = MessageContentSegment.parse(text)
+
+        XCTAssertEqual(segments.count, 2)
+        XCTAssertFalse(segments[0].isEditBlock)
+        XCTAssertEqual(segments[0].text.trimmingCharacters(in: .whitespacesAndNewlines), "下面是下一窗口的精确续跑提示词。")
+        XCTAssertTrue(segments[1].isEditBlock)
+        XCTAssertEqual(
+            segments[1].text,
+            "@DevSpace\n\n请实际接管并继续执行项目：\n\nD:\\wendangcodex\\boss-helper-low-risk\n\n这是当前尚未完成的同一 BOSS Production Batch。"
+        )
+    }
+
+    func testEditWordInsideCodeFenceDoesNotBecomeWritingBlock() {
+        let text = "Before\n```text\nEdit\n\nnot a writing block\n```\nAfter"
+        let segments = MessageContentSegment.parse(text)
+
+        XCTAssertFalse(segments.contains(where: \.isEditBlock))
+        XCTAssertTrue(segments.contains(where: { $0.isCode && $0.text.contains("Edit") }))
+    }
+
     func testToolCardCopyTextCopiesWholeVisibleEditCardInsteadOfOnlyDetail() {
         let message = ChatMessage(
             id: "tool-edit-1",
