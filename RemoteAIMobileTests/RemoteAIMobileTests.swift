@@ -964,6 +964,38 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testDiagnosticsBundleIsZipAndDoubleRedactsStructuredAgentSnapshot() throws {
+        let log = DiagnosticsLog.shared
+        log.clear()
+        log.record("projects_refresh_ok", fields: ["count": "96", "durationMs": "2700"])
+        log.record("send_failed", fields: ["transportKind": "timeout", "durationMs": "31000"], level: "ERROR")
+        let agentSnapshot: JSONValue = .object([
+            "schemaVersion": .number(1),
+            "authorization": .string("Bearer TOP_SECRET_AUTH_VALUE"),
+            "relay": .object(["online": .bool(true)]),
+            "logTail": .array([.object(["event": .string("relay_status"), "secret": .string("TOP_SECRET_AGENT_VALUE")])])
+        ])
+        let url = try log.exportDiagnosticBundle(agentSnapshot: agentSnapshot, state: ["machineState": "Online"])
+        let archive = try Data(contentsOf: url)
+        XCTAssertGreaterThan(archive.count, 22)
+        XCTAssertEqual(Array(archive.prefix(4)), [0x50, 0x4b, 0x03, 0x04])
+        let raw = String(decoding: archive, as: UTF8.self)
+        XCTAssertTrue(raw.contains("diagnostics/performance-summary.json"))
+        XCTAssertTrue(raw.contains("diagnostics/bug-capsules.json"))
+        XCTAssertTrue(raw.contains("windows/agent-snapshot.json"))
+        XCTAssertTrue(raw.contains("<redacted>"))
+        XCTAssertFalse(raw.contains("TOP_SECRET_AUTH_VALUE"))
+        XCTAssertFalse(raw.contains("TOP_SECRET_AGENT_VALUE"))
+        try? FileManager.default.removeItem(at: url)
+        log.clear()
+    }
+
+    func testGetDiagnosticsIsAValidatedReadOnlyProtocolAction() throws {
+        let command = RemoteCommand.make(machineId: "machine-1", runtimeId: "runtime.web", instanceId: "agent", action: "getDiagnostics")
+        XCTAssertNoThrow(try ProtocolSecurity.validate(command, expectedMachineId: "machine-1"))
+    }
+
+    @MainActor
     func testFreshPhoneBootstrapsFromWindowsLastKnownGoodWithoutPromotingItToAuthoritativeCache() async throws {
         let mock = MockTransport(historyCount: 1)
         await mock.setScenario(.staleWebCatalog)

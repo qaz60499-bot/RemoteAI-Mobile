@@ -103,6 +103,10 @@ final class WorkspaceStore: ObservableObject {
         pendingCommandPrefix(machineId: machineId) + id.uuidString.lowercased()
     }
 
+    private static func durationMilliseconds(since start: Date) -> String {
+        String(max(0, Int(Date().timeIntervalSince(start) * 1000)))
+    }
+
     private static func diagnosticFields(for error: Error, adding extra: [String: String] = [:]) -> [String: String] {
         var fields = extra
         fields["errorType"] = String(describing: type(of: error))
@@ -122,6 +126,37 @@ final class WorkspaceStore: ObservableObject {
         self.transport = transport
         self.cache = cache
         DiagnosticsLog.shared.record("store_initialized", fields: ["transport": String(describing: type(of: transport))])
+    }
+
+    func exportDiagnosticsBundle() async throws -> URL {
+        DiagnosticsLog.shared.record("diagnostics_export_begin", fields: [
+            "machineState": machine.state.rawValue,
+            "connectionPhase": connectionPhase.rawValue,
+            "browserConnected": String(describing: desktopBrowserConnected),
+            "relayConnected": String(describing: desktopRelayConnected),
+            "agentConnected": String(describing: desktopAgentConnected)
+        ])
+        var agentSnapshot: JSONValue?
+        if isPaired && machine.state != .offline {
+            do {
+                agentSnapshot = try await transport.diagnosticsSnapshot(machineId: machine.id)
+            } catch {
+                DiagnosticsLog.shared.record("diagnostics_agent_snapshot_failed", fields: Self.diagnosticFields(for: error), level: "WARN")
+            }
+        }
+        let state = [
+            "machineState": machine.state.rawValue,
+            "connectionPhase": connectionPhase.rawValue,
+            "browserConnected": String(describing: desktopBrowserConnected),
+            "relayConnected": String(describing: desktopRelayConnected),
+            "agentConnected": String(describing: desktopAgentConnected),
+            "projectCount": String(webProjects.count),
+            "sessionCount": String(sessions.count),
+            "runtimeCount": String(runtimes.count)
+        ]
+        let url = try DiagnosticsLog.shared.exportDiagnosticBundle(agentSnapshot: agentSnapshot, state: state)
+        DiagnosticsLog.shared.record("diagnostics_export_ok", fields: ["filename": url.lastPathComponent])
+        return url
     }
 
     static func makeDefault() -> WorkspaceStore {
@@ -285,6 +320,7 @@ final class WorkspaceStore: ObservableObject {
             }
         }
         refreshWebProjectsInFlight = true
+        let refreshStartedAt = Date()
         defer {
             refreshWebProjectsInFlight = false
             if refreshWebProjectsQueued {
@@ -349,13 +385,13 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.put(webProjects, key: "web.projects")
             guard generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended else { return }
             errors["web.projects"] = nil
-            DiagnosticsLog.shared.record("projects_refresh_ok", fields: ["count": String(webProjects.count)])
+            DiagnosticsLog.shared.record("projects_refresh_ok", fields: ["count": String(webProjects.count), "durationMs": Self.durationMilliseconds(since: refreshStartedAt)])
         } catch {
             if generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended {
                 webProjectsSnapshotState = .providerUnavailable
                 hasLoadedWebProjects = !webProjects.isEmpty
                 errors["web.projects"] = error.localizedDescription
-                DiagnosticsLog.shared.record("projects_refresh_failed", fields: Self.diagnosticFields(for: error), level: "ERROR")
+                DiagnosticsLog.shared.record("projects_refresh_failed", fields: Self.diagnosticFields(for: error, adding: ["durationMs": Self.durationMilliseconds(since: refreshStartedAt)]), level: "ERROR")
             }
         }
     }
@@ -444,6 +480,7 @@ final class WorkspaceStore: ObservableObject {
             }
         }
         guard refresh else { return }
+        let projectLoadStartedAt = Date()
         guard machine.state == .online else {
             if projectConversationsByAlias[projectAlias, default: []].isEmpty {
                 errors["web.project.\(projectAlias)"] = "PC Offline — connect to Windows to load this Project's conversations."
@@ -521,12 +558,12 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended else { return }
             mergeProjectSessions(page.items)
             errors["web.project.\(projectAlias)"] = nil
-            DiagnosticsLog.shared.record("project_load_ok", fields: ["project": projectAlias, "count": String(page.items.count), "hasMore": String(page.hasMore)])
+            DiagnosticsLog.shared.record("project_load_ok", fields: ["project": projectAlias, "count": String(page.items.count), "hasMore": String(page.hasMore), "durationMs": Self.durationMilliseconds(since: projectLoadStartedAt)])
         } catch {
             if generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended {
                 projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
                 errors["web.project.\(projectAlias)"] = error.localizedDescription
-                DiagnosticsLog.shared.record("project_load_failed", fields: Self.diagnosticFields(for: error, adding: ["project": projectAlias]), level: "ERROR")
+                DiagnosticsLog.shared.record("project_load_failed", fields: Self.diagnosticFields(for: error, adding: ["project": projectAlias, "durationMs": Self.durationMilliseconds(since: projectLoadStartedAt)]), level: "ERROR")
             }
         }
     }
@@ -903,6 +940,7 @@ final class WorkspaceStore: ObservableObject {
         guard commandSendsInFlight.insert(commandId).inserted else { return false }
         defer { commandSendsInFlight.remove(commandId) }
         let generation = lifecycleGeneration
+        let sendStartedAt = Date()
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         DiagnosticsLog.shared.record("send_begin", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "hasInput": String(!trimmed.isEmpty), "attachments": String(attachments.count), "commandId": commandId.uuidString])
         guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
@@ -991,7 +1029,7 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             try? await cache.saveDraft("", sessionId: sessionId)
             if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = nil }
-            DiagnosticsLog.shared.record("send_ok", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "state": finalState.rawValue])
+            DiagnosticsLog.shared.record("send_ok", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "state": finalState.rawValue, "durationMs": Self.durationMilliseconds(since: sendStartedAt)])
             return true
         } catch is CancellationError {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }

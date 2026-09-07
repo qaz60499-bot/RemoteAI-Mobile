@@ -20,7 +20,7 @@ enum ProtocolSecurity {
     ]
 
     static let commandActions: Set<String> = [
-        "getStatus", "listRuntimes", "listInstances", "listSessions",
+        "getStatus", "getDiagnostics", "listRuntimes", "listInstances", "listSessions",
         "createSession", "resumeSession", "stopSession", "getSessionStatus",
         "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore", "readMessageAttachmentChunk",
         "getChangesAfterCursor",

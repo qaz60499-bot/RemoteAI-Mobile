@@ -83,11 +83,19 @@ struct RootView: View {
     private func runtimeIcon(_ kind: RuntimeKind) -> String { switch kind { case .web: return "globe"; case .codex: return "terminal" } }
 }
 
+private struct DiagnosticExportItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
 struct DiagnosticsView: View {
     @EnvironmentObject var store: WorkspaceStore
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var log = DiagnosticsLog.shared
     @State private var copied = false
+    @State private var exporting = false
+    @State private var exportItem: DiagnosticExportItem?
+    @State private var exportError: String?
 
     var body: some View {
         NavigationView {
@@ -113,6 +121,21 @@ struct DiagnosticsView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } }
                 ToolbarItemGroup(placement: .confirmationAction) {
+                    Button(exporting ? "导出中…" : "导出 ZIP") {
+                        guard !exporting else { return }
+                        exporting = true
+                        exportError = nil
+                        Task {
+                            do {
+                                let url = try await store.exportDiagnosticsBundle()
+                                exportItem = DiagnosticExportItem(url: url)
+                            } catch {
+                                exportError = String(describing: error)
+                            }
+                            exporting = false
+                        }
+                    }
+                    .disabled(exporting)
                     Button("清空") { log.clear() }
                     Button(copied ? "已复制" : "复制") {
                         log.copyToPasteboard()
@@ -120,6 +143,17 @@ struct DiagnosticsView: View {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
                     }
                 }
+            }
+            .sheet(item: $exportItem) { item in
+                SystemActivitySheet(url: item.url)
+            }
+            .alert("诊断包导出失败", isPresented: Binding(
+                get: { exportError != nil },
+                set: { if !$0 { exportError = nil } }
+            )) {
+                Button("好", role: .cancel) { exportError = nil }
+            } message: {
+                Text(exportError ?? "未知错误")
             }
         }
     }

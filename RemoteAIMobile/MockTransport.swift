@@ -218,6 +218,17 @@ actor MockTransport: Transport {
         switch command.action {
         case "getStatus":
             response = success(["machineId": .string(machineId), "latestSequence": .number(Double(sequence))])
+        case "getDiagnostics":
+            response = success([
+                "schemaVersion": .number(1),
+                "generatedAt": .string(RemoteAIDate.string(Date())),
+                "agent": .object(["latestSequence": .number(Double(sequence)), "started": .bool(true)]),
+                "browser": .object(["connected": .bool(true)]),
+                "relay": .object(["configured": .bool(true), "online": .bool(true), "queuedFrames": .number(0)]),
+                "inventory": .object(["pairedDeviceCount": .number(1), "webProjectCount": .number(Double(webProjects.count))]),
+                "runtimeStatus": .array([]),
+                "logTail": .array([])
+            ])
         case "listRuntimes":
             response = try success(runtimes)
         case "listInstances":

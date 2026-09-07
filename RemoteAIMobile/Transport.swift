@@ -183,6 +183,11 @@ extension Transport {
         try await agentStatusSnapshot(machineId: machineId).latestSequence
     }
 
+    func diagnosticsSnapshot(machineId: String) async throws -> JSONValue {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "getDiagnostics")
+        return try await requireSuccess(execute(command))
+    }
+
     func listRuntimes(machineId: String) async throws -> [RuntimeDescriptor] {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "listRuntimes")
         let response = try await requireSuccess(execute(command))
