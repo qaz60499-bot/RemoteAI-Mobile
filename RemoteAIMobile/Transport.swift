@@ -164,7 +164,7 @@ extension Transport {
     }
 
     func agentStatusSnapshot(machineId: String) async throws -> AgentStatusSnapshot {
-        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "getStatus")
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "getStatus", payload: ["assistantDeltaVersion": .number(1)])
         let response = try await requireSuccess(execute(command))
         guard let object = response.objectValue,
               let sequence = object["latestSequence"]?.intValue else { throw TransportError.malformedData }

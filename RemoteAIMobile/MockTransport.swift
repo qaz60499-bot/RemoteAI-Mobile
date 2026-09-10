@@ -135,6 +135,7 @@ actor MockTransport: Transport {
     }
     func injectEvent(_ event: RemoteEvent, deliverLive: Bool = false) {
         eventLog.append(event)
+        sequence = max(sequence, event.sequence)
         if deliverLive { continuation?.yield(event) }
     }
     func injectHealth(_ event: TransportHealthEvent) {

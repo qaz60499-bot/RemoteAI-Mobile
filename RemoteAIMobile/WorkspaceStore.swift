@@ -42,6 +42,10 @@ final class WorkspaceStore: ObservableObject {
     private var healthTask: Task<Void, Never>?
     private var connectionMonitorTask: Task<Void, Never>?
     private var streamingBuffers: [String: (id: String, text: String, sequence: Int64, attachments: [MessageAttachment])] = [:]
+    private var assistantStreams: [String: AssistantStream] = [:]
+    private var incompleteAssistantStreams: [String: RemoteEvent] = [:]
+    private var lastOnlineHeadProbe = Date.distantPast
+    @Published private(set) var syncState = "unknown"
     private let messageAttachmentCache = NSCache<NSString, NSData>()
     private var flushTask: Task<Void, Never>?
     private var startInProgress = false
@@ -1402,6 +1406,11 @@ final class WorkspaceStore: ObservableObject {
         instances.removeAll()
         sessions.removeAll()
         messagesBySession.removeAll()
+        assistantStreams.removeAll()
+        incompleteAssistantStreams.removeAll()
+        streamingBuffers.removeAll()
+        syncState = "unknown"
+        lastOnlineHeadProbe = .distantPast
         webProjects.removeAll()
         projectConversationsByAlias.removeAll()
         projectNextCursorByAlias.removeAll()
@@ -1601,12 +1610,15 @@ final class WorkspaceStore: ObservableObject {
                         self.applyConnectionFailure(error)
                         if (error as? TransportError) == .pairingRequired { break }
                     }
+                } else if self.machine.state == .online && Date().timeIntervalSince(self.lastOnlineHeadProbe) >= 15 {
+                    await self.verifyOnlineSyncHead()
                 }
             }
         }
     }
 
     private func applyConnectionFailure(_ error: Error) {
+        syncState = "unknown"
         machine.state = .offline
         DiagnosticsLog.shared.record("connection_failure", fields: Self.diagnosticFields(for: error), level: "ERROR")
         if let transportError = error as? TransportError {
@@ -1980,6 +1992,33 @@ final class WorkspaceStore: ObservableObject {
         try? await cache.setLastSequence(event.sequence)
     }
 
+    // An open socket proves transport health, not that the final event arrived.
+    // Reuse the authenticated status/cursor path even during otherwise quiet periods.
+    func verifyOnlineSyncHead() async {
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        guard !isSuspended, machine.state == .online, !deltaRecoveryInFlight else { return }
+        lastOnlineHeadProbe = Date()
+        let appliedBeforeProbe = (try? await cache.lastSequence()) ?? 0
+        do {
+            let head = try await activeTransport.latestSequence(machineId: machine.id)
+            guard generation == lifecycleGeneration, transport === activeTransport, !isSuspended else { return }
+            let applied = (try? await cache.lastSequence()) ?? 0
+            if head > applied || head < appliedBeforeProbe {
+                syncState = "stale"
+                DiagnosticsLog.shared.record("online_sync_gap", fields: ["head": String(head), "applied": String(applied)])
+                await recoverDelta(freshLatestSequence: head)
+            }
+            let current = (try? await cache.lastSequence()) ?? 0
+            for event in Array(incompleteAssistantStreams.values) { _ = await restoreAssistantStream(through: event) }
+            syncState = current >= head && errors["sync"] == nil && incompleteAssistantStreams.isEmpty ? "synced" : "stale"
+        } catch {
+            guard generation == lifecycleGeneration, transport === activeTransport, !isSuspended else { return }
+            syncState = "stale"
+            applyConnectionFailure(error)
+        }
+    }
+
     private func recoverDelta(freshLatestSequence: Int64? = nil) async {
         guard machine.state == .online else { return }
         if freshLatestSequence == nil,
@@ -2139,7 +2178,7 @@ final class WorkspaceStore: ObservableObject {
             tracker = SequenceTracker(lastSequence: cursor)
             deltaRecoveryFailureCount = 0
             deltaRecoveryRetryNotBefore = nil
-            errors["sync"] = nil
+            errors["sync"] = incompleteAssistantStreams.isEmpty ? nil : "Streaming reconciliation is incomplete."
         } catch {
             if generation == lifecycleGeneration, !isSuspended {
                 let index = min(deltaRecoveryFailureCount, Self.deltaRecoveryFailureBackoffSeconds.count - 1)
@@ -2185,8 +2224,38 @@ final class WorkspaceStore: ObservableObject {
         }
 
         switch event.type {
-        case "MESSAGE_UPDATED":
-            let content = event.payload["content"]?.stringValue ?? ""
+        case "MESSAGE_UPDATED" where event.payload["partial"]?.boolValue != false || event.payload["messageId"]?.stringValue == nil:
+            let content: String
+            if let delta = event.payload["contentDelta"]?.stringValue {
+                guard let streamId = event.payload["streamId"]?.stringValue,
+                      let base = event.payload["baseRevision"]?.intValue,
+                      let revision = event.payload["revision"]?.intValue else { return }
+                if assistantStreams[sessionId]?.id == streamId,
+                   let appliedRevision = assistantStreams[sessionId]?.revision, appliedRevision >= revision { return }
+                let appended = assistantStreams[sessionId]?.append(id: streamId, baseRevision: base, revision: revision, delta: delta) == true
+                var restored = appended
+                if !restored { restored = await restoreAssistantStream(through: event) }
+                if !restored {
+                    incompleteAssistantStreams[sessionId] = event
+                    syncState = "stale"
+                    errors["sync"] = "Streaming revision gap; waiting for canonical reconciliation."
+                    DiagnosticsLog.shared.record("stream_revision_gap", fields: ["session": sessionId], level: "WARN")
+                    return
+                }
+                content = assistantStreams[sessionId]!.presentationText
+            } else {
+                let snapshot = event.payload["content"]?.stringValue ?? ""
+                if let streamId = event.payload["streamId"]?.stringValue,
+                   let revision = event.payload["revision"]?.intValue {
+                    let stream = AssistantStream(id: streamId, revision: revision, text: snapshot)
+                    assistantStreams[sessionId] = stream
+                    incompleteAssistantStreams.removeValue(forKey: sessionId)
+                    content = stream.presentationText
+                } else {
+                    assistantStreams.removeValue(forKey: sessionId)
+                    content = snapshot
+                }
+            }
             let attachments = (try? event.payload["attachments"]?.decode([MessageAttachment].self)) ?? []
             let id = event.payload["messageId"]?.stringValue ?? streamingBuffers[sessionId]?.id ?? "stream-\(sessionId)"
             bufferStreaming(sessionId: sessionId, id: id, content: content, attachments: attachments, sequence: event.sequence)
@@ -2201,10 +2270,18 @@ final class WorkspaceStore: ObservableObject {
                     liveRunStatusBySession[sessionId] = status
                 }
             }
-        case "MESSAGE_ADDED":
+        case "MESSAGE_ADDED", "MESSAGE_UPDATED":
             if let server = try? JSONValue.object(event.payload).decode(ServerMessage.self) {
                 let base = server.chatMessage
                 if base.role == .assistant {
+                    if let stream = assistantStreams[sessionId] {
+                        DiagnosticsLog.shared.record("stream_canonical_reconciled", fields: [
+                            "session": sessionId,
+                            "canonicalEqual": String(stream.text == base.text),
+                            "finalBytes": String(base.text.utf8.count),
+                            "accumulatedBytes": String(stream.utf8Count),
+                        ])
+                    }
                     discardStreamingPlaceholder(sessionId: sessionId)
                     // MESSAGE_ADDED is the durable final boundary. Converge the visible
                     // run state even if the following GENERATION_STOPPED event is lost.
@@ -2393,6 +2470,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func applyAgentStatusSnapshot(_ snapshot: AgentStatusSnapshot) {
+        lastOnlineHeadProbe = Date()
         let previousBrowser = desktopBrowserConnected
         desktopAgentConnected = true
         desktopBrowserConnected = snapshot.browserConnected
@@ -2519,6 +2597,7 @@ final class WorkspaceStore: ObservableObject {
         guard let item = streamingBuffers.removeValue(forKey: sessionId) else { return }
         var list = messagesBySession[sessionId, default: []]
         if let index = list.firstIndex(where: { $0.id == item.id }) {
+            guard list[index].text != item.text || list[index].attachments != item.attachments else { return }
             list[index].text = item.text
             list[index].attachments = item.attachments
             // Text/attachments do not change the established sort key.
@@ -2535,10 +2614,66 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func discardStreamingPlaceholder(sessionId: String) {
+        assistantStreams.removeValue(forKey: sessionId)
+        incompleteAssistantStreams.removeValue(forKey: sessionId)
+        if incompleteAssistantStreams.isEmpty, errors["sync"]?.hasPrefix("Streaming") == true { errors["sync"] = nil }
         streamingBuffers.removeValue(forKey: sessionId)
         var list = messagesBySession[sessionId, default: []]
         list.removeAll { $0.role == .assistant && ($0.toolStatus == "Streaming" || $0.id == "stream-\(sessionId)") }
         messagesBySession[sessionId] = list
+    }
+
+    func streamingFullText(sessionId: String, fallback: String) -> String {
+        assistantStreams[sessionId]?.text ?? fallback
+    }
+
+    // After a process restart the durable global cursor can outlive a transient
+    // stream. Replay that one object from its reset using the existing events-since
+    // API; never rewind the global cursor or reapply historical side effects.
+    private func restoreAssistantStream(through target: RemoteEvent) async -> Bool {
+        guard let sessionId = target.sessionId,
+              let streamId = target.payload["streamId"]?.stringValue,
+              let targetRevision = target.payload["revision"]?.intValue,
+              let start = target.payload["streamStartSequence"]?.intValue,
+              start > 0, start <= target.sequence else { return false }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        var cursor = start - 1
+        var restored: AssistantStream?
+        do {
+            // Bound work even for a malicious/stale pointer. A canonical final or
+            // later full reset can always replace this transient state.
+            for _ in 0..<100 {
+                let page = try await activeTransport.delta(machineId: machine.id, after: cursor)
+                guard generation == lifecycleGeneration, transport === activeTransport, !isSuspended else { return false }
+                for event in page.events where event.sequence <= target.sequence && event.sessionId == sessionId && event.type == "MESSAGE_UPDATED" {
+                    guard event.payload["streamId"]?.stringValue == streamId,
+                          let revision = event.payload["revision"]?.intValue else { continue }
+                    if let snapshot = event.payload["content"]?.stringValue {
+                        restored = AssistantStream(id: streamId, revision: revision, text: snapshot)
+                    } else if let delta = event.payload["contentDelta"]?.stringValue,
+                              let base = event.payload["baseRevision"]?.intValue {
+                        guard restored?.append(id: streamId, baseRevision: base, revision: revision, delta: delta) == true else { return false }
+                    }
+                }
+                if let restored, restored.revision == targetRevision {
+                    if assistantStreams[sessionId]?.id != streamId || (assistantStreams[sessionId]?.revision ?? 0) < targetRevision {
+                        assistantStreams[sessionId] = restored
+                    }
+                    incompleteAssistantStreams.removeValue(forKey: sessionId)
+                    if incompleteAssistantStreams.isEmpty, errors["sync"]?.hasPrefix("Streaming") == true { errors["sync"] = nil }
+                    let attachments = (try? target.payload["attachments"]?.decode([MessageAttachment].self)) ?? []
+                    bufferStreaming(sessionId: sessionId, id: "stream-\(sessionId)", content: restored.presentationText, attachments: attachments, sequence: target.sequence)
+                    DiagnosticsLog.shared.record("stream_revision_recovered", fields: ["session": sessionId, "revision": String(targetRevision)])
+                    return true
+                }
+                guard page.hasMore, page.nextCursor > cursor, page.nextCursor < target.sequence else { return false }
+                cursor = page.nextCursor
+            }
+        } catch {
+            DiagnosticsLog.shared.record("stream_revision_recovery_failed", fields: Self.diagnosticFields(for: error), level: "WARN")
+        }
+        return false
     }
 
     private func settleRunStateIfAuthoritativeFinalExists(_ remote: [ChatMessage], sessionId: String) async {

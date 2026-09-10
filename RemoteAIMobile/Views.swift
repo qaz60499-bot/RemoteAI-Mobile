@@ -511,7 +511,7 @@ struct ChatView: View {
                                 // Definite failures restore the composer and use a new operation.
                                 // Only unknown delivery is replayed with the original command ID.
                                 let retryable = message.kind == .error || commandState == .unknown
-                                MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel).equatable().id(message.id)
+                                MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel, fullStreamingText: message.toolStatus == "Streaming" ? { store.streamingFullText(sessionId: message.sessionId, fallback: message.displayText) } : nil).equatable().id(message.id)
                             }
                             Color.clear
                                 .frame(height: 1)
@@ -1166,6 +1166,7 @@ struct MessageRow: View, Equatable {
     let commandState: CommandState?
     let retry: (() -> Void)?
     var retryContextKey: String = ""
+    var fullStreamingText: (() -> String)? = nil
 
     static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
         lhs.message == rhs.message && lhs.commandState == rhs.commandState
@@ -1176,8 +1177,9 @@ struct MessageRow: View, Equatable {
     private var renderContent: MessageRenderContent { MessageRenderCache.shared.content(for: message) }
     private var displayText: String { renderContent.displayText }
     private var displayAttachments: [MessageAttachment] { renderContent.attachments }
-    private var isLargeDisplayText: Bool { renderContent.isLarge }
+    private var isLargeDisplayText: Bool { renderContent.isLarge || (fullStreamingText != nil && message.text.count >= 2001) }
     private var contentSegments: [MessageContentSegment] { renderContent.segments }
+    private var selectionText: String { fullStreamingText?() ?? displayText }
 
     var body: some View {
         Group {
@@ -1299,9 +1301,9 @@ struct MessageRow: View, Equatable {
                         }
                         if isLargeDisplayText {
                             Button {
-                                selectionRequest = TextSelectionRequest(text: displayText, monospaced: false)
+                                selectionRequest = TextSelectionRequest(text: selectionText, monospaced: false)
                             } label: {
-                                Label("查看全文（约 \(max(1, displayText.utf8.count / 1024)) KB）", systemImage: "doc.text.magnifyingglass")
+                                Label(fullStreamingText != nil ? "查看全文（生成中）" : "查看全文（约 \(max(1, displayText.utf8.count / 1024)) KB）", systemImage: "doc.text.magnifyingglass")
                                     .font(.caption.weight(.medium))
                             }
                             .buttonStyle(.borderless)
@@ -1319,14 +1321,14 @@ struct MessageRow: View, Equatable {
                         if !displayText.isEmpty {
                             HStack(spacing: 12) {
                                 Button {
-                                    UIPasteboard.general.string = displayText
+                                    UIPasteboard.general.string = selectionText
                                 } label: {
                                     Label("复制全文", systemImage: "doc.on.doc")
                                         .font(.caption2)
                                 }
                                 .buttonStyle(.borderless)
                                 Button {
-                                    selectionRequest = TextSelectionRequest(text: displayText, monospaced: false)
+                                    selectionRequest = TextSelectionRequest(text: selectionText, monospaced: false)
                                 } label: {
                                     Label("选择部分", systemImage: "text.cursor")
                                         .font(.caption2)
