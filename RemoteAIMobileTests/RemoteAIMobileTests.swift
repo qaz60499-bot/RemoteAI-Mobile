@@ -829,6 +829,45 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testCreateProjectUsesTransportTruthWhenPresentationMachineStateIsStale() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        store.machine.state = .connecting
+
+        let created = await store.createWebProject(name: "Stale presentation create")
+
+        XCTAssertNotNil(created)
+        let createAttempts = await mock.actionAttemptCount("createProject")
+        XCTAssertEqual(createAttempts, 1)
+        XCTAssertEqual(store.machine.state, .online)
+        XCTAssertNil(store.errors["web.projects"])
+        await store.suspend()
+    }
+
+    @MainActor
+    func testPartialProjectHeadMergeShowsNewestChatWithoutDeletingVerifiedTail() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        let verified = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(verified.map(\.conversationAlias), ["mock-1"])
+
+        await mock.setScenario(.partialWebCatalogWithNewHead)
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+
+        let merged = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(merged.map(\.conversationAlias), ["partial-new-head", "mock-1"])
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .partialDOM)
+        XCTAssertNil(store.errors["web.project.g-p-remoteai"])
+        let cached: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
+        XCTAssertEqual(cached?.map(\.conversationAlias), ["partial-new-head", "mock-1"])
+        await store.suspend()
+    }
+
+    @MainActor
     func testPartialWebCatalogCannotOverwriteVerifiedProjectsConversationsOrCache() async throws {
         let mock = MockTransport(historyCount: 1)
         let cache = try SQLiteStore.inMemory()
@@ -878,6 +917,15 @@ final class RemoteAIMobileTests: XCTestCase {
         let cached: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
         XCTAssertNil(cached, "A partial-DOM bootstrap remains non-authoritative and must not replace the phone's durable verified cache")
         await store.suspend()
+    }
+
+    func testLongMessageRenderingPolicyKeepsChatRowsBounded() {
+        let huge = String(repeating: "RemoteAI diagnostics line\n", count: 8_000)
+        XCTAssertTrue(MessageRenderingPolicy.isLarge(huge))
+        let inline = MessageRenderingPolicy.inlineText(huge)
+        XCTAssertLessThan(inline.utf8.count, 16 * 1024)
+        XCTAssertTrue(inline.contains("长消息已折叠"))
+        XCTAssertEqual(MessageRenderingPolicy.inlineText("short answer"), "short answer")
     }
 
     func testMessageContentSegmentsExposeCodeBlocksForOneTapCopyAndPartialSelection() {
@@ -1163,25 +1211,20 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testUnknownCreateProjectDeliveryReusesCommandAndDoesNotDuplicateServerProject() async throws {
+    func testUnknownCreateProjectDeliveryReconnectsAndReusesCommandWithoutDuplicatingServerProject() async throws {
         let mock = MockTransport(scenario: .disconnectAfterCreateProject, historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
         await store.start()
 
-        let first = await store.createWebProject(name: "Idempotent Project")
-        XCTAssertNil(first)
-        let afterUnknown = await mock.projectCount()
-        XCTAssertEqual(afterUnknown, 3, "The first create side effect was committed before the response was lost")
-
-        await mock.setScenario(.normal)
-        try await mock.connect()
-        let secondResult = await store.createWebProject(name: "Idempotent Project")
-        let second = try XCTUnwrap(secondResult)
+        let createdResult = await store.createWebProject(name: "Idempotent Project")
+        let created = try XCTUnwrap(createdResult)
         let finalCount = await mock.projectCount()
         let createAttempts = await mock.actionAttemptCount("createProject")
-        XCTAssertEqual(finalCount, 3, "Retry must replay the same command instead of creating a second Project")
-        XCTAssertEqual(createAttempts, 2)
-        XCTAssertEqual(store.webProjects.filter { $0.projectAlias == second.projectAlias }.count, 1)
+        XCTAssertEqual(finalCount, 3, "Reconnect retry must replay the same command instead of creating a second Project")
+        XCTAssertEqual(createAttempts, 2, "The recoverable disconnect should trigger exactly one same-command reconnect retry")
+        XCTAssertEqual(store.webProjects.filter { $0.projectAlias == created.projectAlias }.count, 1)
+        XCTAssertEqual(store.machine.state, .online)
+        XCTAssertNil(store.errors["web.projects"])
         await store.suspend()
     }
 

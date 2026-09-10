@@ -81,6 +81,8 @@ final class WorkspaceStore: ObservableObject {
     private var metadataRefreshDeferredForDelta = false
     private var deltaRecoveryInFlight = false
     private var deltaRecoveryQueued = false
+    private var authoritativeResyncAfterDelta = false
+    private var authoritativeResyncProjectAliases = Set<String>()
     private var deltaRecoveryFailureCount = 0
     private var deltaRecoveryRetryNotBefore: Date?
     private static let deltaRecoveryFailureBackoffSeconds: [TimeInterval] = [1, 2, 4, 8]
@@ -399,26 +401,50 @@ final class WorkspaceStore: ObservableObject {
     func createWebProject(name: String) async -> WebProjectDescriptor? {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let operationKey = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-        guard creatingWebProjects.insert(operationKey).inserted else { return nil }
-        defer { creatingWebProjects.remove(operationKey) }
+        let normalizedOperationKey = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        guard creatingWebProjects.insert(normalizedOperationKey).inserted else { return nil }
+        defer { creatingWebProjects.remove(normalizedOperationKey) }
         let generation = lifecycleGeneration
-        guard machine.state == .online else {
-            errors["web.projects"] = "PC Offline — new Projects require the Windows browser runtime."
-            return nil
-        }
         let activeTransport = transport
         let activeMachineId = machine.id
+        DiagnosticsLog.shared.record("project_create_attempt", fields: [
+            "machineState": machine.state.rawValue,
+            "connectionPhase": connectionPhase.rawValue,
+        ])
         webProjectsRevision &+= 1
+        let pendingKey = "createProject.\(normalizedOperationKey)"
         do {
-            let commandId = await pendingOperationCommandId(key: "createProject.\(operationKey)", machineId: activeMachineId)
+            let commandId = await pendingOperationCommandId(key: pendingKey, machineId: activeMachineId)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
-            let created = try await activeTransport.createWebProject(machineId: activeMachineId, projectName: trimmed, commandId: commandId)
-            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, machine.state == .online, !isSuspended else { return nil }
+
+            // machine.state is a presentation snapshot and can briefly lag behind a
+            // healthy Relay/Agent connection after foregrounding. Do not silently drop
+            // the create before Transport gets a chance to prove the real state. Reuse
+            // the same command id across one reconnect retry so an ACK-loss cannot create
+            // a duplicate ChatGPT Project.
+            let created: WebProjectDescriptor
+            do {
+                created = try await activeTransport.createWebProject(machineId: activeMachineId, projectName: trimmed, commandId: commandId)
+            } catch let transportError as TransportError where Self.isRecoverableCommandTransportError(transportError) {
+                DiagnosticsLog.shared.record("project_create_retry", fields: Self.diagnosticFields(for: transportError, adding: ["commandId": commandId.uuidString]), level: "WARN")
+                if !(await activeTransport.isConnected) { try await activeTransport.connect() }
+                let latest = try await activeTransport.latestSequence(machineId: activeMachineId)
+                guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
+                machine.state = .online
+                connectionPhase = .online
+                errors["connection"] = nil
+                await recoverDelta(freshLatestSequence: latest)
+                created = try await activeTransport.createWebProject(machineId: activeMachineId, projectName: trimmed, commandId: commandId)
+            }
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
+            machine.state = .online
+            connectionPhase = .online
+            desktopAgentConnected = true
+            desktopBrowserConnected = true
             // Commit a second epoch bump after the remote mutation succeeds. Any refresh
             // that began while createProject was in flight must not overwrite this row.
             webProjectsRevision &+= 1
-            await finishPendingOperation(key: "createProject.\(operationKey)", machineId: activeMachineId, expectedCommandId: commandId)
+            await finishPendingOperation(key: pendingKey, machineId: activeMachineId, expectedCommandId: commandId)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
             webProjects.removeAll { $0.projectAlias == created.projectAlias }
             webProjects.insert(created, at: 0)
@@ -427,11 +453,13 @@ final class WorkspaceStore: ObservableObject {
             hasLoadedWebProjects = true
             try? await cache.put(webProjects, key: "web.projects")
             errors["web.projects"] = nil
+            DiagnosticsLog.shared.record("project_create_ok", fields: ["projectAlias": created.projectAlias, "commandId": commandId.uuidString])
             return created
         } catch {
             if generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended {
-                if !isUnknownDelivery(error) { await finishPendingOperation(key: "createProject.\(operationKey)", machineId: activeMachineId) }
+                if !isUnknownDelivery(error) { await finishPendingOperation(key: pendingKey, machineId: activeMachineId) }
                 errors["web.projects"] = error.localizedDescription
+                DiagnosticsLog.shared.record("project_create_failed", fields: Self.diagnosticFields(for: error), level: "ERROR")
             }
             return nil
         }
@@ -508,7 +536,7 @@ final class WorkspaceStore: ObservableObject {
                 }
             }
             guard page.isAuthoritativeLiveDOM else {
-                let verifiedWindowsBootstrap = page.source == "browser-dom-partial-title-hints"
+                let verifiedWindowsBootstrap = ["browser-dom-partial-title-hints", "browser-dom-partial-head-merge"].contains(page.source ?? "")
                     && projectConversationsByAlias[projectAlias, default: []].isEmpty
                     && !page.items.isEmpty
                 if (page.state == .staleCache || verifiedWindowsBootstrap),
@@ -529,12 +557,19 @@ final class WorkspaceStore: ObservableObject {
                     return
                 }
                 projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
-                // Degraded responses may carry only metadata title hints from local
-                // Chrome History. Merge those only when the conversation identity was
-                // already verified; stale identity/order is never accepted.
-                if mergeConversationTitleHints(page.items, projectAlias: projectAlias) {
+                // A partial live DOM may prove a monotonic newest-first head before it
+                // intersects our verified list. Accept only that safe prefix; never use
+                // a partial snapshot to delete/reorder the verified tail. Matching known
+                // identities may still repair placeholder titles.
+                let mergedHead = page.source == "browser-dom-partial-head-merge"
+                    && mergeConversationPartialHead(page.items, projectAlias: projectAlias)
+                let repairedTitles = mergeConversationTitleHints(page.items, projectAlias: projectAlias)
+                if mergedHead || repairedTitles {
                     try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
                     mergeProjectSessions(projectConversationsByAlias[projectAlias] ?? [])
+                }
+                if mergedHead {
+                    DiagnosticsLog.shared.record("project_load_partial_head_merged", fields: ["project": projectAlias, "count": String(projectConversationsByAlias[projectAlias, default: []].count)])
                 }
                 // A partial DOM is a freshness condition, not a confirmed provider
                 // failure. Keep any verified rows interactive and avoid flashing a red
@@ -1827,6 +1862,34 @@ final class WorkspaceStore: ObservableObject {
     }
 
     @discardableResult
+    private func mergeConversationPartialHead(_ incoming: [WebConversationDescriptor], projectAlias: String) -> Bool {
+        guard let current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
+        let currentAliases = Set(current.compactMap(\.conversationAlias))
+        guard !currentAliases.isEmpty else { return false }
+        let validIncoming = incoming.filter { $0.projectAlias == projectAlias && $0.conversationAlias != nil }
+        guard let firstKnownIndex = validIncoming.firstIndex(where: { row in
+            row.conversationAlias.map(currentAliases.contains) ?? false
+        }), firstKnownIndex > 0 else { return false }
+
+        var seenAliases = currentAliases
+        var safeHead: [WebConversationDescriptor] = []
+        for row in validIncoming[..<firstKnownIndex] {
+            guard let alias = row.conversationAlias, !seenAliases.contains(alias) else { continue }
+            seenAliases.insert(alias)
+            safeHead.append(row)
+        }
+        guard !safeHead.isEmpty else { return false }
+
+        let safeAliases = Set(safeHead.compactMap(\.conversationAlias))
+        let merged = safeHead + current.filter { row in
+            guard let alias = row.conversationAlias else { return true }
+            return !safeAliases.contains(alias)
+        }
+        projectConversationsByAlias[projectAlias] = Array(merged.prefix(50))
+        return true
+    }
+
+    @discardableResult
     private func mergeConversationTitleHints(_ hints: [WebConversationDescriptor], projectAlias: String) -> Bool {
         guard var current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
         let byAlias = Dictionary(uniqueKeysWithValues: hints.compactMap { hint -> (String, WebConversationDescriptor)? in
@@ -1935,13 +1998,39 @@ final class WorkspaceStore: ObservableObject {
             } else {
                 deltaRecoveryQueued = false
                 deltaRecoveryDisplayMessagesBySession = nil
-                if metadataRefreshDeferredForDelta,
+                if authoritativeResyncAfterDelta,
                    generation == lifecycleGeneration,
                    machine.state == .online,
                    !isSuspended {
+                    let aliases = authoritativeResyncProjectAliases
+                    authoritativeResyncAfterDelta = false
+                    authoritativeResyncProjectAliases.removeAll()
+                    metadataRefreshDeferredForDelta = false
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              generation == self.lifecycleGeneration,
+                              self.machine.state == .online,
+                              !self.isSuspended else { return }
+                        DiagnosticsLog.shared.record("delta_fast_forward_resync_begin", fields: ["projects": String(aliases.count)])
+                        await self.refreshMetadata()
+                        await self.refreshWebProjects(force: true)
+                        for alias in aliases {
+                            guard generation == self.lifecycleGeneration,
+                                  self.machine.state == .online,
+                                  !self.isSuspended else { return }
+                            await self.loadProjectConversations(projectAlias: alias, refresh: true, force: true)
+                        }
+                        DiagnosticsLog.shared.record("delta_fast_forward_resync_ok", fields: ["projects": String(aliases.count)])
+                    }
+                } else if metadataRefreshDeferredForDelta,
+                          generation == lifecycleGeneration,
+                          machine.state == .online,
+                          !isSuspended {
                     metadataRefreshDeferredForDelta = false
                     Task { [weak self] in await self?.refreshMetadata() }
                 } else {
+                    authoritativeResyncAfterDelta = false
+                    authoritativeResyncProjectAliases.removeAll()
                     metadataRefreshDeferredForDelta = false
                 }
             }
@@ -1958,10 +2047,20 @@ final class WorkspaceStore: ObservableObject {
                     tracker = SequenceTracker(lastSequence: cursor)
                     deltaRecoveryFailureCount = 0
                     deltaRecoveryRetryNotBefore = nil
+                    // Skipping tens of thousands of historical progress events is correct,
+                    // but moving the cursor alone leaves cached Projects/sessions stale.
+                    // Force a bounded authoritative rebuild after this recovery pass and
+                    // let the currently visible ChatView immediately re-read its history.
+                    authoritativeResyncAfterDelta = true
+                    authoritativeResyncProjectAliases.formUnion(projectConversationsByAlias.keys)
+                    visibleSessionSyncAt.removeAll()
+                    visibleSessionHistorySyncAt.removeAll()
+                    metadataRefreshDeferredForDelta = true
                     DiagnosticsLog.shared.record("delta_recovery_fast_forward", fields: [
                         "cursor": String(previousCursor),
                         "latestSequence": String(freshLatestSequence),
                         "skippedEvents": String(max(0, lag)),
+                        "resyncProjects": String(authoritativeResyncProjectAliases.count),
                     ], level: "WARN")
                     return
                 }

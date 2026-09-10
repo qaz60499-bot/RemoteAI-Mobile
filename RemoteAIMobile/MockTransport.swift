@@ -4,7 +4,7 @@ enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
     case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, alreadyExecutedThenSuccess, deltaOnlySend
-    case duplicateEvent, sequenceGap, partialWebCatalog, staleWebCatalog, unclassifiedWebCatalog, offline
+    case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, unclassifiedWebCatalog, offline
 }
 
 actor MockTransport: Transport {
@@ -270,13 +270,31 @@ actor MockTransport: Transport {
                 return max(0, value)
             }()
             let all = webProjectConversations[alias, default: []]
-            let degraded = scenario == .partialWebCatalog || scenario == .unclassifiedWebCatalog
+            let degraded = scenario == .partialWebCatalog || scenario == .partialWebCatalogWithNewHead || scenario == .unclassifiedWebCatalog
             let staleBootstrap = scenario == .staleWebCatalog
+            let partialHead = scenario == .partialWebCatalogWithNewHead
             // A degraded DOM can still expose safe metadata hints for identities the
-            // client already knows. Keep one matching row so WorkspaceStore can prove
-            // it repairs titles without replacing the verified identity snapshot.
-            let slice = degraded ? Array(all.dropFirst(offset).prefix(1)) : Array(all.dropFirst(offset).prefix(limit))
+            // client already knows. The partial-head fixture additionally models a new
+            // newest conversation followed immediately by a verified anchor.
+            let slice: [WebConversationDescriptor]
+            if partialHead, let anchor = all.first {
+                let now = Date()
+                let newest = WebConversationDescriptor(
+                    localConversationId: "webconv-partial-new-head",
+                    canonicalUrl: "https://chatgpt.com/g/\(alias)/c/partial-new-head",
+                    projectId: project.projectId,
+                    displayTitle: "Newest partial head",
+                    projectAlias: alias,
+                    conversationAlias: "partial-new-head",
+                    lastVisited: now,
+                    updatedAt: now
+                )
+                slice = [newest, anchor]
+            } else {
+                slice = degraded ? Array(all.dropFirst(offset).prefix(1)) : Array(all.dropFirst(offset).prefix(limit))
+            }
             let nextOffset = offset + slice.count
+            let partialSource = partialHead ? "browser-dom-partial-head-merge" : "browser-dom-partial-title-hints"
             response = try success(WebProjectConversationPage(
                 project: project,
                 items: slice,
@@ -284,9 +302,9 @@ actor MockTransport: Transport {
                 nextCursor: degraded ? nil : (nextOffset < all.count ? "offset:\(nextOffset)" : nil),
                 hasMore: degraded ? false : nextOffset < all.count,
                 observedAt: Date(),
-                source: staleBootstrap ? "windows-last-known-good" : (scenario == .partialWebCatalog ? "browser-dom-partial-title-hints" : "browser-dom"),
-                stale: staleBootstrap ? true : (scenario == .partialWebCatalog ? true : (scenario == .unclassifiedWebCatalog ? nil : false)),
-                state: staleBootstrap ? .staleCache : (scenario == .partialWebCatalog ? .partialDOM : (scenario == .unclassifiedWebCatalog ? nil : .authoritativeLiveDOM)),
+                source: staleBootstrap ? "windows-last-known-good" : ((scenario == .partialWebCatalog || partialHead) ? partialSource : "browser-dom"),
+                stale: staleBootstrap ? true : ((scenario == .partialWebCatalog || partialHead) ? true : (scenario == .unclassifiedWebCatalog ? nil : false)),
+                state: staleBootstrap ? .staleCache : ((scenario == .partialWebCatalog || partialHead) ? .partialDOM : (scenario == .unclassifiedWebCatalog ? nil : .authoritativeLiveDOM)),
                 snapshotId: degraded ? nil : "mock-conversations-\(alias)-\(all.count)"
             ))
         case "openProject":

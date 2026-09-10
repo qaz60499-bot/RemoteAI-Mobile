@@ -305,7 +305,7 @@ struct InstanceView: View {
             if isChatGPTWeb {
                 // Projects are the primary navigation surface here. Refresh them first
                 // instead of waiting for the ordinary-chat history request to finish.
-                await store.refreshWebProjects(force: false)
+                await store.refreshWebProjects(force: true)
                 await store.refreshSessions(runtime: runtime, instance: instance)
             } else {
                 await store.refreshSessions(runtime: runtime, instance: instance)
@@ -425,7 +425,7 @@ struct WebProjectView: View {
                 }
             }
         )
-        .task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: false) }
+        .task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: true) }
         .onChange(of: store.machine.state) { state in
             guard state == .online, rows.isEmpty else { return }
             Task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: false) }
@@ -744,7 +744,7 @@ struct ChatView: View {
             // currently visible conversation at a bounded cadence so the final reply,
             // process state, or provider failure appears without leaving/reopening it.
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
                 guard !Task.isCancelled else { break }
                 if scenePhase == .active {
                     await store.synchronizeVisibleSession(session.id)
@@ -946,6 +946,21 @@ struct PhotoLibraryAttachmentPicker: UIViewControllerRepresentable {
     }
 }
 
+enum MessageRenderingPolicy {
+    static let inlineByteLimit = 12 * 1024
+    static let inlineCharacterLimit = 8_000
+
+    static func isLarge(_ value: String) -> Bool {
+        value.utf8.count > inlineByteLimit
+    }
+
+    static func inlineText(_ value: String) -> String {
+        guard isLarge(value) else { return value }
+        let preview = String(value.prefix(inlineCharacterLimit))
+        return preview + "\n\n…（长消息已折叠，点击下方“查看全文”读取完整内容）"
+    }
+}
+
 struct MessageContentSegment: Identifiable, Equatable {
     private static let editBlockMarker = "__REMOTEAI_EDIT_BLOCK__"
 
@@ -1096,7 +1111,9 @@ struct MessageRow: View {
     @State private var selectionRequest: TextSelectionRequest?
     private var displayText: String { message.displayText }
     private var displayAttachments: [MessageAttachment] { message.resolvedAttachments }
-    private var contentSegments: [MessageContentSegment] { MessageContentSegment.parse(displayText) }
+    private var isLargeDisplayText: Bool { MessageRenderingPolicy.isLarge(displayText) }
+    private var inlineDisplayText: String { MessageRenderingPolicy.inlineText(displayText) }
+    private var contentSegments: [MessageContentSegment] { MessageContentSegment.parse(inlineDisplayText) }
 
     var body: some View {
         Group {
@@ -1210,6 +1227,18 @@ struct MessageRow: View {
                             } else {
                                 Text(segment.text).textSelection(.enabled)
                             }
+                        }
+                        if isLargeDisplayText {
+                            Button {
+                                selectionRequest = TextSelectionRequest(text: displayText, monospaced: false)
+                            } label: {
+                                Label("查看全文（约 \(max(1, displayText.utf8.count / 1024)) KB）", systemImage: "doc.text.magnifyingglass")
+                                    .font(.caption.weight(.medium))
+                            }
+                            .buttonStyle(.borderless)
+                            Text("聊天列表只渲染长消息前部，完整内容仍保留，避免超长日志阻塞主线程。")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
                         }
                         if !displayAttachments.isEmpty {
                             VStack(alignment: .leading, spacing: 8) {
@@ -1589,6 +1618,11 @@ struct NewWebProjectView: View {
                     Text("Windows 会在你当前已登录的 ChatGPT 页面里真实创建 Project。")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                }
+                if let error = store.errors["web.projects"] {
+                    Section {
+                        ErrorBanner(text: error) { store.clearError(sessionId: "web.projects") }
+                    }
                 }
             }
             .remoteAITopBreathingRoom()
