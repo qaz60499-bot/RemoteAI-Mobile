@@ -948,7 +948,7 @@ struct PhotoLibraryAttachmentPicker: UIViewControllerRepresentable {
 
 enum MessageRenderingPolicy {
     static let inlineByteLimit = 12 * 1024
-    static let inlineCharacterLimit = 8_000
+    static let inlineCharacterLimit = 2_000
 
     static func isLarge(_ value: String) -> Bool {
         value.utf8.count > inlineByteLimit
@@ -977,10 +977,19 @@ struct MessageContentSegment: Identifiable, Equatable {
         let pattern = #"(^|\r?\n[ \t]*\r?\n)[ \t]*Edit[ \t]*\r?\n[ \t]*\r?\n"#
         let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .anchorsMatchLines])
         let allMatches = regex?.matches(in: value, range: NSRange(location: 0, length: nsValue.length)) ?? []
+        var fenceCursor = 0
+        var insideFence = false
         let matches = allMatches.filter { match in
-            let prefix = nsValue.substring(with: NSRange(location: 0, length: match.range.location))
-            let fenceCount = max(0, prefix.components(separatedBy: "```").count - 1)
-            return fenceCount % 2 == 0
+            // Scan each interval once; rebuilding every preceding prefix made
+            // repeated Edit blocks quadratic in the size of the input.
+            while fenceCursor < match.range.location {
+                let fence = nsValue.range(of: "```", options: [], range: NSRange(location: fenceCursor, length: match.range.location - fenceCursor))
+                guard fence.location != NSNotFound else { break }
+                insideFence.toggle()
+                fenceCursor = NSMaxRange(fence)
+            }
+            fenceCursor = match.range.location
+            return !insideFence
         }
 
         if !matches.isEmpty {
@@ -1103,17 +1112,66 @@ struct TextSelectionSheet: View {
     }
 }
 
+// Cache prepared content, not SwiftUI views or selection sheets. A streaming
+// replacement invalidates only its own entry; unrelated store publications do
+// not repeat attachment regexes, preview copies and segment parsing.
+final class MessageRenderContent: NSObject {
+    let sourceText: String
+    let sourceAttachments: [MessageAttachment]?
+    let sourceDetail: String?
+    let displayText: String
+    let attachments: [MessageAttachment]
+    let isLarge: Bool
+    let segments: [MessageContentSegment]
+    let inlineDetail: String?
+
+    init(message: ChatMessage) {
+        sourceText = message.text
+        sourceAttachments = message.attachments
+        sourceDetail = message.detail
+        displayText = message.displayText
+        attachments = message.resolvedAttachments
+        isLarge = MessageRenderingPolicy.isLarge(displayText)
+        segments = MessageContentSegment.parse(MessageRenderingPolicy.inlineText(displayText))
+        inlineDetail = message.detail.map { MessageRenderingPolicy.inlineText($0) }
+    }
+
+    func matches(_ message: ChatMessage) -> Bool {
+        sourceText == message.text && sourceAttachments == message.attachments && sourceDetail == message.detail
+    }
+}
+
+final class MessageRenderCache {
+    static let shared = MessageRenderCache()
+    private let entries = NSCache<NSString, MessageRenderContent>()
+
+    init() {
+        entries.countLimit = 128
+        entries.totalCostLimit = 4 * 1024 * 1024
+    }
+
+    func content(for message: ChatMessage) -> MessageRenderContent {
+        let key = "\(message.sessionId.utf8.count):\(message.sessionId)\(message.id)" as NSString
+        if let cached = entries.object(forKey: key), cached.matches(message) { return cached }
+        let content = MessageRenderContent(message: message)
+        let cost = message.text.utf8.count + content.displayText.utf8.count
+            + (message.detail?.utf8.count ?? 0) + content.segments.reduce(0) { $0 + $1.text.utf8.count }
+        entries.setObject(content, forKey: key, cost: cost)
+        return content
+    }
+}
+
 struct MessageRow: View {
     let message: ChatMessage
     let commandState: CommandState?
     let retry: (() -> Void)?
     @State private var toolExpanded = true
     @State private var selectionRequest: TextSelectionRequest?
-    private var displayText: String { message.displayText }
-    private var displayAttachments: [MessageAttachment] { message.resolvedAttachments }
-    private var isLargeDisplayText: Bool { MessageRenderingPolicy.isLarge(displayText) }
-    private var inlineDisplayText: String { MessageRenderingPolicy.inlineText(displayText) }
-    private var contentSegments: [MessageContentSegment] { MessageContentSegment.parse(inlineDisplayText) }
+    private var renderContent: MessageRenderContent { MessageRenderCache.shared.content(for: message) }
+    private var displayText: String { renderContent.displayText }
+    private var displayAttachments: [MessageAttachment] { renderContent.attachments }
+    private var isLargeDisplayText: Bool { renderContent.isLarge }
+    private var contentSegments: [MessageContentSegment] { renderContent.segments }
 
     var body: some View {
         Group {
@@ -1121,11 +1179,16 @@ struct MessageRow: View {
                 DisclosureGroup(isExpanded: $toolExpanded) {
                     if let detail = message.detail {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(detail)
+                            Text(renderContent.inlineDetail ?? "")
                                 .font(.system(.caption, design: .monospaced))
                                 .foregroundColor(.secondary)
                                 .textSelection(.enabled)
                             HStack(spacing: 12) {
+                                if MessageRenderingPolicy.isLarge(detail) {
+                                    Button("查看全文") {
+                                        selectionRequest = TextSelectionRequest(text: detail, monospaced: true)
+                                    }
+                                }
                                 Button("选择部分") {
                                     selectionRequest = TextSelectionRequest(text: detail, monospaced: true)
                                 }

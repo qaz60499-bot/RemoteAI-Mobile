@@ -936,6 +936,70 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(segments[2], MessageContentSegment(id: 2, text: "\nAfter", isCode: false, language: nil))
     }
 
+    func testRenderCacheReusesUnchangedContentAndInvalidatesStreamingAndTools() {
+        let cache = MessageRenderCache()
+        var message = ChatMessage(id: "same", sessionId: "long-chat", sequence: 1, role: .assistant, kind: .text,
+                                  text: String(repeating: "日志 abc\n", count: 20_000), toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
+        let first = cache.content(for: message)
+        XCTAssertTrue(cache.content(for: message) === first)
+        XCTAssertEqual(first.displayText, message.text)
+        XCTAssertLessThan(first.segments.map(\.text).joined().count, 2_200)
+        message.text += "final suffix"
+        let updated = cache.content(for: message)
+        XCTAssertFalse(updated === first)
+        XCTAssertTrue(updated.displayText.hasSuffix("final suffix"))
+        message.detail = String(repeating: "large tool output\n", count: 10_000)
+        let tool = cache.content(for: message)
+        XCTAssertFalse(tool === updated)
+        XCTAssertLessThan(tool.inlineDetail!.count, 2_200)
+        XCTAssertEqual(tool.sourceDetail, message.detail)
+    }
+
+    func testLongTextMatrixPreservesFullContentWithBoundedPreviews() {
+        for bytes in [512, 10 * 1024, 30 * 1024, 50 * 1024, 100 * 1024, 151 * 1024] {
+            let text = String(repeating: "x", count: bytes)
+            let inline = MessageRenderingPolicy.inlineText(text)
+            if bytes > MessageRenderingPolicy.inlineByteLimit {
+                XCTAssertLessThan(inline.utf8.count, 2_300)
+            } else {
+                XCTAssertEqual(inline, text)
+            }
+        }
+    }
+
+    func testManyEditBlocksKeepFenceStateAcrossMatches() {
+        let unit = "\n\nEdit\n\noutside\n```text\n\nEdit\n\ninside\n```"
+        let segments = MessageContentSegment.parse(String(repeating: unit, count: 100))
+        XCTAssertEqual(segments.filter(\.isEditBlock).count, 100)
+        XCTAssertTrue(segments.filter(\.isEditBlock).allSatisfy { $0.text.contains("inside") })
+    }
+
+    func testLongTextPreparationBenchmarkMatrix() {
+        // Preparation-only measurements on the test host, never device FPS.
+        for bytes in [512, 10 * 1024, 30 * 1024, 50 * 1024, 100 * 1024, 151 * 1024] {
+            let message = ChatMessage(id: "bench", sessionId: "mock", sequence: 1, role: .assistant, kind: .text,
+                                      text: String(repeating: "x", count: bytes), toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
+            var consumed = 0
+            let before = Date()
+            for _ in 0..<100 {
+                let text = message.displayText
+                let preview = text.utf8.count > 12 * 1024 ? String(text.prefix(8_000)) : text
+                consumed += MessageContentSegment.parse(preview).count
+            }
+            let uncachedMs = Date().timeIntervalSince(before) * 1_000
+            let cache = MessageRenderCache()
+            let cold = Date()
+            let prepared = cache.content(for: message)
+            let coldMs = Date().timeIntervalSince(cold) * 1_000
+            let warm = Date()
+            for _ in 0..<100 { consumed += cache.content(for: message).segments.count }
+            let warmMs = Date().timeIntervalSince(warm) * 1_000
+            XCTAssertGreaterThan(consumed, 0)
+            XCTAssertEqual(prepared.displayText, message.text)
+            print("RENDER_PREP bytes=\(bytes) uncached100Ms=\(uncachedMs) coldMs=\(coldMs) cached100Ms=\(warmMs)")
+        }
+    }
+
     func testFlattenedWritingEditBlockBecomesOneCopyableSegment() {
         let text = """
         下面是下一窗口的精确续跑提示词。

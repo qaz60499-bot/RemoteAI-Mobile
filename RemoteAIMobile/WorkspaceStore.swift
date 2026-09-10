@@ -2502,10 +2502,12 @@ final class WorkspaceStore: ObservableObject {
         if let index = list.firstIndex(where: { $0.id == item.id }) {
             list[index].text = item.text
             list[index].attachments = item.attachments
+            // Text/attachments do not change the established sort key.
+            messagesBySession[sessionId] = list
         } else {
             list.append(ChatMessage(id: item.id, sessionId: sessionId, sequence: item.sequence, role: .assistant, kind: .text, text: item.text, toolName: nil, toolStatus: "Streaming", detail: nil, attachments: item.attachments, createdAt: Date()))
+            messagesBySession[sessionId] = sortedMessages(list)
         }
-        messagesBySession[sessionId] = sortedMessages(list)
     }
 
     private func flushAllStreaming() {

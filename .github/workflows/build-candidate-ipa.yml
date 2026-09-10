@@ -23,7 +23,7 @@ env:
 jobs:
   build:
     name: Candidate Test + Device IPA
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 35
     steps:
