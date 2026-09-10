@@ -1749,8 +1749,19 @@ final class WorkspaceStore: ObservableObject {
     private func markSessionActivity(_ sessionId: String, at: Date) {
         guard let index = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
         if let current = sessions[index].lastActivityAt, current >= at { return }
-        sessions[index].lastActivityAt = at
-        sessions.sort { $0.orderingDate > $1.orderingDate }
+        var updated = sessions[index]
+        updated.lastActivityAt = at
+        // Activity can only move this one session toward the front. Usually the
+        // streaming session is already first; a full catalog sort adds no value.
+        if index == 0 || sessions[index - 1].orderingDate >= updated.orderingDate {
+            sessions[index] = updated
+        } else {
+            var reordered = sessions
+            reordered.remove(at: index)
+            let destination = reordered.firstIndex { $0.orderingDate < updated.orderingDate } ?? reordered.endIndex
+            reordered.insert(updated, at: destination)
+            sessions = reordered
+        }
     }
 
     private func loadCachedFirst() async {
@@ -2185,7 +2196,10 @@ final class WorkspaceStore: ObservableObject {
                 // transit. Treat streaming content itself as proof that the run is busy
                 // so the progress strip remains visible on the phone.
                 setSessionState(sessionId, .busy)
-                liveRunStatusBySession[sessionId] = processStatusLabel(for: content)
+                let status = processStatusLabel(for: content)
+                if liveRunStatusBySession[sessionId] != status {
+                    liveRunStatusBySession[sessionId] = status
+                }
             }
         case "MESSAGE_ADDED":
             if let server = try? JSONValue.object(event.payload).decode(ServerMessage.self) {
@@ -2419,6 +2433,9 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func processStatusLabel(for content: String) -> String {
+        // This is a status label, not an answer classifier. Do not lowercase and
+        // repeatedly scan an ever-growing answer on MainActor for every event.
+        guard content.utf8.count <= 512 else { return "正在生成回答…" }
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "正在生成回答…" }
         let lower = trimmed.lowercased()
@@ -2474,7 +2491,9 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func setSessionState(_ sessionId: String, _ state: SessionState) {
-        if let index = sessions.firstIndex(where: { $0.id == sessionId }) { sessions[index].state = state }
+        if let index = sessions.firstIndex(where: { $0.id == sessionId }), sessions[index].state != state {
+            sessions[index].state = state
+        }
     }
 
     private func markLiveRunActivity(sessionId: String, at: Date) {

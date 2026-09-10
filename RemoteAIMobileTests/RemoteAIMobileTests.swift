@@ -1799,6 +1799,26 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testLongStreamingAnswerKeepsStatusBoundedAndPreservesCompleteContent() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let content = String(repeating: "answer line\n", count: 9_000) + "generating image is an example in this answer"
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1, eventId: UUID(), sequence: 1201, machineId: "my-pc",
+            runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "MESSAGE_UPDATED",
+            payload: ["messageId": .string("large-stream"), "role": .string("assistant"), "content": .string(content), "partial": .bool(true)],
+            createdAt: Date()
+        ), deliverLive: true)
+        try await Task.sleep(nanoseconds: 180_000_000)
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "正在生成回答…")
+        XCTAssertEqual(store.messagesBySession["photo-upload"]?.first(where: { $0.id == "large-stream" })?.text, content)
+        XCTAssertEqual(store.sessions.first?.id, "photo-upload")
+        await store.suspend()
+    }
+
+    @MainActor
     func testWorkspaceStoreExposesLiveRunStatusUntilGenerationStops() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)

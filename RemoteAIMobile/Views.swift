@@ -511,7 +511,7 @@ struct ChatView: View {
                                 // Definite failures restore the composer and use a new operation.
                                 // Only unknown delivery is replayed with the original command ID.
                                 let retryable = message.kind == .error || commandState == .unknown
-                                MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil).id(message.id)
+                                MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel).equatable().id(message.id)
                             }
                             Color.clear
                                 .frame(height: 1)
@@ -1161,10 +1161,16 @@ final class MessageRenderCache {
     }
 }
 
-struct MessageRow: View {
+struct MessageRow: View, Equatable {
     let message: ChatMessage
     let commandState: CommandState?
     let retry: (() -> Void)?
+    var retryContextKey: String = ""
+
+    static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
+        lhs.message == rhs.message && lhs.commandState == rhs.commandState
+            && (lhs.retry == nil) == (rhs.retry == nil) && lhs.retryContextKey == rhs.retryContextKey
+    }
     @State private var toolExpanded = true
     @State private var selectionRequest: TextSelectionRequest?
     private var renderContent: MessageRenderContent { MessageRenderCache.shared.content(for: message) }
