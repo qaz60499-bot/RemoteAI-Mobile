@@ -191,12 +191,17 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/test_candidate_runner.py
-          ARGS=()
           if [[ '${{ inputs.gate }}' == 'streaming' ]]; then
-            ARGS+=(--only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable)
-            ARGS+=(--only testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable)
+            python3 scripts/run_candidate_ui_tests.py \
+              --udid '${{ steps.simulator.outputs.udid }}' \
+              --only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable \
+              --only testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable \
+              | tee build/ui-tests.log
+          else
+            python3 scripts/run_candidate_ui_tests.py \
+              --udid '${{ steps.simulator.outputs.udid }}' \
+              | tee build/ui-tests.log
           fi
-          python3 scripts/run_candidate_ui_tests.py --udid '${{ steps.simulator.outputs.udid }}' "${ARGS[@]}" | tee build/ui-tests.log
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
 
       - name: Streaming cadence and process samples without accessibility polling
