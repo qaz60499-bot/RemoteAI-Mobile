@@ -12,6 +12,8 @@ import subprocess
 import shutil
 import threading
 import time
+import os
+import signal
 
 
 def run(command, timeout, capture=False):
@@ -40,6 +42,68 @@ def sample_app_process(udid, output, stop):
             stop.wait(1)
 
 
+def run_test(command, evidence):
+    """Keep a live log and kill only this invocation's process group on timeout."""
+    print("+ " + " ".join(command), flush=True)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, start_new_session=True)
+    def copy_output():
+        with (evidence / "xcodebuild.log").open("w") as log:
+            for line in process.stdout:
+                log.write(line)
+                log.flush()
+                print(line, end="", flush=True)
+    reader = threading.Thread(target=copy_output, daemon=True)
+    reader.start()
+    try:
+        code = process.wait(timeout=300)
+        if code:
+            raise subprocess.CalledProcessError(code, command)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+        raise
+    finally:
+        reader.join(timeout=10)
+
+
+def preserve_evidence(udid, evidence):
+    # Diagnostics must not replace the original test/timeout failure.
+    errors = []
+    def attempt(command):
+        try:
+            result = subprocess.run(command, timeout=30, capture_output=True, text=True)
+            if result.returncode:
+                errors.append({"command": command, "error": result.stderr})
+            return result
+        except subprocess.TimeoutExpired:
+            errors.append({"command": command, "error": "timeout"})
+            return None
+    attempt(["xcrun", "xcresulttool", "export", "attachments", "--path",
+             str(evidence / "result.xcresult"), "--output-path", str(evidence / "attachments")])
+    container = attempt(["xcrun", "simctl", "get_app_container", udid, "com.remoteai.mobile", "data"])
+    if container is not None and container.returncode == 0:
+        logs = pathlib.Path(container.stdout.strip()) / "Library/Application Support/RemoteAI/Diagnostics"
+        if logs.exists():
+            shutil.copytree(logs, evidence / "diagnostics", dirs_exist_ok=True)
+    attempt(["xcrun", "simctl", "io", udid, "screenshot", str(evidence / "screen.png")])
+    (evidence / "collection-errors.json").write_text(json.dumps(errors, indent=2))
+
+
+def boot_candidate(udid):
+    devices = json.loads(run(["xcrun", "simctl", "list", "devices", "-j"], 45, True))
+    selected = [d for rows in devices["devices"].values() for d in rows if d["udid"] == udid]
+    assert len(selected) == 1 and selected[0]["name"].startswith("RemoteAI-Candidate-"), "Candidate simulator missing"
+    if selected[0]["state"] != "Shutdown":
+        run(["xcrun", "simctl", "shutdown", udid], 60)
+    run(["xcrun", "simctl", "boot", udid], 60)
+    run(["xcrun", "simctl", "bootstatus", udid, "-b"], 120)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--udid", required=True)
@@ -59,42 +123,43 @@ def main():
     if args.only:
         methods = [m for m in methods if m.rsplit("/", 1)[-1] in args.only]
         assert len(methods) == len(set(args.only)), "Requested UI test was not discovered"
+    # Exercise the changed behavior before spending time on navigation regressions.
+    methods.sort(key=lambda method: ("LongStreaming" not in method, method))
+    # Compile once, outside the per-method simulator launch deadline.
+    run(["xcodebuild", "build-for-testing", "-project", "RemoteAIMobile.xcodeproj",
+         "-scheme", "RemoteAIMobile", "-configuration", "Debug",
+         "-destination", f"platform=iOS Simulator,id={args.udid}"], 600)
     for method in methods:
-        devices = json.loads(run(["xcrun", "simctl", "list", "devices", "-j"], 45, True))
-        selected = [d for rows in devices["devices"].values() for d in rows if d["udid"] == args.udid]
-        assert len(selected) == 1, "Candidate simulator missing"
-        if selected[0]["state"] != "Shutdown":
-            run(["xcrun", "simctl", "shutdown", args.udid], 60)
-        run(["xcrun", "simctl", "boot", args.udid], 60)
-        run(["xcrun", "simctl", "bootstatus", args.udid, "-b"], 120)
-        evidence = pathlib.Path("build/ui-evidence") / method.rsplit("/", 1)[-1]
-        evidence.mkdir(parents=True, exist_ok=True)
-        stop_sampling = threading.Event()
-        sampler = threading.Thread(target=sample_app_process,
-                                   args=(args.udid, evidence / "process.jsonl", stop_sampling), daemon=True)
-        sampler.start()
-        try:
-            run(["xcodebuild", "test", "-project", "RemoteAIMobile.xcodeproj",
-                 "-scheme", "RemoteAIMobile", "-configuration", "Debug",
-                 "-destination", f"platform=iOS Simulator,id={args.udid}",
-                 "-resultBundlePath", str(evidence / "result.xcresult"),
-                 "-parallel-testing-enabled", "NO", f"-only-testing:{method}"], 300)
-        finally:
-            stop_sampling.set()
-            sampler.join(timeout=6)
-            subprocess.run(["xcrun", "xcresulttool", "export", "attachments", "--path",
-                            str(evidence / "result.xcresult"), "--output-path",
-                            str(evidence / "attachments")], timeout=45)
-            # Preserve app-side evidence even if an accessibility query fails.
-            container = subprocess.run(["xcrun", "simctl", "get_app_container", args.udid,
-                                        "com.remoteai.mobile", "data"], capture_output=True,
-                                       text=True, timeout=30)
-            if container.returncode == 0:
-                logs = pathlib.Path(container.stdout.strip()) / "Library/Application Support/RemoteAI/Diagnostics"
-                if logs.exists():
-                    shutil.copytree(logs, evidence / "diagnostics", dirs_exist_ok=True)
-            subprocess.run(["xcrun", "simctl", "io", args.udid, "screenshot",
-                            str(evidence / "screen.png")], timeout=30)
+        for attempt in range(2):
+            boot_candidate(args.udid)
+            evidence = pathlib.Path("build/ui-evidence") / method.rsplit("/", 1)[-1] / f"attempt-{attempt + 1}"
+            evidence.mkdir(parents=True, exist_ok=True)
+            stop_sampling = threading.Event()
+            sampler = threading.Thread(target=sample_app_process,
+                                       args=(args.udid, evidence / "process.jsonl", stop_sampling), daemon=True)
+            sampler.start()
+            startup_timeout = False
+            try:
+                run_test(["xcodebuild", "test-without-building", "-project", "RemoteAIMobile.xcodeproj",
+                          "-scheme", "RemoteAIMobile", "-configuration", "Debug",
+                          "-destination", f"platform=iOS Simulator,id={args.udid}",
+                          "-resultBundlePath", str(evidence / "result.xcresult"),
+                          "-parallel-testing-enabled", "NO", f"-only-testing:{method}"], evidence)
+            except subprocess.TimeoutExpired:
+                test_started = "Test Case '-[" in (evidence / "xcodebuild.log").read_text()
+                app_sampled = '"pid"' in (evidence / "process.jsonl").read_text()
+                if attempt or test_started or app_sampled:
+                    raise
+                startup_timeout = True
+            finally:
+                stop_sampling.set()
+                sampler.join(timeout=6)
+                preserve_evidence(args.udid, evidence)
+            if not startup_timeout:
+                break
+            print("SIMULATOR_STARTUP_RECOVERY_ONCE: no test case or app process started", flush=True)
+            # This service is on the disposable hosted runner, never the user's host.
+            run(["killall", "-9", "com.apple.CoreSimulator.CoreSimulatorService"], 15)
     print(f"CANDIDATE_UI_TESTS_PASS={len(methods)}", flush=True)
 
 

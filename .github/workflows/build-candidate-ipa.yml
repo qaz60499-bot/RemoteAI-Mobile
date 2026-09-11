@@ -31,7 +31,7 @@ jobs:
     name: Candidate Test + Device IPA
     if: github.event_name == 'workflow_dispatch'
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -190,6 +190,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/test_candidate_runner.py
           ARGS=()
           if [[ '${{ inputs.gate }}' == 'streaming' ]]; then
             ARGS+=(--only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable)
@@ -197,6 +198,12 @@ jobs:
           fi
           python3 scripts/run_candidate_ui_tests.py --udid '${{ steps.simulator.outputs.udid }}' "${ARGS[@]}" | tee build/ui-tests.log
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
+
+      - name: Streaming cadence and process samples without accessibility polling
+        if: inputs.gate != 'streaming'
+        run: |
+          set -euo pipefail
+          python3 scripts/sample_streaming_performance.py --udid '${{ steps.simulator.outputs.udid }}' | tee build/stream-performance.log
 
       - name: Build unsigned iphoneos arm64 app
         if: inputs.gate != 'streaming'
