@@ -440,7 +440,13 @@ struct ChatView: View {
     let runtime: RuntimeDescriptor
     let instance: InstanceDescriptor
     let session: SessionDescriptor
-    @State private var input = ""
+    // The composer alone observes keystrokes. ChatView keeps the reference but
+    // does not invalidate the history/scroll tree for every text edit.
+    @State private var draft = ComposerDraft()
+    private var input: String {
+        get { draft.text }
+        nonmutating set { draft.text = newValue }
+    }
     @State private var loadingOlder = false
     @State private var pendingAttachments: [PendingAttachment] = []
     @State private var showPhotoPicker = false
@@ -657,7 +663,7 @@ struct ChatView: View {
                     .background(.ultraThinMaterial)
                 }
                 Composer(
-                    text: $input,
+                    draft: draft,
                     attachments: $pendingAttachments,
                     enabled: store.machine.state == .online && !sending,
                     isGenerating: isGenerating,
@@ -814,8 +820,13 @@ struct ChatView: View {
     }
 }
 
+final class ComposerDraft: ObservableObject {
+    @Published var text = ""
+}
+
 struct Composer: View {
-    @Binding var text: String
+    @ObservedObject var draft: ComposerDraft
+    private var text: String { draft.text }
     @Binding var attachments: [PendingAttachment]
     let enabled: Bool
     let isGenerating: Bool
@@ -883,7 +894,7 @@ struct Composer: View {
                 .disabled(!enabled)
                 .accessibilityLabel(isRecording ? "Stop voice input" : "Voice input")
 
-                TextEditor(text: $text)
+                TextEditor(text: $draft.text)
                     .frame(minHeight: 36, maxHeight: 92)
                     .padding(.horizontal, 7).padding(.vertical, 2)
                     .background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground)))
@@ -1350,7 +1361,13 @@ struct MessageRow: View, Equatable {
                                 .padding(9)
                                 .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
                             } else {
-                                Text(segment.text).textSelection(.enabled)
+                                if fullStreamingText != nil {
+                                    // Live text changes continuously; native selection
+                                    // bookkeeping is reserved for the full-text sheet.
+                                    Text(segment.text)
+                                } else {
+                                    Text(segment.text).textSelection(.enabled)
+                                }
                             }
                         }
                         if isLargeDisplayText {
