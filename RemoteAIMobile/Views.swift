@@ -511,7 +511,11 @@ struct ChatView: View {
                                 // Definite failures restore the composer and use a new operation.
                                 // Only unknown delivery is replayed with the original command ID.
                                 let retryable = message.kind == .error || commandState == .unknown
-                                MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel, fullStreamingText: message.toolStatus == "Streaming" ? { store.streamingFullText(sessionId: message.sessionId, fallback: message.displayText) } : nil).equatable().id(message.id)
+                                if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
+                                    AssistantStreamRow(stream: stream, message: message).id(message.id)
+                                } else {
+                                    MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel).equatable().id(message.id)
+                                }
                             }
                             Color.clear
                                 .frame(height: 1)
@@ -737,6 +741,9 @@ struct ChatView: View {
                     ?? ""
             }
             await store.loadSession(session.id)
+            if let mock = store.transport as? MockTransport {
+                await mock.runStressIfRequested(sessionId: session.id)
+            }
             if input.isEmpty { input = await store.draft(sessionId: session.id) }
 
             // Push remains the primary path, but a logically-connected websocket can
@@ -1161,6 +1168,33 @@ final class MessageRenderCache {
     }
 }
 
+struct AssistantStreamRow: View {
+    @ObservedObject var stream: AssistantStream
+    @Environment(\.scenePhase) private var scenePhase
+    let message: ChatMessage
+
+    var body: some View {
+        let began = StreamPerformance.now
+        var visible = message
+        visible.text = stream.visibleText
+        let _ = MessageRenderCache.shared.content(for: visible)
+        let _ = stream.performance.preparation.add((StreamPerformance.now - began) * 1000)
+        return VStack(alignment: .leading, spacing: 4) {
+            MessageRow(message: visible, commandState: nil, retry: nil, fullStreamingText: { stream.text })
+            Text("已接收 \(stream.visibleBytes) 字节 · 显示最新内容")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .accessibilityIdentifier("assistant-stream-progress")
+        }
+        .onAppear { stream.performance.startFrames() }
+        .onDisappear { stream.performance.stopFrames() }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active { stream.performance.startFrames() }
+            else { stream.performance.stopFrames() }
+        }
+    }
+}
+
 struct MessageRow: View, Equatable {
     let message: ChatMessage
     let commandState: CommandState?
@@ -1307,7 +1341,7 @@ struct MessageRow: View, Equatable {
                                     .font(.caption.weight(.medium))
                             }
                             .buttonStyle(.borderless)
-                            Text("聊天列表只渲染长消息前部，完整内容仍保留，避免超长日志阻塞主线程。")
+                            Text(fullStreamingText != nil ? "正在显示最新生成的内容，可查看或复制当前全文。" : "长消息已折叠，可查看或复制全文。")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }

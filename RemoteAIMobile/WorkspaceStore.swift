@@ -42,7 +42,7 @@ final class WorkspaceStore: ObservableObject {
     private var healthTask: Task<Void, Never>?
     private var connectionMonitorTask: Task<Void, Never>?
     private var streamingBuffers: [String: (id: String, text: String, sequence: Int64, attachments: [MessageAttachment])] = [:]
-    private var assistantStreams: [String: AssistantStream] = [:]
+    @Published private(set) var assistantStreams: [String: AssistantStream] = [:]
     private var incompleteAssistantStreams: [String: RemoteEvent] = [:]
     private var lastOnlineHeadProbe = Date.distantPast
     @Published private(set) var syncState = "unknown"
@@ -168,16 +168,18 @@ final class WorkspaceStore: ObservableObject {
     static func makeDefault() -> WorkspaceStore {
         // Fail closed for persistence: if the protected Application Support store cannot open,
         // keep cache data in memory instead of writing it to an unprotected temporary file.
-        let cache = (try? SQLiteStore.appStore()) ?? (try! SQLiteStore.inMemory())
         let config = RemoteAIConfig.loadMetadata()
         // MockTransport is test-only. Require both an explicit UI-test argument and a
         // UI-test-only environment marker so an installed IPA can never fall into Mock.
         let process = ProcessInfo.processInfo
         let useMock = process.arguments.contains("-UITestMockMode")
             && process.environment["REMOTEAI_UI_TEST_MOCK"] == "1"
-        let transport: Transport = useMock ? MockTransport() : CloudflareTransport(config: config)
+        let cache = useMock ? (try! SQLiteStore.inMemory())
+            : ((try? SQLiteStore.appStore()) ?? (try! SQLiteStore.inMemory()))
+        let stressChars = Int(process.environment["REMOTEAI_UI_STRESS_CHARS"] ?? "") ?? 0
+        let transport: Transport = useMock ? MockTransport(stressChars: stressChars) : CloudflareTransport(config: config)
         let store = WorkspaceStore(transport: transport, cache: cache)
-        store.machine = MachineMetadata(id: config.machineId, name: "My PC", state: .connecting)
+        store.machine = MachineMetadata(id: useMock ? "my-pc" : config.machineId, name: "My PC", state: .connecting)
         return store
     }
 
@@ -2206,8 +2208,16 @@ final class WorkspaceStore: ObservableObject {
         }
 
         sessionRouteHints[sessionId] = (event.machineId, event.runtimeId, event.instanceId)
+        let applyBegan = StreamPerformance.now
+        let previousStream = assistantStreams[sessionId]
+        defer {
+            if event.type == "MESSAGE_UPDATED" {
+                (assistantStreams[sessionId] ?? previousStream)?.performance.apply.add((StreamPerformance.now - applyBegan) * 1000)
+            }
+        }
         let runEventTypes = ["MESSAGE_UPDATED", "MESSAGE_ADDED", "TOOL_STARTED", "TOOL_FINISHED", "GENERATION_STARTED", "GENERATION_STOPPED"]
-        if runEventTypes.contains(event.type) {
+        let isAssistantDelta = event.type == "MESSAGE_UPDATED" && event.payload["contentDelta"]?.stringValue != nil
+        if runEventTypes.contains(event.type) && !isAssistantDelta {
             DiagnosticsLog.shared.record("event_applied", fields: [
                 "type": event.type,
                 "sequence": String(event.sequence),
@@ -2220,7 +2230,9 @@ final class WorkspaceStore: ObservableObject {
             // immediately; a later authoritative listSessions refresh replaces its
             // generic title rather than losing the run state entirely.
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: event.instanceId, updatedAt: event.createdAt)
-            markSessionActivity(sessionId, at: event.createdAt)
+            // Begin/final already order the session. Updating this @Published
+            // catalog for every delta invalidates all history despite row isolation.
+            if !isAssistantDelta { markSessionActivity(sessionId, at: event.createdAt) }
         }
 
         switch event.type {
@@ -2248,6 +2260,7 @@ final class WorkspaceStore: ObservableObject {
                 if let streamId = event.payload["streamId"]?.stringValue,
                    let revision = event.payload["revision"]?.intValue {
                     let stream = AssistantStream(id: streamId, revision: revision, text: snapshot)
+                    assistantStreams[sessionId]?.performance.stopFrames()
                     assistantStreams[sessionId] = stream
                     incompleteAssistantStreams.removeValue(forKey: sessionId)
                     content = stream.presentationText
@@ -2275,9 +2288,20 @@ final class WorkspaceStore: ObservableObject {
                 let base = server.chatMessage
                 if base.role == .assistant {
                     if let stream = assistantStreams[sessionId] {
+                        let reconciledAt = StreamPerformance.now
+                        let canonicalEqual = stream.text == base.text
+                        var metrics = stream.performance.summary()
+                        metrics["session"] = sessionId
+                        metrics["finalBytes"] = String(base.text.utf8.count)
+                        metrics["finalChars"] = String(base.text.count)
+                        metrics["canonicalEqual"] = String(canonicalEqual)
+                        metrics["canonicalCompareMs"] = String(format: "%.3f", (StreamPerformance.now - reconciledAt) * 1000)
+                        metrics["finalEventAgeMs"] = String(format: "%.3f", Date().timeIntervalSince(event.createdAt) * 1000)
+                        DiagnosticsLog.shared.record("stream_performance", fields: metrics)
+                        stream.performance.stopFrames()
                         DiagnosticsLog.shared.record("stream_canonical_reconciled", fields: [
                             "session": sessionId,
-                            "canonicalEqual": String(stream.text == base.text),
+                            "canonicalEqual": String(canonicalEqual),
                             "finalBytes": String(base.text.utf8.count),
                             "accumulatedBytes": String(stream.utf8Count),
                         ])
@@ -2595,6 +2619,13 @@ final class WorkspaceStore: ObservableObject {
 
     private func flushStreaming(sessionId: String) {
         guard let item = streamingBuffers.removeValue(forKey: sessionId) else { return }
+        let stream = assistantStreams[sessionId]
+        stream?.flushPresentation()
+        // Incremental streams publish through their own row, without copying the
+        // message array or invalidating the ChatView on every presentation tick.
+        if stream != nil,
+           let existing = messagesBySession[sessionId]?.first(where: { $0.id == item.id }),
+           existing.attachments == item.attachments { return }
         var list = messagesBySession[sessionId, default: []]
         if let index = list.firstIndex(where: { $0.id == item.id }) {
             guard list[index].text != item.text || list[index].attachments != item.attachments else { return }
@@ -2614,6 +2645,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func discardStreamingPlaceholder(sessionId: String) {
+        assistantStreams[sessionId]?.performance.stopFrames()
         assistantStreams.removeValue(forKey: sessionId)
         incompleteAssistantStreams.removeValue(forKey: sessionId)
         if incompleteAssistantStreams.isEmpty, errors["sync"]?.hasPrefix("Streaming") == true { errors["sync"] = nil }

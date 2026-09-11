@@ -84,4 +84,34 @@ final class RemoteAIMobileUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Scan QR Code"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.buttons["Pair"].exists)
     }
+
+    func testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable() throws {
+        let app = makeMockApp()
+        app.launchEnvironment["REMOTEAI_UI_STRESS_CHARS"] = "30000"
+        app.launch()
+        app.staticTexts["Web"].tap()
+        XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 5))
+        app.staticTexts["Photo SaaS"].tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 5))
+        app.staticTexts["上传性能优化"].tap()
+        let progress = app.staticTexts["assistant-stream-progress"]
+        XCTAssertTrue(progress.waitForExistence(timeout: 10))
+        let initial = progress.label
+        let changed = NSPredicate { _, _ in progress.exists && progress.label != initial }
+        expectation(for: changed, evaluatedWith: nil)
+        waitForExpectations(timeout: 4)
+        let composer = app.textViews["MessageComposer"]
+        composer.tap()
+        composer.typeText("still responsive")
+        XCTAssertEqual(composer.value as? String, "still responsive")
+        app.swipeDown()
+        app.swipeDown()
+        let latest = app.buttons["回到最新消息"]
+        if latest.waitForExistence(timeout: 3) { latest.tap() }
+        let final = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "STRESS_BEGIN_30000")).firstMatch
+        let finished = NSPredicate { _, _ in !progress.exists && final.exists }
+        expectation(for: finished, evaluatedWith: nil)
+        waitForExpectations(timeout: 40)
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "STRESS_BEGIN_30000")).firstMatch.exists)
+    }
 }

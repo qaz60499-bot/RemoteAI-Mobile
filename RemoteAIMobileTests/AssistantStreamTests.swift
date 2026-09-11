@@ -1,7 +1,52 @@
 import XCTest
+import Combine
 @testable import RemoteAIMobile
 
 final class AssistantStreamTests: XCTestCase {
+    func testVisibleTailAdvancesAfterPreviewLimitWithoutFullMaterialization() {
+        let stream = AssistantStream(id: "tail", revision: 0, text: String(repeating: "旧", count: 50_000))
+        let before = stream.visibleText
+        XCTAssertTrue(stream.append(id: "tail", baseRevision: 0, revision: 1, delta: "最新🙂e\u{301}"))
+        XCTAssertEqual(stream.visibleText, before, "Network events wait for the presentation flush")
+        stream.flushPresentation()
+        XCTAssertTrue(stream.visibleText.hasSuffix("最新🙂e\u{301}"))
+        XCTAssertLessThanOrEqual(stream.visibleText.count, 2001)
+        XCTAssertEqual(stream.materializedBytes, 0)
+        XCTAssertNotEqual(stream.visibleText, before)
+        XCTAssertEqual(stream.text, String(repeating: "旧", count: 50_000) + "最新🙂e\u{301}")
+    }
+
+    @MainActor
+    func testActiveTailPublishesWithoutRepublishingHistoryArray() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 100)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await mock.injectEvent(event(1201, payload: ["streamId": .string("tail"), "revision": .number(0), "content": .string(String(repeating: "a", count: 30_000)), "partial": .bool(true)]), deliverLive: true)
+        for _ in 0..<100 {
+            if store.messagesBySession["photo-upload", default: []].contains(where: { $0.toolStatus == "Streaming" }) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let stream = try XCTUnwrap(store.assistantStreams["photo-upload"])
+        var arrayPublications = 0
+        let subscription = store.$messagesBySession.dropFirst().sink { _ in arrayPublications += 1 }
+        let history = store.messagesBySession["photo-upload"]
+        for revision in 1...3 {
+            let marker = " 新内容\(revision)🙂"
+            await mock.injectEvent(event(Int64(1201 + revision), payload: ["streamId": .string("tail"), "revision": .number(Double(revision)), "baseRevision": .number(Double(revision - 1)), "contentDelta": .string(marker), "partial": .bool(true)]), deliverLive: true)
+            for _ in 0..<100 {
+                if stream.visibleText.hasSuffix(marker) { break }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertTrue(stream.visibleText.hasSuffix(marker))
+        }
+        XCTAssertEqual(arrayPublications, 0)
+        XCTAssertEqual(store.messagesBySession["photo-upload"], history)
+        XCTAssertEqual(stream.materializedBytes, 0)
+        subscription.cancel()
+        await store.suspend()
+    }
+
     func testUnicodeDuplicateGapAndRewrite() {
         let stream = AssistantStream(id: "one", revision: 1, text: "中文🙂")
         XCTAssertTrue(stream.append(id: "one", baseRevision: 1, revision: 2, delta: " e\u{301}"))

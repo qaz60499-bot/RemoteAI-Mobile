@@ -30,13 +30,16 @@ actor MockTransport: Transport {
     private var finishedAttachmentData: [String: Data] = [:]
     private var activeMessageAttachmentReads = 0
     private var peakMessageAttachmentReads = 0
+    private let stressChars: Int
+    private var stressStarted = false
 
     private let machineId = "my-pc"
     private let runtimes: [ServerRuntime]
     private let instances: [ServerInstance]
 
-    init(scenario: MockScenario = .normal, historyCount: Int = 1200) {
+    init(scenario: MockScenario = .normal, historyCount: Int = 1200, stressChars: Int = 0) {
         self.scenario = scenario
+        self.stressChars = [10_000, 30_000, 50_000, 100_000, 150_000].contains(stressChars) ? stressChars : 0
         // Protocol timestamps are serialized at millisecond precision. Build deterministic
         // mock history on the same precision so `(createdAt, messageId)` cursor comparisons
         // do not change after an encode/decode round-trip.
@@ -75,7 +78,7 @@ actor MockTransport: Transport {
                     messageId: "mock-\(i)",
                     sessionId: "photo-upload",
                     role: assistant ? "assistant" : "user",
-                    content: assistant ? "Mock assistant response \(i). This verifies long-history pagination without rendering everything at once." : "Mock user message \(i)",
+                    content: assistant ? "Mock assistant response \(i). This verifies long-history pagination without rendering everything at once." + (stressChars > 0 ? String(repeating: "\n历史 Markdown **文字** `code` 中文🙂", count: 500) : "") : "Mock user message \(i)",
                     externalId: nil,
                     createdAt: now.addingTimeInterval(Double(i - historyCount) * 30)
                 ))
@@ -87,6 +90,30 @@ actor MockTransport: Transport {
     }
 
     var isConnected: Bool { connected }
+
+    // Uses the same Transport event stream as production. Only explicitly enabled
+    // UI mock mode can create this fixture, with a separate in-memory SQLite cache.
+    func runStressIfRequested(sessionId: String) async {
+        guard stressChars > 0, !stressStarted, sessionId == "photo-upload" else { return }
+        stressStarted = true
+        do { try await Task.sleep(nanoseconds: 750_000_000) } catch { return }
+        let streamId = "stress-\(stressChars)"
+        await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "GENERATION_STARTED", payload: [:])
+        let startSequence = sequence + 1
+        await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "MESSAGE_UPDATED", payload: ["streamId": .string(streamId), "revision": .number(0), "content": .string(""), "partial": .bool(true)])
+        var full = ""
+        for n in 0..<(stressChars / 100) {
+            let marker = n == 0 ? "STRESS_BEGIN_\(stressChars)\n" : "\n[\(n)] "
+            let chunk = String((marker + String(repeating: "中文🙂 e\u{301} **bold** `code` tail ", count: 10)).prefix(100))
+            full += chunk
+            await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "MESSAGE_UPDATED", payload: ["streamId": .string(streamId), "revision": .number(Double(n + 1)), "baseRevision": .number(Double(n)), "streamStartSequence": .number(Double(startSequence)), "contentDelta": .string(chunk), "partial": .bool(true)])
+            do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
+        }
+        let final = ServerMessage(messageId: "stress-final-\(stressChars)", sessionId: sessionId, role: "assistant", content: full, externalId: nil, createdAt: Date())
+        history[sessionId, default: []].append(final)
+        await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "MESSAGE_ADDED", payload: (try? JSONValue.encode(final).objectValue) ?? [:])
+        await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "GENERATION_STOPPED", payload: [:])
+    }
     func setScenario(_ value: MockScenario) { scenario = value }
     func setSequence(_ value: Int64) { sequence = max(0, value) }
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
