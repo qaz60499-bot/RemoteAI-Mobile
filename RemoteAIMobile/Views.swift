@@ -530,8 +530,16 @@ struct ChatView: View {
                                 .frame(height: 1)
                                 .id("bottom")
                                 .onAppear {
+                                    // LazyVStack may recycle/retain the bottom sentinel while a
+                                    // streaming row is changing height. Never let that lifecycle
+                                    // event cancel an explicit user intent to browse older history;
+                                    // otherwise tail-following can re-enable between two drag events
+                                    // and the "回到最新消息" affordance disappears intermittently.
+                                    guard !userBrowsingHistory else {
+                                        isAtBottom = false
+                                        return
+                                    }
                                     isAtBottom = true
-                                    userBrowsingHistory = false
                                 }
                                 .onDisappear { isAtBottom = false }
                         }
