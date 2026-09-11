@@ -177,7 +177,10 @@ final class WorkspaceStore: ObservableObject {
         let cache = useMock ? (try! SQLiteStore.inMemory())
             : ((try? SQLiteStore.appStore()) ?? (try! SQLiteStore.inMemory()))
         let stressChars = Int(process.environment["REMOTEAI_UI_STRESS_CHARS"] ?? "") ?? 0
-        let transport: Transport = useMock ? MockTransport(stressChars: stressChars) : CloudflareTransport(config: config)
+        let stressChunkDelayMilliseconds = Int(process.environment["REMOTEAI_UI_STRESS_CHUNK_MS"] ?? "") ?? 50
+        let transport: Transport = useMock
+            ? MockTransport(stressChars: stressChars, stressChunkDelayMilliseconds: stressChunkDelayMilliseconds)
+            : CloudflareTransport(config: config)
         let store = WorkspaceStore(transport: transport, cache: cache)
         store.machine = MachineMetadata(id: useMock ? "my-pc" : config.machineId, name: "My PC", state: .connecting)
         return store

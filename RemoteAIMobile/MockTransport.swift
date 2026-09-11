@@ -31,15 +31,18 @@ actor MockTransport: Transport {
     private var activeMessageAttachmentReads = 0
     private var peakMessageAttachmentReads = 0
     private let stressChars: Int
+    private let stressChunkDelayNanoseconds: UInt64
     private var stressStarted = false
 
     private let machineId = "my-pc"
     private let runtimes: [ServerRuntime]
     private let instances: [ServerInstance]
 
-    init(scenario: MockScenario = .normal, historyCount: Int = 1200, stressChars: Int = 0) {
+    init(scenario: MockScenario = .normal, historyCount: Int = 1200, stressChars: Int = 0, stressChunkDelayMilliseconds: Int = 50) {
         self.scenario = scenario
         self.stressChars = [10_000, 30_000, 50_000, 100_000, 150_000].contains(stressChars) ? stressChars : 0
+        let boundedStressDelay = min(500, max(20, stressChunkDelayMilliseconds))
+        self.stressChunkDelayNanoseconds = UInt64(boundedStressDelay) * 1_000_000
         // Protocol timestamps are serialized at millisecond precision. Build deterministic
         // mock history on the same precision so `(createdAt, messageId)` cursor comparisons
         // do not change after an encode/decode round-trip.
@@ -107,7 +110,7 @@ actor MockTransport: Transport {
             let chunk = String((marker + String(repeating: "中文🙂 e\u{301} **bold** `code` tail ", count: 10)).prefix(100))
             full += chunk
             await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "MESSAGE_UPDATED", payload: ["streamId": .string(streamId), "revision": .number(Double(n + 1)), "baseRevision": .number(Double(n)), "streamStartSequence": .number(Double(startSequence)), "contentDelta": .string(chunk), "partial": .bool(true)])
-            do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
+            do { try await Task.sleep(nanoseconds: stressChunkDelayNanoseconds) } catch { return }
         }
         let final = ServerMessage(messageId: "stress-final-\(stressChars)", sessionId: sessionId, role: "assistant", content: full, externalId: nil, createdAt: Date())
         history[sessionId, default: []].append(final)

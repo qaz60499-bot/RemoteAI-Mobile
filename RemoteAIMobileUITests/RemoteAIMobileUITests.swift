@@ -97,6 +97,10 @@ final class RemoteAIMobileUITests: XCTestCase {
         let app = makeMockApp()
         app.launchEnvironment["REMOTEAI_UI_STRESS_CHARS"] = String(chars)
         app.launchEnvironment["REMOTEAI_UI_STRESS_DIRECT"] = "1"
+        // Hosted-runner accessibility setup can consume tens of seconds before the
+        // composer interaction starts. Slow only this UI-test fixture so the stream
+        // is guaranteed to remain active while typing/scrolling are exercised.
+        app.launchEnvironment["REMOTEAI_UI_STRESS_CHUNK_MS"] = "150"
         app.launch()
         let progress = app.staticTexts["assistant-stream-progress"]
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
