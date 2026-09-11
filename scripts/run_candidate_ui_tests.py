@@ -56,7 +56,12 @@ def run_test(command, evidence):
     reader = threading.Thread(target=copy_output, daemon=True)
     reader.start()
     try:
-        code = process.wait(timeout=300)
+        # Hosted runners can spend several minutes starting XCTest automation before
+        # a long-stream UI case begins. Preserve the strict 300s budget for ordinary
+        # UI tests, but let the explicit 30k/50k streaming cases cover that startup
+        # cost plus their deterministic stream duration.
+        timeout = 480 if any("LongStreaming" in part for part in command) else 300
+        code = process.wait(timeout=timeout)
         if code:
             raise subprocess.CalledProcessError(code, command)
     except subprocess.TimeoutExpired:
