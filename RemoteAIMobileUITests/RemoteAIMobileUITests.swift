@@ -107,7 +107,10 @@ final class RemoteAIMobileUITests: XCTestCase {
         let initial = progress.label
         let changed = NSPredicate { _, _ in progress.exists && progress.label != initial }
         expectation(for: changed, evaluatedWith: nil)
-        waitForExpectations(timeout: 4)
+        // XCUI accessibility reads on hosted runners can each take several seconds.
+        // Give the progress label enough time to be sampled at least twice while
+        // the UI-only stream remains active for the interaction checks below.
+        waitForExpectations(timeout: 15)
         let composer = app.textViews["MessageComposer"]
         let typingBegan = ProcessInfo.processInfo.systemUptime
         composer.tap()
