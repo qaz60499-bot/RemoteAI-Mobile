@@ -541,7 +541,16 @@ struct ChatView: View {
                     .background(Color(.systemGroupedBackground))
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 8)
-                            .onChanged { _ in userBrowsingHistory = true }
+                            .onChanged { value in
+                                // A downward finger drag moves the transcript toward older
+                                // messages. Mark that intent immediately instead of relying
+                                // only on LazyVStack bottom-sentinel disappearance, which may
+                                // be delayed while the sentinel remains retained offscreen.
+                                if value.translation.height > 8 {
+                                    userBrowsingHistory = true
+                                    isAtBottom = false
+                                }
+                            }
                     )
                     .onAppear {
                         guard !didInitialScrollToBottom, !messages.isEmpty else { return }
