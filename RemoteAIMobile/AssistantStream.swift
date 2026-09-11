@@ -45,6 +45,7 @@ final class AssistantStream: ObservableObject {
         defer { performance.merge.add((StreamPerformance.now - began) * 1000) }
         guard baseRevision >= 0, baseRevision < Int64.max,
               self.id == id, self.revision == baseRevision, revision == baseRevision + 1 else { return false }
+        performance.receivedDelta()
         chunks.append(delta)
         utf8Count += delta.utf8.count
         preview = String((preview + String(delta.suffix(2001))).suffix(2001))

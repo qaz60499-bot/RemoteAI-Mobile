@@ -1191,6 +1191,7 @@ struct AssistantStreamRow: View {
 
     var body: some View {
         let began = StreamPerformance.now
+        let _ = stream.performance.rowUpdated(bytes: stream.visibleBytes)
         var visible = message
         visible.text = stream.visibleText
         let _ = MessageRenderCache.shared.content(for: visible)

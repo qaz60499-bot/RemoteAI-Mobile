@@ -32,6 +32,10 @@ final class StreamPerformance: NSObject {
     var preparation = StreamDurationSamples()
     var flushToFrame = StreamDurationSamples()
     var frameIntervals = StreamDurationSamples()
+    private var visibleUpdateIntervals = StreamDurationSamples()
+    private var lastVisibleUpdate: Double?
+    private var lastVisibleBytes: Int?
+    private var firstDeltaMs: Double?
     let beganAt = ProcessInfo.processInfo.systemUptime
     private var displayLink: CADisplayLink?
     private var previousFrame: CFTimeInterval?
@@ -42,6 +46,18 @@ final class StreamPerformance: NSObject {
     private var stallCount = 0
 
     static var now: Double { ProcessInfo.processInfo.systemUptime }
+
+    func receivedDelta() {
+        if firstDeltaMs == nil { firstDeltaMs = (Self.now - beganAt) * 1000 }
+    }
+
+    func rowUpdated(bytes: Int) {
+        guard bytes != lastVisibleBytes else { return }
+        let now = Self.now
+        if let previous = lastVisibleUpdate { visibleUpdateIntervals.add((now - previous) * 1000) }
+        lastVisibleUpdate = now
+        lastVisibleBytes = bytes
+    }
 
     func published() {
         if pendingFlush == nil { pendingFlush = Self.now }
@@ -84,12 +100,15 @@ final class StreamPerformance: NSObject {
         var result = ["build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
                       "durationMs": String(format: "%.3f", (Self.now - beganAt) * 1000),
                       "firstVisibleMs": firstVisibleMs.map { String(format: "%.3f", $0) } ?? "unmeasured",
+                      "firstDeltaAfterStreamInitMs": firstDeltaMs.map { String(format: "%.3f", $0) } ?? "unmeasured",
+                      "visibleCadenceDefinition": "row body observes a changed byte count; includes offscreen intervals",
                       "callbackFPS": frameSeconds > 0 ? String(format: "%.2f", Double(frameCount) / frameSeconds) : "unmeasured",
                       "mainThreadStallsOver100Ms": String(stallCount),
                       "renderDefinition": "preparation and flush-to-display-link; GPU render measured externally",
                       "percentileWindow": "last 4096 samples; max covers entire stream"]
         for fields in [merge.fields("merge"), apply.fields("apply"), preparation.fields("preparation"),
-                       flushToFrame.fields("flushToFrame"), frameIntervals.fields("frameInterval")] {
+                       flushToFrame.fields("flushToFrame"), frameIntervals.fields("frameInterval"),
+                       visibleUpdateIntervals.fields("visibleUpdateInterval")] {
             result.merge(fields) { _, new in new }
         }
         return result

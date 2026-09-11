@@ -86,8 +86,16 @@ final class RemoteAIMobileUITests: XCTestCase {
     }
 
     func testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable() throws {
+        try verifyStreamingInteraction(chars: 30_000)
+    }
+
+    func testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable() throws {
+        try verifyStreamingInteraction(chars: 50_000)
+    }
+
+    private func verifyStreamingInteraction(chars: Int) throws {
         let app = makeMockApp()
-        app.launchEnvironment["REMOTEAI_UI_STRESS_CHARS"] = "30000"
+        app.launchEnvironment["REMOTEAI_UI_STRESS_CHARS"] = String(chars)
         app.launchEnvironment["REMOTEAI_UI_STRESS_DIRECT"] = "1"
         app.launch()
         let progress = app.staticTexts["assistant-stream-progress"]
@@ -97,18 +105,24 @@ final class RemoteAIMobileUITests: XCTestCase {
         expectation(for: changed, evaluatedWith: nil)
         waitForExpectations(timeout: 4)
         let composer = app.textViews["MessageComposer"]
+        let typingBegan = ProcessInfo.processInfo.systemUptime
         composer.tap()
         composer.typeText("still responsive")
         XCTAssertEqual(composer.value as? String, "still responsive")
+        XCTAssertTrue(progress.exists, "Typing must finish while the stream is still live")
+        print("STREAM_UI chars=\(chars) composerInteractionMs=\((ProcessInfo.processInfo.systemUptime - typingBegan) * 1000)")
+        let scrollingBegan = ProcessInfo.processInfo.systemUptime
         app.swipeDown()
         app.swipeDown()
         let latest = app.buttons["回到最新消息"]
         XCTAssertTrue(latest.waitForExistence(timeout: 3))
         latest.tap()
-        let final = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "STRESS_BEGIN_30000")).firstMatch
+        print("STREAM_UI chars=\(chars) historyAndReturnInteractionMs=\((ProcessInfo.processInfo.systemUptime - scrollingBegan) * 1000)")
+        let marker = "STRESS_BEGIN_\(chars)"
+        let final = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", marker)).firstMatch
         let finished = NSPredicate { _, _ in !progress.exists && final.exists }
         expectation(for: finished, evaluatedWith: nil)
         waitForExpectations(timeout: 40)
-        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "STRESS_BEGIN_30000")).firstMatch.exists)
+        XCTAssertTrue(final.exists)
     }
 }

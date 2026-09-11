@@ -191,7 +191,10 @@ jobs:
         run: |
           set -euo pipefail
           ARGS=()
-          if [[ '${{ inputs.gate }}' == 'streaming' ]]; then ARGS+=(--only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable); fi
+          if [[ '${{ inputs.gate }}' == 'streaming' ]]; then
+            ARGS+=(--only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable)
+            ARGS+=(--only testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable)
+          fi
           python3 scripts/run_candidate_ui_tests.py --udid '${{ steps.simulator.outputs.udid }}' "${ARGS[@]}" | tee build/ui-tests.log
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
 
