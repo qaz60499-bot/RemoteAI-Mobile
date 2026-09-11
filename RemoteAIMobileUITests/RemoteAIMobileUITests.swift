@@ -88,12 +88,8 @@ final class RemoteAIMobileUITests: XCTestCase {
     func testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable() throws {
         let app = makeMockApp()
         app.launchEnvironment["REMOTEAI_UI_STRESS_CHARS"] = "30000"
+        app.launchEnvironment["REMOTEAI_UI_STRESS_DIRECT"] = "1"
         app.launch()
-        app.staticTexts["Web"].tap()
-        XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 5))
-        app.staticTexts["Photo SaaS"].tap()
-        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 5))
-        app.staticTexts["上传性能优化"].tap()
         let progress = app.staticTexts["assistant-stream-progress"]
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
         let initial = progress.label
@@ -107,7 +103,8 @@ final class RemoteAIMobileUITests: XCTestCase {
         app.swipeDown()
         app.swipeDown()
         let latest = app.buttons["回到最新消息"]
-        if latest.waitForExistence(timeout: 3) { latest.tap() }
+        XCTAssertTrue(latest.waitForExistence(timeout: 3))
+        latest.tap()
         let final = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "STRESS_BEGIN_30000")).firstMatch
         let finished = NSPredicate { _, _ in !progress.exists && final.exists }
         expectation(for: finished, evaluatedWith: nil)

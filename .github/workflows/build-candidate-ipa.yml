@@ -2,6 +2,12 @@ name: Build Candidate IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      gate:
+        description: Validation scope
+        type: choice
+        options: [candidate, streaming]
+        default: candidate
 
 permissions:
   contents: read
@@ -141,6 +147,7 @@ jobs:
           simctl_bounded list devices | grep -F "$UDID"
 
       - name: Protocol Security / Fuzz
+        if: inputs.gate != 'streaming'
         shell: bash
         run: |
           set -euo pipefail
@@ -156,6 +163,7 @@ jobs:
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/protocol-security.log | tail -1
 
       - name: Unit tests
+        if: inputs.gate != 'streaming'
         shell: bash
         run: |
           set -euo pipefail
@@ -172,14 +180,23 @@ jobs:
           grep -E 'PROJECT_REFRESH_STRESS_TOTAL=2500' build/tests.log
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/tests.log | tail -1
 
+      - name: Streaming unit tests
+        if: inputs.gate == 'streaming'
+        run: |
+          set -euo pipefail
+          xcodebuild test -project RemoteAIMobile.xcodeproj -scheme RemoteAIMobile -configuration Debug -destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}' -only-testing:RemoteAIMobileTests/AssistantStreamTests | tee build/stream-unit.log
+
       - name: UI tests with isolated simulator process lifecycle
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/run_candidate_ui_tests.py --udid '${{ steps.simulator.outputs.udid }}' | tee build/ui-tests.log
+          ARGS=()
+          if [[ '${{ inputs.gate }}' == 'streaming' ]]; then ARGS+=(--only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable); fi
+          python3 scripts/run_candidate_ui_tests.py --udid '${{ steps.simulator.outputs.udid }}' "${ARGS[@]}" | tee build/ui-tests.log
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
 
       - name: Build unsigned iphoneos arm64 app
+        if: inputs.gate != 'streaming'
         shell: bash
         run: |
           set -euo pipefail
@@ -197,6 +214,7 @@ jobs:
             CODE_SIGN_IDENTITY=""
 
       - name: Verify device app and ad-hoc sign
+        if: inputs.gate != 'streaming'
         id: package
         shell: bash
         run: |
@@ -221,6 +239,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Package and audit Candidate IPA
+        if: inputs.gate != 'streaming'
         id: ipa
         shell: bash
         run: |
@@ -239,6 +258,7 @@ jobs:
           echo "name=$IPA_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Reproducible packaging check
+        if: inputs.gate != 'streaming'
         shell: bash
         run: |
           set -euo pipefail
@@ -249,6 +269,7 @@ jobs:
           rm -f "$REPRO"
 
       - name: Candidate IPA verifier negative tests
+        if: inputs.gate != 'streaming'
         shell: bash
         run: |
           set -euo pipefail
@@ -267,6 +288,7 @@ jobs:
           rm -f "$CORRUPT" "$RENAMED_ENC"
 
       - name: Upload Candidate IPA artifact
+        if: inputs.gate != 'streaming'
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -281,6 +303,7 @@ jobs:
           retention-days: 7
 
       - name: Summary
+        if: inputs.gate != 'streaming'
         shell: bash
         run: |
           {
@@ -294,3 +317,11 @@ jobs:
             echo '- IPA: `${{ steps.ipa.outputs.name }}`'
             echo '- Artifact ID: `${{ steps.upload.outputs.artifact-id }}`'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve UI evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: UI-evidence
+          path: build/ui-evidence
+          retention-days: 7

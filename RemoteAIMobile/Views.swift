@@ -512,7 +512,10 @@ struct ChatView: View {
                                 // Only unknown delivery is replayed with the original command ID.
                                 let retryable = message.kind == .error || commandState == .unknown
                                 if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
-                                    AssistantStreamRow(stream: stream, message: message).id(message.id)
+                                    AssistantStreamRow(stream: stream, message: message, followTail: {
+                                        guard !userBrowsingHistory else { return }
+                                        proxy.scrollTo("bottom", anchor: .bottom)
+                                    }).id(message.id)
                                 } else {
                                     MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel).equatable().id(message.id)
                                 }
@@ -1172,6 +1175,8 @@ struct AssistantStreamRow: View {
     @ObservedObject var stream: AssistantStream
     @Environment(\.scenePhase) private var scenePhase
     let message: ChatMessage
+    var followTail: () -> Void = {}
+    @State private var followTask: Task<Void, Never>?
 
     var body: some View {
         let began = StreamPerformance.now
@@ -1187,7 +1192,22 @@ struct AssistantStreamRow: View {
                 .accessibilityIdentifier("assistant-stream-progress")
         }
         .onAppear { stream.performance.startFrames() }
-        .onDisappear { stream.performance.stopFrames() }
+        .onDisappear {
+            stream.performance.stopFrames()
+            followTask?.cancel()
+            followTask = nil
+        }
+        .onChange(of: stream.visibleBytes) { _ in
+            // Coalesce presentation ticks, without postponing indefinitely while
+            // deltas keep arriving. The callback rechecks browsing at execution.
+            guard followTask == nil else { return }
+            followTask = Task { @MainActor in
+                do { try await Task.sleep(nanoseconds: 150_000_000) }
+                catch { return }
+                followTail()
+                followTask = nil
+            }
+        }
         .onChange(of: scenePhase) { phase in
             if phase == .active { stream.performance.startFrames() }
             else { stream.performance.stopFrames() }
