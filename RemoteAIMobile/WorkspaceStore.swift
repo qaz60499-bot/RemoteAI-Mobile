@@ -948,7 +948,8 @@ final class WorkspaceStore: ObservableObject {
                 runtimeId: route.runtimeId,
                 instanceId: route.instanceId,
                 sessionId: sessionId,
-                attachmentId: attachmentId
+                attachmentId: attachmentId,
+                attachmentName: attachment.name
             )
             guard downloaded.data.count <= 20 * 1024 * 1024 else { return nil }
             messageAttachmentCache.setObject(downloaded.data as NSData, forKey: cacheKey, cost: downloaded.data.count)

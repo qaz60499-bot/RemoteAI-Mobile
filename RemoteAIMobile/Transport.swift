@@ -351,7 +351,7 @@ extension Transport {
         }
     }
 
-    func downloadMessageAttachment(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachmentId: String) async throws -> DownloadedMessageAttachment {
+    func downloadMessageAttachment(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachmentId: String, attachmentName: String? = nil) async throws -> DownloadedMessageAttachment {
         try ProtocolSecurity.validateIdentifier(attachmentId)
 
         let first = try await readMessageAttachmentChunk(
@@ -360,6 +360,7 @@ extension Transport {
             instanceId: instanceId,
             sessionId: sessionId,
             attachmentId: attachmentId,
+            attachmentName: attachmentName,
             index: 0
         )
         let totalChunks = (first.chunk.sizeBytes + first.chunk.chunkBytes - 1) / first.chunk.chunkBytes
@@ -397,6 +398,7 @@ extension Transport {
                         instanceId: instanceId,
                         sessionId: sessionId,
                         attachmentId: attachmentId,
+                        attachmentName: attachmentName,
                         index: index
                     )
                     guard item.chunk.sizeBytes == expectedSize,
@@ -419,6 +421,7 @@ extension Transport {
                             instanceId: instanceId,
                             sessionId: sessionId,
                             attachmentId: attachmentId,
+                            attachmentName: attachmentName,
                             index: index
                         )
                         guard item.chunk.sizeBytes == expectedSize,
@@ -441,18 +444,23 @@ extension Transport {
         return DownloadedMessageAttachment(attachmentId: attachmentId, name: expectedName, contentType: expectedContentType, data: data)
     }
 
-    private func readMessageAttachmentChunk(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachmentId: String, index: Int) async throws -> (chunk: MessageAttachmentChunk, data: Data) {
+    private func readMessageAttachmentChunk(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachmentId: String, attachmentName: String?, index: Int) async throws -> (chunk: MessageAttachmentChunk, data: Data) {
         guard index >= 0 && index <= 400 else { throw TransportError.frameTooLarge }
+        var payload: [String: JSONValue] = [
+            "attachmentId": .string(attachmentId),
+            "index": .number(Double(index))
+        ]
+        if let attachmentName {
+            let normalized = attachmentName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalized.isEmpty { payload["attachmentName"] = .string(String(normalized.prefix(220))) }
+        }
         let command = RemoteCommand.make(
             machineId: machineId,
             runtimeId: runtimeId,
             instanceId: instanceId,
             sessionId: sessionId,
             action: "readMessageAttachmentChunk",
-            payload: [
-                "attachmentId": .string(attachmentId),
-                "index": .number(Double(index))
-            ]
+            payload: payload
         )
         let chunk = try await requireSuccess(execute(command)).decode(MessageAttachmentChunk.self)
         guard chunk.attachmentId == attachmentId,

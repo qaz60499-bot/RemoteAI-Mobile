@@ -9,8 +9,8 @@ final class AssistantStream: ObservableObject {
     private(set) var revision: Int64
     private var chunks: [String]
     private var preview: String
-    @Published private(set) var visibleText: String
-    @Published private(set) var visibleBytes: Int
+    private(set) var visibleText: String
+    private(set) var visibleBytes: Int
     private(set) var utf8Count: Int
     private(set) var materializedBytes = 0
 
@@ -36,8 +36,10 @@ final class AssistantStream: ObservableObject {
     // Only the active row observes this object; history arrays stay untouched.
     func flushPresentation() {
         performance.published()
-        if visibleText != preview { visibleText = preview }
-        if visibleBytes != utf8Count { visibleBytes = utf8Count }
+        guard visibleText != preview || visibleBytes != utf8Count else { return }
+        objectWillChange.send()
+        visibleText = preview
+        visibleBytes = utf8Count
     }
 
     func append(id: String, baseRevision: Int64, revision: Int64, delta: String) -> Bool {

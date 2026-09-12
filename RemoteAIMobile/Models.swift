@@ -318,10 +318,10 @@ struct ChatMessage: Codable, Identifiable, Hashable {
         var parts: [String] = []
         let name = toolName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let status = toolStatus?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let rawDetail = detail ?? ""
         parts.append(name.isEmpty ? "Tool" : name)
         if !status.isEmpty { parts.append(status) }
-        if !detail.isEmpty { parts.append(detail) }
+        if !rawDetail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { parts.append(rawDetail) }
         return parts.joined(separator: "\n")
     }
 
