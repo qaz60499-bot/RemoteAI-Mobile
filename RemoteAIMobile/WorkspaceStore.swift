@@ -384,9 +384,26 @@ final class WorkspaceStore: ObservableObject {
             return
         }
         do {
-            let response = try await transport.listProjectsResponse(machineId: machine.id)
+            let response = try await transport.listProjectsResponse(machineId: machine.id, forceRefresh: force)
             guard generation == lifecycleGeneration, revision == webProjectsRevision, machine.state == .online, !isSuspended else { return }
             guard response.isAuthoritativeLiveDOM else {
+                if response.state == .staleCache,
+                   response.source == "windows-verified-cache" {
+                    if webProjects.isEmpty, !response.items.isEmpty {
+                        webProjects = response.items
+                    }
+                    webProjectsSnapshotState = .staleCache
+                    hasLoadedWebProjects = !webProjects.isEmpty
+                    errors["web.projects"] = nil
+                    DiagnosticsLog.shared.record("projects_refresh_cache_fast", fields: ["count": String(response.items.count), "durationMs": Self.durationMilliseconds(since: refreshStartedAt)])
+                    if !force {
+                        // Reuse the Store's existing coalescing queue for the live DOM
+                        // follow-up. This guarantees at most one authoritative rerun even
+                        // when another UI refresh arrives while the cache response is in flight.
+                        refreshWebProjectsQueued = true
+                    }
+                    return
+                }
                 if response.state == .staleCache,
                    webProjects.isEmpty,
                    !response.items.isEmpty {

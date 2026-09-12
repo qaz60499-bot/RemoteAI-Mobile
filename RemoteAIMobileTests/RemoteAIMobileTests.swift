@@ -943,6 +943,35 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testAutomaticProjectRefreshShowsVerifiedWindowsCacheBeforeAuthoritativeFollowup() async throws {
+        let mock = MockTransport(scenario: .verifiedWebCatalogCache, historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+
+        let startedAt = Date()
+        await store.refreshWebProjects(force: false)
+        let fastReturnMilliseconds = Date().timeIntervalSince(startedAt) * 1_000
+        XCTAssertLessThan(fastReturnMilliseconds, 150, "Verified Windows Project cache should not wait for live ChatGPT DOM discovery")
+        XCTAssertEqual(store.webProjects.map(\.projectAlias), ["g-p-remoteai", "g-p-photo"])
+        XCTAssertEqual(store.webProjectsSnapshotState, .staleCache)
+        XCTAssertTrue(store.hasLoadedWebProjects)
+        XCTAssertNil(store.errors["web.projects"])
+
+        for _ in 0..<300 {
+            if await mock.actionAttemptCount("listProjects") >= 2,
+               store.webProjectsSnapshotState == .authoritativeLiveDOM {
+                break
+            }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let finalProjectAttempts = await mock.actionAttemptCount("listProjects")
+        XCTAssertEqual(finalProjectAttempts, 2, "Cache-first automatic load should schedule exactly one authoritative DOM follow-up")
+        XCTAssertEqual(store.webProjectsSnapshotState, .authoritativeLiveDOM)
+        XCTAssertEqual(store.webProjects.map(\.projectAlias), ["g-p-remoteai", "g-p-photo"])
+        await store.suspend()
+    }
+
+    @MainActor
     func testAutomaticProjectRefreshUsesFreshnessBudgetAndYieldsToActiveWebChat() async throws {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())

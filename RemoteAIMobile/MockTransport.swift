@@ -4,7 +4,7 @@ enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
     case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, alreadyExecutedThenSuccess, deltaOnlySend
-    case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, unclassifiedWebCatalog, offline
+    case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
 }
 
 actor MockTransport: Transport {
@@ -280,7 +280,10 @@ actor MockTransport: Transport {
             }
             response = try success(Array(eligible.suffix(max(1, min(limit, 100)))))
         case "listProjects":
-            if scenario == .partialWebCatalog {
+            if scenario == .verifiedWebCatalogCache,
+               command.payload["preferCache"]?.boolValue == true {
+                response = try success(WebProjectListResponse(items: webProjects, observedAt: Date(), source: "windows-verified-cache", stale: true, state: .staleCache, snapshotId: "mock-projects-verified-cache-\(webProjects.count)"))
+            } else if scenario == .partialWebCatalog {
                 response = try success(WebProjectListResponse(items: Array(webProjects.prefix(1)), observedAt: Date(), source: "browser-dom", stale: true, state: .partialDOM, snapshotId: "mock-projects-partial-1"))
             } else if scenario == .staleWebCatalog {
                 response = try success(WebProjectListResponse(items: webProjects, observedAt: Date(), source: "windows-last-known-good", stale: true, state: .staleCache, snapshotId: "mock-projects-stale-\(webProjects.count)"))

@@ -303,9 +303,10 @@ struct InstanceView: View {
         .sheet(isPresented: $newProject) { NewWebProjectView().environmentObject(store) }
         .task {
             if isChatGPTWeb {
-                // Projects are the primary navigation surface here. Refresh them first
-                // instead of waiting for the ordinary-chat history request to finish.
-                await store.refreshWebProjects(force: true)
+                // Projects are the primary navigation surface here. Show the last
+                // verified Windows/iOS cache first, then let WorkspaceStore schedule
+                // the authoritative DOM refresh without blocking initial navigation.
+                await store.refreshWebProjects(force: false)
                 await store.refreshSessions(runtime: runtime, instance: instance)
             } else {
                 await store.refreshSessions(runtime: runtime, instance: instance)
