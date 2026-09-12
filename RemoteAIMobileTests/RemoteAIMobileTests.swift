@@ -171,6 +171,7 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(RemoteAIConfig.migratedRelayURL(unrelated), unrelated)
     }
 
+    @MainActor
     func testStreamingFlushCadenceStaysFastButBoundedForLongReplies() {
         XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 1_000), 45_000_000)
         XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 30_000), 60_000_000)
