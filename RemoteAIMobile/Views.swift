@@ -521,7 +521,7 @@ struct ChatView: View {
                                     AssistantStreamRow(stream: stream, message: message, followTail: {
                                         guard !userBrowsingHistory else { return }
                                         proxy.scrollTo("bottom", anchor: .bottom)
-                                    }).id(message.id)
+                                    }).equatable().id(message.id)
                                 } else {
                                     MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel).equatable().id(message.id)
                                 }
@@ -1001,6 +1001,10 @@ enum MessageRenderingPolicy {
 
 struct MessageContentSegment: Identifiable, Equatable {
     private static let editBlockMarker = "__REMOTEAI_EDIT_BLOCK__"
+    private static let editRegex = try! NSRegularExpression(
+        pattern: #"(^|\r?\n[ \t]*\r?\n)[ \t]*Edit[ \t]*\r?\n[ \t]*\r?\n"#,
+        options: [.caseInsensitive, .anchorsMatchLines]
+    )
 
     let id: Int
     let text: String
@@ -1010,25 +1014,12 @@ struct MessageContentSegment: Identifiable, Equatable {
     var isEditBlock: Bool { !isCode && language == Self.editBlockMarker }
 
     static func parse(_ value: String) -> [MessageContentSegment] {
+        if !value.contains("```"), value.range(of: "Edit", options: .caseInsensitive) == nil {
+            return value.isEmpty ? [] : [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)]
+        }
         var result: [MessageContentSegment] = []
         let nsValue = value as NSString
-        let pattern = #"(^|\r?\n[ \t]*\r?\n)[ \t]*Edit[ \t]*\r?\n[ \t]*\r?\n"#
-        let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .anchorsMatchLines])
-        let allMatches = regex?.matches(in: value, range: NSRange(location: 0, length: nsValue.length)) ?? []
-        var fenceCursor = 0
-        var insideFence = false
-        let matches = allMatches.filter { match in
-            // Scan each interval once; rebuilding every preceding prefix made
-            // repeated Edit blocks quadratic in the size of the input.
-            while fenceCursor < match.range.location {
-                let fence = nsValue.range(of: "```", options: [], range: NSRange(location: fenceCursor, length: match.range.location - fenceCursor))
-                guard fence.location != NSNotFound else { break }
-                insideFence.toggle()
-                fenceCursor = NSMaxRange(fence)
-            }
-            fenceCursor = match.range.location
-            return !insideFence
-        }
+        let matches = editMatches(in: value, nsValue: nsValue)
 
         if !matches.isEmpty {
             var cursor = 0
@@ -1055,6 +1046,44 @@ struct MessageContentSegment: Identifiable, Equatable {
 
         appendMarkdownSegments(value, to: &result)
         return result.isEmpty ? [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)] : result
+    }
+
+    static func editBlocks(in value: String) -> [MessageContentSegment] {
+        guard value.range(of: "Edit", options: .caseInsensitive) != nil else { return [] }
+        let nsValue = value as NSString
+        let matches = editMatches(in: value, nsValue: nsValue)
+        guard !matches.isEmpty else { return [] }
+
+        var blocks: [MessageContentSegment] = []
+        for (index, match) in matches.enumerated() {
+            let bodyStart = NSMaxRange(match.range)
+            let bodyEnd = index + 1 < matches.count ? matches[index + 1].range.location : nsValue.length
+            guard bodyEnd > bodyStart else { continue }
+            let body = nsValue.substring(with: NSRange(location: bodyStart, length: bodyEnd - bodyStart))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !body.isEmpty {
+                blocks.append(MessageContentSegment(id: blocks.count, text: body, isCode: false, language: editBlockMarker))
+            }
+        }
+        return blocks
+    }
+
+    private static func editMatches(in value: String, nsValue: NSString) -> [NSTextCheckingResult] {
+        let allMatches = editRegex.matches(in: value, range: NSRange(location: 0, length: nsValue.length))
+        var fenceCursor = 0
+        var insideFence = false
+        return allMatches.filter { match in
+            // Scan each interval once; rebuilding every preceding prefix made
+            // repeated Edit blocks quadratic in the size of the input.
+            while fenceCursor < match.range.location {
+                let fence = nsValue.range(of: "```", options: [], range: NSRange(location: fenceCursor, length: match.range.location - fenceCursor))
+                guard fence.location != NSNotFound else { break }
+                insideFence.toggle()
+                fenceCursor = NSMaxRange(fence)
+            }
+            fenceCursor = match.range.location
+            return !insideFence
+        }
     }
 
     private static func appendMarkdownSegments(_ value: String, to result: inout [MessageContentSegment]) {
@@ -1161,6 +1190,7 @@ final class MessageRenderContent: NSObject {
     let attachments: [MessageAttachment]
     let isLarge: Bool
     let segments: [MessageContentSegment]
+    let preservedEditBlocks: [MessageContentSegment]
     let inlineDetail: String?
 
     init(message: ChatMessage) {
@@ -1171,6 +1201,7 @@ final class MessageRenderContent: NSObject {
         attachments = message.resolvedAttachments
         isLarge = MessageRenderingPolicy.isLarge(displayText)
         segments = MessageContentSegment.parse(MessageRenderingPolicy.inlineText(displayText))
+        preservedEditBlocks = isLarge ? MessageContentSegment.editBlocks(in: displayText) : []
         inlineDetail = message.detail.map { MessageRenderingPolicy.inlineText($0) }
     }
 
@@ -1193,18 +1224,24 @@ final class MessageRenderCache {
         if let cached = entries.object(forKey: key), cached.matches(message) { return cached }
         let content = MessageRenderContent(message: message)
         let cost = message.text.utf8.count + content.displayText.utf8.count
-            + (message.detail?.utf8.count ?? 0) + content.segments.reduce(0) { $0 + $1.text.utf8.count }
+            + (message.detail?.utf8.count ?? 0)
+            + content.segments.reduce(0) { $0 + $1.text.utf8.count }
+            + content.preservedEditBlocks.reduce(0) { $0 + $1.text.utf8.count }
         entries.setObject(content, forKey: key, cost: cost)
         return content
     }
 }
 
-struct AssistantStreamRow: View {
+struct AssistantStreamRow: View, Equatable {
     @ObservedObject var stream: AssistantStream
     @Environment(\.scenePhase) private var scenePhase
     let message: ChatMessage
     var followTail: () -> Void = {}
     @State private var followTask: Task<Void, Never>?
+
+    static func == (lhs: AssistantStreamRow, rhs: AssistantStreamRow) -> Bool {
+        lhs.stream === rhs.stream && lhs.message == rhs.message
+    }
 
     var body: some View {
         let began = StreamPerformance.now
@@ -1261,15 +1298,58 @@ struct MessageRow: View, Equatable {
     private var displayText: String { renderContent.displayText }
     private var displayAttachments: [MessageAttachment] { renderContent.attachments }
     private var isLargeDisplayText: Bool { renderContent.isLarge || (fullStreamingText != nil && message.text.count >= 2001) }
-    private var contentSegments: [MessageContentSegment] { renderContent.segments }
+    private var contentSegments: [MessageContentSegment] {
+        if renderContent.isLarge, fullStreamingText == nil {
+            return renderContent.segments.filter { !$0.isEditBlock }
+        }
+        return renderContent.segments
+    }
+    private var preservedEditBlocks: [MessageContentSegment] {
+        fullStreamingText == nil ? renderContent.preservedEditBlocks : []
+    }
     private var selectionText: String { fullStreamingText?() ?? displayText }
 
     var body: some View {
         Group {
             if message.kind == .toolEvent {
-                DisclosureGroup(isExpanded: $toolExpanded) {
-                    if let detail = message.detail {
-                        VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Button {
+                            withAnimation(.easeOut(duration: 0.12)) { toolExpanded.toggle() }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: message.toolStatus == "Completed" ? "checkmark.circle.fill" : "gearshape.2")
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(message.toolName ?? "Tool")
+                                        .font(.subheadline.weight(.semibold))
+                                        .lineLimit(1)
+                                    Text(message.toolStatus ?? "Running")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Image(systemName: toolExpanded ? "chevron.down" : "chevron.right")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundColor(.secondary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        Spacer(minLength: 8)
+                        Button {
+                            UIPasteboard.general.string = message.toolCardCopyText
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.subheadline.weight(.medium))
+                                .frame(width: 34, height: 34)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("复制整块")
+                        .accessibilityIdentifier("tool-card-copy-whole")
+                    }
+                    if toolExpanded, let detail = message.detail {
+                        VStack(alignment: .leading, spacing: 8) {
                             Text(renderContent.inlineDetail ?? "")
                                 .font(.system(.caption, design: .monospaced))
                                 .foregroundColor(.secondary)
@@ -1283,18 +1363,22 @@ struct MessageRow: View, Equatable {
                                 Button("选择部分") {
                                     selectionRequest = TextSelectionRequest(text: detail, monospaced: true)
                                 }
-                                Button("复制整块") { UIPasteboard.general.string = message.toolCardCopyText }
+                                Spacer(minLength: 0)
+                            }
+                            HStack(spacing: 12) {
+                                Button("复制整块") {
+                                    UIPasteboard.general.string = message.toolCardCopyText
+                                }
                                 Button("选择整块") {
                                     selectionRequest = TextSelectionRequest(text: message.toolCardCopyText, monospaced: true)
                                 }
+                                Spacer(minLength: 0)
                             }
-                            .font(.caption2)
-                            .buttonStyle(.borderless)
+                            .accessibilityIdentifier("tool-card-copy-actions")
                         }
-                        .padding(.top, 6)
+                        .font(.caption2)
+                        .buttonStyle(.borderless)
                     }
-                } label: {
-                    HStack { Image(systemName: message.toolStatus == "Completed" ? "checkmark.circle.fill" : "gearshape.2"); VStack(alignment: .leading, spacing: 2) { Text(message.toolName ?? "Tool").font(.subheadline.weight(.semibold)); Text(message.toolStatus ?? "Running").font(.caption).foregroundColor(.secondary) }; Spacer() }
                 }
                 .padding(12)
                 .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
@@ -1316,42 +1400,7 @@ struct MessageRow: View, Equatable {
                     VStack(alignment: .leading, spacing: 8) {
                         ForEach(contentSegments) { segment in
                             if segment.isEditBlock {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack(spacing: 8) {
-                                        Label("Edit", systemImage: "square.and.pencil")
-                                            .font(.caption.weight(.semibold))
-                                            .foregroundColor(.secondary)
-                                        Spacer()
-                                        Button {
-                                            UIPasteboard.general.string = segment.text
-                                        } label: {
-                                            Label("复制整块", systemImage: "doc.on.doc")
-                                                .font(.caption2)
-                                        }
-                                        .buttonStyle(.borderless)
-                                        Button("选择部分") {
-                                            selectionRequest = TextSelectionRequest(text: segment.text, monospaced: false)
-                                        }
-                                        .font(.caption2)
-                                        .buttonStyle(.borderless)
-                                    }
-                                    Text(segment.text)
-                                        .textSelection(.enabled)
-                                }
-                                .padding(10)
-                                .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
-                                .contextMenu {
-                                    Button {
-                                        UIPasteboard.general.string = segment.text
-                                    } label: {
-                                        Label("复制整块", systemImage: "doc.on.doc")
-                                    }
-                                    Button {
-                                        selectionRequest = TextSelectionRequest(text: segment.text, monospaced: false)
-                                    } label: {
-                                        Label("选择部分", systemImage: "text.cursor")
-                                    }
-                                }
+                                editBlockCard(segment)
                             } else if segment.isCode {
                                 VStack(alignment: .leading, spacing: 6) {
                                     HStack(spacing: 8) {
@@ -1387,6 +1436,9 @@ struct MessageRow: View, Equatable {
                                     Text(segment.text).textSelection(.enabled)
                                 }
                             }
+                        }
+                        ForEach(preservedEditBlocks) { segment in
+                            editBlockCard(segment)
                         }
                         if isLargeDisplayText {
                             Button {
@@ -1439,6 +1491,54 @@ struct MessageRow: View, Equatable {
         }
         .sheet(item: $selectionRequest) { request in
             TextSelectionSheet(text: request.text, monospaced: request.monospaced)
+        }
+    }
+
+    @ViewBuilder
+    private func editBlockCard(_ segment: MessageContentSegment) -> some View {
+        let isLargeEdit = MessageRenderingPolicy.isLarge(segment.text)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label("Edit", systemImage: "square.and.pencil")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondary)
+                Spacer(minLength: 8)
+            }
+            HStack(spacing: 12) {
+                Button {
+                    UIPasteboard.general.string = segment.text
+                } label: {
+                    Label("复制整块", systemImage: "doc.on.doc")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                Button(isLargeEdit ? "查看 / 选择全文" : "选择部分") {
+                    selectionRequest = TextSelectionRequest(text: segment.text, monospaced: false)
+                }
+                .font(.caption2)
+                .buttonStyle(.borderless)
+                Spacer(minLength: 0)
+            }
+            if isLargeEdit {
+                Text(MessageRenderingPolicy.inlineText(segment.text))
+            } else {
+                Text(segment.text)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = segment.text
+            } label: {
+                Label("复制整块", systemImage: "doc.on.doc")
+            }
+            Button {
+                selectionRequest = TextSelectionRequest(text: segment.text, monospaced: false)
+            } label: {
+                Label("选择部分", systemImage: "text.cursor")
+            }
         }
     }
 }

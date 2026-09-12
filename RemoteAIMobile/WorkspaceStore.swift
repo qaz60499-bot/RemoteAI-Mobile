@@ -57,6 +57,7 @@ final class WorkspaceStore: ObservableObject {
     // awaiting I/O. Keep per-operation gates at the Store boundary, not only in Views.
     private var refreshWebProjectsInFlight = false
     private var refreshWebProjectsQueued = false
+    private var webProjectsRefreshNeedsConnectivityRetry = false
     private var lastWebProjectsRefreshAt: Date?
     private static let webProjectsAutomaticRefreshMinimumInterval: TimeInterval = 20
     private var projectConversationRefreshes = Set<String>()
@@ -125,6 +126,13 @@ final class WorkspaceStore: ObservableObject {
     private static func isRecoverableCommandTransportError(_ error: TransportError) -> Bool {
         if error == .disconnected || error == .timeout || error == .offline { return true }
         if case .remote(let code, _) = error { return code == "ALREADY_EXECUTED" }
+        return false
+    }
+
+    private static func shouldRetryWebProjectsAfterConnectivityRecovery(_ error: Error) -> Bool {
+        guard let transportError = error as? TransportError else { return false }
+        if transportError == .disconnected || transportError == .timeout || transportError == .offline { return true }
+        if case .remote(let code, _) = transportError { return code == "BROWSER_NOT_CONNECTED" }
         return false
     }
 
@@ -262,6 +270,7 @@ final class WorkspaceStore: ObservableObject {
             errors["connection"] = nil
             DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence)])
             startConnectionMonitor()
+            scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "initial-online")
 
             // Metadata is deliberately downstream of the online transition. A slow or
             // failed catalog refresh must never leave the UI stuck in Connecting.
@@ -359,6 +368,7 @@ final class WorkspaceStore: ObservableObject {
         }
         guard machine.state == .online else {
             hasLoadedWebProjects = !webProjects.isEmpty
+            webProjectsRefreshNeedsConnectivityRetry = true
             DiagnosticsLog.shared.record("projects_refresh_skipped_offline", fields: ["cachedCount": String(webProjects.count)], level: "WARN")
             return
         }
@@ -391,6 +401,7 @@ final class WorkspaceStore: ObservableObject {
             webProjects = response.items
             webProjectsSnapshotState = .authoritativeLiveDOM
             webProjectsSnapshotId = response.snapshotId
+            webProjectsRefreshNeedsConnectivityRetry = false
             lastWebProjectsRefreshAt = Date()
             hasLoadedWebProjects = true
             try? await cache.put(webProjects, key: "web.projects")
@@ -401,6 +412,7 @@ final class WorkspaceStore: ObservableObject {
             if generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended {
                 webProjectsSnapshotState = .providerUnavailable
                 hasLoadedWebProjects = !webProjects.isEmpty
+                webProjectsRefreshNeedsConnectivityRetry = Self.shouldRetryWebProjectsAfterConnectivityRecovery(error)
                 errors["web.projects"] = error.localizedDescription
                 DiagnosticsLog.shared.record("projects_refresh_failed", fields: Self.diagnosticFields(for: error, adding: ["durationMs": Self.durationMilliseconds(since: refreshStartedAt)]), level: "ERROR")
             }
@@ -1578,6 +1590,7 @@ final class WorkspaceStore: ObservableObject {
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
                         DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence), "source": "reconnect"])
+                        self.scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "relay-reconnect")
                         // Reconcile the durable event gap before any catalog refresh. A
                         // reconnect must restore the active chat first; project/runtime
                         // metadata is lower priority and may be comparatively slow.
@@ -1606,6 +1619,7 @@ final class WorkspaceStore: ObservableObject {
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
                         DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence), "source": "agent-recovered"])
+                        self.scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "agent-recovered")
                         await self.recoverDelta(freshLatestSequence: authenticatedSequence)
                         await self.refreshMetadata()
                     } catch {
@@ -1791,8 +1805,12 @@ final class WorkspaceStore: ObservableObject {
         if webProjects.isEmpty,
            let value: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
             webProjects = value
-            // Cached Projects are an offline snapshot. Only refreshWebProjects() may
-            // mark the list as live/current for this store lifetime.
+            // Render the last verified Project list immediately on cold launch. It is
+            // still explicitly stale until refreshWebProjects() replaces it with live
+            // DOM truth, but the user should never stare at an empty Projects surface
+            // while Relay/Browser connectivity is being restored.
+            webProjectsSnapshotState = .staleCache
+            hasLoadedWebProjects = !value.isEmpty
         }
         tracker = SequenceTracker(lastSequence: (try? await cache.lastSequence()) ?? 0)
         let process = ProcessInfo.processInfo
@@ -2496,6 +2514,24 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    private func scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: String) {
+        let generation = lifecycleGeneration
+        Task { @MainActor [weak self] in
+            guard let self,
+                  generation == self.lifecycleGeneration,
+                  !self.isSuspended,
+                  self.machine.state == .online,
+                  self.desktopBrowserConnected != false,
+                  self.webProjectsRefreshNeedsConnectivityRetry else { return }
+            self.webProjectsRefreshNeedsConnectivityRetry = false
+            DiagnosticsLog.shared.record("projects_refresh_connectivity_recovery", fields: [
+                "reason": reason,
+                "cachedCount": String(self.webProjects.count),
+            ])
+            await self.refreshWebProjects(force: false)
+        }
+    }
+
     private func applyAgentStatusSnapshot(_ snapshot: AgentStatusSnapshot) {
         lastOnlineHeadProbe = Date()
         let previousBrowser = desktopBrowserConnected
@@ -2511,6 +2547,7 @@ final class WorkspaceStore: ObservableObject {
             let hadOfflineMarker = systemTransportOfflineChannels.remove("browser-bridge") != nil
             if previousBrowser == false || hadOfflineMarker {
                 recentSystemNotice = "电脑端 Browser Bridge 已恢复，当前会话正在补同步。"
+                scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "browser-status-recovered")
             }
         }
     }
@@ -2534,6 +2571,10 @@ final class WorkspaceStore: ObservableObject {
         if state == "online", systemTransportOfflineChannels.remove(channel) != nil {
             recentSystemNotice = "\(label) 已于 \(time) 恢复；刚刚发生过一次断连，当前会话正在补同步。"
             DiagnosticsLog.shared.record("remote_transport_recovered", fields: ["channel": channel, "at": time])
+            if channel == "browser-bridge" {
+                desktopBrowserConnected = true
+                scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "browser-transport-recovered")
+            }
         }
     }
 

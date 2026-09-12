@@ -703,6 +703,30 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectRefreshSkippedBeforeOnlineRetriesOnceConnectivityRecovers() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+
+        // Model the UI entering ChatGPT while the app is still connecting. The first
+        // Project refresh cannot hit Windows yet, but it must remember that work.
+        await store.refreshWebProjects(force: true)
+        let beforeOnline = await mock.actionAttemptCount("listProjects")
+        XCTAssertEqual(beforeOnline, 0)
+
+        await store.start()
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("listProjects") > 0 { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+
+        let afterOnline = await mock.actionAttemptCount("listProjects")
+        XCTAssertEqual(afterOnline, 1)
+        XCTAssertEqual(store.webProjects.map(\.projectAlias), ["g-p-remoteai", "g-p-photo"])
+        XCTAssertEqual(store.webProjectsSnapshotState, .authoritativeLiveDOM)
+        await store.suspend()
+    }
+
+    @MainActor
     func testAutomaticProjectRefreshUsesFreshnessBudgetAndYieldsToActiveWebChat() async throws {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())

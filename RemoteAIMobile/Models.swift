@@ -170,6 +170,18 @@ struct MessageAttachment: Codable, Identifiable, Hashable {
         let lower = name.lowercased()
         return [".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic"].contains { lower.hasSuffix($0) }
     }
+
+    var isReferencePreviewImage: Bool {
+        guard isImage else { return false }
+        for raw in [previewURL, downloadURL].compactMap({ $0 }) {
+            guard let url = URL(string: raw) else { continue }
+            let host = url.host?.lowercased() ?? ""
+            let path = url.path.lowercased()
+            if host == "www.google.com", path == "/s2/favicons" { return true }
+            if path.contains("favicon") || path.contains("apple-touch-icon") || path.contains("site-icon") { return true }
+        }
+        return false
+    }
 }
 
 struct WebProjectDescriptor: Codable, Identifiable, Hashable {
@@ -346,6 +358,7 @@ struct ChatMessage: Codable, Identifiable, Hashable {
     private static func deduplicatedAttachments(_ attachments: [MessageAttachment]) -> [MessageAttachment] {
         var seen = Set<String>()
         return attachments.filter { attachment in
+            guard !attachment.isReferencePreviewImage else { return false }
             let key = "\(attachment.attachmentId ?? "")|\(attachment.name.lowercased())|\(attachment.previewURL ?? "")|\(attachment.downloadURL ?? "")"
             return seen.insert(key).inserted
         }
