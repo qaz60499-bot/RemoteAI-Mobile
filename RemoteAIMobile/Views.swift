@@ -521,7 +521,7 @@ struct ChatView: View {
                                     AssistantStreamRow(stream: stream, message: message, followTail: {
                                         guard !userBrowsingHistory else { return }
                                         proxy.scrollTo("bottom", anchor: .bottom)
-                                    }).equatable().id(message.id)
+                                    }).id(message.id)
                                 } else {
                                     MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel).equatable().id(message.id)
                                 }
