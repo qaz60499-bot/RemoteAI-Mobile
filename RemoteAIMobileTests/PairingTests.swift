@@ -553,16 +553,17 @@ final class PairingTests: XCTestCase {
 
         await transport.forceDisconnect()
         let startedAt = Date()
-        for _ in 0..<25 {
-            if await transport.isConnected { break }
-            try await Task.sleep(nanoseconds: 50_000_000)
+        let deadline = startedAt.addingTimeInterval(1.0)
+        while Date() < deadline {
+            if await transport.isConnected, store.connectionPhase == .online { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
         }
         let connected = await transport.isConnected
         let elapsed = Date().timeIntervalSince(startedAt)
         let connectionCount = await transport.connectionCount()
 
         XCTAssertTrue(connected, "The background monitor should reconnect without waiting for a manual foreground cycle")
-        XCTAssertLessThan(elapsed, 1.0, "Socket-drop recovery should be noticeably faster than the previous 2-second polling loop")
+        XCTAssertLessThan(elapsed, 1.0, "Socket-drop recovery, including authentication, should stay below one second")
         XCTAssertGreaterThanOrEqual(connectionCount, 2)
         XCTAssertEqual(store.connectionPhase, .online)
         await store.suspend()
