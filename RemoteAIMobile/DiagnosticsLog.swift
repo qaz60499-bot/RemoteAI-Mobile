@@ -150,6 +150,13 @@ final class DiagnosticsLog: ObservableObject {
     private let legacyFileURL: URL
     private let iso = ISO8601DateFormatter()
     private let logger = Logger(subsystem: "com.remoteai.mobile", category: "diagnostics")
+    private static let systemMirrorFieldAllowlist: Set<String> = [
+        "state", "errortype", "transportkind", "durationms", "closecode", "sequence", "latestsequence",
+        "cachedcount", "count", "attachments", "attachmentcount", "build", "finalbytes", "finalchars",
+        "canonicalequal", "firstvisiblems", "firstdeltaafterstreaminitms", "visibleupdateintervalp50ms",
+        "visibleupdateintervalp95ms", "flushtoframep95ms", "mainthreadstallsover100ms", "reconnectattempt",
+        "agentconnected", "browserconnected", "storagedegraded"
+    ]
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var lastCleanupAt = Date.distantPast
@@ -186,13 +193,25 @@ final class DiagnosticsLog: ObservableObject {
         lines.append(rendered)
         pruneDisplay()
         append(record)
-        switch record.level {
-        case "ERROR": logger.error("\(rendered, privacy: .public)")
-        case "WARN": logger.warning("\(rendered, privacy: .public)")
-        case "DEBUG": logger.debug("\(rendered, privacy: .public)")
-        default: logger.info("\(rendered, privacy: .public)")
-        }
+        mirrorToSystemLog(record)
         cleanupIfNeeded()
+    }
+
+    private func mirrorToSystemLog(_ record: RemoteAIDiagnosticRecord) {
+        var parts = [record.event]
+        for key in record.fields.keys.sorted() {
+            guard Self.systemMirrorFieldAllowlist.contains(key.lowercased()) else { continue }
+            let safeKey = RemoteAIDiagnosticRedactor.text(key, limit: 48)
+            let safeValue = RemoteAIDiagnosticRedactor.text(record.fields[key] ?? "", limit: 128)
+            parts.append("\(safeKey)=\(safeValue)")
+        }
+        let summary = RemoteAIDiagnosticRedactor.text(parts.joined(separator: " "), limit: 1024)
+        switch record.level {
+        case "ERROR": logger.error("\(summary, privacy: .public)")
+        case "WARN": logger.warning("\(summary, privacy: .public)")
+        case "DEBUG": logger.debug("\(summary, privacy: .public)")
+        default: logger.info("\(summary, privacy: .public)")
+        }
     }
 
     func copyToPasteboard() {

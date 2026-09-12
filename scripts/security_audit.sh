@@ -58,9 +58,29 @@ fi
 if grep -nE 'UserDefaults|SQLiteStore|sqlite3_' RemoteAIMobile/Security.swift; then
   fail "pairing key implementation references non-Keychain persistence"
 fi
-if grep -R -nE 'print\(|NSLog\(|os_log\(|Logger\(' RemoteAIMobile; then
-  fail "runtime logging call detected; review before allowing potentially sensitive payloads"
+if grep -R -nE 'print\(|NSLog\(|os_log\(|Logger\(' RemoteAIMobile --exclude='DiagnosticsLog.swift'; then
+  fail "runtime logging call detected outside the reviewed diagnostics mirror"
 fi
+"$PYTHON" - <<'PY'
+import re
+from pathlib import Path
+
+path = Path("RemoteAIMobile/DiagnosticsLog.swift")
+text = path.read_text(encoding="utf-8")
+if 'systemMirrorFieldAllowlist' not in text or 'mirrorToSystemLog(record)' not in text:
+    raise SystemExit("reviewed diagnostics system-log mirror is missing")
+if 'logger.error("\\(rendered' in text or 'logger.warning("\\(rendered' in text or 'logger.info("\\(rendered' in text or 'logger.debug("\\(rendered' in text:
+    raise SystemExit("full rendered diagnostics must never be mirrored into system logs")
+calls = re.findall(r'logger\.(?:error|warning|debug|info)\([^\n]+', text)
+expected = {
+    'logger.error("\\(summary, privacy: .public)")',
+    'logger.warning("\\(summary, privacy: .public)")',
+    'logger.debug("\\(summary, privacy: .public)")',
+    'logger.info("\\(summary, privacy: .public)")',
+}
+if set(calls) != expected or len(calls) != 4:
+    raise SystemExit(f"unexpected diagnostics system-log call set: {calls}")
+PY
 
 grep -q 'PRAGMA secure_delete=ON' RemoteAIMobile/SQLiteStore.swift || fail "SQLite secure_delete is not enabled"
 grep -q 'PRAGMA journal_mode=WAL' RemoteAIMobile/SQLiteStore.swift || fail "SQLite WAL mode missing"
