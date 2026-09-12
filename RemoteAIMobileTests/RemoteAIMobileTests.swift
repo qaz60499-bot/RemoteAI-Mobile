@@ -86,9 +86,11 @@ final class RemoteAIMobileTests: XCTestCase {
         let cache = try SQLiteStore.inMemory()
         try await cache.setLastSequence(120)
         try await cache.setLastSequence(110)
-        XCTAssertEqual(try await cache.lastSequence(), 120)
+        let afterRegressionAttempt = try await cache.lastSequence()
+        XCTAssertEqual(afterRegressionAttempt, 120)
         try await cache.setLastSequence(121)
-        XCTAssertEqual(try await cache.lastSequence(), 121)
+        let afterAdvance = try await cache.lastSequence()
+        XCTAssertEqual(afterAdvance, 121)
     }
 
     func testBase64URLRoundTrip() throws {
@@ -546,7 +548,8 @@ final class RemoteAIMobileTests: XCTestCase {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
-        XCTAssertEqual(try await cache.lastSequence(), 1200)
+        let initialCursor = try await cache.lastSequence()
+        XCTAssertEqual(initialCursor, 1200)
 
         let now = Date()
         let finalMessage = ServerMessage(
@@ -603,7 +606,8 @@ final class RemoteAIMobileTests: XCTestCase {
             if await mock.actionAttemptCount("getChangesAfterCursor") > 0 { break }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
-        XCTAssertGreaterThan(await mock.actionAttemptCount("getChangesAfterCursor"), 0)
+        let deltaAttempts = await mock.actionAttemptCount("getChangesAfterCursor")
+        XCTAssertGreaterThan(deltaAttempts, 0)
 
         // The delayed delta page has already captured 1201...1203. While it is in
         // flight, the websocket delivers those same events and continues to 1210.
@@ -626,11 +630,13 @@ final class RemoteAIMobileTests: XCTestCase {
             if try await cache.lastSequence() >= 1210 { break }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
-        XCTAssertEqual(try await cache.lastSequence(), 1210, "Live websocket must be able to advance beyond the in-flight delta snapshot")
+        let liveHead = try await cache.lastSequence()
+        XCTAssertEqual(liveHead, 1210, "Live websocket must be able to advance beyond the in-flight delta snapshot")
 
         await recovery.value
         XCTAssertNil(store.errors["sync"], "Overlapping live/delta events must not enter replay backoff")
-        XCTAssertEqual(try await cache.lastSequence(), 1210, "A stale delta completion must not roll the durable cursor backward")
+        let recoveredHead = try await cache.lastSequence()
+        XCTAssertEqual(recoveredHead, 1210, "A stale delta completion must not roll the durable cursor backward")
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "race-final" }.count, 1, "Overlapping live/delta MESSAGE_ADDED must apply once")
 
         // A new contiguous event after recovery proves the in-memory tracker also kept
@@ -653,12 +659,14 @@ final class RemoteAIMobileTests: XCTestCase {
             if try await cache.lastSequence() >= 1211 { break }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
-        XCTAssertEqual(try await cache.lastSequence(), 1211)
+        let postRecoveryHead = try await cache.lastSequence()
+        XCTAssertEqual(postRecoveryHead, 1211)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
 
         await store.synchronizeVisibleSession("photo-upload", force: true)
         XCTAssertNil(store.errors["sync"], "A second delta after the overlap must not rediscover live events as a replay attack")
-        XCTAssertEqual(try await cache.lastSequence(), 1211)
+        let secondRecoveryHead = try await cache.lastSequence()
+        XCTAssertEqual(secondRecoveryHead, 1211)
         await store.suspend()
     }
 
@@ -687,7 +695,8 @@ final class RemoteAIMobileTests: XCTestCase {
             if try await cache.lastSequence() >= 1201 { break }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
-        XCTAssertEqual(try await cache.lastSequence(), 1201)
+        let firstAppliedHead = try await cache.lastSequence()
+        XCTAssertEqual(firstAppliedHead, 1201)
 
         let replay = RemoteEvent(
             protocolVersion: 1,
@@ -707,7 +716,8 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         XCTAssertEqual(store.errors["sync"], TransportError.replayDetected.localizedDescription)
-        XCTAssertEqual(try await cache.lastSequence(), 1201, "A reused event id at a future sequence must not advance the durable cursor")
+        let replayHead = try await cache.lastSequence()
+        XCTAssertEqual(replayHead, 1201, "A reused event id at a future sequence must not advance the durable cursor")
         await store.suspend()
     }
 
