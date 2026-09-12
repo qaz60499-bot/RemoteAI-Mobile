@@ -193,9 +193,9 @@ final class RemoteAIMobileTests: XCTestCase {
 
     @MainActor
     func testStreamingFlushCadenceStaysFastButBoundedForLongReplies() {
-        XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 1_000), 45_000_000)
-        XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 30_000), 60_000_000)
-        XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 100_000), 75_000_000)
+        XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 1_000), 55_000_000)
+        XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 30_000), 70_000_000)
+        XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 100_000), 90_000_000)
     }
 
     func testRelayDeviceURLUsesFrozenConnectContract() throws {

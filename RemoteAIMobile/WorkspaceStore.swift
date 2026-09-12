@@ -77,9 +77,13 @@ final class WorkspaceStore: ObservableObject {
     private static let idleVisibleSessionHistorySyncMinimumInterval: TimeInterval = 30
     private static let connectionMonitorIntervalNanoseconds: UInt64 = 500_000_000
     static func streamingFlushDelayNanoseconds(forByteCount bytes: Int) -> UInt64 {
-        if bytes < 16 * 1024 { return 45_000_000 }
-        if bytes < 64 * 1024 { return 60_000_000 }
-        return 75_000_000
+        // Keep Build 27 visibly faster than Build 26 without forcing the main thread
+        // to re-render long tails at the most aggressive cadence. CI performance
+        // sampling showed 45/60/75 ms improved visible latency but increased >100 ms
+        // stalls for 30k and 100k streams, so taper large replies back toward 90 ms.
+        if bytes < 16 * 1024 { return 55_000_000 }
+        if bytes < 64 * 1024 { return 70_000_000 }
+        return 90_000_000
     }
     private static let sendRecoveryBackoffNanoseconds: [UInt64] = [0, 500_000_000, 1_500_000_000]
     private var olderMessageLoads = Set<String>()
