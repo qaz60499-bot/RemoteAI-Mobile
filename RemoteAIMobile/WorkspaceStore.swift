@@ -2478,7 +2478,6 @@ final class WorkspaceStore: ObservableObject {
             }
 
         case .agent:
-            let wasOnline = desktopAgentConnected == true
             switch event.state {
             case .online:
                 desktopAgentConnected = true

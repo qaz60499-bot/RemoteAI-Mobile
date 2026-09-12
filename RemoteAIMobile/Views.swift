@@ -1223,10 +1223,11 @@ final class MessageRenderCache {
         let key = "\(message.sessionId.utf8.count):\(message.sessionId)\(message.id)" as NSString
         if let cached = entries.object(forKey: key), cached.matches(message) { return cached }
         let content = MessageRenderContent(message: message)
-        let cost = message.text.utf8.count + content.displayText.utf8.count
-            + (message.detail?.utf8.count ?? 0)
-            + content.segments.reduce(0) { $0 + $1.text.utf8.count }
-            + content.preservedEditBlocks.reduce(0) { $0 + $1.text.utf8.count }
+        let sourceCost = message.text.utf8.count + content.displayText.utf8.count
+        let detailCost = message.detail?.utf8.count ?? 0
+        let segmentCost = content.segments.reduce(into: 0) { $0 += $1.text.utf8.count }
+        let editCost = content.preservedEditBlocks.reduce(into: 0) { $0 += $1.text.utf8.count }
+        let cost = sourceCost + detailCost + segmentCost + editCost
         entries.setObject(content, forKey: key, cost: cost)
         return content
     }
