@@ -2009,18 +2009,17 @@ final class WorkspaceStore: ObservableObject {
             errors["sync"] = error.localizedDescription
             return
         }
-        let priorSequence = tracker.lastSequence
-        let decision = tracker.ingest(event.sequence)
+        let decision = tracker.decision(for: event.sequence)
         if decision.duplicate { return }
         if decision.gap {
             await recoverDelta()
             return
         }
         guard eventReplayGuard.accept(event.eventId.uuidString.lowercased()) else {
-            tracker = SequenceTracker(lastSequence: priorSequence)
             errors["sync"] = TransportError.replayDetected.localizedDescription
             return
         }
+        tracker.advanceMonotonically(to: event.sequence)
         await applyEvent(event)
         try? await cache.setLastSequence(event.sequence)
     }
@@ -2127,7 +2126,7 @@ final class WorkspaceStore: ObservableObject {
                     let previousCursor = cursor
                     cursor = max(0, freshLatestSequence)
                     try? await cache.setLastSequence(cursor)
-                    tracker = SequenceTracker(lastSequence: cursor)
+                    tracker.advanceMonotonically(to: cursor)
                     deltaRecoveryFailureCount = 0
                     deltaRecoveryRetryNotBefore = nil
                     // Skipping tens of thousands of historical progress events is correct,
@@ -2158,7 +2157,7 @@ final class WorkspaceStore: ObservableObject {
                     cursor = try await transport.latestSequence(machineId: machine.id)
                 }
                 try? await cache.setLastSequence(cursor)
-                tracker = SequenceTracker(lastSequence: cursor)
+                tracker.advanceMonotonically(to: cursor)
                 return
             }
             while true {
@@ -2200,6 +2199,7 @@ final class WorkspaceStore: ObservableObject {
                         try? await cache.setLastSequence(cursor)
                         continue
                     }
+                    tracker.advanceMonotonically(to: event.sequence)
                     await applyEvent(event)
                     cursor = event.sequence
                     try? await cache.setLastSequence(cursor)
@@ -2208,7 +2208,7 @@ final class WorkspaceStore: ObservableObject {
                 try? await cache.setLastSequence(cursor)
                 if !result.hasMore { break }
             }
-            tracker = SequenceTracker(lastSequence: cursor)
+            tracker.advanceMonotonically(to: cursor)
             deltaRecoveryFailureCount = 0
             deltaRecoveryRetryNotBefore = nil
             errors["sync"] = incompleteAssistantStreams.isEmpty ? nil : "Streaming reconciliation is incomplete."

@@ -81,8 +81,13 @@ actor SQLiteStore {
         return result
     }
 
-    func setLastSequence(_ value: Int64) throws { try put(String(value), key: "sync.lastSequence") }
-    func lastSequence() throws -> Int64 { Int64(try get(String.self, key: "sync.lastSequence") ?? "0") ?? 0 }
+    func setLastSequence(_ value: Int64) throws {
+        let candidate = max(0, value)
+        let current = try lastSequence()
+        guard candidate > current else { return }
+        try put(String(candidate), key: "sync.lastSequence")
+    }
+    func lastSequence() throws -> Int64 { max(0, Int64(try get(String.self, key: "sync.lastSequence") ?? "0") ?? 0) }
     func saveDraft(_ text: String, sessionId: String) throws { try put(text, key: "draft.\(sessionId)") }
     func draft(sessionId: String) throws -> String { try get(String.self, key: "draft.\(sessionId)") ?? "" }
     func saveUIState(_ value: String, key: String) throws { try put(value, key: "ui.\(key)") }

@@ -73,6 +73,24 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(decision.duplicate)
     }
 
+    func testSequenceTrackerMonotonicAdvanceNeverMovesBackward() {
+        var tracker = SequenceTracker(lastSequence: 10)
+        XCTAssertTrue(tracker.advanceMonotonically(to: 14))
+        XCTAssertEqual(tracker.lastSequence, 14)
+        XCTAssertFalse(tracker.advanceMonotonically(to: 12))
+        XCTAssertFalse(tracker.advanceMonotonically(to: 14))
+        XCTAssertEqual(tracker.lastSequence, 14)
+    }
+
+    func testSQLiteSequenceCursorNeverRegresses() async throws {
+        let cache = try SQLiteStore.inMemory()
+        try await cache.setLastSequence(120)
+        try await cache.setLastSequence(110)
+        XCTAssertEqual(try await cache.lastSequence(), 120)
+        try await cache.setLastSequence(121)
+        XCTAssertEqual(try await cache.lastSequence(), 121)
+    }
+
     func testBase64URLRoundTrip() throws {
         let data = Data([0xfb, 0xff, 0x00, 0x10, 0x7f])
         let encoded = Base64URL.encode(data)
@@ -519,6 +537,177 @@ final class RemoteAIMobileTests: XCTestCase {
         let recoveredSequence = try await cache.lastSequence()
         XCTAssertEqual(recoveredSequence, 1201)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testDeltaRecoveryKeepsLiveHeadMonotonicWhenDelayedPageFallsBehind() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        XCTAssertEqual(try await cache.lastSequence(), 1200)
+
+        let now = Date()
+        let finalMessage = ServerMessage(
+            messageId: "race-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "race-final-content",
+            externalId: nil,
+            createdAt: now
+        )
+        let overlapEvents = [
+            RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: 1201,
+                machineId: "my-pc",
+                runtimeId: "runtime.web",
+                instanceId: "photo",
+                sessionId: "photo-upload",
+                type: "GENERATION_STARTED",
+                payload: [:],
+                createdAt: now
+            ),
+            RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: 1202,
+                machineId: "my-pc",
+                runtimeId: "runtime.web",
+                instanceId: "photo",
+                sessionId: "photo-upload",
+                type: "MESSAGE_ADDED",
+                payload: try JSONValue.encode(finalMessage).objectValue ?? [:],
+                createdAt: now.addingTimeInterval(0.01)
+            ),
+            RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: 1203,
+                machineId: "my-pc",
+                runtimeId: "runtime.web",
+                instanceId: "photo",
+                sessionId: "photo-upload",
+                type: "GENERATION_STOPPED",
+                payload: [:],
+                createdAt: now.addingTimeInterval(0.02)
+            ),
+        ]
+        for event in overlapEvents { await mock.injectEvent(event) }
+        await mock.setResponseDelay(action: "getChangesAfterCursor", nanoseconds: 300_000_000)
+
+        let recovery = Task { await store.synchronizeVisibleSession("photo-upload", force: true) }
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("getChangesAfterCursor") > 0 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertGreaterThan(await mock.actionAttemptCount("getChangesAfterCursor"), 0)
+
+        // The delayed delta page has already captured 1201...1203. While it is in
+        // flight, the websocket delivers those same events and continues to 1210.
+        for event in overlapEvents { await mock.injectEvent(event, deliverLive: true) }
+        for sequence in 1204...1210 {
+            await mock.injectEvent(RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: Int64(sequence),
+                machineId: "my-pc",
+                runtimeId: "runtime.system",
+                instanceId: "agent",
+                sessionId: nil,
+                type: "TRANSPORT_STATUS",
+                payload: ["channel": .string("relay"), "state": .string("online")],
+                createdAt: now.addingTimeInterval(Double(sequence - 1200) / 100.0)
+            ), deliverLive: true)
+        }
+        for _ in 0..<100 {
+            if try await cache.lastSequence() >= 1210 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(try await cache.lastSequence(), 1210, "Live websocket must be able to advance beyond the in-flight delta snapshot")
+
+        await recovery.value
+        XCTAssertNil(store.errors["sync"], "Overlapping live/delta events must not enter replay backoff")
+        XCTAssertEqual(try await cache.lastSequence(), 1210, "A stale delta completion must not roll the durable cursor backward")
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "race-final" }.count, 1, "Overlapping live/delta MESSAGE_ADDED must apply once")
+
+        // A new contiguous event after recovery proves the in-memory tracker also kept
+        // the live head. With the old bug the tracker was reset to 1203 and 1211 was
+        // misclassified as a gap instead of being applied.
+        let postRecovery = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1211,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: now.addingTimeInterval(0.2)
+        )
+        await mock.injectEvent(postRecovery, deliverLive: true)
+        for _ in 0..<100 {
+            if try await cache.lastSequence() >= 1211 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(try await cache.lastSequence(), 1211)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        XCTAssertNil(store.errors["sync"], "A second delta after the overlap must not rediscover live events as a replay attack")
+        XCTAssertEqual(try await cache.lastSequence(), 1211)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testLiveReplayGuardStillRejectsReusedEventIdAtFutureSequence() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let reusedId = UUID()
+        let now = Date()
+        let first = RemoteEvent(
+            protocolVersion: 1,
+            eventId: reusedId,
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: now
+        )
+        await mock.injectEvent(first, deliverLive: true)
+        for _ in 0..<80 {
+            if try await cache.lastSequence() >= 1201 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(try await cache.lastSequence(), 1201)
+
+        let replay = RemoteEvent(
+            protocolVersion: 1,
+            eventId: reusedId,
+            sequence: 1202,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STOPPED",
+            payload: [:],
+            createdAt: now.addingTimeInterval(0.1)
+        )
+        await mock.injectEvent(replay, deliverLive: true)
+        for _ in 0..<80 {
+            if store.errors["sync"] != nil { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(store.errors["sync"], TransportError.replayDetected.localizedDescription)
+        XCTAssertEqual(try await cache.lastSequence(), 1201, "A reused event id at a future sequence must not advance the durable cursor")
         await store.suspend()
     }
 

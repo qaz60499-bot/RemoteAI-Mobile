@@ -457,13 +457,29 @@ struct SequenceDecision: Equatable { let duplicate: Bool; let gap: Bool }
 struct SequenceTracker {
     private(set) var lastSequence: Int64
     init(lastSequence: Int64 = 0) { self.lastSequence = max(0, lastSequence) }
-    mutating func ingest(_ sequence: Int64) -> SequenceDecision {
+
+    func decision(for sequence: Int64) -> SequenceDecision {
         if sequence <= lastSequence { return .init(duplicate: true, gap: false) }
         if lastSequence > 0 && sequence - lastSequence > 1 {
             return .init(duplicate: false, gap: true)
         }
-        lastSequence = sequence
         return .init(duplicate: false, gap: false)
+    }
+
+    @discardableResult
+    mutating func advanceMonotonically(to sequence: Int64) -> Bool {
+        let candidate = max(0, sequence)
+        guard candidate > lastSequence else { return false }
+        lastSequence = candidate
+        return true
+    }
+
+    mutating func ingest(_ sequence: Int64) -> SequenceDecision {
+        let decision = decision(for: sequence)
+        if !decision.duplicate && !decision.gap {
+            advanceMonotonically(to: sequence)
+        }
+        return decision
     }
 }
 
