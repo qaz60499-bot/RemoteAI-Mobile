@@ -927,8 +927,11 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(beforeOnline, 0)
 
         await store.start()
-        for _ in 0..<100 {
-            if await mock.actionAttemptCount("listProjects") > 0 { break }
+        for _ in 0..<250 {
+            let attempted = await mock.actionAttemptCount("listProjects") > 0
+            let applied = store.webProjectsSnapshotState == .authoritativeLiveDOM
+                && store.webProjects.map(\.projectAlias) == ["g-p-remoteai", "g-p-photo"]
+            if attempted && applied { break }
             try await Task.sleep(nanoseconds: 2_000_000)
         }
 

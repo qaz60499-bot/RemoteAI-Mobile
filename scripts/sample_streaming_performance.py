@@ -28,7 +28,8 @@ def measure(udid, chars):
     environment = dict(os.environ)
     environment.update({"SIMCTL_CHILD_REMOTEAI_UI_TEST_MOCK": "1",
                         "SIMCTL_CHILD_REMOTEAI_UI_STRESS_DIRECT": "1",
-                        "SIMCTL_CHILD_REMOTEAI_UI_STRESS_CHARS": str(chars)})
+                        "SIMCTL_CHILD_REMOTEAI_UI_STRESS_CHARS": str(chars),
+                        "SIMCTL_CHILD_REMOTEAI_STREAM_FRAME_SAMPLING": "1"})
     stop = threading.Event()
     sampler = threading.Thread(target=sample_app_process,
                                args=(udid, output / "process.jsonl", stop), daemon=True)

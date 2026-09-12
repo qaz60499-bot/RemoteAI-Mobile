@@ -27,6 +27,14 @@ struct StreamDurationSamples {
 }
 
 final class StreamPerformance: NSObject {
+    // CADisplayLink is diagnostic instrumentation, not part of the rendering path.
+    // Keeping a 60 Hz display link alive for an entire long generation prevents the
+    // main run loop from becoming quiescent and adds avoidable work to production.
+    // CI's dedicated performance sampler opts in explicitly when frame metrics are
+    // required; normal app/UI-test streaming only records event-driven timings.
+    private static var frameSamplingEnabled: Bool {
+        ProcessInfo.processInfo.environment["REMOTEAI_STREAM_FRAME_SAMPLING"] == "1"
+    }
     var merge = StreamDurationSamples()
     var apply = StreamDurationSamples()
     var preparation = StreamDurationSamples()
@@ -64,7 +72,7 @@ final class StreamPerformance: NSObject {
     }
 
     func startFrames() {
-        guard displayLink == nil else { return }
+        guard Self.frameSamplingEnabled, displayLink == nil else { return }
         previousFrame = nil
         let link = CADisplayLink(target: self, selector: #selector(frame(_:)))
         link.preferredFramesPerSecond = 60
