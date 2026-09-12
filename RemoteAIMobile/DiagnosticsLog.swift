@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import UIKit
 import CryptoKit
 
@@ -148,6 +149,7 @@ final class DiagnosticsLog: ObservableObject {
     private let directoryURL: URL
     private let legacyFileURL: URL
     private let iso = ISO8601DateFormatter()
+    private let logger = Logger(subsystem: "com.remoteai.mobile", category: "diagnostics")
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private var lastCleanupAt = Date.distantPast
@@ -180,9 +182,16 @@ final class DiagnosticsLog: ObservableObject {
             event: RemoteAIDiagnosticRedactor.event(event),
             fields: RemoteAIDiagnosticRedactor.fields(fields)
         )
-        lines.append(render(record))
+        let rendered = render(record)
+        lines.append(rendered)
         pruneDisplay()
         append(record)
+        switch record.level {
+        case "ERROR": logger.error("\(rendered, privacy: .public)")
+        case "WARN": logger.warning("\(rendered, privacy: .public)")
+        case "DEBUG": logger.debug("\(rendered, privacy: .public)")
+        default: logger.info("\(rendered, privacy: .public)")
+        }
         cleanupIfNeeded()
     }
 

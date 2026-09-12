@@ -164,6 +164,19 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertNoThrow(try RemoteAIConfig.validateSecureRelay(URL(string: "https://example.com")!))
     }
 
+    func testLegacyWorkersDevRelayMigratesToCustomDomain() throws {
+        let legacy = try XCTUnwrap(URL(string: "https://remoteai-relay.qaz60499.workers.dev"))
+        XCTAssertEqual(RemoteAIConfig.migratedRelayURL(legacy), RemoteAIConfig.preferredRelayBaseURL)
+        let unrelated = try XCTUnwrap(URL(string: "https://relay.example.com"))
+        XCTAssertEqual(RemoteAIConfig.migratedRelayURL(unrelated), unrelated)
+    }
+
+    func testStreamingFlushCadenceStaysFastButBoundedForLongReplies() {
+        XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 1_000), 45_000_000)
+        XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 30_000), 60_000_000)
+        XCTAssertEqual(WorkspaceStore.streamingFlushDelayNanoseconds(forByteCount: 100_000), 75_000_000)
+    }
+
     func testRelayDeviceURLUsesFrozenConnectContract() throws {
         let url = try RemoteAIConfig.deviceWebSocketURL(baseURL: URL(string: "https://relay.example.com/base")!, machineId: "machine-a", deviceId: "ios-a")
         XCTAssertEqual(url.scheme, "wss")
@@ -1050,6 +1063,23 @@ final class RemoteAIMobileTests: XCTestCase {
         )
     }
 
+    func testFlattenedWritingEditBlockWithoutBlankLineAfterLabelIsCopyable() {
+        let text = """
+        下面是续跑提示词。
+
+        Edit
+        @DevSpace
+
+        请继续当前项目，不要重新开始。
+        """
+        let segments = MessageContentSegment.parse(text)
+
+        XCTAssertEqual(segments.count, 2)
+        XCTAssertFalse(segments[0].isEditBlock)
+        XCTAssertTrue(segments[1].isEditBlock)
+        XCTAssertEqual(segments[1].text, "@DevSpace\n\n请继续当前项目，不要重新开始。")
+    }
+
     func testEditWordInsideCodeFenceDoesNotBecomeWritingBlock() {
         let text = "Before\n```text\nEdit\n\nnot a writing block\n```\nAfter"
         let segments = MessageContentSegment.parse(text)
@@ -1650,6 +1680,7 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertTrue(MessageAttachment(attachmentId: nil, name: "generated.bin", contentType: "image/webp", sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
         XCTAssertTrue(MessageAttachment(attachmentId: nil, name: "photo.JPG", contentType: nil, sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
         XCTAssertFalse(MessageAttachment(attachmentId: nil, name: "archive.zip", contentType: "application/zip", sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
+        XCTAssertFalse(MessageAttachment(attachmentId: nil, name: "RemoteAI.ipa", contentType: "application/octet-stream", sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
     }
 
     func testAttachmentPreviewDownwardDismissRequiresStrongVerticalIntent() {

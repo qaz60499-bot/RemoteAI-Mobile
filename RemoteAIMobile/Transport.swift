@@ -6,12 +6,21 @@ struct RemoteAIConfig: Codable, Equatable {
     var machineId: String
 
     static let placeholder = RemoteAIConfig(relayBaseURL: URL(string: "https://relay.example.invalid")!, machineId: "my-pc")
+    static let preferredRelayBaseURL = URL(string: "https://remote.guessyy.ccwu.cc")!
+    private static let legacyRelayHosts: Set<String> = ["remoteai-relay.qaz60499.workers.dev"]
     private static let relayKey = "remoteai.relayBaseURL"
     private static let machineKey = "remoteai.machineId"
 
+    static func migratedRelayURL(_ url: URL) -> URL {
+        guard let host = url.host?.lowercased(), legacyRelayHosts.contains(host) else { return url }
+        return preferredRelayBaseURL
+    }
+
     static func loadMetadata() -> RemoteAIConfig {
         let defaults = UserDefaults.standard
-        guard let raw = defaults.string(forKey: relayKey), let url = URL(string: raw) else { return .placeholder }
+        guard let raw = defaults.string(forKey: relayKey), let storedURL = URL(string: raw) else { return .placeholder }
+        let url = migratedRelayURL(storedURL)
+        if url != storedURL { defaults.set(url.absoluteString, forKey: relayKey) }
         return RemoteAIConfig(relayBaseURL: url, machineId: defaults.string(forKey: machineKey) ?? "my-pc")
     }
 

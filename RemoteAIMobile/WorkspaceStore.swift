@@ -72,8 +72,15 @@ final class WorkspaceStore: ObservableObject {
     private var visibleSessionHistorySyncAt: [String: Date] = [:]
     private var systemTransportOfflineChannels = Set<String>()
     private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 2.5
-    private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 10
+    private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 20
+    private static let activeVisibleSessionHistorySyncMinimumInterval: TimeInterval = 10
+    private static let idleVisibleSessionHistorySyncMinimumInterval: TimeInterval = 30
     private static let connectionMonitorIntervalNanoseconds: UInt64 = 500_000_000
+    static func streamingFlushDelayNanoseconds(forByteCount bytes: Int) -> UInt64 {
+        if bytes < 16 * 1024 { return 45_000_000 }
+        if bytes < 64 * 1024 { return 60_000_000 }
+        return 75_000_000
+    }
     private static let sendRecoveryBackoffNanoseconds: [UInt64] = [0, 500_000_000, 1_500_000_000]
     private var olderMessageLoads = Set<String>()
     private var creatingWebProjects = Set<String>()
@@ -928,9 +935,11 @@ final class WorkspaceStore: ObservableObject {
         // mobile client does not hammer the Relay every 1.5s while ChatGPT is thinking.
         let stillActive = remoteStatus.map { $0.state == .busy || $0.state == .waiting } ?? active
         let historyNow = Date()
+        let historyMinimumInterval = stillActive
+            ? Self.activeVisibleSessionHistorySyncMinimumInterval
+            : Self.idleVisibleSessionHistorySyncMinimumInterval
         let historyDue = force
-            || !stillActive
-            || visibleSessionHistorySyncAt[sessionId].map { historyNow.timeIntervalSince($0) >= 10 } != false
+            || visibleSessionHistorySyncAt[sessionId].map { historyNow.timeIntervalSince($0) >= historyMinimumInterval } != false
         if historyDue {
             visibleSessionHistorySyncAt[sessionId] = historyNow
             await loadSession(sessionId)
@@ -2654,8 +2663,10 @@ final class WorkspaceStore: ObservableObject {
     private func bufferStreaming(sessionId: String, id: String, content: String, attachments: [MessageAttachment], sequence: Int64) {
         streamingBuffers[sessionId] = (id, content, sequence, attachments)
         if flushTask == nil {
+            let byteCount = assistantStreams[sessionId]?.utf8Count ?? content.utf8.count
+            let delay = Self.streamingFlushDelayNanoseconds(forByteCount: byteCount)
             flushTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 90_000_000)
+                try? await Task.sleep(nanoseconds: delay)
                 self?.flushAllStreaming()
             }
         }

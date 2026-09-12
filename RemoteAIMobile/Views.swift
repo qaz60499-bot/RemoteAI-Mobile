@@ -461,6 +461,7 @@ struct ChatView: View {
     @State private var didInitialScrollToBottom = false
     @State private var userBrowsingHistory = false
     @StateObject private var speechInput = SpeechInputController()
+    @State private var textSelectionRequest: TextSelectionRequest?
     @FocusState private var focused: Bool
 
     var messages: [ChatMessage] {
@@ -521,9 +522,13 @@ struct ChatView: View {
                                     AssistantStreamRow(stream: stream, message: message, followTail: {
                                         guard !userBrowsingHistory else { return }
                                         proxy.scrollTo("bottom", anchor: .bottom)
+                                    }, onSelectText: { text, monospaced in
+                                        textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
                                     }).id(message.id)
                                 } else {
-                                    MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel).equatable().id(message.id)
+                                    MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel, onSelectText: { text, monospaced in
+                                        textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
+                                    }).equatable().id(message.id)
                                 }
                             }
                             Color.clear
@@ -750,6 +755,9 @@ struct ChatView: View {
             case .success(let urls): appendFileURLs(urls)
             case .failure(let error): attachmentError = error.localizedDescription
             }
+        }
+        .sheet(item: $textSelectionRequest) { request in
+            TextSelectionSheet(text: request.text, monospaced: request.monospaced)
         }
         .onDisappear { speechInput.stop() }
         .onChange(of: scenePhase) { phase in
@@ -1002,7 +1010,7 @@ enum MessageRenderingPolicy {
 struct MessageContentSegment: Identifiable, Equatable {
     private static let editBlockMarker = "__REMOTEAI_EDIT_BLOCK__"
     private static let editRegex = try! NSRegularExpression(
-        pattern: #"(^|\r?\n[ \t]*\r?\n)[ \t]*Edit[ \t]*\r?\n[ \t]*\r?\n"#,
+        pattern: #"(^|\r?\n[ \t]*\r?\n)[ \t]*Edit[ \t]*\r?\n(?:[ \t]*\r?\n)?"#,
         options: [.caseInsensitive, .anchorsMatchLines]
     )
 
@@ -1238,6 +1246,7 @@ struct AssistantStreamRow: View, Equatable {
     @Environment(\.scenePhase) private var scenePhase
     let message: ChatMessage
     var followTail: () -> Void = {}
+    var onSelectText: ((String, Bool) -> Void)? = nil
     @State private var followTask: Task<Void, Never>?
 
     static func == (lhs: AssistantStreamRow, rhs: AssistantStreamRow) -> Bool {
@@ -1252,7 +1261,7 @@ struct AssistantStreamRow: View, Equatable {
         let _ = MessageRenderCache.shared.content(for: visible)
         let _ = stream.performance.preparation.add((StreamPerformance.now - began) * 1000)
         return VStack(alignment: .leading, spacing: 4) {
-            MessageRow(message: visible, commandState: nil, retry: nil, fullStreamingText: { stream.text })
+            MessageRow(message: visible, commandState: nil, retry: nil, fullStreamingText: { stream.text }, onSelectText: onSelectText)
             Text("已接收 \(stream.visibleBytes) 字节 · 显示最新内容")
                 .font(.caption2)
                 .foregroundColor(.secondary)
@@ -1288,13 +1297,13 @@ struct MessageRow: View, Equatable {
     let retry: (() -> Void)?
     var retryContextKey: String = ""
     var fullStreamingText: (() -> String)? = nil
+    var onSelectText: ((String, Bool) -> Void)? = nil
 
     static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
         lhs.message == rhs.message && lhs.commandState == rhs.commandState
             && (lhs.retry == nil) == (rhs.retry == nil) && lhs.retryContextKey == rhs.retryContextKey
     }
     @State private var toolExpanded = true
-    @State private var selectionRequest: TextSelectionRequest?
     private var renderContent: MessageRenderContent { MessageRenderCache.shared.content(for: message) }
     private var displayText: String { renderContent.displayText }
     private var displayAttachments: [MessageAttachment] { renderContent.attachments }
@@ -1358,11 +1367,11 @@ struct MessageRow: View, Equatable {
                             HStack(spacing: 12) {
                                 if MessageRenderingPolicy.isLarge(detail) {
                                     Button("查看全文") {
-                                        selectionRequest = TextSelectionRequest(text: detail, monospaced: true)
+                                        onSelectText?(detail, true)
                                     }
                                 }
                                 Button("选择部分") {
-                                    selectionRequest = TextSelectionRequest(text: detail, monospaced: true)
+                                    onSelectText?(detail, true)
                                 }
                                 Spacer(minLength: 0)
                             }
@@ -1371,7 +1380,7 @@ struct MessageRow: View, Equatable {
                                     UIPasteboard.general.string = message.toolCardCopyText
                                 }
                                 Button("选择整块") {
-                                    selectionRequest = TextSelectionRequest(text: message.toolCardCopyText, monospaced: true)
+                                    onSelectText?(message.toolCardCopyText, true)
                                 }
                                 Spacer(minLength: 0)
                             }
@@ -1390,7 +1399,7 @@ struct MessageRow: View, Equatable {
                         Label("复制整块", systemImage: "doc.on.doc")
                     }
                     Button {
-                        selectionRequest = TextSelectionRequest(text: message.toolCardCopyText, monospaced: true)
+                        onSelectText?(message.toolCardCopyText, true)
                     } label: {
                         Label("选择整块", systemImage: "text.cursor")
                     }
@@ -1410,7 +1419,7 @@ struct MessageRow: View, Equatable {
                                             .foregroundColor(.secondary)
                                         Spacer()
                                         Button("选择部分") {
-                                            selectionRequest = TextSelectionRequest(text: segment.text, monospaced: true)
+                                            onSelectText?(segment.text, true)
                                         }
                                         .font(.caption2)
                                         .buttonStyle(.borderless)
@@ -1443,7 +1452,7 @@ struct MessageRow: View, Equatable {
                         }
                         if isLargeDisplayText {
                             Button {
-                                selectionRequest = TextSelectionRequest(text: selectionText, monospaced: false)
+                                onSelectText?(selectionText, false)
                             } label: {
                                 Label(fullStreamingText != nil ? "查看全文（生成中）" : "查看全文（约 \(max(1, displayText.utf8.count / 1024)) KB）", systemImage: "doc.text.magnifyingglass")
                                     .font(.caption.weight(.medium))
@@ -1470,7 +1479,7 @@ struct MessageRow: View, Equatable {
                                 }
                                 .buttonStyle(.borderless)
                                 Button {
-                                    selectionRequest = TextSelectionRequest(text: selectionText, monospaced: false)
+                                    onSelectText?(selectionText, false)
                                 } label: {
                                     Label("选择部分", systemImage: "text.cursor")
                                         .font(.caption2)
@@ -1489,9 +1498,6 @@ struct MessageRow: View, Equatable {
                     if message.role != .user { Spacer(minLength: 44) }
                 }
             }
-        }
-        .sheet(item: $selectionRequest) { request in
-            TextSelectionSheet(text: request.text, monospaced: request.monospaced)
         }
     }
 
@@ -1514,7 +1520,7 @@ struct MessageRow: View, Equatable {
                 }
                 .buttonStyle(.borderless)
                 Button(isLargeEdit ? "查看 / 选择全文" : "选择部分") {
-                    selectionRequest = TextSelectionRequest(text: segment.text, monospaced: false)
+                    onSelectText?(segment.text, false)
                 }
                 .font(.caption2)
                 .buttonStyle(.borderless)
@@ -1536,7 +1542,7 @@ struct MessageRow: View, Equatable {
                 Label("复制整块", systemImage: "doc.on.doc")
             }
             Button {
-                selectionRequest = TextSelectionRequest(text: segment.text, monospaced: false)
+                onSelectText?(segment.text, false)
             } label: {
                 Label("选择部分", systemImage: "text.cursor")
             }
