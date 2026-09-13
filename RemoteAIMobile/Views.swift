@@ -350,6 +350,7 @@ struct SessionRow: View {
 
 struct WebProjectView: View {
     @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.scenePhase) private var scenePhase
     let runtime: RuntimeDescriptor
     let instance: InstanceDescriptor
     let project: WebProjectDescriptor
@@ -427,8 +428,12 @@ struct WebProjectView: View {
             }
         )
         .task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: true) }
+        .onChange(of: scenePhase) { phase in
+            guard phase == .active, store.machine.state == .online else { return }
+            Task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: true) }
+        }
         .onChange(of: store.machine.state) { state in
-            guard state == .online, rows.isEmpty else { return }
+            guard state == .online else { return }
             Task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: false) }
         }
         .refreshable { await store.loadProjectConversations(projectAlias: project.projectAlias, force: true) }

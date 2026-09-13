@@ -1271,6 +1271,25 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testForcedProjectRefreshBypassesAutomaticFreshnessWindow() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"])
+
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
+        let beforeAutomaticAttempt = await mock.actionAttemptCount("listProjectConversations")
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", force: false)
+        XCTAssertEqual(await mock.actionAttemptCount("listProjectConversations"), beforeAutomaticAttempt, "An immediate automatic refresh should stay throttled")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"])
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["seed-0", "seed-1"], "Foreground/user-forced refresh must bypass the automatic freshness window")
+        await store.suspend()
+    }
+
+    @MainActor
     func testPartialProjectHeadMergeShowsNewestChatWithoutDeletingVerifiedTail() async throws {
         let mock = MockTransport(historyCount: 1)
         let cache = try SQLiteStore.inMemory()
