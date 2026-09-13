@@ -1293,7 +1293,14 @@ struct AssistantStreamRow: View, Equatable {
         let preparedContent = MessageRenderCache.shared.content(for: visible)
         let _ = stream.performance.preparation.add((StreamPerformance.now - began) * 1000)
         return VStack(alignment: .leading, spacing: 4) {
+            // The live tail changes many times per second. Keeping the full rendered
+            // message subtree in the accessibility graph makes VoiceOver/XCUITest ask
+            // SwiftUI for a fresh snapshot while that subtree is mutating, which can
+            // starve every other phone control during 30k/50k+ streams. The visual tail
+            // stays fully rendered; accessibility gets one bounded progress element
+            // until the durable final message replaces this streaming row.
             MessageRow(message: visible, commandState: nil, retry: nil, fullStreamingText: { stream.text }, onSelectText: onSelectText, preparedRenderContent: preparedContent)
+                .accessibilityHidden(true)
             Text("已接收 \(stream.visibleBytes) 字节 · 显示最新内容")
                 .font(.caption2)
                 .foregroundColor(.secondary)
