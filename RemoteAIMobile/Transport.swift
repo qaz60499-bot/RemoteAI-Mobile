@@ -89,6 +89,14 @@ struct AgentStatusSnapshot: Equatable {
     let relayLastDisconnectedAt: Date?
 }
 
+struct RemoteProviderSurfaceIssue: Equatable {
+    let code: String
+    let state: String
+    let message: String
+    let retryable: Bool
+    let at: Date?
+}
+
 struct RemoteSessionStatusSnapshot: Equatable {
     let sessionId: String
     let state: SessionState
@@ -96,6 +104,7 @@ struct RemoteSessionStatusSnapshot: Equatable {
     let lastActivityAt: Date?
     let lastProgressStatus: String?
     let lastProgressAt: Date?
+    let providerSurfaceIssue: RemoteProviderSurfaceIssue?
 }
 
 enum TransportError: LocalizedError, Equatable {
@@ -225,13 +234,28 @@ extension Transport {
               object["sessionId"]?.stringValue == sessionId,
               let status = object["status"]?.stringValue else { throw TransportError.malformedData }
         let metadata = object["metadata"]?.objectValue ?? [:]
+        let providerIssueObject = metadata["providerSurfaceIssue"]?.objectValue
+        let providerIssue: RemoteProviderSurfaceIssue? = {
+            guard let providerIssueObject,
+                  let code = providerIssueObject["code"]?.stringValue,
+                  let state = providerIssueObject["state"]?.stringValue,
+                  let message = providerIssueObject["message"]?.stringValue else { return nil }
+            return RemoteProviderSurfaceIssue(
+                code: code,
+                state: state,
+                message: message,
+                retryable: providerIssueObject["retryable"]?.boolValue == true,
+                at: providerIssueObject["at"]?.stringValue.flatMap(RemoteAIDate.parse)
+            )
+        }()
         return RemoteSessionStatusSnapshot(
             sessionId: sessionId,
             state: .server(status),
             browserConnected: object["browserConnected"]?.boolValue,
             lastActivityAt: metadata["lastActivityAt"]?.stringValue.flatMap(RemoteAIDate.parse),
             lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
-            lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+            lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse),
+            providerSurfaceIssue: providerIssue
         )
     }
 

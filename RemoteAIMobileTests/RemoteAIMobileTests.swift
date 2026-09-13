@@ -2567,6 +2567,122 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testWebProviderSurfaceIssueShowsOnPhoneWithoutFabricatingBusyStateAndClearsOnRecovery() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "SESSION_STATUS",
+            payload: [
+                "providerSurface": .bool(true),
+                "state": .string("degraded"),
+                "providerState": .string("connection-lost"),
+                "code": .string("PROVIDER_UNAVAILABLE"),
+                "message": .string("电脑端 ChatGPT 网页连接已中断；Windows Agent 仍在线，RemoteAI 正在等待 ChatGPT 恢复。"),
+                "retryable": .bool(true),
+                "at": .string(RemoteAIDate.string(now))
+            ],
+            createdAt: now
+        ), deliverLive: true)
+
+        for _ in 0..<80 where store.errors["photo-upload"] == nil {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        XCTAssertEqual(store.errors["photo-upload"], "电脑端 ChatGPT 网页连接已中断；Windows Agent 仍在线，RemoteAI 正在等待 ChatGPT 恢复。")
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "An idle provider outage must not look like an active generation")
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1202,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "SESSION_STATUS",
+            payload: [
+                "providerSurface": .bool(true),
+                "state": .string("online"),
+                "providerState": .string("online"),
+                "recovered": .bool(true),
+                "at": .string(RemoteAIDate.string(now.addingTimeInterval(1)))
+            ],
+            createdAt: now.addingTimeInterval(1)
+        ), deliverLive: true)
+
+        for _ in 0..<80 where store.errors["photo-upload"] != nil {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNil(store.errors["photo-upload"])
+        XCTAssertTrue(store.recentSystemNotice?.contains("ChatGPT 网页已恢复") == true)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebBindingChangeIsVisibleAndDoesNotMergeConversationIdentity() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1210,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "WEB_BINDING_CHANGED",
+            payload: [
+                "reason": .string("conversationContextChanged"),
+                "previousConversationAlias": .string("a"),
+                "observedConversationAlias": .string("b")
+            ],
+            createdAt: now
+        ), deliverLive: true)
+        for _ in 0..<80 where store.recentSystemNotice?.contains("不会跟着串线") != true {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(store.recentSystemNotice?.contains("不会跟着串线") == true)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1211,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "WEB_BINDING_CHANGED",
+            payload: [
+                "reason": .string("registeredPageNavigated"),
+                "activeTabId": .number(99)
+            ],
+            createdAt: now.addingTimeInterval(1)
+        ), deliverLive: true)
+        for _ in 0..<80 where store.recentSystemNotice?.contains("已重新绑定") != true {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(store.recentSystemNotice?.contains("已重新绑定") == true)
+        await store.suspend()
+    }
+
+    @MainActor
     func testFailedGenerationDiscardsStreamingPrefixAndShowsProviderError() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)

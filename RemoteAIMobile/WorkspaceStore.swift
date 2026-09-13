@@ -71,6 +71,9 @@ final class WorkspaceStore: ObservableObject {
     private var visibleSessionSyncAt: [String: Date] = [:]
     private var visibleSessionHistorySyncAt: [String: Date] = [:]
     private var systemTransportOfflineChannels = Set<String>()
+    private var webProviderIssueMessageBySession: [String: String] = [:]
+    private var webProviderIssueStateBySession: [String: String] = [:]
+    private var webBindingDetachedSessions = Set<String>()
     private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 2.5
     private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 20
     private static let activeVisibleSessionHistorySyncMinimumInterval: TimeInterval = 10
@@ -925,6 +928,13 @@ final class WorkspaceStore: ObservableObject {
                 if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
                 liveRunActivityAtBySession.removeValue(forKey: sessionId)
             }
+            if route.runtimeId == "runtime.web" {
+                // SESSION_STATUS push is the fast path. The authoritative session-status
+                // poll carries the same providerSurfaceIssue metadata so a phone that
+                // was backgrounded or briefly disconnected still converges to the real
+                // ChatGPT page state after reconnect.
+                applyWebProviderSurfaceIssue(sessionId: sessionId, issue: snapshot.providerSurfaceIssue)
+            }
             return snapshot
         } catch let error as TransportError where error == .disconnected || error == .timeout || error == .offline {
             DiagnosticsLog.shared.record("session_status_deferred", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
@@ -1517,6 +1527,9 @@ final class WorkspaceStore: ObservableObject {
         projectConversationLoadingByAlias.removeAll()
         liveRunStatusBySession.removeAll()
         liveRunActivityAtBySession.removeAll()
+        webProviderIssueMessageBySession.removeAll()
+        webProviderIssueStateBySession.removeAll()
+        webBindingDetachedSessions.removeAll()
         webProjectsSnapshotId = nil
         projectConversationSnapshotIds.removeAll()
         lastWebProjectsRefreshAt = nil
@@ -2609,7 +2622,40 @@ final class WorkspaceStore: ObservableObject {
                 clearLiveRunActivity(sessionId: sessionId)
                 errors[sessionId] = nil
             }
-        case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED":
+        case "SESSION_STATUS":
+            if event.payload["providerSurface"]?.boolValue == true {
+                let degraded = event.payload["state"]?.stringValue == "degraded"
+                let issue: RemoteProviderSurfaceIssue? = degraded ? RemoteProviderSurfaceIssue(
+                    code: event.payload["code"]?.stringValue ?? "PROVIDER_UNAVAILABLE",
+                    state: event.payload["providerState"]?.stringValue ?? "degraded",
+                    message: event.payload["message"]?.stringValue ?? "ChatGPT 网页当前不可用，RemoteAI 正在等待恢复。",
+                    retryable: event.payload["retryable"]?.boolValue == true,
+                    at: event.payload["at"]?.stringValue.flatMap(RemoteAIDate.parse)
+                ) : nil
+                applyWebProviderSurfaceIssue(sessionId: sessionId, issue: issue)
+                return
+            }
+            await requestMetadataRefresh()
+        case "WEB_BINDING_CHANGED":
+            let reason = event.payload["reason"]?.stringValue ?? "unknown"
+            let activeTabId = event.payload["activeTabId"]?.intValue
+            if activeTabId == nil && ["tabClosed", "conversationContextChanged", "projectContextChanged", "tabReassignedToRegisteredConversation"].contains(reason) {
+                webBindingDetachedSessions.insert(sessionId)
+                switch reason {
+                case "tabClosed":
+                    recentSystemNotice = "电脑端对应的 ChatGPT 标签页已关闭；RemoteAI 会在需要时重新打开并绑定该会话。"
+                case "conversationContextChanged":
+                    recentSystemNotice = "电脑端 ChatGPT 标签页已切换到其他对话；手机当前会话不会跟着串线，RemoteAI 会按原会话身份重新绑定。"
+                case "projectContextChanged":
+                    recentSystemNotice = "电脑端 ChatGPT 标签页已切换到其他 Project；手机当前 Project/Chat 身份保持不变。"
+                default:
+                    recentSystemNotice = "电脑端 ChatGPT 标签页绑定发生变化；RemoteAI 正在重新核对当前会话。"
+                }
+            } else if activeTabId != nil, webBindingDetachedSessions.remove(sessionId) != nil {
+                recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。"
+            }
+            await requestMetadataRefresh()
+        case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED":
             await requestMetadataRefresh()
         case "COMMAND_RESULT", "COMMAND_REJECTED":
             if let raw = event.payload["commandId"]?.stringValue, let commandId = UUID(uuidString: raw) {
@@ -2618,6 +2664,51 @@ final class WorkspaceStore: ObservableObject {
         default:
             break
         }
+    }
+
+    private func applyWebProviderSurfaceIssue(sessionId: String, issue: RemoteProviderSurfaceIssue?) {
+        if let issue {
+            let message = issue.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "ChatGPT 网页当前不可用，RemoteAI 正在等待恢复。"
+                : issue.message
+            let previousMessage = webProviderIssueMessageBySession[sessionId]
+            let previousState = webProviderIssueStateBySession[sessionId]
+            webProviderIssueMessageBySession[sessionId] = message
+            webProviderIssueStateBySession[sessionId] = issue.state
+            errors[sessionId] = message
+
+            let currentState = sessions.first(where: { $0.id == sessionId })?.state
+            if currentState == .busy || currentState == .waiting {
+                liveRunStatusBySession[sessionId] = message
+            }
+            if previousMessage != message || previousState != issue.state {
+                recentSystemNotice = message
+                DiagnosticsLog.shared.record("web_provider_surface_issue", fields: [
+                    "session": sessionId,
+                    "state": issue.state,
+                    "code": issue.code,
+                    "retryable": String(issue.retryable),
+                ], level: "WARN")
+            }
+            return
+        }
+
+        guard let previousMessage = webProviderIssueMessageBySession.removeValue(forKey: sessionId) else { return }
+        let previousState = webProviderIssueStateBySession.removeValue(forKey: sessionId) ?? "degraded"
+        if errors[sessionId] == previousMessage { errors[sessionId] = nil }
+        if liveRunStatusBySession[sessionId] == previousMessage {
+            let currentState = sessions.first(where: { $0.id == sessionId })?.state
+            if currentState == .busy || currentState == .waiting {
+                liveRunStatusBySession[sessionId] = "ChatGPT 网页已恢复，正在继续处理…"
+            } else {
+                liveRunStatusBySession.removeValue(forKey: sessionId)
+            }
+        }
+        recentSystemNotice = "电脑端 ChatGPT 网页已恢复；当前会话正在补同步。"
+        DiagnosticsLog.shared.record("web_provider_surface_recovered", fields: [
+            "session": sessionId,
+            "previousState": previousState,
+        ])
     }
 
     func clearRecentSystemNotice() {
