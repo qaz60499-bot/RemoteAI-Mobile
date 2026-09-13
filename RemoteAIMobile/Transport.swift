@@ -281,11 +281,12 @@ extension Transport {
         try await listProjectsResponse(machineId: machineId, forceRefresh: forceRefresh).items
     }
 
-    func listProjectConversations(machineId: String, projectAlias: String, limit: Int = 30, cursor: String? = nil) async throws -> WebProjectConversationPage {
+    func listProjectConversations(machineId: String, projectAlias: String, limit: Int = 30, cursor: String? = nil, forceRefresh: Bool = false) async throws -> WebProjectConversationPage {
         let safeLimit = max(1, min(limit, 50))
         var payload: [String: JSONValue] = [
             "projectAlias": .string(projectAlias),
-            "limit": .number(Double(safeLimit))
+            "limit": .number(Double(safeLimit)),
+            "preferCache": .bool(!forceRefresh)
         ]
         if let cursor, !cursor.isEmpty { payload["cursor"] = .string(cursor) }
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "listProjectConversations", payload: payload)

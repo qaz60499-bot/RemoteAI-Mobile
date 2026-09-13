@@ -571,7 +571,7 @@ final class WorkspaceStore: ObservableObject {
             return
         }
         do {
-            var page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30)
+            var page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, forceRefresh: force)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
             // The ChatGPT sidebar lazily mounts untouched Project conversation panels.
             // If the first read explicitly reports a partial DOM and we have no verified
@@ -584,7 +584,7 @@ final class WorkspaceStore: ObservableObject {
                    revision == projectConversationRevisions[projectAlias, default: 0],
                    machine.state == .online,
                    !isSuspended,
-                   let retry = try? await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30),
+                   let retry = try? await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, forceRefresh: force),
                    retry.isAuthoritativeLiveDOM {
                     page = retry
                 }
@@ -668,7 +668,7 @@ final class WorkspaceStore: ObservableObject {
               let cursor = projectNextCursorByAlias[projectAlias],
               let expectedSnapshotId = projectConversationSnapshotIds[projectAlias] else { return }
         do {
-            let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, cursor: cursor)
+            let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, cursor: cursor, forceRefresh: true)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
             guard page.isAuthoritativeLiveDOM else {
                 projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable

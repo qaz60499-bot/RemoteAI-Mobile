@@ -1271,6 +1271,19 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testForcedProjectConversationRefreshBypassesWindowsVerifiedCache() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", force: true)
+
+        let preferCache = await mock.lastPreferCacheValue("listProjectConversations")
+        XCTAssertEqual(preferCache, false, "Explicit Project refresh must request live Windows/ChatGPT state instead of the verified cache")
+        await store.suspend()
+    }
+
+    @MainActor
     func testForcedProjectRefreshBypassesAutomaticFreshnessWindow() async throws {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())

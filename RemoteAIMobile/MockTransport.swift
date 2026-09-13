@@ -23,6 +23,7 @@ actor MockTransport: Transport {
     private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
     private var commandAttempts: [String: Int] = [:]
+    private var lastPreferCacheByAction: [String: Bool] = [:]
     private var connectAttempts = 0
     private var executionDelayNanoseconds: UInt64 = 0
     private var requestDelayNanoseconds: [String: UInt64] = [:]
@@ -123,6 +124,7 @@ actor MockTransport: Transport {
     func setRequestDelay(action: String, nanoseconds: UInt64) { requestDelayNanoseconds[action] = nanoseconds }
     func setResponseDelay(action: String, nanoseconds: UInt64) { responseDelayNanoseconds[action] = nanoseconds }
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
+    func lastPreferCacheValue(_ action: String) -> Bool? { lastPreferCacheByAction[action] }
     func connectionAttemptCount() -> Int { connectAttempts }
     func projectCount() -> Int { webProjects.count }
     func projectConversationCount(_ alias: String) -> Int { webProjectConversations[alias, default: []].count }
@@ -203,6 +205,9 @@ actor MockTransport: Transport {
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
         try ProtocolSecurity.validate(command, expectedMachineId: machineId)
         commandAttempts[command.action, default: 0] += 1
+        if let preferCache = command.payload["preferCache"]?.boolValue {
+            lastPreferCacheByAction[command.action] = preferCache
+        }
         let tracksMessageAttachmentRead = command.action == "readMessageAttachmentChunk"
         if tracksMessageAttachmentRead {
             activeMessageAttachmentReads += 1
