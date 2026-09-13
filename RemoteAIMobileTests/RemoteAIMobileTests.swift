@@ -1281,7 +1281,8 @@ final class RemoteAIMobileTests: XCTestCase {
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
         let beforeAutomaticAttempt = await mock.actionAttemptCount("listProjectConversations")
         await store.loadProjectConversations(projectAlias: "g-p-remoteai", force: false)
-        XCTAssertEqual(await mock.actionAttemptCount("listProjectConversations"), beforeAutomaticAttempt, "An immediate automatic refresh should stay throttled")
+        let afterAutomaticAttempt = await mock.actionAttemptCount("listProjectConversations")
+        XCTAssertEqual(afterAutomaticAttempt, beforeAutomaticAttempt, "An immediate automatic refresh should stay throttled")
         XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"])
 
         await store.loadProjectConversations(projectAlias: "g-p-remoteai", force: true)
