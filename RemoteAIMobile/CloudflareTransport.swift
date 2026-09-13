@@ -7,6 +7,7 @@ actor CloudflareTransport: Transport {
     private let maxInboundFrameBytes = ProtocolSecurity.maxInboundFrameBytes
     private let maxOutboundFrameBytes = ProtocolSecurity.maxOutboundFrameBytes
     private let commandTimeoutNanoseconds: UInt64 = 30_000_000_000
+    private let projectDiscoveryTimeoutNanoseconds: UInt64 = 75_000_000_000
     private let connectionTimeoutSeconds: TimeInterval = 8
     private let sendTimeoutSeconds: TimeInterval = 10
     private let heartbeatIntervalNanoseconds: UInt64 = 20_000_000_000
@@ -150,11 +151,14 @@ actor CloudflareTransport: Transport {
         guard let encryptedObject = try JSONValue.encode(encrypted).objectValue else { throw TransportError.malformedData }
         let frame = RelayFrame(v: 1, kind: "ENCRYPTED", machineId: config.machineId, deviceId: deviceId, messageId: messageId, body: encryptedObject)
 
+        let timeoutNanoseconds = (command.action == "listProjects" || command.action == "listProjectConversations")
+            ? projectDiscoveryTimeoutNanoseconds
+            : commandTimeoutNanoseconds
         return try await withCheckedThrowingContinuation { continuation in
             pending[command.commandId] = continuation
             timeoutTasks[command.commandId]?.cancel()
             timeoutTasks[command.commandId] = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: self?.commandTimeoutNanoseconds ?? 30_000_000_000)
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
                 guard !Task.isCancelled else { return }
                 await self?.failPending(command.commandId, error: TransportError.timeout)
             }
