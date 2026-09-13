@@ -1287,21 +1287,40 @@ struct AssistantStreamRow: View, Equatable {
 
     var body: some View {
         let began = StreamPerformance.now
-        let _ = stream.performance.rowUpdated(bytes: stream.visibleBytes)
-        var visible = message
-        visible.text = stream.visibleText
-        let preparedContent = MessageRenderCache.shared.content(for: visible)
+        let visibleText = stream.visibleText
+        let visibleBytes = stream.visibleBytes
+        let _ = stream.performance.rowUpdated(bytes: visibleBytes)
+        // Keep the live path deliberately cheap. Re-running the full Markdown/Edit/
+        // attachment renderer for every presentation tick can monopolize the main
+        // thread on 30k/50k+ answers and even starve accessibility snapshots. The
+        // durable final message still uses MessageRow, so formatting is restored once.
         let _ = stream.performance.preparation.add((StreamPerformance.now - began) * 1000)
-        return VStack(alignment: .leading, spacing: 4) {
-            // The live tail changes many times per second. Keeping the full rendered
-            // message subtree in the accessibility graph makes VoiceOver/XCUITest ask
-            // SwiftUI for a fresh snapshot while that subtree is mutating, which can
-            // starve every other phone control during 30k/50k+ streams. The visual tail
-            // stays fully rendered; accessibility gets one bounded progress element
-            // until the durable final message replaces this streaming row.
-            MessageRow(message: visible, commandState: nil, retry: nil, fullStreamingText: { stream.text }, onSelectText: onSelectText, preparedRenderContent: preparedContent)
-                .accessibilityHidden(true)
-            Text("已接收 \(stream.visibleBytes) 字节 · 显示最新内容")
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .bottom) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(visibleText)
+                        .accessibilityHidden(true)
+                    HStack(spacing: 12) {
+                        Button {
+                            UIPasteboard.general.string = stream.text
+                        } label: {
+                            Label("复制当前全文", systemImage: "doc.on.doc")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        Button("查看 / 选择当前全文") {
+                            onSelectText?(stream.text, false)
+                        }
+                        .font(.caption2)
+                        .buttonStyle(.borderless)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(RoundedRectangle(cornerRadius: 16).fill(Color(.secondarySystemGroupedBackground)))
+                Spacer(minLength: 44)
+            }
+            Text("已接收 \(visibleBytes) 字节 · 显示最新内容")
                 .font(.caption2)
                 .foregroundColor(.secondary)
                 .accessibilityIdentifier("assistant-stream-progress")
