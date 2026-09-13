@@ -1312,6 +1312,31 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(segments[1].text, "@DevSpace\n\n请继续当前项目，不要重新开始。")
     }
 
+    func testFlattenedContinuationPromptWithoutEditLabelBecomesCopyableBlock() {
+        let text = """
+        下面是下一窗口的提示词，请直接复制。
+
+        请继续实际接管：
+        D:\\wendangcodex\\RemoteAI-Mobile
+
+        这不是新任务，不要重新诊断。必须以当前真实磁盘、Git 和真机状态为唯一事实源继续。
+        请继续完成 Codex 审计、测试和交付。
+        """
+        let segments = MessageContentSegment.parse(text)
+
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertTrue(segments[0].isEditBlock)
+        XCTAssertTrue(segments[0].text.hasPrefix("请继续实际接管："))
+        XCTAssertTrue(segments[0].text.contains("RemoteAI-Mobile"))
+    }
+
+    func testOrdinaryLongAnswerWithoutEditLabelIsNotMisclassified() {
+        let text = String(repeating: "这是普通说明文字，不包含接管指令或 Codex 续跑要求。", count: 80)
+        let segments = MessageContentSegment.parse(text)
+
+        XCTAssertFalse(segments.contains(where: \.isEditBlock))
+    }
+
     func testEditWordInsideCodeFenceDoesNotBecomeWritingBlock() {
         let text = "Before\n```text\nEdit\n\nnot a writing block\n```\nAfter"
         let segments = MessageContentSegment.parse(text)
@@ -1913,6 +1938,7 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertTrue(MessageAttachment(attachmentId: nil, name: "photo.JPG", contentType: nil, sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
         XCTAssertFalse(MessageAttachment(attachmentId: nil, name: "archive.zip", contentType: "application/zip", sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
         XCTAssertFalse(MessageAttachment(attachmentId: nil, name: "RemoteAI.ipa", contentType: "application/octet-stream", sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
+        XCTAssertFalse(MessageAttachment(attachmentId: nil, name: "sample.apk", contentType: "application/vnd.android.package-archive", sizeBytes: nil, previewURL: nil, downloadURL: nil).isImage)
     }
 
     func testAttachmentPreviewDownwardDismissRequiresStrongVerticalIntent() {
@@ -1945,6 +1971,43 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(downloaded.contentType, "image/png")
         XCTAssertEqual(downloaded.data, Data("mock message attachment".utf8))
         XCTAssertTrue(ProtocolSecurity.commandActions.contains("readMessageAttachmentChunk"))
+    }
+
+    func testMessageAttachmentTransferPolicySupportsLargeInboundFilesWithoutChangingOutboundLimit() {
+        XCTAssertEqual(MessageAttachmentTransferPolicy.previewCacheBytes, 20 * 1024 * 1024)
+        XCTAssertEqual(MessageAttachmentTransferPolicy.maxDownloadBytes, 128 * 1024 * 1024)
+        XCTAssertEqual(MessageAttachmentTransferPolicy.maxDownloadChunks, 2048)
+    }
+
+    func testPrivateMessageAttachmentCanStreamDirectlyToFileForArchiveDownloads() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let source = Data((0..<(512 * 1024 + 137)).map { UInt8($0 % 251) })
+        let uploaded = try await mock.uploadAttachment(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            attachment: PendingAttachment(name: "sample-release.apk", contentType: "application/vnd.android.package-archive", data: source)
+        )
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("RemoteAI-File-Download-Test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let downloaded = try await mock.downloadMessageAttachmentFile(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            attachmentId: uploaded.attachmentId,
+            attachmentName: "sample-release.apk",
+            destinationDirectory: directory
+        )
+
+        XCTAssertEqual(downloaded.name, "sample-release.apk")
+        XCTAssertEqual(downloaded.contentType, "application/vnd.android.package-archive")
+        XCTAssertEqual(downloaded.sizeBytes, source.count)
+        XCTAssertEqual(try Data(contentsOf: downloaded.url), source)
+        XCTAssertEqual(downloaded.url.lastPathComponent, "sample-release.apk")
     }
 
     func testLargePrivateMessageAttachmentDownloadsRemainingChunksConcurrentlyAndReassemblesInOrder() async throws {

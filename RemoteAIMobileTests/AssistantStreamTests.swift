@@ -47,6 +47,21 @@ final class AssistantStreamTests: XCTestCase {
         await store.suspend()
     }
 
+    func testPresentationFlushPublishesTextAndByteCountAtomically() {
+        let stream = AssistantStream(id: "atomic", revision: 0, text: "start")
+        var publications = 0
+        let subscription = stream.objectWillChange.sink { publications += 1 }
+
+        XCTAssertTrue(stream.append(id: "atomic", baseRevision: 0, revision: 1, delta: " more"))
+        XCTAssertEqual(publications, 0, "Network deltas should remain buffered until the presentation flush")
+        stream.flushPresentation()
+
+        XCTAssertEqual(publications, 1, "One presentation flush must invalidate the streaming row only once")
+        XCTAssertEqual(stream.visibleText, "start more")
+        XCTAssertEqual(stream.visibleBytes, "start more".utf8.count)
+        subscription.cancel()
+    }
+
     func testUnicodeDuplicateGapAndRewrite() {
         let stream = AssistantStream(id: "one", revision: 1, text: "中文🙂")
         XCTAssertTrue(stream.append(id: "one", baseRevision: 1, revision: 2, delta: " e\u{301}"))

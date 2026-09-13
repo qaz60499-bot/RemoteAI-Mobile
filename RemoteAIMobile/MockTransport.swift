@@ -385,6 +385,9 @@ actor MockTransport: Transport {
             let attachmentId = command.payload["attachmentId"]?.stringValue ?? ""
             let index = Int(command.payload["index"]?.intValue ?? 0)
             let data = finishedAttachmentData[attachmentId] ?? Data("mock message attachment".utf8)
+            let requestedName = command.payload["attachmentName"]?.stringValue
+            let responseName = requestedName?.isEmpty == false ? requestedName! : "mock-image.png"
+            let responseType = responseName.lowercased().hasSuffix(".apk") ? "application/vnd.android.package-archive" : "image/png"
             let chunkBytes = 64 * 1024
             let offset = index * chunkBytes
             guard offset <= data.count else {
@@ -395,8 +398,8 @@ actor MockTransport: Transport {
             let chunkData = data.subdata(in: offset..<end)
             response = try success(MessageAttachmentChunk(
                 attachmentId: attachmentId,
-                name: "mock-image.png",
-                contentType: "image/png",
+                name: responseName,
+                contentType: responseType,
                 sizeBytes: data.count,
                 sha256: nil,
                 index: index,

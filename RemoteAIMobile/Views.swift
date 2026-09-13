@@ -1023,6 +1023,10 @@ struct MessageContentSegment: Identifiable, Equatable {
     var isEditBlock: Bool { !isCode && language == Self.editBlockMarker }
 
     static func parse(_ value: String) -> [MessageContentSegment] {
+        if value.range(of: "Edit", options: .caseInsensitive) == nil,
+           let inferred = inferredContinuationPrompt(in: value) {
+            return [MessageContentSegment(id: 0, text: inferred, isCode: false, language: editBlockMarker)]
+        }
         if !value.contains("```"), value.range(of: "Edit", options: .caseInsensitive) == nil {
             return value.isEmpty ? [] : [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)]
         }
@@ -1058,7 +1062,8 @@ struct MessageContentSegment: Identifiable, Equatable {
     }
 
     static func editBlocks(in value: String) -> [MessageContentSegment] {
-        guard value.range(of: "Edit", options: .caseInsensitive) != nil else { return [] }
+        let inferredPrompt = inferredContinuationPrompt(in: value)
+        guard value.range(of: "Edit", options: .caseInsensitive) != nil else { return continuationPromptBlocks(inferredPrompt) }
         let nsValue = value as NSString
         let matches = editMatches(in: value, nsValue: nsValue)
         guard !matches.isEmpty else { return [] }
@@ -1075,6 +1080,32 @@ struct MessageContentSegment: Identifiable, Equatable {
             }
         }
         return blocks
+    }
+
+    private static func inferredContinuationPrompt(in value: String) -> String? {
+        guard value.utf8.count >= 256 else { return nil }
+        var score = 0
+        if value.contains("继续实际接管") || value.contains("请继续实际接管") || value.contains("继续接管") { score += 2 }
+        if value.contains("不要重新") { score += 1 }
+        if value.contains("必须以") { score += 1 }
+        if value.contains("当前真实") || value.contains("真实状态") { score += 1 }
+        if value.localizedCaseInsensitiveContains("Codex") { score += 1 }
+        guard score >= 4 else { return nil }
+
+        let lines = value.components(separatedBy: .newlines)
+        guard let start = lines.firstIndex(where: { line in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.contains("继续实际接管")
+                || trimmed.contains("请继续实际接管")
+                || trimmed.contains("继续接管")
+        }) else { return nil }
+        let body = lines[start...].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty ? nil : body
+    }
+
+    private static func continuationPromptBlocks(_ prompt: String?) -> [MessageContentSegment] {
+        guard let prompt, !prompt.isEmpty else { return [] }
+        return [MessageContentSegment(id: 0, text: prompt, isCode: false, language: editBlockMarker)]
     }
 
     private static func editMatches(in value: String, nsValue: NSString) -> [NSTextCheckingResult] {
@@ -1259,10 +1290,10 @@ struct AssistantStreamRow: View, Equatable {
         let _ = stream.performance.rowUpdated(bytes: stream.visibleBytes)
         var visible = message
         visible.text = stream.visibleText
-        let _ = MessageRenderCache.shared.content(for: visible)
+        let preparedContent = MessageRenderCache.shared.content(for: visible)
         let _ = stream.performance.preparation.add((StreamPerformance.now - began) * 1000)
         return VStack(alignment: .leading, spacing: 4) {
-            MessageRow(message: visible, commandState: nil, retry: nil, fullStreamingText: { stream.text }, onSelectText: onSelectText)
+            MessageRow(message: visible, commandState: nil, retry: nil, fullStreamingText: { stream.text }, onSelectText: onSelectText, preparedRenderContent: preparedContent)
             Text("已接收 \(stream.visibleBytes) 字节 · 显示最新内容")
                 .font(.caption2)
                 .foregroundColor(.secondary)
@@ -1279,7 +1310,7 @@ struct AssistantStreamRow: View, Equatable {
             // deltas keep arriving. The callback rechecks browsing at execution.
             guard followTask == nil else { return }
             followTask = Task { @MainActor in
-                do { try await Task.sleep(nanoseconds: 150_000_000) }
+                do { try await Task.sleep(nanoseconds: 250_000_000) }
                 catch { return }
                 followTail()
                 followTask = nil
@@ -1299,13 +1330,14 @@ struct MessageRow: View, Equatable {
     var retryContextKey: String = ""
     var fullStreamingText: (() -> String)? = nil
     var onSelectText: ((String, Bool) -> Void)? = nil
+    var preparedRenderContent: MessageRenderContent? = nil
 
     static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
         lhs.message == rhs.message && lhs.commandState == rhs.commandState
             && (lhs.retry == nil) == (rhs.retry == nil) && lhs.retryContextKey == rhs.retryContextKey
     }
     @State private var toolExpanded = true
-    private var renderContent: MessageRenderContent { MessageRenderCache.shared.content(for: message) }
+    private var renderContent: MessageRenderContent { preparedRenderContent ?? MessageRenderCache.shared.content(for: message) }
     private var displayText: String { renderContent.displayText }
     private var displayAttachments: [MessageAttachment] { renderContent.attachments }
     private var isLargeDisplayText: Bool { renderContent.isLarge || (fullStreamingText != nil && message.text.count >= 2001) }
@@ -1667,11 +1699,17 @@ private struct MessageAttachmentView: View {
     @State private var cachedImage: UIImage?
     @State private var cacheLoadFinished = false
     @State private var previewItem: AttachmentPreviewItem?
+    @State private var exportItem: AttachmentPreviewItem?
     @State private var previewError: String?
     @State private var isOpeningPreview = false
 
     private var canOpenFromAgent: Bool {
         attachment.attachmentId?.hasPrefix("webasset-") == true
+    }
+
+    private var prefersFileExport: Bool {
+        let lower = attachment.name.lowercased()
+        return [".zip", ".ipa", ".apk", ".7z", ".rar"].contains { lower.hasSuffix($0) }
     }
 
     private var targetURL: URL? {
@@ -1692,9 +1730,29 @@ private struct MessageAttachmentView: View {
     var body: some View {
         Group {
             if canOpenFromAgent {
-                Button(action: openFromAgent) { cardContent }
-                    .buttonStyle(.plain)
-                    .disabled(isOpeningPreview)
+                VStack(alignment: .leading, spacing: 6) {
+                    Button(action: openFromAgent) { cardContent }
+                        .buttonStyle(.plain)
+                        .disabled(isOpeningPreview)
+                    HStack(spacing: 12) {
+                        Button {
+                            saveFromAgent()
+                        } label: {
+                            Label("保存到文件", systemImage: "arrow.down.to.line")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(isOpeningPreview)
+                        if !attachment.isImage {
+                            Text("无需预览支持，也可直接保存 ZIP / IPA / APK 等文件")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .lineLimit(2)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 8)
+                }
             } else if let targetURL {
                 Link(destination: targetURL) { cardContent }
                     .buttonStyle(.plain)
@@ -1704,6 +1762,9 @@ private struct MessageAttachmentView: View {
         }
         .sheet(item: $previewItem) { item in
             AttachmentPreviewSheet(item: item)
+        }
+        .sheet(item: $exportItem) { item in
+            DocumentExportPicker(url: item.url)
         }
         .alert("无法打开附件", isPresented: Binding(
             get: { previewError != nil },
@@ -1720,7 +1781,7 @@ private struct MessageAttachmentView: View {
 
     private var cardContent: some View {
         HStack(spacing: 10) {
-            if attachment.isImage, attachment.attachmentId?.hasPrefix("webasset-") == true {
+            if shouldAutoLoadAgentImage {
                 Group {
                     if let cachedImage {
                         Image(uiImage: cachedImage).resizable().scaledToFill()
@@ -1779,24 +1840,36 @@ private struct MessageAttachmentView: View {
         .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground).opacity(0.7)))
     }
 
+    private var shouldAutoLoadAgentImage: Bool {
+        guard attachment.isImage, attachment.attachmentId?.hasPrefix("webasset-") == true else { return false }
+        guard let sizeBytes = attachment.sizeBytes else { return false }
+        return sizeBytes <= 4 * 1024 * 1024
+    }
+
     private func openFromAgent() {
+        materializeFromAgent(forExport: prefersFileExport)
+    }
+
+    private func saveFromAgent() {
+        materializeFromAgent(forExport: true)
+    }
+
+    private func materializeFromAgent(forExport: Bool) {
         guard !isOpeningPreview else { return }
         isOpeningPreview = true
-        Task { @MainActor in
-            defer { isOpeningPreview = false }
-            guard let data = await store.loadMessageAttachmentData(sessionId: sessionId, attachment: attachment) else {
-                previewError = "无法从当前网页会话读取这个附件。请确认电脑端 ChatGPT 页面仍能访问该文件。"
+        Task {
+            guard let url = await store.downloadMessageAttachmentFile(sessionId: sessionId, attachment: attachment) else {
+                await MainActor.run {
+                    isOpeningPreview = false
+                    previewError = "无法从当前网页会话下载这个附件。请确认电脑端 ChatGPT 页面仍能访问该文件。"
+                }
                 return
             }
-            do {
-                let safeName = preferredPreviewFilename(data: data)
-                let directory = FileManager.default.temporaryDirectory.appendingPathComponent("RemoteAI-Previews", isDirectory: true)
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let url = directory.appendingPathComponent("\(UUID().uuidString)-\(safeName)")
-                try data.write(to: url, options: .atomic)
-                previewItem = AttachmentPreviewItem(url: url)
-            } catch {
-                previewError = "附件已下载，但无法创建本地预览文件。"
+            await MainActor.run {
+                isOpeningPreview = false
+                let item = AttachmentPreviewItem(url: url)
+                if forExport { exportItem = item }
+                else { previewItem = item }
             }
         }
     }

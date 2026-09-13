@@ -134,6 +134,20 @@ struct RemoteAttachmentDescriptor: Codable, Identifiable, Hashable {
     let sha256: String
 }
 
+enum MessageAttachmentTransferPolicy {
+    static let previewCacheBytes = 20 * 1024 * 1024
+    static let maxDownloadBytes = 128 * 1024 * 1024
+    static let maxDownloadChunks = 2048
+}
+
+struct DownloadedMessageAttachmentFile: Hashable {
+    let attachmentId: String
+    let name: String
+    let contentType: String
+    let sizeBytes: Int
+    let url: URL
+}
+
 struct DownloadedMessageAttachment: Hashable {
     let attachmentId: String
     let name: String

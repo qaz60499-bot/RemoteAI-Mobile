@@ -3,14 +3,20 @@ import Combine
 
 // Protocol revision is independent of presentation flushes and of Swift grapheme
 // counts. A delta can only extend the exact acknowledged stream revision.
+private struct AssistantStreamPresentation: Equatable {
+    let text: String
+    let bytes: Int
+}
+
 final class AssistantStream: ObservableObject {
     let id: String
     let performance = StreamPerformance()
     private(set) var revision: Int64
     private var chunks: [String]
     private var preview: String
-    @Published private(set) var visibleText: String
-    @Published private(set) var visibleBytes: Int
+    @Published private var presentation: AssistantStreamPresentation
+    var visibleText: String { presentation.text }
+    var visibleBytes: Int { presentation.bytes }
     private(set) var utf8Count: Int
     private(set) var materializedBytes = 0
 
@@ -19,9 +25,8 @@ final class AssistantStream: ObservableObject {
         self.revision = revision
         chunks = [text]
         preview = String(text.suffix(2001))
-        visibleText = preview
         utf8Count = text.utf8.count
-        visibleBytes = utf8Count
+        presentation = AssistantStreamPresentation(text: preview, bytes: utf8Count)
     }
 
     // Normal deltas never materialize the sealed prefix. Only explicit full-text
@@ -36,8 +41,8 @@ final class AssistantStream: ObservableObject {
     // Only the active row observes this object; history arrays stay untouched.
     func flushPresentation() {
         performance.published()
-        if visibleText != preview { visibleText = preview }
-        if visibleBytes != utf8Count { visibleBytes = utf8Count }
+        let next = AssistantStreamPresentation(text: preview, bytes: utf8Count)
+        if presentation != next { presentation = next }
     }
 
     func append(id: String, baseRevision: Int64, revision: Int64, delta: String) -> Bool {

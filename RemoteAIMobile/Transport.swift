@@ -379,7 +379,7 @@ extension Transport {
             index: 0
         )
         let totalChunks = (first.chunk.sizeBytes + first.chunk.chunkBytes - 1) / first.chunk.chunkBytes
-        guard totalChunks >= 1, totalChunks <= 400 else { throw TransportError.frameTooLarge }
+        guard totalChunks >= 1, totalChunks <= MessageAttachmentTransferPolicy.maxDownloadChunks else { throw TransportError.frameTooLarge }
         if totalChunks == 1 {
             return DownloadedMessageAttachment(
                 attachmentId: attachmentId,
@@ -459,8 +459,120 @@ extension Transport {
         return DownloadedMessageAttachment(attachmentId: attachmentId, name: expectedName, contentType: expectedContentType, data: data)
     }
 
+    func downloadMessageAttachmentFile(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachmentId: String, attachmentName: String? = nil, destinationDirectory: URL) async throws -> DownloadedMessageAttachmentFile {
+        try ProtocolSecurity.validateIdentifier(attachmentId)
+        let first = try await readMessageAttachmentChunk(
+            machineId: machineId,
+            runtimeId: runtimeId,
+            instanceId: instanceId,
+            sessionId: sessionId,
+            attachmentId: attachmentId,
+            attachmentName: attachmentName,
+            index: 0
+        )
+        let expectedSize = first.chunk.sizeBytes
+        let expectedChunkBytes = first.chunk.chunkBytes
+        let expectedName = first.chunk.name
+        let expectedContentType = first.chunk.contentType
+        let totalChunks = (expectedSize + expectedChunkBytes - 1) / expectedChunkBytes
+        guard totalChunks >= 1, totalChunks <= MessageAttachmentTransferPolicy.maxDownloadChunks else { throw TransportError.frameTooLarge }
+
+        let rawName = URL(fileURLWithPath: expectedName).lastPathComponent
+        let forbidden = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/\\:"))
+        let sanitized = rawName
+            .components(separatedBy: forbidden)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+        let safeName = sanitized.isEmpty ? "attachment" : String(sanitized.prefix(180))
+        try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
+        let originalURL = destinationDirectory.appendingPathComponent(safeName)
+        let base = originalURL.deletingPathExtension().lastPathComponent
+        let ext = originalURL.pathExtension
+        var fileURL = originalURL
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: fileURL.path), suffix <= 999 {
+            let candidateName = ext.isEmpty ? "\(base) (\(suffix))" : "\(base) (\(suffix)).\(ext)"
+            fileURL = destinationDirectory.appendingPathComponent(candidateName)
+            suffix += 1
+        }
+        guard !FileManager.default.fileExists(atPath: fileURL.path),
+              FileManager.default.createFile(atPath: fileURL.path, contents: nil) else { throw TransportError.malformedData }
+        let handle = try FileHandle(forWritingTo: fileURL)
+
+        do {
+            try handle.write(contentsOf: first.data)
+            let maxConcurrentChunks = 6
+            try await withThrowingTaskGroup(of: (Int, Data).self) { group in
+                var nextIndex = 1
+                for _ in 0..<min(maxConcurrentChunks, totalChunks - 1) {
+                    let index = nextIndex
+                    nextIndex += 1
+                    group.addTask {
+                        let item = try await self.readMessageAttachmentChunk(
+                            machineId: machineId,
+                            runtimeId: runtimeId,
+                            instanceId: instanceId,
+                            sessionId: sessionId,
+                            attachmentId: attachmentId,
+                            attachmentName: attachmentName,
+                            index: index
+                        )
+                        guard item.chunk.sizeBytes == expectedSize,
+                              item.chunk.chunkBytes == expectedChunkBytes,
+                              item.chunk.name == expectedName,
+                              item.chunk.contentType == expectedContentType else { throw TransportError.malformedData }
+                        return (index, item.data)
+                    }
+                }
+                while let (index, data) = try await group.next() {
+                    try handle.seek(toOffset: UInt64(index * expectedChunkBytes))
+                    try handle.write(contentsOf: data)
+                    if nextIndex < totalChunks {
+                        let index = nextIndex
+                        nextIndex += 1
+                        group.addTask {
+                            let item = try await self.readMessageAttachmentChunk(
+                                machineId: machineId,
+                                runtimeId: runtimeId,
+                                instanceId: instanceId,
+                                sessionId: sessionId,
+                                attachmentId: attachmentId,
+                                attachmentName: attachmentName,
+                                index: index
+                            )
+                            guard item.chunk.sizeBytes == expectedSize,
+                                  item.chunk.chunkBytes == expectedChunkBytes,
+                                  item.chunk.name == expectedName,
+                                  item.chunk.contentType == expectedContentType else { throw TransportError.malformedData }
+                            return (index, item.data)
+                        }
+                    }
+                }
+            }
+            try handle.synchronize()
+            try handle.close()
+            let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+            let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
+            guard size == expectedSize else {
+                try? FileManager.default.removeItem(at: fileURL)
+                throw TransportError.malformedData
+            }
+            return DownloadedMessageAttachmentFile(
+                attachmentId: attachmentId,
+                name: safeName,
+                contentType: expectedContentType,
+                sizeBytes: expectedSize,
+                url: fileURL
+            )
+        } catch {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: fileURL)
+            throw error
+        }
+    }
+
     private func readMessageAttachmentChunk(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachmentId: String, attachmentName: String?, index: Int) async throws -> (chunk: MessageAttachmentChunk, data: Data) {
-        guard index >= 0 && index <= 400 else { throw TransportError.frameTooLarge }
+        guard index >= 0 && index < MessageAttachmentTransferPolicy.maxDownloadChunks else { throw TransportError.frameTooLarge }
         var payload: [String: JSONValue] = [
             "attachmentId": .string(attachmentId),
             "index": .number(Double(index))
@@ -481,7 +593,7 @@ extension Transport {
         guard chunk.attachmentId == attachmentId,
               chunk.index == index,
               chunk.sizeBytes > 0,
-              chunk.sizeBytes <= 20 * 1024 * 1024,
+              chunk.sizeBytes <= MessageAttachmentTransferPolicy.maxDownloadBytes,
               chunk.chunkBytes >= 16 * 1024,
               chunk.chunkBytes <= 96 * 1024,
               let data = Data(base64Encoded: chunk.dataBase64) else { throw TransportError.malformedData }

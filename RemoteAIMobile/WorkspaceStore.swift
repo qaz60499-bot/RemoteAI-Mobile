@@ -30,7 +30,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var desktopBrowserConnected: Bool?
     @Published var desktopRelayConnected: Bool?
     @Published var desktopAgentConnected: Bool?
-    @Published var desktopStatusUpdatedAt: Date?
+    var desktopStatusUpdatedAt: Date?
 
     static let connectingStateMaxDuration: TimeInterval = 45
 
@@ -872,18 +872,23 @@ final class WorkspaceStore: ObservableObject {
                 staleIdleSnapshot = false
             }
             if let index = sessions.firstIndex(where: { $0.id == sessionId }) {
+                let current = sessions[index]
+                var updated = current
                 if !staleIdleSnapshot {
-                    sessions[index].state = snapshot.state
-                    sessions[index].lastProgressStatus = snapshot.lastProgressStatus
-                    sessions[index].lastProgressAt = snapshot.lastProgressAt
+                    updated.state = snapshot.state
+                    updated.lastProgressStatus = snapshot.lastProgressStatus
+                    updated.lastProgressAt = snapshot.lastProgressAt
                 }
                 if let activity = snapshot.lastActivityAt {
-                    sessions[index].lastActivityAt = max(sessions[index].lastActivityAt ?? sessions[index].updatedAt, activity)
+                    updated.lastActivityAt = max(updated.lastActivityAt ?? updated.updatedAt, activity)
+                }
+                if updated != current {
+                    sessions[index] = updated
                 }
             }
             if route.runtimeId == "runtime.web", let browserConnected = snapshot.browserConnected {
                 let previous = desktopBrowserConnected
-                desktopBrowserConnected = browserConnected
+                if previous != browserConnected { desktopBrowserConnected = browserConnected }
                 desktopStatusUpdatedAt = Date()
                 if !browserConnected {
                     systemTransportOfflineChannels.insert("browser-bridge")
@@ -904,14 +909,15 @@ final class WorkspaceStore: ObservableObject {
             if snapshot.state == .busy || snapshot.state == .waiting {
                 markLiveRunActivity(sessionId: sessionId, at: snapshot.lastProgressAt ?? snapshot.lastActivityAt ?? Date())
                 if let raw = snapshot.lastProgressStatus, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    liveRunStatusBySession[sessionId] = route.runtimeId == "runtime.web" ? webProcessStatusLabel(raw) : processStatusLabel(for: raw)
+                    let label = route.runtimeId == "runtime.web" ? webProcessStatusLabel(raw) : processStatusLabel(for: raw)
+                    if liveRunStatusBySession[sessionId] != label { liveRunStatusBySession[sessionId] = label }
                 } else if liveRunStatusBySession[sessionId] == nil {
                     liveRunStatusBySession[sessionId] = route.runtimeId == "runtime.web"
                         ? "电脑端 ChatGPT 仍在运行…"
                         : "电脑端任务仍在运行…"
                 }
             } else if snapshot.state == .idle {
-                liveRunStatusBySession.removeValue(forKey: sessionId)
+                if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
                 liveRunActivityAtBySession.removeValue(forKey: sessionId)
             }
             return snapshot
@@ -967,6 +973,42 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    func downloadMessageAttachmentFile(sessionId: String, attachment: MessageAttachment) async -> URL? {
+        guard let attachmentId = attachment.attachmentId, attachmentId.hasPrefix("webasset-") else { return nil }
+        guard machine.state == .online, !isSuspended, let route = routeForSession(sessionId) else { return nil }
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let directory = documents.appendingPathComponent("Downloads", isDirectory: true)
+        do {
+            let downloaded = try await transport.downloadMessageAttachmentFile(
+                machineId: machine.id,
+                runtimeId: route.runtimeId,
+                instanceId: route.instanceId,
+                sessionId: sessionId,
+                attachmentId: attachmentId,
+                attachmentName: attachment.name,
+                destinationDirectory: directory
+            )
+            DiagnosticsLog.shared.record("attachment_download_ready", fields: [
+                "session": sessionId,
+                "attachmentId": attachmentId,
+                "sizeBytes": String(downloaded.sizeBytes),
+            ])
+            return downloaded.url
+        } catch {
+            var fields: [String: String] = [
+                "session": sessionId,
+                "attachmentId": attachmentId,
+                "errorType": String(describing: type(of: error)),
+            ]
+            if let transportError = error as? TransportError {
+                fields.merge(transportError.diagnosticFields) { _, new in new }
+            }
+            DiagnosticsLog.shared.record("attachment_download_failed", fields: fields, level: "WARN")
+            return nil
+        }
+    }
+
     func loadMessageAttachmentData(sessionId: String, attachment: MessageAttachment) async -> Data? {
         guard let attachmentId = attachment.attachmentId, attachmentId.hasPrefix("webasset-") else { return nil }
         let cacheKey = "\(sessionId)|\(attachmentId)" as NSString
@@ -981,9 +1023,11 @@ final class WorkspaceStore: ObservableObject {
                 attachmentId: attachmentId,
                 attachmentName: attachment.name
             )
-            guard downloaded.data.count <= 20 * 1024 * 1024 else { return nil }
-            messageAttachmentCache.setObject(downloaded.data as NSData, forKey: cacheKey, cost: downloaded.data.count)
-            messageAttachmentCache.totalCostLimit = 40 * 1024 * 1024
+            guard downloaded.data.count <= MessageAttachmentTransferPolicy.maxDownloadBytes else { return nil }
+            if downloaded.data.count <= MessageAttachmentTransferPolicy.previewCacheBytes {
+                messageAttachmentCache.setObject(downloaded.data as NSData, forKey: cacheKey, cost: downloaded.data.count)
+                messageAttachmentCache.totalCostLimit = 40 * 1024 * 1024
+            }
             return downloaded.data
         } catch {
             var fields: [String: String] = [
@@ -2100,7 +2144,9 @@ final class WorkspaceStore: ObservableObject {
                 Task { [weak self] in await self?.recoverDelta() }
             } else {
                 deltaRecoveryQueued = false
-                deltaRecoveryDisplayMessagesBySession = nil
+                if deltaRecoveryDisplayMessagesBySession != nil {
+                    deltaRecoveryDisplayMessagesBySession = nil
+                }
                 if authoritativeResyncAfterDelta,
                    generation == lifecycleGeneration,
                    machine.state == .online,
@@ -2232,7 +2278,12 @@ final class WorkspaceStore: ObservableObject {
             tracker.advanceMonotonically(to: cursor)
             deltaRecoveryFailureCount = 0
             deltaRecoveryRetryNotBefore = nil
-            errors["sync"] = incompleteAssistantStreams.isEmpty ? nil : "Streaming reconciliation is incomplete."
+            if incompleteAssistantStreams.isEmpty {
+                if errors["sync"] != nil { errors.removeValue(forKey: "sync") }
+            } else {
+                let message = "Streaming reconciliation is incomplete."
+                if errors["sync"] != message { errors["sync"] = message }
+            }
         } catch {
             if generation == lifecycleGeneration, !isSuspended {
                 let index = min(deltaRecoveryFailureCount, Self.deltaRecoveryFailureBackoffSeconds.count - 1)
