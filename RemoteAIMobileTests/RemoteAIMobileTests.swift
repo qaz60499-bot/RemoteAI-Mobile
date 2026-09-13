@@ -2317,7 +2317,11 @@ final class RemoteAIMobileTests: XCTestCase {
             payload: ["messageId": .string("large-stream"), "role": .string("assistant"), "content": .string(content), "partial": .bool(true)],
             createdAt: Date()
         ), deliverLive: true)
-        try await Task.sleep(nanoseconds: 180_000_000)
+        for _ in 0..<60 {
+            let visible = store.messagesBySession["photo-upload"]?.first(where: { $0.id == "large-stream" })?.text
+            if visible == content { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
         XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "正在生成回答…")
         XCTAssertEqual(store.messagesBySession["photo-upload"]?.first(where: { $0.id == "large-stream" })?.text, content)
         XCTAssertEqual(store.sessions.first?.id, "photo-upload")
@@ -2641,7 +2645,7 @@ final class RemoteAIMobileTests: XCTestCase {
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
             eventId: UUID(),
-            sequence: 1210,
+            sequence: 1201,
             machineId: "my-pc",
             runtimeId: "runtime.web",
             instanceId: "photo",
@@ -2663,7 +2667,7 @@ final class RemoteAIMobileTests: XCTestCase {
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
             eventId: UUID(),
-            sequence: 1211,
+            sequence: 1202,
             machineId: "my-pc",
             runtimeId: "runtime.web",
             instanceId: "photo",

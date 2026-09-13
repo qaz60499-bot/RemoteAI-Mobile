@@ -2396,6 +2396,13 @@ final class WorkspaceStore: ObservableObject {
         }
 
         sessionRouteHints[sessionId] = (event.machineId, event.runtimeId, event.instanceId)
+        if event.type == "WEB_BINDING_CHANGED"
+            || (event.type == "SESSION_STATUS" && event.payload["providerSurface"]?.boolValue == true) {
+            // Browser/provider state can arrive before lazy session catalog hydration.
+            // Materialize a minimal row so the phone can show the real desktop state
+            // immediately instead of dropping the status until a later listSessions.
+            ensureSessionDescriptorExists(sessionId: sessionId, instanceId: event.instanceId, updatedAt: event.createdAt)
+        }
         let applyBegan = StreamPerformance.now
         let previousStream = assistantStreams[sessionId]
         defer {
