@@ -4,7 +4,7 @@ enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
     case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, alreadyExecutedThenSuccess, deltaOnlySend
-    case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
+    case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, staleThenFreshProjectConversations, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
 }
 
 actor MockTransport: Transport {
@@ -310,7 +310,9 @@ actor MockTransport: Transport {
             }()
             let all = webProjectConversations[alias, default: []]
             let degraded = scenario == .partialWebCatalog || scenario == .partialWebCatalogWithNewHead || scenario == .unclassifiedWebCatalog
-            let staleBootstrap = scenario == .staleWebCatalog
+            let transientStale = scenario == .staleThenFreshProjectConversations
+                && commandAttempts["listProjectConversations", default: 0] == 1
+            let staleBootstrap = scenario == .staleWebCatalog || transientStale
             let partialHead = scenario == .partialWebCatalogWithNewHead
             // A degraded DOM can still expose safe metadata hints for identities the
             // client already knows. The partial-head fixture additionally models a new

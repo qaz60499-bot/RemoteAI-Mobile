@@ -573,20 +573,27 @@ final class WorkspaceStore: ObservableObject {
         do {
             var page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, forceRefresh: force)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
-            // The ChatGPT sidebar lazily mounts untouched Project conversation panels.
-            // If the first read explicitly reports a partial DOM and we have no verified
-            // rows yet, one bounded read-only retry is safe and avoids requiring the
-            // user to create a New Chat merely to make history appear.
-            if !page.isAuthoritativeLiveDOM,
-               projectConversationsByAlias[projectAlias, default: []].isEmpty {
-                try? await Task.sleep(nanoseconds: 450_000_000)
+            // The ChatGPT sidebar lazily mounts Project conversation panels, and a live
+            // scan can transiently return partial/stale data even when the phone already
+            // has an older verified list. An explicit/foreground refresh must therefore
+            // make one bounded second live read instead of treating that old list as a
+            // reason to stop. Automatic background refreshes keep the cheaper bootstrap
+            // behavior unless the Project has no verified rows at all.
+            let shouldRetryIncompleteLiveRead = !page.isAuthoritativeLiveDOM
+                && (force || projectConversationsByAlias[projectAlias, default: []].isEmpty)
+            if shouldRetryIncompleteLiveRead {
+                try? await Task.sleep(nanoseconds: 650_000_000)
                 if generation == lifecycleGeneration,
                    revision == projectConversationRevisions[projectAlias, default: 0],
                    machine.state == .online,
                    !isSuspended,
-                   let retry = try? await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, forceRefresh: force),
-                   retry.isAuthoritativeLiveDOM {
-                    page = retry
+                   let retry = try? await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, forceRefresh: force) {
+                    // Prefer any fresher retry. Authoritative live DOM is final; a partial
+                    // retry may still contain a safe newest-head merge that the logic
+                    // below can apply without deleting the verified tail.
+                    if retry.isAuthoritativeLiveDOM || retry.source == "browser-dom-partial-head-merge" {
+                        page = retry
+                    }
                 }
             }
             guard page.isAuthoritativeLiveDOM else {

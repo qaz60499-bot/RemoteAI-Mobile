@@ -1304,6 +1304,36 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testForcedProjectRefreshRetriesTransientStaleResultEvenWithExistingRows() async throws {
+        let mock = MockTransport(scenario: .staleThenFreshProjectConversations, historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
+        let cache = try SQLiteStore.inMemory()
+        let now = Date()
+        let old = WebConversationDescriptor(
+            localConversationId: "webconv-old-cache",
+            canonicalUrl: "https://chatgpt.com/g/g-p-remoteai/c/old-cache",
+            projectId: nil,
+            displayTitle: "Old cached conversation",
+            projectAlias: "g-p-remoteai",
+            conversationAlias: "old-cache",
+            lastVisited: now.addingTimeInterval(-60),
+            updatedAt: now.addingTimeInterval(-60)
+        )
+        try await cache.put([old], key: "web.project.g-p-remoteai.conversations")
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+
+        let attempts = await mock.actionAttemptCount("listProjectConversations")
+        XCTAssertEqual(attempts, 2, "A forced refresh must retry one transient stale/partial live read even when an older verified list is already visible")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["seed-0", "seed-1"])
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .authoritativeLiveDOM)
+        XCTAssertNil(store.errors["web.project.g-p-remoteai"])
+        await store.suspend()
+    }
+
+    @MainActor
     func testPartialProjectHeadMergeShowsNewestChatWithoutDeletingVerifiedTail() async throws {
         let mock = MockTransport(historyCount: 1)
         let cache = try SQLiteStore.inMemory()
