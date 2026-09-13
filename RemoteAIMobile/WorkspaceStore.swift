@@ -830,13 +830,16 @@ final class WorkspaceStore: ObservableObject {
             merge(page.items, into: sessionId)
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: page.items.last?.createdAt ?? Date())
             await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
-            hasMoreBySession[sessionId] = page.hasMore
+            if hasMoreBySession[sessionId] != page.hasMore {
+                hasMoreBySession[sessionId] = page.hasMore
+            }
             // A successful history read must not erase a provider terminal failure that
             // was delivered as GENERATION_STOPPED. Keeping the error while the session
             // is explicitly .error lets ChatView continue showing rate-limit / unusual-
             // activity evidence even while periodic reconciliation polls are running.
-            if sessions.first(where: { $0.id == sessionId })?.state != .error {
-                errors[sessionId] = nil
+            if sessions.first(where: { $0.id == sessionId })?.state != .error,
+               errors[sessionId] != nil {
+                errors.removeValue(forKey: sessionId)
             }
         } catch {
             guard generation == lifecycleGeneration, !isSuspended else { return }
@@ -2103,16 +2106,17 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, transport === activeTransport, !isSuspended else { return }
             let applied = (try? await cache.lastSequence()) ?? 0
             if head > applied || head < appliedBeforeProbe {
-                syncState = "stale"
+                if syncState != "stale" { syncState = "stale" }
                 DiagnosticsLog.shared.record("online_sync_gap", fields: ["head": String(head), "applied": String(applied)])
                 await recoverDelta(freshLatestSequence: head)
             }
             let current = (try? await cache.lastSequence()) ?? 0
             for event in Array(incompleteAssistantStreams.values) { _ = await restoreAssistantStream(through: event) }
-            syncState = current >= head && errors["sync"] == nil && incompleteAssistantStreams.isEmpty ? "synced" : "stale"
+            let nextSyncState = current >= head && errors["sync"] == nil && incompleteAssistantStreams.isEmpty ? "synced" : "stale"
+            if syncState != nextSyncState { syncState = nextSyncState }
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, !isSuspended else { return }
-            syncState = "stale"
+            if syncState != "stale" { syncState = "stale" }
             applyConnectionFailure(error)
         }
     }
@@ -2241,13 +2245,19 @@ final class WorkspaceStore: ObservableObject {
                     deferredPresentationDuringRecovery = true
                 }
                 if !result.events.isEmpty {
-                    if deltaRecoveryDisplayMessagesBySession == nil {
-                        // Delta replay repairs state in the background, but historical
-                        // TOOL/MESSAGE progress should not animate onto the screen one
-                        // event at a time. Freeze the visible transcript until the
-                        // recovery (including a queued follow-up pass) converges, then
-                        // publish the final merged state once.
-                        deltaRecoveryDisplayMessagesBySession = messagesBySession
+                    // Freeze only transcripts touched by this recovery page. Copying the
+                    // entire messagesBySession dictionary scales with every Chat already
+                    // loaded on the phone even though a delta burst usually belongs to
+                    // one active conversation.
+                    let affectedSessionIds = Set(result.events.compactMap { $0.sessionId })
+                    if !affectedSessionIds.isEmpty {
+                        var displaySnapshot = deltaRecoveryDisplayMessagesBySession ?? [:]
+                        var snapshotChanged = deltaRecoveryDisplayMessagesBySession == nil
+                        for sessionId in affectedSessionIds where displaySnapshot[sessionId] == nil {
+                            displaySnapshot[sessionId] = messagesBySession[sessionId, default: []]
+                            snapshotChanged = true
+                        }
+                        if snapshotChanged { deltaRecoveryDisplayMessagesBySession = displaySnapshot }
                     }
                     DiagnosticsLog.shared.record("delta_recovery_batch", fields: [
                         "cursor": String(requestedCursor),
@@ -2839,14 +2849,21 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func discardStreamingPlaceholder(sessionId: String) {
-        assistantStreams[sessionId]?.performance.stopFrames()
-        assistantStreams.removeValue(forKey: sessionId)
+        if let stream = assistantStreams[sessionId] {
+            stream.performance.stopFrames()
+            assistantStreams.removeValue(forKey: sessionId)
+        }
         incompleteAssistantStreams.removeValue(forKey: sessionId)
-        if incompleteAssistantStreams.isEmpty, errors["sync"]?.hasPrefix("Streaming") == true { errors["sync"] = nil }
+        if incompleteAssistantStreams.isEmpty, errors["sync"]?.hasPrefix("Streaming") == true {
+            errors.removeValue(forKey: "sync")
+        }
         streamingBuffers.removeValue(forKey: sessionId)
-        var list = messagesBySession[sessionId, default: []]
-        list.removeAll { $0.role == .assistant && ($0.toolStatus == "Streaming" || $0.id == "stream-\(sessionId)") }
-        messagesBySession[sessionId] = list
+        if let current = messagesBySession[sessionId],
+           current.contains(where: { $0.role == .assistant && ($0.toolStatus == "Streaming" || $0.id == "stream-\(sessionId)") }) {
+            var updated = current
+            updated.removeAll { $0.role == .assistant && ($0.toolStatus == "Streaming" || $0.id == "stream-\(sessionId)") }
+            messagesBySession[sessionId] = updated
+        }
     }
 
     func streamingFullText(sessionId: String, fallback: String) -> String {
@@ -2921,10 +2938,10 @@ final class WorkspaceStore: ObservableObject {
         }
 
         discardStreamingPlaceholder(sessionId: sessionId)
-        liveRunStatusBySession.removeValue(forKey: sessionId)
+        if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
         clearLiveRunActivity(sessionId: sessionId)
         setSessionState(sessionId, .idle)
-        errors[sessionId] = nil
+        if errors[sessionId] != nil { errors.removeValue(forKey: sessionId) }
 
         await settleRunningToolRows(sessionId: sessionId)
     }
@@ -2938,7 +2955,7 @@ final class WorkspaceStore: ObservableObject {
                 local[index].toolStatus = "Completed"
                 changed.append(local[index])
             }
-            messagesBySession[sessionId] = local
+            if !changed.isEmpty { messagesBySession[sessionId] = local }
         }
         if !changed.isEmpty { try? await cache.upsertMessages(changed) }
     }
@@ -2972,18 +2989,25 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func merge(_ incoming: [ChatMessage], into sessionId: String) {
-        let visibleExisting = messagesBySession[sessionId, default: []].filter {
+        let current = messagesBySession[sessionId, default: []]
+        let visibleExisting = current.filter {
+            !($0.kind == .toolEvent
+                && $0.toolName == "ChatGPT Web"
+                && isTransientWebProcessDetail($0.detail))
+        }
+        let visibleIncoming = incoming.filter {
             !($0.kind == .toolEvent
                 && $0.toolName == "ChatGPT Web"
                 && isTransientWebProcessDetail($0.detail))
         }
         var map = Dictionary(uniqueKeysWithValues: visibleExisting.map { ($0.id, $0) })
-        for message in incoming where !(message.kind == .toolEvent
-            && message.toolName == "ChatGPT Web"
-            && isTransientWebProcessDetail(message.detail)) {
-            map[message.id] = message
+        if visibleExisting.count == current.count,
+           visibleIncoming.allSatisfy({ map[$0.id] == $0 }) {
+            return
         }
-        messagesBySession[sessionId] = sortedMessages(Array(map.values))
+        for message in visibleIncoming { map[message.id] = message }
+        let merged = sortedMessages(Array(map.values))
+        if current != merged { messagesBySession[sessionId] = merged }
     }
 
     private func sortedMessages(_ messages: [ChatMessage]) -> [ChatMessage] {

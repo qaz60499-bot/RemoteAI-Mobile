@@ -1,5 +1,6 @@
 import XCTest
 import Security
+import Combine
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
@@ -624,6 +625,26 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains(where: { $0.kind == .toolEvent }))
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        await store.suspend()
+    }
+
+    @MainActor
+    func testStableSessionReconciliationDoesNotRepublishUnchangedTranscript() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let now = Date()
+        await mock.appendHistoryMessage(ServerMessage(messageId: "stable-user", sessionId: "photo-upload", role: "user", content: "question", externalId: nil, createdAt: now))
+        await mock.appendHistoryMessage(ServerMessage(messageId: "stable-final", sessionId: "photo-upload", role: "assistant", content: "answer", externalId: nil, createdAt: now.addingTimeInterval(0.1)))
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await store.loadSession("photo-upload")
+
+        var publications = 0
+        let cancellable = store.objectWillChange.sink { publications += 1 }
+        await store.loadSession("photo-upload")
+
+        XCTAssertEqual(publications, 0, "An identical periodic history reconciliation must not invalidate the whole ChatView")
+        withExtendedLifetime(cancellable) {}
         await store.suspend()
     }
 
