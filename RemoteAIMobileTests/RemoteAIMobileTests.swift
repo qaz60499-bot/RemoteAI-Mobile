@@ -547,11 +547,15 @@ final class RemoteAIMobileTests: XCTestCase {
         ))
 
         await store.verifyOnlineSyncHead()
+        // Fresh recovered progress must become live immediately, while the transcript
+        // bubble still follows the normal bounded presentation cadence instead of
+        // forcing an extra synchronous ChatView repaint during delta reconciliation.
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "latest recovered tail")
+        try await Task.sleep(nanoseconds: 120_000_000)
 
         let recoveredSequence = try await cache.lastSequence()
         XCTAssertEqual(recoveredSequence, 1213)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
-        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "正在生成回答…")
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "recovered-active-stream" })?.text, "latest recovered tail")
         XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains(where: { $0.kind == .toolEvent }), "A large historical catch-up must not replay tool progress rows one by one into the visible transcript")
         await store.suspend()
