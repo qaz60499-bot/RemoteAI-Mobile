@@ -102,6 +102,7 @@ final class WorkspaceStore: ObservableObject {
     private var deltaRecoveryFailureCount = 0
     private var deltaRecoveryRetryNotBefore: Date?
     private static let deltaRecoveryFailureBackoffSeconds: [TimeInterval] = [1, 2, 4, 8]
+    private static let deltaRecoveryPresentationCoalescingThreshold = 12
     private static let maxHistoricalDeltaReplayEvents: Int64 = 2_000
     private var webProjectsRevision: UInt64 = 0
     private var webProjectsSnapshotId: String?
@@ -2227,11 +2228,18 @@ final class WorkspaceStore: ObservableObject {
                 tracker.advanceMonotonically(to: cursor)
                 return
             }
+            var deferredPresentationDuringRecovery = false
             while true {
                 guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
                 let requestedCursor = cursor
                 let result = try await transport.delta(machineId: machine.id, after: cursor)
                 guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+                let suppressTransientPresentation = result.events.count >= Self.deltaRecoveryPresentationCoalescingThreshold
+                var coalescedSessionPresentation: [String: (active: Bool, status: String?, at: Date)] = [:]
+                if suppressTransientPresentation,
+                   result.events.contains(where: { $0.type == "MESSAGE_UPDATED" && $0.payload["partial"]?.boolValue != false }) {
+                    deferredPresentationDuringRecovery = true
+                }
                 if !result.events.isEmpty {
                     if deltaRecoveryDisplayMessagesBySession == nil {
                         // Delta replay repairs state in the background, but historical
@@ -2246,6 +2254,7 @@ final class WorkspaceStore: ObservableObject {
                         "count": String(result.events.count),
                         "firstSequence": String(result.events.first?.sequence ?? requestedCursor),
                         "lastSequence": String(result.events.last?.sequence ?? requestedCursor),
+                        "presentationCoalesced": String(suppressTransientPresentation),
                     ])
                 }
                 for event in result.events where event.sequence > cursor {
@@ -2267,13 +2276,51 @@ final class WorkspaceStore: ObservableObject {
                         continue
                     }
                     tracker.advanceMonotonically(to: event.sequence)
-                    await applyEvent(event)
+                    if suppressTransientPresentation, let sessionId = event.sessionId {
+                        switch event.type {
+                        case "GENERATION_STARTED":
+                            coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                        case "MESSAGE_UPDATED" where event.payload["partial"]?.boolValue != false:
+                            coalescedSessionPresentation[sessionId] = (true, "正在生成回答…", event.createdAt)
+                        case "TOOL_STARTED", "TOOL_FINISHED":
+                            coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                        case "MESSAGE_ADDED" where event.payload["role"]?.stringValue == "assistant":
+                            coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
+                        case "GENERATION_STOPPED" where event.payload["ok"]?.boolValue != false:
+                            coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
+                        default:
+                            break
+                        }
+                    }
+                    await applyEvent(event, suppressTransientPresentation: suppressTransientPresentation)
                     cursor = event.sequence
                     try? await cache.setLastSequence(cursor)
+                }
+                if suppressTransientPresentation {
+                    for (sessionId, presentation) in coalescedSessionPresentation {
+                        markSessionActivity(sessionId, at: presentation.at)
+                        if presentation.active {
+                            markLiveRunActivity(sessionId: sessionId, at: presentation.at)
+                            setSessionState(sessionId, .busy)
+                            if let status = presentation.status, liveRunStatusBySession[sessionId] != status {
+                                liveRunStatusBySession[sessionId] = status
+                            }
+                        } else if sessions.first(where: { $0.id == sessionId })?.state != .error {
+                            setSessionState(sessionId, .idle)
+                            if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
+                            clearLiveRunActivity(sessionId: sessionId)
+                        }
+                    }
                 }
                 cursor = max(cursor, result.nextCursor)
                 try? await cache.setLastSequence(cursor)
                 if !result.hasMore { break }
+            }
+            if deferredPresentationDuringRecovery {
+                // If the catch-up ended mid-generation, publish only the latest assembled
+                // stream tail once. A final MESSAGE_ADDED will already have discarded the
+                // transient buffer, so this is a no-op for completed historical runs.
+                flushAllStreaming()
             }
             tracker.advanceMonotonically(to: cursor)
             deltaRecoveryFailureCount = 0
@@ -2298,7 +2345,7 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func applyEvent(_ event: RemoteEvent) async {
+    private func applyEvent(_ event: RemoteEvent, suppressTransientPresentation: Bool = false) async {
         if event.type == "TRANSPORT_STATUS" {
             applyTransportStatusEvent(event)
             return
@@ -2320,7 +2367,11 @@ final class WorkspaceStore: ObservableObject {
         }
         let runEventTypes = ["MESSAGE_UPDATED", "MESSAGE_ADDED", "TOOL_STARTED", "TOOL_FINISHED", "GENERATION_STARTED", "GENERATION_STOPPED"]
         let isAssistantDelta = event.type == "MESSAGE_UPDATED" && event.payload["contentDelta"]?.stringValue != nil
-        if runEventTypes.contains(event.type) && !isAssistantDelta {
+        let isHistoricalProgressEvent = isAssistantDelta
+            || event.type == "TOOL_STARTED"
+            || event.type == "TOOL_FINISHED"
+            || event.type == "GENERATION_STARTED"
+        if runEventTypes.contains(event.type) && !isAssistantDelta && !(suppressTransientPresentation && isHistoricalProgressEvent) {
             DiagnosticsLog.shared.record("event_applied", fields: [
                 "type": event.type,
                 "sequence": String(event.sequence),
@@ -2335,7 +2386,9 @@ final class WorkspaceStore: ObservableObject {
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: event.instanceId, updatedAt: event.createdAt)
             // Begin/final already order the session. Updating this @Published
             // catalog for every delta invalidates all history despite row isolation.
-            if !isAssistantDelta { markSessionActivity(sessionId, at: event.createdAt) }
+            if !isAssistantDelta && !(suppressTransientPresentation && isHistoricalProgressEvent) {
+                markSessionActivity(sessionId, at: event.createdAt)
+            }
         }
 
         switch event.type {
@@ -2374,8 +2427,15 @@ final class WorkspaceStore: ObservableObject {
             }
             let attachments = (try? event.payload["attachments"]?.decode([MessageAttachment].self)) ?? []
             let id = event.payload["messageId"]?.stringValue ?? streamingBuffers[sessionId]?.id ?? "stream-\(sessionId)"
-            bufferStreaming(sessionId: sessionId, id: id, content: content, attachments: attachments, sequence: event.sequence)
-            if event.payload["partial"]?.boolValue != false {
+            bufferStreaming(
+                sessionId: sessionId,
+                id: id,
+                content: content,
+                attachments: attachments,
+                sequence: event.sequence,
+                deferPresentation: suppressTransientPresentation
+            )
+            if event.payload["partial"]?.boolValue != false && !suppressTransientPresentation {
                 markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
                 // A transient event can arrive even when GENERATION_STARTED was lost in
                 // transit. Treat streaming content itself as proof that the run is busy
@@ -2422,6 +2482,11 @@ final class WorkspaceStore: ObservableObject {
                 try? await cache.upsertMessages([message])
             }
         case "TOOL_STARTED", "TOOL_FINISHED":
+            // Historical catch-up does not need to replay tool animation/status rows one
+            // event at a time. The durable assistant message (or the next live event)
+            // remains authoritative, while suppressing this UI-only work avoids dozens
+            // of ObservableObject invalidations when reconnecting after a short gap.
+            if suppressTransientPresentation { return }
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             let completed = event.type == "TOOL_FINISHED"
             if !completed { setSessionState(sessionId, .busy) }
@@ -2487,6 +2552,7 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.upsertMessages([message])
             liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
         case "GENERATION_STARTED":
+            if suppressTransientPresentation { return }
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             setSessionState(sessionId, .busy)
             liveRunStatusBySession[sessionId] = "ChatGPT 正在处理…"
@@ -2732,8 +2798,9 @@ final class WorkspaceStore: ObservableObject {
         liveRunActivityAtBySession.removeValue(forKey: sessionId)
     }
 
-    private func bufferStreaming(sessionId: String, id: String, content: String, attachments: [MessageAttachment], sequence: Int64) {
+    private func bufferStreaming(sessionId: String, id: String, content: String, attachments: [MessageAttachment], sequence: Int64, deferPresentation: Bool = false) {
         streamingBuffers[sessionId] = (id, content, sequence, attachments)
+        if deferPresentation { return }
         if flushTask == nil {
             let byteCount = assistantStreams[sessionId]?.utf8Count ?? content.utf8.count
             let delay = Self.streamingFlushDelayNanoseconds(forByteCount: byteCount)

@@ -499,6 +499,135 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testLargeDeltaRecoveryCoalescesHistoricalProgressButPublishesLatestActiveTail() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let initialSequence = try await cache.lastSequence()
+        XCTAssertEqual(initialSequence, 1200)
+
+        let now = Date()
+        for offset in 1...12 {
+            let started = offset % 2 == 1
+            await mock.injectEvent(RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: Int64(1200 + offset),
+                machineId: "my-pc",
+                runtimeId: "runtime.web",
+                instanceId: "photo",
+                sessionId: "photo-upload",
+                type: started ? "TOOL_STARTED" : "TOOL_FINISHED",
+                payload: [
+                    "tool": .object(["id": .string("replay-tool-\(offset)"), "name": .string("web_search")]),
+                    "summary": .string(started ? "Searching" : "Done")
+                ],
+                createdAt: now.addingTimeInterval(Double(offset) / 100.0)
+            ))
+        }
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1213,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_UPDATED",
+            payload: [
+                "messageId": .string("recovered-active-stream"),
+                "role": .string("assistant"),
+                "content": .string("latest recovered tail"),
+                "partial": .bool(true)
+            ],
+            createdAt: now.addingTimeInterval(0.13)
+        ))
+
+        await store.verifyOnlineSyncHead()
+
+        let recoveredSequence = try await cache.lastSequence()
+        XCTAssertEqual(recoveredSequence, 1213)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "正在生成回答…")
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "recovered-active-stream" })?.text, "latest recovered tail")
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains(where: { $0.kind == .toolEvent }), "A large historical catch-up must not replay tool progress rows one by one into the visible transcript")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testLargeDeltaRecoveryKeepsDurableFinalWhileDroppingHistoricalToolAnimation() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let initialSequence = try await cache.lastSequence()
+        XCTAssertEqual(initialSequence, 1200)
+
+        let now = Date()
+        for offset in 1...12 {
+            await mock.injectEvent(RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: Int64(1200 + offset),
+                machineId: "my-pc",
+                runtimeId: "runtime.web",
+                instanceId: "photo",
+                sessionId: "photo-upload",
+                type: offset % 2 == 1 ? "TOOL_STARTED" : "TOOL_FINISHED",
+                payload: [
+                    "tool": .object(["id": .string("historical-tool-\(offset)"), "name": .string("web_search")]),
+                    "summary": .string("historical progress")
+                ],
+                createdAt: now.addingTimeInterval(Double(offset) / 100.0)
+            ))
+        }
+        let final = ServerMessage(
+            messageId: "coalesced-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "durable final survives",
+            externalId: nil,
+            createdAt: now.addingTimeInterval(0.13)
+        )
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1213,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: try XCTUnwrap(try JSONValue.encode(final).objectValue),
+            createdAt: now.addingTimeInterval(0.13)
+        ))
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1214,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STOPPED",
+            payload: ["ok": .bool(true)],
+            createdAt: now.addingTimeInterval(0.14)
+        ))
+
+        await store.verifyOnlineSyncHead()
+
+        let recoveredSequence = try await cache.lastSequence()
+        XCTAssertEqual(recoveredSequence, 1214)
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "coalesced-final" }.count, 1)
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "coalesced-final" })?.text, "durable final survives")
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains(where: { $0.kind == .toolEvent }))
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        await store.suspend()
+    }
+
+    @MainActor
     func testDeltaRecoveryTreatsLiveAndDeltaOverlapAsIdempotent() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 1)

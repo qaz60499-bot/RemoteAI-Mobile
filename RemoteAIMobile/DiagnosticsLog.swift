@@ -155,7 +155,7 @@ final class DiagnosticsLog: ObservableObject {
         "cachedcount", "count", "attachments", "attachmentcount", "build", "finalbytes", "finalchars",
         "canonicalequal", "firstvisiblems", "firstdeltaafterstreaminitms", "visibleupdateintervalp50ms",
         "visibleupdateintervalp95ms", "flushtoframep95ms", "mainthreadstallsover100ms", "reconnectattempt",
-        "agentconnected", "browserconnected", "storagedegraded"
+        "agentconnected", "browserconnected", "storagedegraded", "presentationcoalesced"
     ]
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
