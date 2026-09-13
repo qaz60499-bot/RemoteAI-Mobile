@@ -103,6 +103,7 @@ final class WorkspaceStore: ObservableObject {
     private var deltaRecoveryRetryNotBefore: Date?
     private static let deltaRecoveryFailureBackoffSeconds: [TimeInterval] = [1, 2, 4, 8]
     private static let deltaRecoveryPresentationCoalescingThreshold = 12
+    private static let deltaRecoveryHistoricalPresentationAge: TimeInterval = 2
     private static let maxHistoricalDeltaReplayEvents: Int64 = 2_000
     private var webProjectsRevision: UInt64 = 0
     private var webProjectsSnapshotId: String?
@@ -2238,12 +2239,8 @@ final class WorkspaceStore: ObservableObject {
                 let requestedCursor = cursor
                 let result = try await transport.delta(machineId: machine.id, after: cursor)
                 guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
-                let suppressTransientPresentation = result.events.count >= Self.deltaRecoveryPresentationCoalescingThreshold
+                let coalesceHistoricalPresentation = result.events.count >= Self.deltaRecoveryPresentationCoalescingThreshold
                 var coalescedSessionPresentation: [String: (active: Bool, status: String?, at: Date)] = [:]
-                if suppressTransientPresentation,
-                   result.events.contains(where: { $0.type == "MESSAGE_UPDATED" && $0.payload["partial"]?.boolValue != false }) {
-                    deferredPresentationDuringRecovery = true
-                }
                 if !result.events.isEmpty {
                     // Freeze only transcripts touched by this recovery page. Copying the
                     // entire messagesBySession dictionary scales with every Chat already
@@ -2264,7 +2261,7 @@ final class WorkspaceStore: ObservableObject {
                         "count": String(result.events.count),
                         "firstSequence": String(result.events.first?.sequence ?? requestedCursor),
                         "lastSequence": String(result.events.last?.sequence ?? requestedCursor),
-                        "presentationCoalesced": String(suppressTransientPresentation),
+                        "presentationCoalesced": String(coalesceHistoricalPresentation),
                     ])
                 }
                 for event in result.events where event.sequence > cursor {
@@ -2286,27 +2283,45 @@ final class WorkspaceStore: ObservableObject {
                         continue
                     }
                     tracker.advanceMonotonically(to: event.sequence)
-                    if suppressTransientPresentation, let sessionId = event.sessionId {
-                        switch event.type {
-                        case "GENERATION_STARTED":
-                            coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
-                        case "MESSAGE_UPDATED" where event.payload["partial"]?.boolValue != false:
-                            coalescedSessionPresentation[sessionId] = (true, "正在生成回答…", event.createdAt)
-                        case "TOOL_STARTED", "TOOL_FINISHED":
-                            coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
-                        case "MESSAGE_ADDED" where event.payload["role"]?.stringValue == "assistant":
-                            coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
-                        case "GENERATION_STOPPED" where event.payload["ok"]?.boolValue != false:
-                            coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
-                        default:
-                            break
+                    // Only old replay progress is presentation-coalesced. A current stream
+                    // can be caught inside the same large delta page after a short network
+                    // gap; those fresh events must remain visibly live instead of waiting
+                    // for the whole recovery pass to finish.
+                    let eventAge = max(0, Date().timeIntervalSince(event.createdAt))
+                    let suppressEventPresentation = coalesceHistoricalPresentation
+                        && eventAge >= Self.deltaRecoveryHistoricalPresentationAge
+                    if suppressEventPresentation,
+                       event.type == "MESSAGE_UPDATED",
+                       event.payload["partial"]?.boolValue != false {
+                        deferredPresentationDuringRecovery = true
+                    }
+                    if let sessionId = event.sessionId {
+                        if suppressEventPresentation {
+                            switch event.type {
+                            case "GENERATION_STARTED":
+                                coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                            case "MESSAGE_UPDATED" where event.payload["partial"]?.boolValue != false:
+                                coalescedSessionPresentation[sessionId] = (true, "正在生成回答…", event.createdAt)
+                            case "TOOL_STARTED", "TOOL_FINISHED":
+                                coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                            case "MESSAGE_ADDED" where event.payload["role"]?.stringValue == "assistant":
+                                coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
+                            case "GENERATION_STOPPED" where event.payload["ok"]?.boolValue != false:
+                                coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
+                            default:
+                                break
+                            }
+                        } else if ["GENERATION_STARTED", "MESSAGE_UPDATED", "TOOL_STARTED", "TOOL_FINISHED", "MESSAGE_ADDED", "GENERATION_STOPPED"].contains(event.type) {
+                            // A fresh event for this session supersedes any older batched
+                            // presentation state captured earlier in the same delta page.
+                            coalescedSessionPresentation.removeValue(forKey: sessionId)
                         }
                     }
-                    await applyEvent(event, suppressTransientPresentation: suppressTransientPresentation)
+                    await applyEvent(event, suppressTransientPresentation: suppressEventPresentation)
                     cursor = event.sequence
                     try? await cache.setLastSequence(cursor)
                 }
-                if suppressTransientPresentation {
+                if coalesceHistoricalPresentation {
                     for (sessionId, presentation) in coalescedSessionPresentation {
                         markSessionActivity(sessionId, at: presentation.at)
                         if presentation.active {

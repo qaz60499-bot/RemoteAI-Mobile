@@ -509,6 +509,7 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(initialSequence, 1200)
 
         let now = Date()
+        let historicalBase = now.addingTimeInterval(-30)
         for offset in 1...12 {
             let started = offset % 2 == 1
             await mock.injectEvent(RemoteEvent(
@@ -524,7 +525,7 @@ final class RemoteAIMobileTests: XCTestCase {
                     "tool": .object(["id": .string("replay-tool-\(offset)"), "name": .string("web_search")]),
                     "summary": .string(started ? "Searching" : "Done")
                 ],
-                createdAt: now.addingTimeInterval(Double(offset) / 100.0)
+                createdAt: historicalBase.addingTimeInterval(Double(offset) / 100.0)
             ))
         }
         await mock.injectEvent(RemoteEvent(
@@ -566,6 +567,7 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(initialSequence, 1200)
 
         let now = Date()
+        let historicalBase = now.addingTimeInterval(-30)
         for offset in 1...12 {
             await mock.injectEvent(RemoteEvent(
                 protocolVersion: 1,
@@ -580,7 +582,7 @@ final class RemoteAIMobileTests: XCTestCase {
                     "tool": .object(["id": .string("historical-tool-\(offset)"), "name": .string("web_search")]),
                     "summary": .string("historical progress")
                 ],
-                createdAt: now.addingTimeInterval(Double(offset) / 100.0)
+                createdAt: historicalBase.addingTimeInterval(Double(offset) / 100.0)
             ))
         }
         let final = ServerMessage(
