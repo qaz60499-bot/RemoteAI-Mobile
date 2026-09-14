@@ -624,13 +624,29 @@ final class WorkspaceStore: ObservableObject {
                 // identities may still repair placeholder titles.
                 let mergedHead = page.source == "browser-dom-partial-head-merge"
                     && mergeConversationPartialHead(page.items, projectAlias: projectAlias)
+                // A provider/rate-limit failure can leave the browser DOM unavailable even
+                // though Windows has already registered an exact new Project conversation
+                // from an opened tab. Never let a non-empty phone cache hide that verified
+                // identity. Accept only a monotonic unknown prefix before the first known
+                // anchor, preserving the entire verified phone tail and never treating the
+                // stale response as deletion/reorder authority.
+                let mergedVerifiedStaleHead = page.state == .staleCache
+                    && mergeConversationVerifiedStaleHead(page.items, projectAlias: projectAlias)
                 let repairedTitles = mergeConversationTitleHints(page.items, projectAlias: projectAlias)
-                if mergedHead || repairedTitles {
-                    try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+                if mergedHead || mergedVerifiedStaleHead || repairedTitles {
+                    if mergedHead {
+                        // Partial live-DOM head proof is safe to persist as the next
+                        // monotonic verified cache. Stale Windows identity hints remain
+                        // in-memory only and will be re-proved on the next refresh.
+                        try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+                    }
                     mergeProjectSessions(projectConversationsByAlias[projectAlias] ?? [])
                 }
                 if mergedHead {
                     DiagnosticsLog.shared.record("project_load_partial_head_merged", fields: ["project": projectAlias, "count": String(projectConversationsByAlias[projectAlias, default: []].count)])
+                }
+                if mergedVerifiedStaleHead {
+                    DiagnosticsLog.shared.record("project_load_verified_stale_head_merged", fields: ["project": projectAlias, "count": String(projectConversationsByAlias[projectAlias, default: []].count)], level: "WARN")
                 }
                 // A partial DOM is a freshness condition, not a confirmed provider
                 // failure. Keep any verified rows interactive and avoid flashing a red
@@ -2032,6 +2048,33 @@ final class WorkspaceStore: ObservableObject {
             return !safeAliases.contains(alias)
         }
         projectConversationsByAlias[projectAlias] = Array(merged.prefix(50))
+        return true
+    }
+
+    @discardableResult
+    private func mergeConversationVerifiedStaleHead(_ incoming: [WebConversationDescriptor], projectAlias: String) -> Bool {
+        guard let current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
+        let currentAliases = Set(current.compactMap(\.conversationAlias))
+        guard !currentAliases.isEmpty else { return false }
+        let validIncoming = incoming.filter { $0.projectAlias == projectAlias && $0.conversationAlias != nil }
+        guard let firstKnownIndex = validIncoming.firstIndex(where: { row in
+            row.conversationAlias.map(currentAliases.contains) ?? false
+        }), firstKnownIndex > 0 else { return false }
+
+        var seenAliases = currentAliases
+        var verifiedHead: [WebConversationDescriptor] = []
+        for row in validIncoming[..<firstKnownIndex] {
+            guard let alias = row.conversationAlias, !seenAliases.contains(alias) else { continue }
+            seenAliases.insert(alias)
+            verifiedHead.append(row)
+        }
+        guard !verifiedHead.isEmpty else { return false }
+
+        let headAliases = Set(verifiedHead.compactMap(\.conversationAlias))
+        projectConversationsByAlias[projectAlias] = Array((verifiedHead + current.filter { row in
+            guard let alias = row.conversationAlias else { return true }
+            return !headAliases.contains(alias)
+        }).prefix(50))
         return true
     }
 

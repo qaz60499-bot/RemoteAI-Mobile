@@ -1334,6 +1334,27 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testVerifiedStaleProjectHeadShowsNewestRegisteredChatWithoutDeletingCachedTail() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"])
+
+        await mock.prependProjectConversation(alias: "g-p-remoteai", conversationAlias: "stale-new-head", title: "Newest registered chat")
+        await mock.setScenario(.staleWebCatalog)
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+
+        let merged = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(merged.map(\.conversationAlias), ["stale-new-head", "mock-1"], "A verified Windows stale-cache head must not be hidden by a non-empty phone cache")
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .staleCache)
+        XCTAssertNil(store.errors["web.project.g-p-remoteai"])
+        XCTAssertTrue(store.sessions.contains(where: { $0.id == "webconv-stale-new-head" }), "The merged newest Project chat must also enter the session catalog so it can be opened immediately")
+        await store.suspend()
+    }
+
+    @MainActor
     func testPartialProjectHeadMergeShowsNewestChatWithoutDeletingVerifiedTail() async throws {
         let mock = MockTransport(historyCount: 1)
         let cache = try SQLiteStore.inMemory()

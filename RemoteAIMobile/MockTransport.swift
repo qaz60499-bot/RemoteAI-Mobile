@@ -159,6 +159,21 @@ actor MockTransport: Transport {
             )
         }
     }
+    func prependProjectConversation(alias: String, conversationAlias: String, title: String) {
+        let now = Date()
+        let row = WebConversationDescriptor(
+            localConversationId: "webconv-\(conversationAlias)",
+            canonicalUrl: "https://chatgpt.com/g/\(alias)/c/\(conversationAlias)",
+            projectId: webProjects.first(where: { $0.projectAlias == alias })?.projectId,
+            displayTitle: title,
+            projectAlias: alias,
+            conversationAlias: conversationAlias,
+            lastVisited: now,
+            updatedAt: now
+        )
+        webProjectConversations[alias, default: []].removeAll { $0.conversationAlias == conversationAlias }
+        webProjectConversations[alias, default: []].insert(row, at: 0)
+    }
     func userMessageCount(sessionId: String, text: String) -> Int {
         history[sessionId, default: []].filter { $0.role == "user" && $0.content == text }.count
     }
