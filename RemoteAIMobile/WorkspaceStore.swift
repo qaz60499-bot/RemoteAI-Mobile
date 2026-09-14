@@ -634,10 +634,11 @@ final class WorkspaceStore: ObservableObject {
                     && mergeConversationVerifiedStaleHead(page.items, projectAlias: projectAlias)
                 let repairedTitles = mergeConversationTitleHints(page.items, projectAlias: projectAlias)
                 if mergedHead || mergedVerifiedStaleHead || repairedTitles {
-                    if mergedHead {
-                        // Partial live-DOM head proof is safe to persist as the next
-                        // monotonic verified cache. Stale Windows identity hints remain
-                        // in-memory only and will be re-proved on the next refresh.
+                    if mergedHead || repairedTitles {
+                        // Preserve the existing title-repair persistence contract and
+                        // persist monotonic partial live-DOM head proof. A stale Windows
+                        // identity-only head merge remains in-memory and will be re-proved
+                        // on the next refresh before it can replace cache truth.
                         try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
                     }
                     mergeProjectSessions(projectConversationsByAlias[projectAlias] ?? [])
