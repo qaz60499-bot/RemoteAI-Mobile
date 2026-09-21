@@ -340,52 +340,89 @@ final class RelayPairingClient {
             let privateKeyRaw = PayloadCrypto.generateDevicePrivateKey()
             let publicKeyB64 = try PayloadCrypto.publicKeySPKIBase64(privateKeyRaw: privateKeyRaw)
             let url = try RemoteAIConfig.deviceWebSocketURL(baseURL: baseURL, machineId: machineId, deviceId: deviceId)
-            let socket = socketFactory(url, ["remoteai.v1"])
-            socket.setMaximumMessageSize(maxFrameBytes)
             let deadline = Date().addingTimeInterval(totalTimeout)
+            var approvalRetryActive = false
+            var lastRetryableError: Error = TransportError.timeout
 
-            advance(.connectingRelay)
-            socket.resume()
-            defer { socket.cancel(code: .normalClosure, reason: nil) }
+            for attempt in 0..<3 {
+                let socket = socketFactory(url, ["remoteai.v1"])
+                socket.setMaximumMessageSize(maxFrameBytes)
+                advance(.connectingRelay)
+                socket.resume()
 
-            try await waitForRelayReady(machineId: machineId, deviceId: deviceId, socket: socket, deadline: deadline)
-            advance(.relayConnected)
+                do {
+                    try await waitForRelayReady(machineId: machineId, deviceId: deviceId, socket: socket, deadline: deadline)
+                    advance(.relayConnected)
 
-            advance(.sendingRequest)
-            try await send(frame: RelayFrame(v: 1, kind: "PAIR_REQUEST", machineId: machineId, deviceId: deviceId, messageId: UUID().uuidString, body: [
-                "devicePublicKeyB64": .string(publicKeyB64),
-                "label": .string(String(label.prefix(80)))
-            ]), socket: socket, deadline: deadline)
+                    advance(.sendingRequest)
+                    try await send(frame: RelayFrame(v: 1, kind: "PAIR_REQUEST", machineId: machineId, deviceId: deviceId, messageId: UUID().uuidString, body: [
+                        "devicePublicKeyB64": .string(publicKeyB64),
+                        "label": .string(String(label.prefix(80)))
+                    ]), socket: socket, deadline: deadline)
 
-            advance(.waitingChallenge)
-            let challenge = try await receiveFrame(kind: "PAIR_CHALLENGE", machineId: machineId, deviceId: deviceId, socket: socket, deadline: deadline)
-            advance(.challengeReceived)
-            guard let challengeValue = challenge.body["challenge"]?.stringValue,
-                  !challengeValue.isEmpty,
-                  challengeValue.utf8.count <= 512,
-                  let challengeMachinePublic = challenge.body["machinePublicKeyB64"]?.stringValue else { throw TransportError.malformedData }
+                    advance(.waitingChallenge)
+                    let challenge = try await receiveFrame(kind: "PAIR_CHALLENGE", machineId: machineId, deviceId: deviceId, socket: socket, deadline: deadline)
+                    advance(.challengeReceived)
+                    guard let challengeValue = challenge.body["challenge"]?.stringValue,
+                          !challengeValue.isEmpty,
+                          challengeValue.utf8.count <= 512,
+                          let challengeMachinePublic = challenge.body["machinePublicKeyB64"]?.stringValue else { throw TransportError.malformedData }
 
-            advance(.verifyingWindowsKey)
-            _ = try ProtocolSecurity.validatedPairingMachineKey(challengeKey: challengeMachinePublic, acceptedKey: nil)
-            let proof = PayloadCrypto.pairingProof(pairingCode: pairingCode, challenge: challengeValue, machineId: machineId, deviceId: deviceId, devicePublicKeyB64: publicKeyB64)
+                    advance(.verifyingWindowsKey)
+                    _ = try ProtocolSecurity.validatedPairingMachineKey(challengeKey: challengeMachinePublic, acceptedKey: nil)
+                    let proof = PayloadCrypto.pairingProof(pairingCode: pairingCode, challenge: challengeValue, machineId: machineId, deviceId: deviceId, devicePublicKeyB64: publicKeyB64)
 
-            advance(.sendingProof)
-            try await send(frame: RelayFrame(v: 1, kind: "PAIR_PROOF", machineId: machineId, deviceId: deviceId, messageId: UUID().uuidString, body: ["proof": .string(proof)]), socket: socket, deadline: deadline)
+                    advance(.sendingProof)
+                    try await send(frame: RelayFrame(v: 1, kind: "PAIR_PROOF", machineId: machineId, deviceId: deviceId, messageId: UUID().uuidString, body: ["proof": .string(proof)]), socket: socket, deadline: deadline)
 
-            advance(.waitingApproval)
-            let accepted = try await receiveFrame(kind: "PAIR_ACCEPT", machineId: machineId, deviceId: deviceId, socket: socket, deadline: deadline)
-            let machinePublicKeyB64 = try ProtocolSecurity.validatedPairingMachineKey(
-                challengeKey: challengeMachinePublic,
-                acceptedKey: accepted.body["machinePublicKeyB64"]?.stringValue
-            )
-            let shared = try PayloadCrypto.deriveSharedKey(privateKeyRaw: privateKeyRaw, machinePublicKeyB64: machinePublicKeyB64, machineId: machineId, deviceId: deviceId)
-            try PairingKeyStore.savePairing(machineId: machineId, sharedKey: shared, keychain: keychain)
-            advance(.secureKeySaved)
-            return PairingResult(machineId: machineId, deviceId: deviceId)
+                    advance(.waitingApproval)
+                    let accepted = try await receiveFrame(kind: "PAIR_ACCEPT", machineId: machineId, deviceId: deviceId, socket: socket, deadline: deadline)
+                    let machinePublicKeyB64 = try ProtocolSecurity.validatedPairingMachineKey(
+                        challengeKey: challengeMachinePublic,
+                        acceptedKey: accepted.body["machinePublicKeyB64"]?.stringValue
+                    )
+                    let shared = try PayloadCrypto.deriveSharedKey(privateKeyRaw: privateKeyRaw, machinePublicKeyB64: machinePublicKeyB64, machineId: machineId, deviceId: deviceId)
+                    try PairingKeyStore.savePairing(machineId: machineId, sharedKey: shared, keychain: keychain)
+                    advance(.secureKeySaved)
+                    socket.cancel(code: .normalClosure, reason: nil)
+                    return PairingResult(machineId: machineId, deviceId: deviceId)
+                } catch {
+                    socket.cancel(code: .goingAway, reason: nil)
+                    let approvalPath = approvalRetryActive || stage == .waitingApproval
+                    if approvalPath,
+                       isRetryablePairingSocketError(error),
+                       attempt < 2,
+                       deadline.timeIntervalSinceNow > 0.5 {
+                        approvalRetryActive = true
+                        lastRetryableError = error
+                        continue
+                    }
+                    if approvalRetryActive && isRetryablePairingSocketError(error) {
+                        throw PairingStepError(stage: .waitingApproval, underlying: error)
+                    }
+                    throw error
+                }
+            }
+            throw PairingStepError(stage: .waitingApproval, underlying: lastRetryableError)
         } catch {
             if let error = error as? PairingStepError { throw error }
             throw PairingStepError(stage: stage, underlying: error)
         }
+    }
+
+    private func isRetryablePairingSocketError(_ error: Error) -> Bool {
+        if let transportError = error as? TransportError {
+            return transportError == .timeout || transportError == .disconnected || transportError == .offline
+        }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut, .networkConnectionLost, .notConnectedToInternet, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed:
+                return true
+            default:
+                return false
+            }
+        }
+        return false
     }
 
     private func remaining(until deadline: Date, cap: TimeInterval) throws -> TimeInterval {

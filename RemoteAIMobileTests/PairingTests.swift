@@ -124,6 +124,10 @@ final class PairingTests: XCTestCase {
         .data(try JSONEncoder.remoteAI.encode(frame))
     }
 
+    private func decodedFrame(_ message: URLSessionWebSocketTask.Message) throws -> RelayFrame {
+        try ProtocolSecurity.decodeRelayFrame(WebSocketIO.data(from: message))
+    }
+
     private func relayReady(machineId: String, deviceId: String, agentOnline: Bool = true) throws -> URLSessionWebSocketTask.Message {
         try frameMessage(RelayFrame(
             v: 1,
@@ -179,6 +183,16 @@ final class PairingTests: XCTestCase {
     private func makeClient(socket: ScriptedSocket, totalTimeout: TimeInterval = 1) -> RelayPairingClient {
         RelayPairingClient(totalTimeout: totalTimeout) { _, protocols in
             XCTAssertEqual(protocols, ["remoteai.v1"])
+            return socket
+        }
+    }
+
+    private func makeClient(sockets: [ScriptedSocket], totalTimeout: TimeInterval = 2) -> RelayPairingClient {
+        var index = 0
+        return RelayPairingClient(totalTimeout: totalTimeout) { _, protocols in
+            XCTAssertEqual(protocols, ["remoteai.v1"])
+            let socket = sockets[min(index, sockets.count - 1)]
+            index += 1
             return socket
         }
     }
@@ -288,6 +302,40 @@ final class PairingTests: XCTestCase {
             _ = try await makeClient(socket: socket).pair(baseURL: URL(string: "https://relay.example.com")!, machineId: machineId, pairingCode: "12345678")
             XCTFail("Expected disconnect")
         } catch { assertStageError(error, .waitingApproval) }
+    }
+
+    func testApprovalDisconnectReconnectsPairingSocketAndReusesEphemeralKey() async throws {
+        let machineId = "machine-approval-retry-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        let deviceId = try PairingKeyStore.deviceId()
+        let key = try machinePublicKey()
+        let first = ScriptedSocket([
+            .success(try relayReady(machineId: machineId, deviceId: deviceId)),
+            .success(try challenge(machineId: machineId, deviceId: deviceId, machinePublicKeyB64: key)),
+            .failure(TransportError.disconnected)
+        ])
+        let second = ScriptedSocket([
+            .success(try relayReady(machineId: machineId, deviceId: deviceId)),
+            .success(try challenge(machineId: machineId, deviceId: deviceId, machinePublicKeyB64: key)),
+            .success(try accept(machineId: machineId, deviceId: deviceId, machinePublicKeyB64: key))
+        ])
+
+        let result = try await makeClient(sockets: [first, second]).pair(
+            baseURL: URL(string: "https://relay.example.com")!,
+            machineId: machineId,
+            pairingCode: "12345678"
+        )
+        XCTAssertEqual(result.deviceId, deviceId)
+        XCTAssertTrue(first.cancelled)
+        XCTAssertTrue(second.cancelled)
+
+        let firstFrames = try first.outbound.map { try decodedFrame($0) }
+        let secondFrames = try second.outbound.map { try decodedFrame($0) }
+        let firstRequest = try XCTUnwrap(firstFrames.first(where: { $0.kind == "PAIR_REQUEST" }))
+        let secondRequest = try XCTUnwrap(secondFrames.first(where: { $0.kind == "PAIR_REQUEST" }))
+        XCTAssertEqual(firstRequest.body["devicePublicKeyB64"]?.stringValue, secondRequest.body["devicePublicKeyB64"]?.stringValue)
+        XCTAssertTrue(firstFrames.contains(where: { $0.kind == "PAIR_PROOF" }))
+        XCTAssertTrue(secondFrames.contains(where: { $0.kind == "PAIR_PROOF" }))
     }
 
     func testMixedTypeWindowsQRCodeParsesAndIsComplete() throws {
