@@ -1464,7 +1464,7 @@ final class WorkspaceStore: ObservableObject {
         var payload: [String: JSONValue] = [
             "title": .string(effectiveTitle)
         ]
-        if runtime.kind == .codex, !model.isEmpty {
+        if (runtime.kind == .codex || runtime.kind == .antigravity), !model.isEmpty {
             payload["model"] = .string(model)
         }
         guard machine.state == .online else {
@@ -1491,7 +1491,7 @@ final class WorkspaceStore: ObservableObject {
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
                 await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
                 sessionRevisions[instance.id, default: 0] &+= 1
-                let local = SessionDescriptor(id: UUID().uuidString, instanceId: instance.id, title: title.isEmpty ? (runtime.kind == .web ? "New Chat" : "New Session") : title, state: .idle, updatedAt: Date())
+                let local = SessionDescriptor(id: UUID().uuidString, instanceId: instance.id, title: title.isEmpty ? (runtime.kind == .web || runtime.kind == .antigravity ? "New Chat" : "New Session") : title, state: .idle, updatedAt: Date())
                 sessions.insert(local, at: 0)
                 errors[instance.id] = nil
                 await persistMetadata()

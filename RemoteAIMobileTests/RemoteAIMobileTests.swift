@@ -307,6 +307,34 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(decoded.models.map(\.label), ["GPT-5.6-Sol", "GPT-5.4-Mini"])
     }
 
+    func testAntigravityInstanceCarriesSelectableModelCatalog() throws {
+        let catalog = CodexCatalog(
+            models: [
+                CodexModelOption(id: "MODEL_PLACEHOLDER_M318", label: "Gemini 3.8 Flash (High)"),
+                CodexModelOption(id: "MODEL_PLACEHOLDER_M35", label: "Claude Sonnet 4.6 (Thinking)")
+            ],
+            defaultModel: "MODEL_PLACEHOLDER_M318"
+        )
+        let server = ServerInstance(
+            instanceId: "antigravity.desktop",
+            runtimeId: "runtime.antigravity",
+            label: "Antigravity",
+            kind: "antigravity-desktop",
+            config: [
+                "model": .string("MODEL_PLACEHOLDER_M318"),
+                "modelCatalog": try JSONValue.encode(catalog)
+            ],
+            status: "ready",
+            updatedAt: Date()
+        )
+        let descriptor = server.descriptor
+        let decoded = try XCTUnwrap(descriptor.modelCatalog)
+        XCTAssertEqual(descriptor.configuredModel, "MODEL_PLACEHOLDER_M318")
+        XCTAssertEqual(decoded.defaultModel, "MODEL_PLACEHOLDER_M318")
+        XCTAssertEqual(decoded.models.map(\.id), ["MODEL_PLACEHOLDER_M318", "MODEL_PLACEHOLDER_M35"])
+        XCTAssertEqual(decoded.models.map(\.label), ["Gemini 3.8 Flash (High)", "Claude Sonnet 4.6 (Thinking)"])
+    }
+
     func testMockExposesAllElevenDesktopCodexInstances() async throws {
         let mock = MockTransport(historyCount: 10)
         try await mock.connect()
@@ -2998,5 +3026,6 @@ final class RemoteAIMobileTests: XCTestCase {
     func testRuntimeHierarchyNamesAreDistinct() {
         XCTAssertEqual(RuntimeKind.web.displayName, "Web")
         XCTAssertEqual(RuntimeKind.codex.displayName, "Codex")
+        XCTAssertEqual(RuntimeKind.antigravity.displayName, "Antigravity")
     }
 }

@@ -80,7 +80,7 @@ struct RootView: View {
             .sheet(isPresented: $showingDiagnostics) { DiagnosticsView().environmentObject(store) }
         }.navigationViewStyle(.stack)
     }
-    private func runtimeIcon(_ kind: RuntimeKind) -> String { switch kind { case .web: return "globe"; case .codex: return "terminal" } }
+    private func runtimeIcon(_ kind: RuntimeKind) -> String { switch kind { case .web: return "globe"; case .codex: return "terminal"; case .antigravity: return "sparkles" } }
 }
 
 private struct DiagnosticExportItem: Identifiable {
@@ -461,7 +461,7 @@ struct ChatView: View {
     @State private var sending = false
     @State private var sendTask: Task<Void, Never>?
     @State private var composerCommandId: UUID?
-    @State private var selectedCodexModel = ""
+    @State private var selectedModel = ""
     @State private var voiceBaseText = ""
     @State private var isAtBottom = true
     @State private var didInitialScrollToBottom = false
@@ -474,7 +474,8 @@ struct ChatView: View {
         store.deltaRecoveryDisplayMessagesBySession?[session.id]
             ?? store.messagesBySession[session.id, default: []]
     }
-    private var codexModels: [CodexModelOption] { instance.codexCatalog?.models ?? [] }
+    private var supportsModelSelection: Bool { runtime.kind == .codex || runtime.kind == .antigravity }
+    private var modelOptions: [CodexModelOption] { instance.modelCatalog?.models ?? [] }
     private var currentSession: SessionDescriptor {
         store.sessions.first(where: { $0.id == session.id }) ?? session
     }
@@ -532,7 +533,7 @@ struct ChatView: View {
                                         textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
                                     }).id(message.id)
                                 } else {
-                                    MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: runtime.kind == .codex ? selectedCodexModel : "") } } : nil, retryContextKey: selectedCodexModel, onSelectText: { text, monospaced in
+                                    MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: supportsModelSelection ? selectedModel : "") } } : nil, retryContextKey: selectedModel, onSelectText: { text, monospaced in
                                         textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
                                     }).equatable().id(message.id)
                                 }
@@ -621,13 +622,13 @@ struct ChatView: View {
         }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {
-                if runtime.kind == .codex, !codexModels.isEmpty {
+                if supportsModelSelection, !modelOptions.isEmpty {
                     HStack(spacing: 8) {
                         Label("Model", systemImage: "cpu")
                             .font(.caption.weight(.medium))
                         Spacer()
-                        Picker("Model", selection: $selectedCodexModel) {
-                            ForEach(codexModels) { option in Text(option.label).tag(option.id) }
+                        Picker("Model", selection: $selectedModel) {
+                            ForEach(modelOptions) { option in Text(option.label).tag(option.id) }
                         }
                         .pickerStyle(.menu)
                     }
@@ -723,7 +724,7 @@ struct ChatView: View {
                                     return
                                 }
                             }
-                            let sent = await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, attachments: attachments, model: runtime.kind == .codex ? selectedCodexModel : "", commandId: commandId)
+                            let sent = await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, attachments: attachments, model: supportsModelSelection ? selectedModel : "", commandId: commandId)
                             await MainActor.run {
                                 sending = false
                                 sendTask = nil
@@ -774,10 +775,10 @@ struct ChatView: View {
             }
         }
         .task {
-            if runtime.kind == .codex, selectedCodexModel.isEmpty {
-                selectedCodexModel = instance.configuredModel
-                    ?? instance.codexCatalog?.defaultModel
-                    ?? codexModels.first?.id
+            if supportsModelSelection, selectedModel.isEmpty {
+                selectedModel = instance.configuredModel
+                    ?? instance.modelCatalog?.defaultModel
+                    ?? modelOptions.first?.id
                     ?? ""
             }
             await store.loadSession(session.id)
@@ -2028,13 +2029,14 @@ struct NewSessionView: View {
     @State private var model = ""
     @State private var creating = false
 
-    private var codexCatalog: CodexCatalog {
-        instance.codexCatalog ?? CodexCatalog(models: [], defaultModel: instance.configuredModel)
+    private var supportsModelSelection: Bool { runtime.kind == .codex || runtime.kind == .antigravity }
+    private var modelCatalog: CodexCatalog {
+        instance.modelCatalog ?? CodexCatalog(models: [], defaultModel: instance.configuredModel)
     }
 
     private var canCreate: Bool {
-        if runtime.kind == .codex {
-            return !model.isEmpty && codexCatalog.models.contains(where: { $0.id == model })
+        if supportsModelSelection {
+            return !model.isEmpty && modelCatalog.models.contains(where: { $0.id == model })
         }
         return true
     }
@@ -2054,14 +2056,14 @@ struct NewSessionView: View {
                     Section { ErrorBanner(text: error) { store.clearError(sessionId: instance.id) } }
                 }
 
-                if runtime.kind == .codex {
+                if supportsModelSelection {
                     Section("模型") {
-                        if codexCatalog.models.isEmpty {
-                            Text("Windows 尚未提供此 Codex 实例的模型目录。")
+                        if modelCatalog.models.isEmpty {
+                            Text("Windows 尚未提供此实例的模型目录。")
                                 .font(.caption).foregroundColor(.orange)
                         } else {
                             Picker("Model", selection: $model) {
-                                ForEach(codexCatalog.models) { option in
+                                ForEach(modelCatalog.models) { option in
                                     Text(option.label).tag(option.id)
                                 }
                             }
@@ -2070,13 +2072,13 @@ struct NewSessionView: View {
                 }
             }
             .remoteAITopBreathingRoom()
-            .navigationTitle(runtime.kind == .web ? "New Chat" : "New Session")
+            .navigationTitle(runtime.kind == .web || runtime.kind == .antigravity ? "New Chat" : "New Session")
             .navigationBarTitleDisplayMode(.inline)
             .onAppear {
-                if runtime.kind == .codex {
+                if supportsModelSelection {
                     model = instance.configuredModel
-                        ?? codexCatalog.defaultModel
-                        ?? codexCatalog.models.first?.id
+                        ?? modelCatalog.defaultModel
+                        ?? modelCatalog.models.first?.id
                         ?? ""
                 }
             }
@@ -2168,7 +2170,7 @@ struct PairingView: View {
         case .sendingProof, .waitingApproval: return "Completing the code proof with Windows."
         case .secureKeySaved: return "The derived shared key is stored in ThisDeviceOnly Keychain."
         case .connectingRemoteAI: return "Reconnecting with the newly paired key."
-        case .loadingRuntimes: return "Loading Web and Codex from Windows."
+        case .loadingRuntimes: return "Loading Web, Codex, and Antigravity from Windows."
         case .completed: return "Pairing completed successfully."
         default: return "Every network step is time-limited; the Pair button will recover on failure."
         }

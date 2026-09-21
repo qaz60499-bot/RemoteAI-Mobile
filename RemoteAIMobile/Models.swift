@@ -3,6 +3,7 @@ import Foundation
 enum RuntimeKind: String, Codable, CaseIterable, Identifiable {
     case web = "Web"
     case codex = "Codex"
+    case antigravity = "Antigravity"
 
     var id: String { rawValue }
     var displayName: String { rawValue }
@@ -71,6 +72,13 @@ struct CodexCatalog: Codable, Hashable {
 extension InstanceDescriptor {
     var codexCatalog: CodexCatalog? {
         try? config["codexCatalog"]?.decode(CodexCatalog.self)
+    }
+
+    var modelCatalog: CodexCatalog? {
+        if let value = config["modelCatalog"], let generic = try? value.decode(CodexCatalog.self) {
+            return generic
+        }
+        return codexCatalog
     }
 
     var configuredModel: String? {
