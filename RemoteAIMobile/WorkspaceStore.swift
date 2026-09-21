@@ -50,6 +50,7 @@ final class WorkspaceStore: ObservableObject {
     private var flushTask: Task<Void, Never>?
     private var startInProgress = false
     private var restartAfterStart = false
+    private var pairingInProgress = false
     private var lifecycleGeneration: UInt64 = 0
     private var isSuspended = false
 
@@ -211,7 +212,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func start(pairingProgress: ((PairingStage) -> Void)? = nil) async {
-        guard !isSuspended else { return }
+        guard !isSuspended, !pairingInProgress else { return }
         if startInProgress { return }
         startInProgress = true
         let generation = lifecycleGeneration
@@ -323,6 +324,10 @@ final class WorkspaceStore: ObservableObject {
 
     func resumeFromForeground() async {
         isSuspended = false
+        // Pairing owns a separate relay websocket. Foreground callbacks must not
+        // reopen the normal transport with the same stable deviceId while that
+        // websocket is waiting for PAIR_CHALLENGE / PAIR_ACCEPT.
+        guard !pairingInProgress else { return }
         lifecycleGeneration &+= 1
         machine.state = .connecting
         connectionPhase = .reconnecting
@@ -1509,6 +1514,12 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func savePairing(baseURL: URL, machineId: String, code: String) async throws {
+        guard !pairingInProgress else {
+            throw TransportError.remote("PAIRING_IN_PROGRESS", "A pairing attempt is already in progress.")
+        }
+        pairingInProgress = true
+        defer { pairingInProgress = false }
+
         pairingStage = .preparing
         isSuspended = false
         lifecycleGeneration &+= 1
@@ -1591,6 +1602,11 @@ final class WorkspaceStore: ObservableObject {
         machine = MachineMetadata(id: result.machineId, name: machine.name, state: .connecting)
         isPaired = true
         errors["connection"] = nil
+
+        // The normal transport may start only after the dedicated pairing socket has
+        // completed and returned. Clear the gate before calling start(); otherwise
+        // start() intentionally refuses to create a competing same-device websocket.
+        pairingInProgress = false
         while startInProgress {
             try? await Task.sleep(nanoseconds: 25_000_000)
         }
