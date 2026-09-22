@@ -204,6 +204,37 @@ final class PairingTests: XCTestCase {
         XCTAssertEqual(step.stage, stage, file: file, line: line)
     }
 
+    func testIntentionalAgentShutdownAckSkipsReconnectGrace() throws {
+        let frame = RelayFrame(
+            v: 1,
+            kind: "ACK",
+            machineId: "machine-shutdown",
+            deviceId: nil,
+            messageId: UUID().uuidString,
+            body: [
+                "relay": .string("agent-offline"),
+                "closeCode": .number(1000),
+                "closeReason": .string("agent shutdown"),
+                "intentionalShutdown": .bool(true)
+            ]
+        )
+        XCTAssertTrue(CloudflareTransport.isIntentionalAgentShutdown(frame))
+
+        let transient = RelayFrame(
+            v: 1,
+            kind: "ACK",
+            machineId: "machine-transient",
+            deviceId: nil,
+            messageId: UUID().uuidString,
+            body: [
+                "relay": .string("agent-offline"),
+                "closeCode": .number(1006),
+                "intentionalShutdown": .bool(false)
+            ]
+        )
+        XCTAssertFalse(CloudflareTransport.isIntentionalAgentShutdown(transient))
+    }
+
     func testPairingRelayOfflineFailsInsteadOfHanging() async throws {
         let machineId = "machine-relay-offline-\(UUID().uuidString)"
         let socket = ScriptedSocket([.failure(TransportError.offline)])

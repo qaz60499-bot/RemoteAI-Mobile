@@ -55,6 +55,12 @@ actor CloudflareTransport: Transport {
 
     var isConnected: Bool { connected }
 
+    static func isIntentionalAgentShutdown(_ frame: RelayFrame) -> Bool {
+        frame.kind == "ACK"
+            && frame.body["relay"]?.stringValue == "agent-offline"
+            && frame.body["intentionalShutdown"]?.boolValue == true
+    }
+
     func connect() async throws {
         if connected { return }
         if connecting {
@@ -216,14 +222,28 @@ actor CloudflareTransport: Transport {
                     publishHealth(channel: .agent, state: .online, detail: nil)
                     await recordDiagnostic("relay_agent_online")
                 } else if relayState == "agent-offline" {
-                    // Keep the transport command-capable during the short reconnect
-                    // grace. The Durable Object has a reliable to-Agent queue, so a
-                    // command sent during a typical 1006 can wait there and replay to
-                    // the same commandId when Windows reconnects.
-                    agentReconnectPending = true
-                    publishHealth(channel: .agent, state: .reconnecting, detail: "Windows Agent disconnected from Relay")
-                    await recordDiagnostic("relay_agent_reconnecting", fields: ["graceSeconds": "12"])
-                    scheduleAgentOfflineConfirmation()
+                    if Self.isIntentionalAgentShutdown(frame) {
+                        // A clean user-requested Windows shutdown is terminal, not a
+                        // transient outage. Keep the phone-to-Relay socket alive, but
+                        // surface Windows offline immediately instead of spending the
+                        // reconnect grace pretending the Agent may come back.
+                        agentOnline = false
+                        agentReconnectPending = false
+                        agentOfflineTask?.cancel()
+                        agentOfflineTask = nil
+                        publishHealth(channel: .agent, state: .offline, detail: "Windows Agent was manually stopped")
+                        await recordDiagnostic("relay_agent_offline_manual")
+                        failAllPending(with: TransportError.offline)
+                    } else {
+                        // Keep the transport command-capable during the short reconnect
+                        // grace. The Durable Object has a reliable to-Agent queue, so a
+                        // command sent during a typical 1006 can wait there and replay to
+                        // the same commandId when Windows reconnects.
+                        agentReconnectPending = true
+                        publishHealth(channel: .agent, state: .reconnecting, detail: "Windows Agent disconnected from Relay")
+                        await recordDiagnostic("relay_agent_reconnecting", fields: ["graceSeconds": "12"])
+                        scheduleAgentOfflineConfirmation()
+                    }
                 }
             }
             return
