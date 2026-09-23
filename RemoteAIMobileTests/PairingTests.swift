@@ -36,13 +36,21 @@ final class PairingTests: XCTestCase {
             case statusTimeout
             case stalePairing
             case runtimesFailure
+            case authenticatedThenAgentOffline
         }
 
         private let mode: Mode
         private var connected = false
         private var connectCalls = 0
+        private let healthEvents: AsyncStream<TransportHealthEvent>
+        private let healthContinuation: AsyncStream<TransportHealthEvent>.Continuation
 
-        init(mode: Mode) { self.mode = mode }
+        init(mode: Mode) {
+            self.mode = mode
+            let pipe = AsyncStream<TransportHealthEvent>.makeStream()
+            self.healthEvents = pipe.stream
+            self.healthContinuation = pipe.continuation
+        }
 
         var isConnected: Bool { connected }
         func connect() async throws {
@@ -52,6 +60,7 @@ final class PairingTests: XCTestCase {
         }
         func disconnect() async { connected = false }
         func eventStream() async -> AsyncStream<RemoteEvent> { AsyncStream { _ in } }
+        func healthStream() async -> AsyncStream<TransportHealthEvent> { healthEvents }
         func connectionCount() -> Int { connectCalls }
         func forceDisconnect() { connected = false }
 
@@ -71,6 +80,10 @@ final class PairingTests: XCTestCase {
                 return CommandResponseEnvelope(ok: true, result: try JSONValue.encode(DeltaSyncResult(events: [], nextCursor: 0, hasMore: false)), error: nil, idempotentReplay: false)
             case "listRuntimes":
                 if mode == .runtimesFailure { throw TransportError.remote("CATALOG_TEMPORARY", "catalog unavailable") }
+                if mode == .authenticatedThenAgentOffline {
+                    healthContinuation.yield(TransportHealthEvent(channel: .agent, state: .offline, at: Date(), detail: "post-auth race"))
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
                 let now = Date()
                 return CommandResponseEnvelope(ok: true, result: try JSONValue.encode([
                     ServerRuntime(runtimeId: "runtime.web", kind: RuntimeKind.web.rawValue, label: "Web", capabilities: [], status: "READY", updatedAt: now)
@@ -630,6 +643,22 @@ final class PairingTests: XCTestCase {
         XCTAssertEqual(store.machine.state, .online)
         XCTAssertEqual(store.connectionPhase, .online)
         XCTAssertNotNil(store.errors["sync"])
+        await store.suspend()
+    }
+
+    func testAuthenticatedRoundTripSurvivesPostConnectHealthRace() async throws {
+        let machineId = "machine-post-auth-race-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x38, count: 32))
+        let store = WorkspaceStore(transport: ConnectionScenarioTransport(mode: .authenticatedThenAgentOffline), cache: try SQLiteStore.inMemory())
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+
+        let authenticated = await store.start()
+
+        XCTAssertTrue(authenticated, "An authenticated getStatus round-trip must remain authoritative even if health state changes before start() returns")
+        XCTAssertEqual(store.machine.state, .offline)
+        XCTAssertEqual(store.connectionPhase, .windowsOffline)
+        XCTAssertTrue(PairingKeyStore.isPaired(machineId: machineId))
         await store.suspend()
     }
 

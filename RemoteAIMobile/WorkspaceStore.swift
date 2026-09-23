@@ -211,11 +211,13 @@ final class WorkspaceStore: ObservableObject {
         return store
     }
 
-    func start(pairingProgress: ((PairingStage) -> Void)? = nil) async {
-        guard !isSuspended, !pairingInProgress else { return }
-        if startInProgress { return }
+    @discardableResult
+    func start(pairingProgress: ((PairingStage) -> Void)? = nil) async -> Bool {
+        guard !isSuspended, !pairingInProgress else { return false }
+        if startInProgress { return false }
         startInProgress = true
         let generation = lifecycleGeneration
+        var authenticatedRoundTrip = false
         defer {
             startInProgress = false
             if restartAfterStart && !isSuspended {
@@ -225,7 +227,7 @@ final class WorkspaceStore: ObservableObject {
         }
 
         await loadCachedFirst()
-        guard generation == lifecycleGeneration, !isSuspended else { return }
+        guard generation == lifecycleGeneration, !isSuspended else { return false }
         await normalizeCachedTransientState()
         if !(transport is MockTransport) {
             await removeLegacyMockFixtures()
@@ -256,7 +258,7 @@ final class WorkspaceStore: ObservableObject {
             machine.state = .offline
             connectionPhase = .pairingExpired
             errors["connection"] = "Not paired — scan the Windows pairing code to load your real runtimes and ChatGPT Projects."
-            return
+            return false
         }
         let activeTransport = transport
         installEventConsumer()
@@ -269,7 +271,7 @@ final class WorkspaceStore: ObservableObject {
             try await activeTransport.connect()
             guard generation == lifecycleGeneration, !isSuspended, transport === activeTransport else {
                 await activeTransport.disconnect()
-                return
+                return authenticatedRoundTrip
             }
             connectionPhase = .relayConnected
 
@@ -279,9 +281,14 @@ final class WorkspaceStore: ObservableObject {
             let agentStatus = try await activeTransport.agentStatusSnapshot(machineId: machine.id)
             let authenticatedSequence = agentStatus.latestSequence
             applyAgentStatusSnapshot(agentStatus)
+            // This authenticated encrypted round-trip is the durable proof that the
+            // newly paired key works. UI/health state may legitimately change a moment
+            // later during a Relay or Agent reconnect, but that must not retroactively
+            // turn a successful pairing into PAIR_CONNECTED_BUT_OFFLINE.
+            authenticatedRoundTrip = true
             guard generation == lifecycleGeneration, !isSuspended, transport === activeTransport else {
                 await activeTransport.disconnect()
-                return
+                return authenticatedRoundTrip
             }
             machine.state = .online
             errors["connection"] = nil
@@ -294,14 +301,16 @@ final class WorkspaceStore: ObservableObject {
             pairingProgress?(.loadingRuntimes)
             connectionPhase = .loadingRuntimes
             await recoverDelta(freshLatestSequence: authenticatedSequence)
-            guard generation == lifecycleGeneration, !isSuspended else { return }
+            guard generation == lifecycleGeneration, !isSuspended else { return authenticatedRoundTrip }
             await refreshMetadata()
-            guard generation == lifecycleGeneration, !isSuspended else { return }
-            connectionPhase = .online
+            guard generation == lifecycleGeneration, !isSuspended else { return authenticatedRoundTrip }
+            if machine.state == .online { connectionPhase = .online }
+            return authenticatedRoundTrip
         } catch {
-            guard generation == lifecycleGeneration, !isSuspended else { return }
+            guard generation == lifecycleGeneration, !isSuspended else { return authenticatedRoundTrip }
             applyConnectionFailure(error)
             if (error as? TransportError) != .pairingRequired { startConnectionMonitor() }
+            return authenticatedRoundTrip
         }
     }
 
@@ -1610,11 +1619,17 @@ final class WorkspaceStore: ObservableObject {
         while startInProgress {
             try? await Task.sleep(nanoseconds: 25_000_000)
         }
-        await start { [weak self] stage in
+        let authenticated = await start { [weak self] stage in
             self?.pairingStage = stage
         }
+        guard authenticated else {
+            throw TransportError.remote("PAIR_CONNECTED_BUT_OFFLINE", errors["connection"] ?? "Pairing succeeded, but the Windows service did not complete an authenticated connection.")
+        }
         if machine.state != .online {
-            throw TransportError.remote("PAIR_CONNECTED_BUT_OFFLINE", errors["connection"] ?? "Pairing succeeded, but the Windows service did not become reachable.")
+            DiagnosticsLog.shared.record("pairing_authenticated_reconnect_pending", fields: [
+                "state": machine.state.rawValue,
+                "phase": connectionPhase.rawValue,
+            ], level: "WARN")
         }
         pairingStage = .completed
     }
