@@ -61,6 +61,12 @@ actor CloudflareTransport: Transport {
             && frame.body["intentionalShutdown"]?.boolValue == true
     }
 
+    static func requiresPairingRepair(_ frame: RelayFrame) -> Bool {
+        frame.kind == "ACK"
+            && frame.body["error"]?.stringValue == "UNAUTHORIZED_DEVICE"
+            && frame.body["repairRequired"]?.boolValue == true
+    }
+
     func connect() async throws {
         if connected { return }
         if connecting {
@@ -208,8 +214,11 @@ actor CloudflareTransport: Transport {
             if let code = frame.body["error"]?.stringValue {
                 let message = frame.body["message"]?.stringValue ?? "Windows rejected this device."
                 if code == "UNAUTHORIZED_DEVICE" {
-                    PairingKeyStore.deletePairing(machineId: config.machineId, keychain: keychain)
-                    throw TransportError.pairingRequired
+                    if Self.requiresPairingRepair(frame) {
+                        PairingKeyStore.deletePairing(machineId: config.machineId, keychain: keychain)
+                        throw TransportError.pairingRequired
+                    }
+                    throw TransportError.remote(code, message)
                 }
                 throw TransportError.remote(code, message)
             }
@@ -454,8 +463,11 @@ actor CloudflareTransport: Transport {
             guard frame.deviceId == nil || frame.deviceId == deviceId else { throw TransportError.malformedData }
             if frame.kind == "ACK", let code = frame.body["error"]?.stringValue {
                 if code == "UNAUTHORIZED_DEVICE" {
-                    PairingKeyStore.deletePairing(machineId: config.machineId, keychain: keychain)
-                    throw TransportError.pairingRequired
+                    if Self.requiresPairingRepair(frame) {
+                        PairingKeyStore.deletePairing(machineId: config.machineId, keychain: keychain)
+                        throw TransportError.pairingRequired
+                    }
+                    throw TransportError.remote(code, frame.body["message"]?.stringValue ?? "Relay rejected the connection.")
                 }
                 throw TransportError.remote(code, frame.body["message"]?.stringValue ?? "Relay rejected the connection.")
             }

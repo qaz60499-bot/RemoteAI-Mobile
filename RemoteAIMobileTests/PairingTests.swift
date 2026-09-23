@@ -204,6 +204,35 @@ final class PairingTests: XCTestCase {
         XCTAssertEqual(step.stage, stage, file: file, line: line)
     }
 
+    func testUnauthorizedAckRequiresExplicitRepairFlagBeforePairingIsInvalidated() throws {
+        let transient = RelayFrame(
+            v: 1,
+            kind: "ACK",
+            machineId: "machine-transient-auth",
+            deviceId: "ios-device",
+            messageId: UUID().uuidString,
+            body: [
+                "error": .string("UNAUTHORIZED_DEVICE"),
+                "message": .string("Pairing key agreement failed")
+            ]
+        )
+        XCTAssertFalse(CloudflareTransport.requiresPairingRepair(transient))
+
+        let permanent = RelayFrame(
+            v: 1,
+            kind: "ACK",
+            machineId: "machine-permanent-auth",
+            deviceId: "ios-device",
+            messageId: UUID().uuidString,
+            body: [
+                "error": .string("UNAUTHORIZED_DEVICE"),
+                "message": .string("Pairing expired or key mismatch; repair required"),
+                "repairRequired": .bool(true)
+            ]
+        )
+        XCTAssertTrue(CloudflareTransport.requiresPairingRepair(permanent))
+    }
+
     func testIntentionalAgentShutdownAckSkipsReconnectGrace() throws {
         let frame = RelayFrame(
             v: 1,
