@@ -482,8 +482,8 @@ final class RemoteAIMobileTests: XCTestCase {
         await mock.setExecutionDelay(nanoseconds: 120_000_000)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
 
-        async let first: Void = store.start()
-        async let second: Void = store.start()
+        async let first: Bool = store.start()
+        async let second: Bool = store.start()
         _ = await (first, second)
         let connectionAttempts = await mock.connectionAttemptCount()
         let statusAttempts = await mock.actionAttemptCount("getStatus")
