@@ -63,6 +63,8 @@ final class WorkspaceStore: ObservableObject {
     private static let webProjectsAutomaticRefreshMinimumInterval: TimeInterval = 20
     private var projectConversationRefreshes = Set<String>()
     private var projectConversationRefreshQueued = Set<String>()
+    private var projectConversationActivityRefreshScheduled = Set<String>()
+    private var projectConversationActivityRefreshLastAt: [String: Date] = [:]
     private var projectConversationLastRefreshAttemptAt: [String: Date] = [:]
     private static let projectConversationAutomaticRefreshMinimumInterval: TimeInterval = 8
     private var projectConversationPageLoads = Set<String>()
@@ -920,19 +922,21 @@ final class WorkspaceStore: ObservableObject {
             if let projectAlias { projectConversationRevisions[projectAlias, default: 0] &+= 1 }
             await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
-            let session = created.session
+            var session = created.session
+            // Creation is real user activity. Keep that semantic timestamp on the
+            // session catalog for run recovery, but do not use it to reorder an already
+            // discovered Project list; the sidebar refresh below owns durable ordering.
+            session.lastActivityAt = created.updatedAt
             sessions.removeAll { $0.id == session.id }
             sessions.insert(session, at: 0)
             if let alias = projectAlias {
-                var rows = projectConversationsByAlias[alias, default: []]
-                rows.removeAll { $0.id == created.id }
-                rows.insert(created, at: 0)
-                projectConversationsByAlias[alias] = rows
-                projectConversationSnapshotStateByAlias[alias] = .localConfirmed
-                projectConversationSnapshotIds.removeValue(forKey: alias)
-                projectNextCursorByAlias.removeValue(forKey: alias)
-                projectHasMoreByAlias[alias] = false
-                try? await cache.put(projectConversationsByAlias[alias] ?? [], key: "web.project.\(alias).conversations")
+                if projectConversationRefreshes.contains(alias) {
+                    projectConversationRefreshQueued.insert(alias)
+                } else {
+                    Task { @MainActor [weak self] in
+                        await self?.loadProjectConversations(projectAlias: alias, refresh: true, force: true)
+                    }
+                }
             }
             await persistMetadata()
             errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = nil
@@ -960,11 +964,10 @@ final class WorkspaceStore: ObservableObject {
             sessions.append(contentsOf: remote)
             sessions.sort { $0.orderingDate > $1.orderingDate }
 
-            // listSessions carries durable Agent-side projectAlias + lastActivityAt.
-            // Reconcile that semantic activity back into already-loaded Project rows so
-            // a desktop Busy/recently-finished chat remains visible and moves to the
-            // same newest-first position even when ChatGPT's sidebar DOM is one render
-            // behind or temporarily incomplete.
+            // listSessions carries durable Agent-side Project identity and titles.
+            // Repair safe metadata in already-loaded rows without reordering them.
+            // Busy rows missing from ChatGPT's lazy sidebar are overlaid only at render
+            // time by displayedProjectConversations.
             let reconciledProjects = reconcileProjectConversationActivityFromSessions(remote)
             for alias in reconciledProjects {
                 try? await cache.put(
@@ -2398,6 +2401,102 @@ final class WorkspaceStore: ObservableObject {
         return alias.isEmpty ? nil : alias
     }
 
+    private func webProjectBaseId(from alias: String?) -> String? {
+        guard let alias else { return nil }
+        let value = alias.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard value.hasPrefix("g-p-"), value.count >= 36 else { return nil }
+        let end = value.index(value.startIndex, offsetBy: 36)
+        let prefix = String(value[..<end])
+        let hex = prefix.dropFirst(4)
+        guard hex.count == 32, hex.allSatisfy({ $0.isHexDigit }) else { return nil }
+        if value.count > 36 {
+            guard value[value.index(value.startIndex, offsetBy: 36)] == "-" else { return nil }
+        }
+        return String(hex)
+    }
+
+    private func sameWebProjectAlias(_ left: String?, _ right: String?) -> Bool {
+        if left == right { return true }
+        guard let leftBase = webProjectBaseId(from: left),
+              let rightBase = webProjectBaseId(from: right) else { return false }
+        return leftBase == rightBase
+    }
+
+    /// The complete ChatGPT sidebar snapshot owns membership and pagination, while
+    /// durable Windows/phone activity owns the visible recent-activity head. Keep those
+    /// authorities separate so reordering never truncates a large Project.
+    func displayedProjectConversations(projectAlias: String) -> [WebConversationDescriptor] {
+        let providerRows = projectConversationsByAlias[projectAlias, default: []]
+        let providerById = Dictionary(uniqueKeysWithValues: providerRows.map { ($0.localConversationId, $0) })
+
+        var activityRows: [(descriptor: WebConversationDescriptor, activityAt: Date)] = []
+        var promotedIds = Set<String>()
+        var promotedAliases = Set<String>()
+
+        for session in sessions where session.instanceId == "web.chatgpt" && sameWebProjectAlias(session.projectAlias, projectAlias) {
+            guard let canonicalURL = session.canonicalUrl, !canonicalURL.isEmpty else { continue }
+            let sessionAlias = webConversationAlias(from: canonicalURL)
+            let prior = providerById[session.id]
+                ?? providerRows.first(where: { sessionAlias != nil && $0.conversationAlias == sessionAlias })
+            let active = session.state == .busy || session.state == .waiting
+            let activityAt = session.lastActivityAt ?? (active ? session.updatedAt : nil)
+
+            if let prior {
+                guard let activityAt, active || activityAt > prior.updatedAt else { continue }
+                let title = isSyntheticConversationTitle(prior.displayTitle, conversationAlias: prior.conversationAlias)
+                    && !isSyntheticConversationTitle(session.title, conversationAlias: sessionAlias)
+                    ? session.title
+                    : prior.displayTitle
+                let row = WebConversationDescriptor(
+                    localConversationId: prior.localConversationId,
+                    canonicalUrl: canonicalURL,
+                    projectId: prior.projectId,
+                    displayTitle: title,
+                    projectAlias: prior.projectAlias,
+                    conversationAlias: prior.conversationAlias ?? sessionAlias,
+                    lastVisited: max(prior.lastVisited ?? prior.updatedAt, activityAt),
+                    updatedAt: max(prior.updatedAt, activityAt)
+                )
+                activityRows.append((row, activityAt))
+                promotedIds.insert(prior.localConversationId)
+                if let alias = row.conversationAlias { promotedAliases.insert(alias) }
+                continue
+            }
+
+            // A desktop Chat can start running before ChatGPT lazily mounts its sidebar
+            // row. Session identity is enough to show it immediately without changing
+            // the complete provider-backed list or its pagination state.
+            guard let activityAt else { continue }
+            let row = WebConversationDescriptor(
+                localConversationId: session.id,
+                canonicalUrl: canonicalURL,
+                projectId: webProjects.first(where: { sameWebProjectAlias($0.projectAlias, projectAlias) })?.projectId,
+                displayTitle: session.title,
+                projectAlias: projectAlias,
+                conversationAlias: sessionAlias,
+                lastVisited: activityAt,
+                updatedAt: activityAt
+            )
+            activityRows.append((row, activityAt))
+            promotedIds.insert(session.id)
+            if let alias = sessionAlias { promotedAliases.insert(alias) }
+        }
+
+        activityRows.sort { lhs, rhs in
+            if lhs.activityAt == rhs.activityAt {
+                return lhs.descriptor.localConversationId < rhs.descriptor.localConversationId
+            }
+            return lhs.activityAt > rhs.activityAt
+        }
+
+        let providerTail = providerRows.filter { row in
+            if promotedIds.contains(row.localConversationId) { return false }
+            if let alias = row.conversationAlias, promotedAliases.contains(alias) { return false }
+            return true
+        }
+        return activityRows.map { $0.descriptor } + providerTail
+    }
+
     @discardableResult
     private func reconcileProjectConversationActivityFromSessions(_ remote: [SessionDescriptor]) -> Set<String> {
         let projectSessions = remote.filter {
@@ -2408,82 +2507,59 @@ final class WorkspaceStore: ObservableObject {
         guard !projectSessions.isEmpty else { return [] }
 
         var changedAliases = Set<String>()
-        let grouped = Dictionary(grouping: projectSessions) { $0.projectAlias! }
+        let grouped = Dictionary(grouping: projectSessions) { session -> String in
+            let rawAlias = session.projectAlias!
+            return projectConversationsByAlias.keys.first(where: { sameWebProjectAlias($0, rawAlias) })
+                ?? webProjects.first(where: { sameWebProjectAlias($0.projectAlias, rawAlias) })?.projectAlias
+                ?? rawAlias
+        }
 
         for (projectAlias, sessionsForProject) in grouped {
-            guard webProjects.contains(where: { $0.projectAlias == projectAlias })
-                    || projectConversationsByAlias[projectAlias] != nil else { continue }
+            guard projectConversationsByAlias[projectAlias] != nil else { continue }
             var rows = projectConversationsByAlias[projectAlias, default: []]
             var changed = false
 
-            // Promote oldest -> newest so the newest semantic activity ends at index 0.
-            // lastActivityAt is now sourced only from durable Agent activity metadata;
-            // DOM lastVisited timestamps are deliberately excluded from this ordering.
-            let ordered = sessionsForProject.sorted { lhs, rhs in
-                let left = lhs.lastActivityAt ?? lhs.updatedAt
-                let right = rhs.lastActivityAt ?? rhs.updatedAt
-                if left == right { return lhs.id < rhs.id }
-                return left < right
-            }
-
-            for session in ordered {
-                let isActive = session.state == .busy || session.state == .waiting
-                let semanticActivity = session.lastActivityAt ?? (isActive ? session.updatedAt : nil)
-                let existingIndex = rows.firstIndex(where: { $0.localConversationId == session.id })
-
-                if let existingIndex {
-                    guard let semanticActivity else { continue }
-                    let prior = rows[existingIndex]
-                    // A previously mirrored activity already stamped updatedAt. Do not
-                    // reshuffle the same row on every listSessions refresh.
-                    guard isActive || semanticActivity > prior.updatedAt else { continue }
-
-                    rows.remove(at: existingIndex)
-                    let promoted = WebConversationDescriptor(
-                        localConversationId: prior.localConversationId,
-                        canonicalUrl: session.canonicalUrl ?? prior.canonicalUrl,
-                        projectId: prior.projectId,
-                        displayTitle: isSyntheticConversationTitle(prior.displayTitle, conversationAlias: prior.conversationAlias)
-                            ? session.title
-                            : prior.displayTitle,
-                        projectAlias: prior.projectAlias,
-                        conversationAlias: prior.conversationAlias ?? webConversationAlias(from: session.canonicalUrl),
-                        lastVisited: max(prior.lastVisited ?? prior.updatedAt, semanticActivity),
-                        updatedAt: max(prior.updatedAt, semanticActivity)
-                    )
-                    rows.insert(promoted, at: 0)
-                    changed = true
+            for session in sessionsForProject {
+                let sessionAlias = webConversationAlias(from: session.canonicalUrl)
+                guard let index = rows.firstIndex(where: { row in
+                    row.localConversationId == session.id
+                        || (sessionAlias != nil && row.conversationAlias == sessionAlias)
+                }) else {
+                    // Missing active rows are exposed by displayedProjectConversations.
+                    // Do not mutate the provider-ordered backing snapshot merely because
+                    // Agent activity arrived before ChatGPT mounted that sidebar row.
                     continue
                 }
 
-                // Exact Windows session metadata is stronger evidence than a transiently
-                // incomplete Project DOM. Surface only sessions with real activity (or
-                // a live Busy state); do not resurrect arbitrary old registry rows whose
-                // Project membership may have changed since their last discovery.
-                guard let semanticActivity, let canonicalURL = session.canonicalUrl else { continue }
-                rows.insert(WebConversationDescriptor(
-                    localConversationId: session.id,
-                    canonicalUrl: canonicalURL,
-                    projectId: webProjects.first(where: { $0.projectAlias == projectAlias })?.projectId,
-                    displayTitle: session.title,
-                    projectAlias: projectAlias,
-                    conversationAlias: webConversationAlias(from: canonicalURL),
-                    lastVisited: semanticActivity,
-                    updatedAt: semanticActivity
-                ), at: 0)
+                let prior = rows[index]
+                let repairedTitle = isSyntheticConversationTitle(prior.displayTitle, conversationAlias: prior.conversationAlias)
+                    && !isSyntheticConversationTitle(session.title, conversationAlias: sessionAlias)
+                    ? session.title
+                    : prior.displayTitle
+                let repairedCanonicalURL = session.canonicalUrl ?? prior.canonicalUrl
+                let repairedAlias = prior.conversationAlias ?? sessionAlias
+
+                guard repairedTitle != prior.displayTitle
+                        || repairedCanonicalURL != prior.canonicalUrl
+                        || repairedAlias != prior.conversationAlias else { continue }
+
+                rows[index] = WebConversationDescriptor(
+                    localConversationId: prior.localConversationId,
+                    canonicalUrl: repairedCanonicalURL,
+                    projectId: prior.projectId,
+                    displayTitle: repairedTitle,
+                    projectAlias: prior.projectAlias,
+                    conversationAlias: repairedAlias,
+                    lastVisited: prior.lastVisited,
+                    updatedAt: prior.updatedAt
+                )
                 changed = true
             }
 
             guard changed else { continue }
+            // Metadata repair is allowed in place; row position, snapshot identity,
+            // pagination and hasMore remain owned by the ChatGPT sidebar snapshot.
             projectConversationsByAlias[projectAlias] = rows
-            projectConversationSnapshotStateByAlias[projectAlias] = .localConfirmed
-            projectConversationSnapshotIds.removeValue(forKey: projectAlias)
-            projectNextCursorByAlias.removeValue(forKey: projectAlias)
-            projectHasMoreByAlias[projectAlias] = false
-            projectConversationRevisions[projectAlias, default: 0] &+= 1
-            if projectConversationRefreshes.contains(projectAlias) {
-                projectConversationRefreshQueued.insert(projectAlias)
-            }
             changedAliases.insert(projectAlias)
         }
 
@@ -2491,55 +2567,27 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func promoteProjectConversationActivity(sessionId: String, at: Date) {
+        // Activity is presented by displayedProjectConversations without mutating the
+        // complete provider snapshot. Coalesce live activity into one bounded sidebar
+        // refresh so provider membership/title metadata can still converge.
         let projectAlias = sessions.first(where: { $0.id == sessionId })?.projectAlias
             ?? projectConversationsByAlias.first(where: { _, rows in rows.contains(where: { $0.localConversationId == sessionId }) })?.key
         guard let projectAlias else { return }
-
-        var rows = projectConversationsByAlias[projectAlias, default: []]
-        guard let index = rows.firstIndex(where: { $0.localConversationId == sessionId }) else {
-            // A desktop generation event can beat lazy Project-list discovery. If the
-            // session catalog already proves exact Project membership, materialize the
-            // row immediately rather than hiding a Busy conversation until DOM refresh.
-            guard let session = sessions.first(where: { $0.id == sessionId }),
-                  let canonicalURL = session.canonicalUrl else { return }
-            rows.insert(WebConversationDescriptor(
-                localConversationId: session.id,
-                canonicalUrl: canonicalURL,
-                projectId: webProjects.first(where: { $0.projectAlias == projectAlias })?.projectId,
-                displayTitle: session.title,
-                projectAlias: projectAlias,
-                conversationAlias: webConversationAlias(from: canonicalURL),
-                lastVisited: at,
-                updatedAt: at
-            ), at: 0)
-            projectConversationRevisions[projectAlias, default: 0] &+= 1
-            projectConversationSnapshotStateByAlias[projectAlias] = .localConfirmed
-            projectConversationSnapshotIds.removeValue(forKey: projectAlias)
-            projectConversationsByAlias[projectAlias] = rows
+        if let lastRefresh = projectConversationActivityRefreshLastAt[projectAlias],
+           Date().timeIntervalSince(lastRefresh) < Self.projectConversationAutomaticRefreshMinimumInterval {
             return
         }
+        guard projectConversationActivityRefreshScheduled.insert(projectAlias).inserted else { return }
 
-        // Once the active row is already first, streaming deltas must not keep
-        // invalidating the entire Project list on every token.
-        if index == 0 { return }
-
-        let prior = rows.remove(at: index)
-        let promoted = WebConversationDescriptor(
-            localConversationId: prior.localConversationId,
-            canonicalUrl: prior.canonicalUrl,
-            projectId: prior.projectId,
-            displayTitle: prior.displayTitle,
-            projectAlias: prior.projectAlias,
-            conversationAlias: prior.conversationAlias,
-            lastVisited: max(prior.lastVisited ?? prior.updatedAt, at),
-            updatedAt: max(prior.updatedAt, at)
-        )
-        rows.insert(promoted, at: 0)
-        // Any refresh that started before this activity is now stale with respect to
-        // Project ordering. Bump the epoch once when the row actually moves so a late
-        // DOM response cannot move an actively-used conversation back down the list.
-        projectConversationRevisions[projectAlias, default: 0] &+= 1
-        projectConversationsByAlias[projectAlias] = rows
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard let self else { return }
+            defer { self.projectConversationActivityRefreshScheduled.remove(projectAlias) }
+            guard !self.isSuspended, self.machine.state == .online else { return }
+            self.projectConversationActivityRefreshLastAt[projectAlias] = Date()
+            await self.loadProjectConversations(projectAlias: projectAlias, refresh: true, force: true)
+        }
+        _ = at
     }
 
     private func applyWebPageRegistrationEvent(
@@ -2601,23 +2649,27 @@ final class WorkspaceStore: ObservableObject {
 
         if let existingIndex {
             // Registration of an already-known tab is metadata evidence, not ordering
-            // evidence. Preserve its current Project position until real run activity
-            // or an authoritative DOM snapshot proves a new order.
+            // evidence. Keep the exact provider position and repair only row metadata.
             rows[existingIndex] = row
+            projectConversationsByAlias[projectAlias] = rows
         } else {
-            // A stable desktop conversation identity that did not exist on the phone is
-            // safe to expose immediately. Invalidate any Project refresh that started
-            // before this registration so its older DOM page cannot erase the running
-            // conversation when that request returns.
-            rows.insert(row, at: 0)
-            projectConversationRevisions[projectAlias, default: 0] &+= 1
-            projectConversationSnapshotStateByAlias[projectAlias] = .localConfirmed
-            projectConversationSnapshotIds.removeValue(forKey: projectAlias)
+            // Registration proves identity but not the ChatGPT sidebar position. Keep it
+            // in the session catalog; once the run becomes Busy/Waiting the Project view
+            // overlays it immediately. Ask for a fresh sidebar snapshot so the durable
+            // backing array converges to ChatGPT's real order instead of inventing one.
+            if projectConversationRefreshes.contains(projectAlias) {
+                projectConversationRefreshQueued.insert(projectAlias)
+            } else if !suppressPresentation, machine.state == .online {
+                Task { @MainActor [weak self] in
+                    await self?.loadProjectConversations(projectAlias: projectAlias, refresh: true, force: true)
+                }
+            }
         }
-        projectConversationsByAlias[projectAlias] = rows
 
         if !suppressPresentation {
-            try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+            if existingIndex != nil {
+                try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+            }
             await persistMetadata()
         }
     }

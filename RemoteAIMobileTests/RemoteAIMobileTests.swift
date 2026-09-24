@@ -1351,7 +1351,7 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testSessionCatalogRepairsDesktopProjectActivityOrderAfterReconnect() async throws {
+    func testSessionCatalogDoesNotOverrideProviderProjectOrderAfterReconnect() async throws {
         let mock = MockTransport(historyCount: 1)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 3)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
@@ -1375,8 +1375,13 @@ final class RemoteAIMobileTests: XCTestCase {
 
         XCTAssertEqual(
             store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-0", "seed-1", "seed-2"],
+            "Activity ordering must not truncate or mutate the provider snapshot"
+        )
+        XCTAssertEqual(
+            store.displayedProjectConversations(projectAlias: "g-p-remoteai").map(\.conversationAlias),
             ["seed-2", "seed-0", "seed-1"],
-            "Durable desktop lastActivityAt must repair Project ordering even when the provider sidebar snapshot is stale"
+            "A desktop-modified Chat must move to the visible recent-activity head"
         )
         await store.suspend()
     }
@@ -1403,9 +1408,11 @@ final class RemoteAIMobileTests: XCTestCase {
         let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "web.chatgpt" }))
         await store.refreshSessions(runtime: runtime, instance: instance)
 
-        let rows = store.projectConversationsByAlias["g-p-remoteai"] ?? []
-        XCTAssertEqual(rows.first?.conversationAlias, "busy-live")
-        XCTAssertEqual(rows.first?.displayTitle, "Still running on desktop")
+        let providerRows = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(providerRows.map(\.conversationAlias), ["seed-0", "seed-1"], "Busy visibility must not rewrite provider ordering")
+        let displayedRows = store.displayedProjectConversations(projectAlias: "g-p-remoteai")
+        XCTAssertEqual(displayedRows.first?.conversationAlias, "busy-live")
+        XCTAssertEqual(displayedRows.first?.displayTitle, "Still running on desktop")
         XCTAssertEqual(store.sessions.first(where: { $0.id == "webconv-busy-live" })?.state, .busy)
         await store.suspend()
     }
@@ -1460,7 +1467,7 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testDesktopRegistrationDuringProjectRefreshCannotBeOverwrittenByOlderResponse() async throws {
+    func testDesktopRegistrationDuringProjectRefreshPreservesProviderOrderAndQueuesRefresh() async throws {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
         await store.start()
@@ -1496,14 +1503,20 @@ final class RemoteAIMobileTests: XCTestCase {
         ), deliverLive: true)
         await refresh.value
 
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.first?.conversationAlias, "race-live", "A stale refresh response must not erase a desktop Chat registered while that refresh was in flight")
-        XCTAssertTrue(store.projectConversationsByAlias["g-p-remoteai", default: []].contains(where: { $0.conversationAlias == "mock-1" }))
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"], "Registration must not invent a Project position outside the provider sidebar")
+        XCTAssertTrue(store.sessions.contains(where: { $0.id == "webconv-race-live" }), "The registered desktop Chat must remain available through session identity")
+        for _ in 0..<80 {
+            if await mock.actionAttemptCount("listProjectConversations") >= baselineAttempts + 2 { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let attemptsAfterRegistration = await mock.actionAttemptCount("listProjectConversations")
+        XCTAssertGreaterThanOrEqual(attemptsAfterRegistration, baselineAttempts + 2, "A registration that races an in-flight Project scan must queue a complete follow-up refresh")
         await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 0)
         await store.suspend()
     }
 
     @MainActor
-    func testPhoneSendPromotesProjectConversationToHeadImmediately() async throws {
+    func testPhoneSendKeepsProviderProjectOrderWhileShowingBusyState() async throws {
         let mock = MockTransport(scenario: .deltaOnlySend, historyCount: 0)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
@@ -1521,15 +1534,16 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertTrue(sent)
         XCTAssertEqual(
             store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
-            ["seed-1", "seed-0"],
-            "A confirmed phone send must immediately mirror the Project's recent-activity order"
+            ["seed-0", "seed-1"],
+            "A confirmed phone send must not invent a Project order before the sidebar refresh returns"
         )
+        XCTAssertEqual(store.displayedProjectConversations(projectAlias: "g-p-remoteai").map(\.conversationAlias), ["seed-1", "seed-0"])
         XCTAssertEqual(store.sessions.first(where: { $0.id == "webconv-seed-1" })?.state, .busy)
         await store.suspend()
     }
 
     @MainActor
-    func testLiveDesktopProjectRunImmediatelyPromotesConversationToProjectHead() async throws {
+    func testLiveDesktopProjectRunKeepsKnownConversationInProviderPosition() async throws {
         let mock = MockTransport(historyCount: 1)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
@@ -1551,21 +1565,26 @@ final class RemoteAIMobileTests: XCTestCase {
         ), deliverLive: true)
 
         for _ in 0..<80 {
-            if store.projectConversationsByAlias["g-p-remoteai"]?.first?.localConversationId == "webconv-seed-1" { break }
+            if store.sessions.first(where: { $0.id == "webconv-seed-1" })?.state == .busy { break }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
 
         XCTAssertEqual(
             store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-0", "seed-1"],
+            "Live activity must preserve the complete provider backing order"
+        )
+        XCTAssertEqual(
+            store.displayedProjectConversations(projectAlias: "g-p-remoteai").map(\.conversationAlias),
             ["seed-1", "seed-0"],
-            "A desktop Project conversation must move to the phone's live head as soon as generation starts, not only after completion or a full DOM refresh"
+            "A known desktop Chat must move to the visible head as soon as it becomes Busy"
         )
         XCTAssertEqual(store.sessions.first(where: { $0.id == "webconv-seed-1" })?.state, .busy)
         await store.suspend()
     }
 
     @MainActor
-    func testStatusPollRecoversUnfinishedDesktopProjectRunAndPromotesItToHead() async throws {
+    func testStatusPollRecoversUnfinishedDesktopProjectRunWithoutReorderingKnownRows() async throws {
         let mock = MockTransport(historyCount: 0)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
@@ -1592,14 +1611,19 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertNotNil(store.liveRunStatusBySession["webconv-seed-1"])
         XCTAssertEqual(
             store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-0", "seed-1"],
+            "Status recovery must preserve the complete provider backing order"
+        )
+        XCTAssertEqual(
+            store.displayedProjectConversations(projectAlias: "g-p-remoteai").map(\.conversationAlias),
             ["seed-1", "seed-0"],
-            "An unfinished desktop run recovered by status polling must move to the phone Project head even when its live start event was missed"
+            "Polling recovery must also restore the running Chat's visible recent position"
         )
         await store.suspend()
     }
 
     @MainActor
-    func testDesktopRegisteredProjectConversationAppearsBeforeGenerationCompletes() async throws {
+    func testDesktopRegisteredConversationAppearsAsBusyOverlayBeforeGenerationCompletes() async throws {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
         await store.start()
@@ -1627,12 +1651,7 @@ final class RemoteAIMobileTests: XCTestCase {
             createdAt: registeredAt
         ), deliverLive: true)
 
-        for _ in 0..<80 {
-            if store.projectConversationsByAlias["g-p-remoteai"]?.first?.conversationAlias == "desktop-live" { break }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["desktop-live", "mock-1"])
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"])
         let registeredSession = try XCTUnwrap(store.sessions.first(where: { $0.id == "webconv-desktop-live" }))
         XCTAssertEqual(registeredSession.projectAlias, "g-p-remoteai")
         XCTAssertEqual(registeredSession.title, "Desktop live chat")
@@ -1657,10 +1676,11 @@ final class RemoteAIMobileTests: XCTestCase {
         }
 
         XCTAssertEqual(store.sessions.first(where: { $0.id == "webconv-desktop-live" })?.state, .busy)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"], "Busy state must not rewrite the durable provider order")
         XCTAssertEqual(
-            store.projectConversationsByAlias["g-p-remoteai"]?.first?.conversationAlias,
+            store.displayedProjectConversations(projectAlias: "g-p-remoteai").first?.conversationAlias,
             "desktop-live",
-            "An unfinished desktop conversation must remain visible at the phone's live head while it is still running"
+            "An unfinished desktop conversation missing from the lazy sidebar must still be visible immediately"
         )
         await store.suspend()
     }

@@ -359,7 +359,15 @@ struct WebProjectView: View {
     @State private var createdSession: SessionDescriptor?
     @State private var openCreatedSession = false
 
-    private var rows: [WebConversationDescriptor] { store.projectConversationsByAlias[project.projectAlias, default: []] }
+    private var rows: [WebConversationDescriptor] { store.displayedProjectConversations(projectAlias: project.projectAlias) }
+
+    private func refreshProjectContext(force: Bool) async {
+        // Session status comes from the Windows Agent and does not require opening or
+        // navigating a browser tab. Refresh it first so a desktop-only Busy/Waiting Chat
+        // becomes visible even when its Project sidebar row has not mounted yet.
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        await store.loadProjectConversations(projectAlias: project.projectAlias, force: force)
+    }
 
     var body: some View {
         List {
@@ -427,16 +435,33 @@ struct WebProjectView: View {
                 }
             }
         )
-        .task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: true) }
+        .task {
+            await refreshProjectContext(force: true)
+            // Websocket events are the fast path, but a phone can miss the start of a
+            // desktop run while backgrounded or reconnecting. Poll only the cheap Agent
+            // session catalog while this Project view is visible; never open a browser
+            // just to discover Busy/Waiting state.
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                } catch {
+                    break
+                }
+                guard !Task.isCancelled else { break }
+                if store.machine.state == .online {
+                    await store.refreshSessions(runtime: runtime, instance: instance)
+                }
+            }
+        }
         .onChange(of: scenePhase) { phase in
             guard phase == .active, store.machine.state == .online else { return }
-            Task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: true) }
+            Task { await refreshProjectContext(force: true) }
         }
         .onChange(of: store.machine.state) { state in
             guard state == .online else { return }
-            Task { await store.loadProjectConversations(projectAlias: project.projectAlias, force: false) }
+            Task { await refreshProjectContext(force: false) }
         }
-        .refreshable { await store.loadProjectConversations(projectAlias: project.projectAlias, force: true) }
+        .refreshable { await refreshProjectContext(force: true) }
     }
 }
 
