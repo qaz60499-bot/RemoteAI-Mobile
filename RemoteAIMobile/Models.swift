@@ -236,7 +236,9 @@ struct WebConversationDescriptor: Codable, Identifiable, Hashable {
             updatedAt: updatedAt,
             projectAlias: projectAlias,
             canonicalUrl: canonicalUrl,
-            lastActivityAt: lastVisited
+            // lastVisited is discovery/navigation metadata, not conversation activity.
+            // Treating a sidebar scan as activity silently reorders Project chats.
+            lastActivityAt: nil
         )
     }
 }
@@ -623,7 +625,9 @@ extension ServerSession {
             updatedAt: updatedAt,
             projectAlias: metadata["projectAlias"]?.stringValue,
             canonicalUrl: canonicalUrl,
-            lastActivityAt: persistedActivity ?? lastVisited,
+            // Only semantic activity published by the Agent may drive recent-chat
+            // ordering. lastVisited can be refreshed by DOM discovery alone.
+            lastActivityAt: persistedActivity,
             lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
             lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse)
         )

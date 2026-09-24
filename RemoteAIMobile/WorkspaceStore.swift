@@ -955,6 +955,19 @@ final class WorkspaceStore: ObservableObject {
             sessions.removeAll { $0.instanceId == instance.id }
             sessions.append(contentsOf: remote)
             sessions.sort { $0.orderingDate > $1.orderingDate }
+
+            // listSessions carries durable Agent-side projectAlias + lastActivityAt.
+            // Reconcile that semantic activity back into already-loaded Project rows so
+            // a desktop Busy/recently-finished chat remains visible and moves to the
+            // same newest-first position even when ChatGPT's sidebar DOM is one render
+            // behind or temporarily incomplete.
+            let reconciledProjects = reconcileProjectConversationActivityFromSessions(remote)
+            for alias in reconciledProjects {
+                try? await cache.put(
+                    projectConversationsByAlias[alias] ?? [],
+                    key: "web.project.\(alias).conversations"
+                )
+            }
             await persistMetadata()
             errors["instance.\(instance.id)"] = nil
         } catch {
@@ -2371,12 +2384,136 @@ final class WorkspaceStore: ObservableObject {
         sessions.sort { $0.orderingDate > $1.orderingDate }
     }
 
+    private func webConversationAlias(from canonicalURL: String?) -> String? {
+        guard let canonicalURL,
+              let url = URL(string: canonicalURL) else { return nil }
+        let parts = url.path.split(separator: "/").map(String.init)
+        guard let marker = parts.lastIndex(of: "c"),
+              parts.indices.contains(marker + 1) else { return nil }
+        let alias = parts[marker + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+        return alias.isEmpty ? nil : alias
+    }
+
+    @discardableResult
+    private func reconcileProjectConversationActivityFromSessions(_ remote: [SessionDescriptor]) -> Set<String> {
+        let projectSessions = remote.filter {
+            $0.instanceId == "web.chatgpt"
+                && $0.projectAlias?.isEmpty == false
+                && $0.canonicalUrl?.isEmpty == false
+        }
+        guard !projectSessions.isEmpty else { return [] }
+
+        var changedAliases = Set<String>()
+        let grouped = Dictionary(grouping: projectSessions) { $0.projectAlias! }
+
+        for (projectAlias, sessionsForProject) in grouped {
+            guard webProjects.contains(where: { $0.projectAlias == projectAlias })
+                    || projectConversationsByAlias[projectAlias] != nil else { continue }
+            var rows = projectConversationsByAlias[projectAlias, default: []]
+            var changed = false
+
+            // Promote oldest -> newest so the newest semantic activity ends at index 0.
+            // lastActivityAt is now sourced only from durable Agent activity metadata;
+            // DOM lastVisited timestamps are deliberately excluded from this ordering.
+            let ordered = sessionsForProject.sorted { lhs, rhs in
+                let left = lhs.lastActivityAt ?? lhs.updatedAt
+                let right = rhs.lastActivityAt ?? rhs.updatedAt
+                if left == right { return lhs.id < rhs.id }
+                return left < right
+            }
+
+            for session in ordered {
+                let isActive = session.state == .busy || session.state == .waiting
+                let semanticActivity = session.lastActivityAt ?? (isActive ? session.updatedAt : nil)
+                let existingIndex = rows.firstIndex(where: { $0.localConversationId == session.id })
+
+                if let existingIndex {
+                    guard let semanticActivity else { continue }
+                    let prior = rows[existingIndex]
+                    // A previously mirrored activity already stamped updatedAt. Do not
+                    // reshuffle the same row on every listSessions refresh.
+                    guard isActive || semanticActivity > prior.updatedAt else { continue }
+
+                    rows.remove(at: existingIndex)
+                    let promoted = WebConversationDescriptor(
+                        localConversationId: prior.localConversationId,
+                        canonicalUrl: session.canonicalUrl ?? prior.canonicalUrl,
+                        projectId: prior.projectId,
+                        displayTitle: isSyntheticConversationTitle(prior.displayTitle, conversationAlias: prior.conversationAlias)
+                            ? session.title
+                            : prior.displayTitle,
+                        projectAlias: prior.projectAlias,
+                        conversationAlias: prior.conversationAlias ?? webConversationAlias(from: session.canonicalUrl),
+                        lastVisited: max(prior.lastVisited ?? prior.updatedAt, semanticActivity),
+                        updatedAt: max(prior.updatedAt, semanticActivity)
+                    )
+                    rows.insert(promoted, at: 0)
+                    changed = true
+                    continue
+                }
+
+                // Exact Windows session metadata is stronger evidence than a transiently
+                // incomplete Project DOM. Surface only sessions with real activity (or
+                // a live Busy state); do not resurrect arbitrary old registry rows whose
+                // Project membership may have changed since their last discovery.
+                guard let semanticActivity, let canonicalURL = session.canonicalUrl else { continue }
+                rows.insert(WebConversationDescriptor(
+                    localConversationId: session.id,
+                    canonicalUrl: canonicalURL,
+                    projectId: webProjects.first(where: { $0.projectAlias == projectAlias })?.projectId,
+                    displayTitle: session.title,
+                    projectAlias: projectAlias,
+                    conversationAlias: webConversationAlias(from: canonicalURL),
+                    lastVisited: semanticActivity,
+                    updatedAt: semanticActivity
+                ), at: 0)
+                changed = true
+            }
+
+            guard changed else { continue }
+            projectConversationsByAlias[projectAlias] = rows
+            projectConversationSnapshotStateByAlias[projectAlias] = .localConfirmed
+            projectConversationSnapshotIds.removeValue(forKey: projectAlias)
+            projectNextCursorByAlias.removeValue(forKey: projectAlias)
+            projectHasMoreByAlias[projectAlias] = false
+            projectConversationRevisions[projectAlias, default: 0] &+= 1
+            if projectConversationRefreshes.contains(projectAlias) {
+                projectConversationRefreshQueued.insert(projectAlias)
+            }
+            changedAliases.insert(projectAlias)
+        }
+
+        return changedAliases
+    }
+
     private func promoteProjectConversationActivity(sessionId: String, at: Date) {
         let projectAlias = sessions.first(where: { $0.id == sessionId })?.projectAlias
             ?? projectConversationsByAlias.first(where: { _, rows in rows.contains(where: { $0.localConversationId == sessionId }) })?.key
-        guard let projectAlias,
-              var rows = projectConversationsByAlias[projectAlias],
-              let index = rows.firstIndex(where: { $0.localConversationId == sessionId }) else { return }
+        guard let projectAlias else { return }
+
+        var rows = projectConversationsByAlias[projectAlias, default: []]
+        guard let index = rows.firstIndex(where: { $0.localConversationId == sessionId }) else {
+            // A desktop generation event can beat lazy Project-list discovery. If the
+            // session catalog already proves exact Project membership, materialize the
+            // row immediately rather than hiding a Busy conversation until DOM refresh.
+            guard let session = sessions.first(where: { $0.id == sessionId }),
+                  let canonicalURL = session.canonicalUrl else { return }
+            rows.insert(WebConversationDescriptor(
+                localConversationId: session.id,
+                canonicalUrl: canonicalURL,
+                projectId: webProjects.first(where: { $0.projectAlias == projectAlias })?.projectId,
+                displayTitle: session.title,
+                projectAlias: projectAlias,
+                conversationAlias: webConversationAlias(from: canonicalURL),
+                lastVisited: at,
+                updatedAt: at
+            ), at: 0)
+            projectConversationRevisions[projectAlias, default: 0] &+= 1
+            projectConversationSnapshotStateByAlias[projectAlias] = .localConfirmed
+            projectConversationSnapshotIds.removeValue(forKey: projectAlias)
+            projectConversationsByAlias[projectAlias] = rows
+            return
+        }
 
         // Once the active row is already first, streaming deltas must not keep
         // invalidating the entire Project list on every token.

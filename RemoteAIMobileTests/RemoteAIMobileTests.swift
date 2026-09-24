@@ -1351,6 +1351,66 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionCatalogRepairsDesktopProjectActivityOrderAfterReconnect() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 3)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["seed-0", "seed-1", "seed-2"])
+
+        let activity = Date().addingTimeInterval(120)
+        await mock.seedWebProjectSession(
+            alias: "g-p-remoteai",
+            conversationAlias: "seed-2",
+            title: "Desktop changed this chat",
+            status: "idle",
+            lastActivityAt: activity
+        )
+
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "web.chatgpt" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-2", "seed-0", "seed-1"],
+            "Durable desktop lastActivityAt must repair Project ordering even when the provider sidebar snapshot is stale"
+        )
+        await store.suspend()
+    }
+
+    @MainActor
+    func testBusyProjectSessionMissingFromDOMIsMaterializedImmediately() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+
+        let activity = Date().addingTimeInterval(120)
+        await mock.seedWebProjectSession(
+            alias: "g-p-remoteai",
+            conversationAlias: "busy-live",
+            title: "Still running on desktop",
+            status: "generating",
+            lastActivityAt: activity
+        )
+
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "web.chatgpt" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+
+        let rows = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(rows.first?.conversationAlias, "busy-live")
+        XCTAssertEqual(rows.first?.displayTitle, "Still running on desktop")
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "webconv-busy-live" })?.state, .busy)
+        await store.suspend()
+    }
+
+    @MainActor
     func testStaleWindowsProjectCacheAutomaticallyLoadsAllPagesPastFiftyRows() async throws {
         let mock = MockTransport(scenario: .staleWebCatalog, historyCount: 1)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 125)

@@ -174,6 +174,35 @@ actor MockTransport: Transport {
         webProjectConversations[alias, default: []].removeAll { $0.conversationAlias == conversationAlias }
         webProjectConversations[alias, default: []].insert(row, at: 0)
     }
+
+    func seedWebProjectSession(
+        alias: String,
+        conversationAlias: String,
+        title: String,
+        status: String,
+        lastActivityAt: Date?
+    ) {
+        let now = Date()
+        let sessionId = "webconv-\(conversationAlias)"
+        var metadata: [String: JSONValue] = ["projectAlias": .string(alias)]
+        if let lastActivityAt {
+            metadata["lastActivityAt"] = .string(RemoteAIDate.string(lastActivityAt))
+        }
+        sessions.removeAll { $0.sessionId == sessionId }
+        sessions.append(ServerSession(
+            sessionId: sessionId,
+            runtimeId: "runtime.web",
+            instanceId: "web.chatgpt",
+            externalId: nil,
+            title: title,
+            canonicalUrl: "https://chatgpt.com/g/\(alias)/c/\(conversationAlias)",
+            status: status,
+            metadata: metadata,
+            createdAt: now.addingTimeInterval(-60),
+            updatedAt: lastActivityAt ?? now,
+            lastVisited: now
+        ))
+    }
     func userMessageCount(sessionId: String, text: String) -> Int {
         history[sessionId, default: []].filter { $0.role == "user" && $0.content == text }.count
     }
