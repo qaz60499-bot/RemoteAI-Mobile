@@ -1332,6 +1332,109 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testLiveDesktopProjectRunImmediatelyPromotesConversationToProjectHead() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["seed-0", "seed-1"])
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "web.chatgpt",
+            sessionId: "webconv-seed-1",
+            type: "GENERATION_STARTED",
+            payload: ["provider": .string("chatgpt-web")],
+            createdAt: Date()
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.projectConversationsByAlias["g-p-remoteai"]?.first?.localConversationId == "webconv-seed-1" { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-1", "seed-0"],
+            "A desktop Project conversation must move to the phone's live head as soon as generation starts, not only after completion or a full DOM refresh"
+        )
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "webconv-seed-1" })?.state, .busy)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testDesktopRegisteredProjectConversationAppearsBeforeGenerationCompletes() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"])
+
+        let registeredAt = Date()
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "web.chatgpt",
+            sessionId: "webconv-desktop-live",
+            type: "WEB_PAGE_REGISTERED",
+            payload: [
+                "localConversationId": .string("webconv-desktop-live"),
+                "canonicalUrl": .string("https://chatgpt.com/g/g-p-remoteai/c/desktop-live"),
+                "displayTitle": .string("Desktop live chat"),
+                "projectAlias": .string("g-p-remoteai"),
+                "conversationAlias": .string("desktop-live"),
+                "activeTabId": .number(42),
+            ],
+            createdAt: registeredAt
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.projectConversationsByAlias["g-p-remoteai"]?.first?.conversationAlias == "desktop-live" { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["desktop-live", "mock-1"])
+        let registeredSession = try XCTUnwrap(store.sessions.first(where: { $0.id == "webconv-desktop-live" }))
+        XCTAssertEqual(registeredSession.projectAlias, "g-p-remoteai")
+        XCTAssertEqual(registeredSession.title, "Desktop live chat")
+        XCTAssertEqual(registeredSession.state, .idle)
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1202,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "web.chatgpt",
+            sessionId: "webconv-desktop-live",
+            type: "GENERATION_STARTED",
+            payload: ["provider": .string("chatgpt-web")],
+            createdAt: registeredAt.addingTimeInterval(0.1)
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.sessions.first(where: { $0.id == "webconv-desktop-live" })?.state == .busy { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "webconv-desktop-live" })?.state, .busy)
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.first?.conversationAlias,
+            "desktop-live",
+            "An unfinished desktop conversation must remain visible at the phone's live head while it is still running"
+        )
+        await store.suspend()
+    }
+
+    @MainActor
     func testForcedProjectRefreshRetriesTransientStaleResultEvenWithExistingRows() async throws {
         let mock = MockTransport(scenario: .staleThenFreshProjectConversations, historyCount: 1)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)

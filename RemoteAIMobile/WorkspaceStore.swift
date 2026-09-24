@@ -2160,6 +2160,110 @@ final class WorkspaceStore: ObservableObject {
         sessions.sort { $0.orderingDate > $1.orderingDate }
     }
 
+    private func promoteProjectConversationActivity(sessionId: String, at: Date) {
+        let projectAlias = sessions.first(where: { $0.id == sessionId })?.projectAlias
+            ?? projectConversationsByAlias.first(where: { _, rows in rows.contains(where: { $0.localConversationId == sessionId }) })?.key
+        guard let projectAlias,
+              var rows = projectConversationsByAlias[projectAlias],
+              let index = rows.firstIndex(where: { $0.localConversationId == sessionId }) else { return }
+
+        // Once the active row is already first, streaming deltas must not keep
+        // invalidating the entire Project list on every token.
+        if index == 0 { return }
+
+        let prior = rows.remove(at: index)
+        let promoted = WebConversationDescriptor(
+            localConversationId: prior.localConversationId,
+            canonicalUrl: prior.canonicalUrl,
+            projectId: prior.projectId,
+            displayTitle: prior.displayTitle,
+            projectAlias: prior.projectAlias,
+            conversationAlias: prior.conversationAlias,
+            lastVisited: max(prior.lastVisited ?? prior.updatedAt, at),
+            updatedAt: max(prior.updatedAt, at)
+        )
+        rows.insert(promoted, at: 0)
+        projectConversationsByAlias[projectAlias] = rows
+    }
+
+    private func applyWebPageRegistrationEvent(
+        _ event: RemoteEvent,
+        sessionId: String,
+        suppressPresentation: Bool
+    ) async {
+        guard event.runtimeId == "runtime.web",
+              let projectAlias = event.payload["projectAlias"]?.stringValue,
+              !projectAlias.isEmpty,
+              let canonicalUrl = event.payload["canonicalUrl"]?.stringValue,
+              !canonicalUrl.isEmpty else { return }
+
+        let localConversationId = event.payload["localConversationId"]?.stringValue ?? sessionId
+        let conversationAlias = event.payload["conversationAlias"]?.stringValue
+        let title = event.payload["displayTitle"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveTitle = title.flatMap { $0.isEmpty ? nil : $0 }
+            ?? sessions.first(where: { $0.id == localConversationId })?.title
+            ?? "ChatGPT Conversation"
+
+        if let index = sessions.firstIndex(where: { $0.id == localConversationId }) {
+            var session = sessions[index]
+            session.title = effectiveTitle
+            session.projectAlias = projectAlias
+            session.canonicalUrl = canonicalUrl
+            // Registration proves identity/binding, not new transcript content. Keep
+            // the established ordering timestamp for an already-known conversation.
+            sessions[index] = session
+        } else {
+            sessions.append(SessionDescriptor(
+                id: localConversationId,
+                instanceId: event.instanceId,
+                title: effectiveTitle,
+                state: .idle,
+                updatedAt: event.createdAt,
+                projectAlias: projectAlias,
+                canonicalUrl: canonicalUrl,
+                lastActivityAt: nil
+            ))
+            sessions.sort { $0.orderingDate > $1.orderingDate }
+        }
+
+        var rows = projectConversationsByAlias[projectAlias, default: []]
+        let existingIndex = rows.firstIndex(where: {
+            $0.localConversationId == localConversationId
+                || (conversationAlias != nil && $0.conversationAlias == conversationAlias)
+        })
+        let prior = existingIndex.map { rows[$0] }
+        let row = WebConversationDescriptor(
+            localConversationId: localConversationId,
+            canonicalUrl: canonicalUrl,
+            projectId: prior?.projectId,
+            displayTitle: effectiveTitle,
+            projectAlias: projectAlias,
+            conversationAlias: conversationAlias ?? prior?.conversationAlias,
+            lastVisited: prior?.lastVisited ?? event.createdAt,
+            updatedAt: prior?.updatedAt ?? event.createdAt
+        )
+
+        if let existingIndex {
+            // Registration of an already-known tab is metadata evidence, not ordering
+            // evidence. Preserve its current Project position until real run activity
+            // or an authoritative DOM snapshot proves a new order.
+            rows[existingIndex] = row
+        } else {
+            // A stable desktop conversation identity that did not exist on the phone is
+            // safe to expose immediately. The first generation/message event will keep
+            // it at the live head while a later DOM refresh remains final authority.
+            rows.insert(row, at: 0)
+            projectConversationSnapshotStateByAlias[projectAlias] = .localConfirmed
+            projectConversationSnapshotIds.removeValue(forKey: projectAlias)
+        }
+        projectConversationsByAlias[projectAlias] = Array(rows.prefix(50))
+
+        if !suppressPresentation {
+            try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+            await persistMetadata()
+        }
+    }
+
     private func persistMetadata() async {
         try? await cache.put(machine, key: "machine")
         try? await cache.put(runtimes, key: "runtimes")
@@ -2511,6 +2615,13 @@ final class WorkspaceStore: ObservableObject {
             // immediately; a later authoritative listSessions refresh replaces its
             // generic title rather than losing the run state entirely.
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: event.instanceId, updatedAt: event.createdAt)
+            // Project screens render projectConversationsByAlias rather than sessions.
+            // Mirror live desktop activity into that list too, otherwise a conversation
+            // can be visibly busy in the session catalog while remaining buried at its
+            // old Project position until the next full DOM refresh.
+            if event.runtimeId == "runtime.web" && !suppressTransientPresentation {
+                promoteProjectConversationActivity(sessionId: sessionId, at: event.createdAt)
+            }
             // Begin/final already order the session. Updating this @Published
             // catalog for every delta invalidates all history despite row isolation.
             if !isAssistantDelta && !(suppressTransientPresentation && isHistoricalProgressEvent) {
@@ -2744,7 +2855,15 @@ final class WorkspaceStore: ObservableObject {
                 recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。"
             }
             await requestMetadataRefresh()
-        case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED":
+        case "WEB_PAGE_REGISTERED":
+            // The Windows browser bridge publishes the stable Project/conversation
+            // identity as soon as a desktop Chat becomes observable. Apply that exact
+            // registration locally so a new in-progress desktop conversation appears
+            // on the phone immediately instead of waiting for generation completion or
+            // a later Project DOM scan.
+            await applyWebPageRegistrationEvent(event, sessionId: sessionId, suppressPresentation: suppressTransientPresentation)
+            await requestMetadataRefresh()
+        case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "WEB_PAGE_UNREGISTERED":
             await requestMetadataRefresh()
         case "COMMAND_RESULT", "COMMAND_REJECTED":
             if let raw = event.payload["commandId"]?.stringValue, let commandId = UUID(uuidString: raw) {
