@@ -1141,16 +1141,52 @@ final class WorkspaceStore: ObservableObject {
             errors[sessionId] = "最多一次发送 8 个附件，每个附件不能超过 20MB。"
             return false
         }
-        guard machine.state == .online else {
-            if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
-            errors[sessionId] = attachments.isEmpty
-                ? "PC Offline — draft saved. Tap Send after reconnecting."
-                : "PC Offline — 附件需要连接 Windows 后才能上传。"
-            DiagnosticsLog.shared.record("send_offline", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString], level: "WARN")
-            return false
-        }
         let activeTransport = transport
         let activeMachineId = machine.id
+        if machine.state != .online {
+            // machine.state is a presentation snapshot and can lag a healthy socket by
+            // one reconnect-monitor tick. Before rejecting an explicit user send, let an
+            // already-connected Transport prove the authoritative Agent state. This is
+            // especially important for attachment replay: the same operation/derived
+            // chunk command IDs are idempotent, so a retry immediately after reconnect
+            // must not be dropped merely because the UI still says Offline.
+            var recoveredConnectedTransport = false
+            if await activeTransport.isConnected {
+                do {
+                    let authenticatedSequence = try await activeTransport.latestSequence(machineId: activeMachineId)
+                    guard generation == lifecycleGeneration,
+                          transport === activeTransport,
+                          machine.id == activeMachineId,
+                          !isSuspended else { return false }
+                    machine.state = .online
+                    connectionPhase = .online
+                    errors["connection"] = nil
+                    await recoverDelta(freshLatestSequence: authenticatedSequence)
+                    recoveredConnectedTransport = true
+                    DiagnosticsLog.shared.record("send_stale_offline_recovered", fields: [
+                        "runtime": runtimeId,
+                        "instance": instanceId,
+                        "session": sessionId,
+                        "commandId": commandId.uuidString,
+                    ])
+                } catch {
+                    DiagnosticsLog.shared.record("send_stale_offline_probe_failed", fields: Self.diagnosticFields(for: error, adding: [
+                        "runtime": runtimeId,
+                        "instance": instanceId,
+                        "session": sessionId,
+                        "commandId": commandId.uuidString,
+                    ]), level: "WARN")
+                }
+            }
+            guard recoveredConnectedTransport else {
+                if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
+                errors[sessionId] = attachments.isEmpty
+                    ? "PC Offline — draft saved. Tap Send after reconnecting."
+                    : "PC Offline — 附件需要连接 Windows 后才能上传。"
+                DiagnosticsLog.shared.record("send_offline", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString], level: "WARN")
+                return false
+            }
+        }
 
         commandStates[commandId] = .pending
         var messageCommandPersisted = false
