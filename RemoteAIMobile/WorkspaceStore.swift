@@ -585,7 +585,7 @@ final class WorkspaceStore: ObservableObject {
             return
         }
         do {
-            var page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, forceRefresh: force)
+            var page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, forceRefresh: force)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
             // The ChatGPT sidebar lazily mounts Project conversation panels, and a live
             // scan can transiently return partial/stale data even when the phone already
@@ -601,7 +601,7 @@ final class WorkspaceStore: ObservableObject {
                    revision == projectConversationRevisions[projectAlias, default: 0],
                    machine.state == .online,
                    !isSuspended,
-                   let retry = try? await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, forceRefresh: force) {
+                   let retry = try? await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, forceRefresh: force) {
                     // Prefer any fresher retry. Authoritative live DOM is final; a partial
                     // retry may still contain a safe newest-head merge that the logic
                     // below can apply without deleting the verified tail.
@@ -674,18 +674,69 @@ final class WorkspaceStore: ObservableObject {
                 DiagnosticsLog.shared.record("project_load_incomplete", fields: ["project": projectAlias, "state": String(describing: page.state), "observedCount": String(page.items.count)], level: "WARN")
                 return
             }
-            projectConversationsByAlias[projectAlias] = page.items
+            // A Project refresh mirrors the complete ChatGPT left-sidebar list,
+            // not only its first lazy page. Follow a stable authoritative snapshot until
+            // exhausted; never mix pages from different sidebar revisions.
+            var authoritativeItems = page.items
+            var nextCursor = page.nextCursor
+            var hasMore = page.hasMore
+            let authoritativeSnapshotId = page.snapshotId
+            var seenIds = Set(authoritativeItems.map(\.id))
+            var seenCursors = Set<String>()
+            var pagingStoppedEarly = false
+
+            while hasMore, let cursor = nextCursor {
+                guard seenCursors.insert(cursor).inserted,
+                      let expectedSnapshotId = authoritativeSnapshotId else {
+                    pagingStoppedEarly = true
+                    break
+                }
+                do {
+                    let nextPage = try await transport.listProjectConversations(
+                        machineId: machine.id,
+                        projectAlias: projectAlias,
+                        limit: 50,
+                        cursor: cursor,
+                        forceRefresh: true
+                    )
+                    guard generation == lifecycleGeneration,
+                          revision == projectConversationRevisions[projectAlias, default: 0],
+                          machine.state == .online,
+                          !isSuspended else { return }
+                    guard nextPage.isAuthoritativeLiveDOM,
+                          nextPage.snapshotId == expectedSnapshotId else {
+                        pagingStoppedEarly = true
+                        break
+                    }
+                    for item in nextPage.items where seenIds.insert(item.id).inserted {
+                        authoritativeItems.append(item)
+                    }
+                    nextCursor = nextPage.nextCursor
+                    hasMore = nextPage.hasMore
+                } catch {
+                    pagingStoppedEarly = true
+                    break
+                }
+            }
+
+            projectConversationsByAlias[projectAlias] = authoritativeItems
             projectConversationSnapshotStateByAlias[projectAlias] = .authoritativeLiveDOM
-            if let snapshotId = page.snapshotId { projectConversationSnapshotIds[projectAlias] = snapshotId }
+            if let snapshotId = authoritativeSnapshotId { projectConversationSnapshotIds[projectAlias] = snapshotId }
             else { projectConversationSnapshotIds.removeValue(forKey: projectAlias) }
-            if let cursor = page.nextCursor { projectNextCursorByAlias[projectAlias] = cursor }
+            if let cursor = nextCursor { projectNextCursorByAlias[projectAlias] = cursor }
             else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
-            projectHasMoreByAlias[projectAlias] = page.hasMore
-            try? await cache.put(page.items, key: "web.project.\(projectAlias).conversations")
+            projectHasMoreByAlias[projectAlias] = hasMore
+            try? await cache.put(authoritativeItems, key: "web.project.\(projectAlias).conversations")
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended else { return }
-            mergeProjectSessions(page.items)
+            mergeProjectSessions(authoritativeItems)
             errors["web.project.\(projectAlias)"] = nil
-            DiagnosticsLog.shared.record("project_load_ok", fields: ["project": projectAlias, "count": String(page.items.count), "hasMore": String(page.hasMore), "durationMs": Self.durationMilliseconds(since: projectLoadStartedAt)])
+            DiagnosticsLog.shared.record("project_load_ok", fields: [
+                "project": projectAlias,
+                "count": String(authoritativeItems.count),
+                "hasMore": String(hasMore),
+                "pagingStoppedEarly": String(pagingStoppedEarly),
+                "durationMs": Self.durationMilliseconds(since: projectLoadStartedAt),
+            ])
         } catch {
             if generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended {
                 projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
@@ -706,7 +757,7 @@ final class WorkspaceStore: ObservableObject {
               let cursor = projectNextCursorByAlias[projectAlias],
               let expectedSnapshotId = projectConversationSnapshotIds[projectAlias] else { return }
         do {
-            let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 30, cursor: cursor, forceRefresh: true)
+            let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, cursor: cursor, forceRefresh: true)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
             guard page.isAuthoritativeLiveDOM else {
                 projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
@@ -725,7 +776,7 @@ final class WorkspaceStore: ObservableObject {
             for item in page.items where !merged.contains(where: { $0.id == item.id }) { merged.append(item) }
             // Preserve the authoritative newest-first order supplied by ChatGPT.
             // Registry update timestamps reflect our scan time, not conversation age.
-            projectConversationsByAlias[projectAlias] = Array(merged.prefix(50))
+            projectConversationsByAlias[projectAlias] = merged
             projectConversationSnapshotStateByAlias[projectAlias] = .authoritativeLiveDOM
             if let next = page.nextCursor { projectNextCursorByAlias[projectAlias] = next }
             else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
@@ -774,7 +825,7 @@ final class WorkspaceStore: ObservableObject {
                 var rows = projectConversationsByAlias[alias, default: []]
                 rows.removeAll { $0.id == created.id }
                 rows.insert(created, at: 0)
-                projectConversationsByAlias[alias] = Array(rows.prefix(50))
+                projectConversationsByAlias[alias] = rows
                 projectConversationSnapshotStateByAlias[alias] = .localConfirmed
                 projectConversationSnapshotIds.removeValue(forKey: alias)
                 projectNextCursorByAlias.removeValue(forKey: alias)
@@ -1249,8 +1300,12 @@ final class WorkspaceStore: ObservableObject {
             // is active. Do not wait for a GENERATION_STARTED websocket event: that event
             // can be lost during a ChatGPT SPA document replacement even though Send was
             // accepted. The next authoritative final/delta will settle this state.
+            let confirmedSendAt = Date()
             setSessionState(sessionId, .busy)
-            markLiveRunActivity(sessionId: sessionId, at: Date())
+            markLiveRunActivity(sessionId: sessionId, at: confirmedSendAt)
+            if runtimeId == "runtime.web" {
+                promoteProjectConversationActivity(sessionId: sessionId, at: confirmedSendAt)
+            }
             liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
                 ? "已发送，等待 ChatGPT 响应…"
                 : "已发送，等待远端响应…"
@@ -1304,8 +1359,12 @@ final class WorkspaceStore: ObservableObject {
                         try? await cache.saveDraft("", sessionId: sessionId)
                         errors[sessionId] = nil
                         if messagesBySession[sessionId, default: []].last?.role == .user {
+                            let recoveredSendAt = Date()
                             setSessionState(sessionId, .busy)
-                            markLiveRunActivity(sessionId: sessionId, at: Date())
+                            markLiveRunActivity(sessionId: sessionId, at: recoveredSendAt)
+                            if runtimeId == "runtime.web" {
+                                promoteProjectConversationActivity(sessionId: sessionId, at: recoveredSendAt)
+                            }
                             liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
                                 ? "连接已恢复，等待 ChatGPT 响应…"
                                 : "连接已恢复，等待远端响应…"
@@ -2128,7 +2187,7 @@ final class WorkspaceStore: ObservableObject {
             guard let alias = row.conversationAlias else { return true }
             return !safeAliases.contains(alias)
         }
-        projectConversationsByAlias[projectAlias] = Array(merged.prefix(50))
+        projectConversationsByAlias[projectAlias] = merged
         return true
     }
 
@@ -2152,10 +2211,10 @@ final class WorkspaceStore: ObservableObject {
         guard !verifiedHead.isEmpty else { return false }
 
         let headAliases = Set(verifiedHead.compactMap(\.conversationAlias))
-        projectConversationsByAlias[projectAlias] = Array((verifiedHead + current.filter { row in
+        projectConversationsByAlias[projectAlias] = verifiedHead + current.filter { row in
             guard let alias = row.conversationAlias else { return true }
             return !headAliases.contains(alias)
-        }).prefix(50))
+        }
         return true
     }
 
@@ -2237,6 +2296,10 @@ final class WorkspaceStore: ObservableObject {
             updatedAt: max(prior.updatedAt, at)
         )
         rows.insert(promoted, at: 0)
+        // Any refresh that started before this activity is now stale with respect to
+        // Project ordering. Bump the epoch once when the row actually moves so a late
+        // DOM response cannot move an actively-used conversation back down the list.
+        projectConversationRevisions[projectAlias, default: 0] &+= 1
         projectConversationsByAlias[projectAlias] = rows
     }
 
@@ -2304,13 +2367,15 @@ final class WorkspaceStore: ObservableObject {
             rows[existingIndex] = row
         } else {
             // A stable desktop conversation identity that did not exist on the phone is
-            // safe to expose immediately. The first generation/message event will keep
-            // it at the live head while a later DOM refresh remains final authority.
+            // safe to expose immediately. Invalidate any Project refresh that started
+            // before this registration so its older DOM page cannot erase the running
+            // conversation when that request returns.
             rows.insert(row, at: 0)
+            projectConversationRevisions[projectAlias, default: 0] &+= 1
             projectConversationSnapshotStateByAlias[projectAlias] = .localConfirmed
             projectConversationSnapshotIds.removeValue(forKey: projectAlias)
         }
-        projectConversationsByAlias[projectAlias] = Array(rows.prefix(50))
+        projectConversationsByAlias[projectAlias] = rows
 
         if !suppressPresentation {
             try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")

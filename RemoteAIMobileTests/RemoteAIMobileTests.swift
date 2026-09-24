@@ -1332,6 +1332,51 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectRefreshAutomaticallyLoadsAllPagesPastFiftyRows() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 125)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+
+        let rows = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(rows.count, 125, "A Project refresh must not truncate the sidebar conversation list at 50 rows")
+        XCTAssertEqual(rows.first?.conversationAlias, "seed-0")
+        XCTAssertEqual(rows.last?.conversationAlias, "seed-124")
+        XCTAssertEqual(store.projectHasMoreByAlias["g-p-remoteai"], false)
+        let pageAttempts = await mock.actionAttemptCount("listProjectConversations")
+        XCTAssertGreaterThanOrEqual(pageAttempts, 3)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testPhoneSendPromotesProjectConversationToHeadImmediately() async throws {
+        let mock = MockTransport(scenario: .deltaOnlySend, historyCount: 0)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["seed-0", "seed-1"])
+
+        let sent = await store.send(
+            text: "phone-ordering",
+            runtimeId: "runtime.web",
+            instanceId: "web.chatgpt",
+            sessionId: "webconv-seed-1"
+        )
+
+        XCTAssertTrue(sent)
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-1", "seed-0"],
+            "A confirmed phone send must immediately mirror the Project's recent-activity order"
+        )
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "webconv-seed-1" })?.state, .busy)
+        await store.suspend()
+    }
+
+    @MainActor
     func testLiveDesktopProjectRunImmediatelyPromotesConversationToProjectHead() async throws {
         let mock = MockTransport(historyCount: 1)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
