@@ -1593,6 +1593,7 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.suspend()
     }
 
+    @MainActor
     func testAntigravityAuthoritativeHistoryWindowPrunesOnlyStaleAssistantRows() {
         let base = Date(timeIntervalSince1970: 1_790_167_500)
         let authoritative = [
