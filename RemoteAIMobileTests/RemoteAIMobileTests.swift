@@ -1368,6 +1368,40 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testStatusPollRecoversUnfinishedDesktopProjectRunAndPromotesItToHead() async throws {
+        let mock = MockTransport(historyCount: 0)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["seed-0", "seed-1"])
+
+        let startedAt = Date()
+        await mock.appendHistoryMessage(ServerMessage(
+            messageId: "desktop-running-user",
+            sessionId: "webconv-seed-1",
+            role: "user",
+            content: "desktop turn still running",
+            externalId: nil,
+            createdAt: startedAt
+        ))
+
+        // No live GENERATION_STARTED event is delivered. This models a phone that was
+        // backgrounded/disconnected while the desktop run began. getSessionStatus is the
+        // recovery authority and must both restore busy state and Project ordering.
+        await store.synchronizeVisibleSession("webconv-seed-1", force: true)
+
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "webconv-seed-1" })?.state, .busy)
+        XCTAssertNotNil(store.liveRunStatusBySession["webconv-seed-1"])
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-1", "seed-0"],
+            "An unfinished desktop run recovered by status polling must move to the phone Project head even when its live start event was missed"
+        )
+        await store.suspend()
+    }
+
+    @MainActor
     func testDesktopRegisteredProjectConversationAppearsBeforeGenerationCompletes() async throws {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())

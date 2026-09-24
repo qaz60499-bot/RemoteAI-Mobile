@@ -953,7 +953,16 @@ final class WorkspaceStore: ObservableObject {
                 return nil
             }
             if snapshot.state == .busy || snapshot.state == .waiting {
-                markLiveRunActivity(sessionId: sessionId, at: snapshot.lastProgressAt ?? snapshot.lastActivityAt ?? Date())
+                let activeAt = snapshot.lastProgressAt ?? snapshot.lastActivityAt ?? Date()
+                markLiveRunActivity(sessionId: sessionId, at: activeAt)
+                if route.runtimeId == "runtime.web" {
+                    // A status poll is authoritative recovery evidence for a run that
+                    // may have started while the phone was backgrounded/disconnected.
+                    // Project screens render their own row array, so promote the active
+                    // desktop conversation there as well instead of waiting for a new
+                    // live GENERATION_STARTED/MESSAGE_UPDATED frame.
+                    promoteProjectConversationActivity(sessionId: sessionId, at: activeAt)
+                }
                 if let raw = snapshot.lastProgressStatus, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     let label = route.runtimeId == "runtime.web" ? webProcessStatusLabel(raw) : processStatusLabel(for: raw)
                     if liveRunStatusBySession[sessionId] != label { liveRunStatusBySession[sessionId] = label }
@@ -2526,6 +2535,13 @@ final class WorkspaceStore: ObservableObject {
                         if presentation.active {
                             markLiveRunActivity(sessionId: sessionId, at: presentation.at)
                             setSessionState(sessionId, .busy)
+                            if routeForSession(sessionId)?.runtimeId == "runtime.web" {
+                                // Historical catch-up intentionally coalesces old token
+                                // frames, but active-run ordering is not presentation
+                                // noise. Preserve the same Project-head promotion that a
+                                // live run event would have produced.
+                                promoteProjectConversationActivity(sessionId: sessionId, at: presentation.at)
+                            }
                             if let status = presentation.status, liveRunStatusBySession[sessionId] != status {
                                 liveRunStatusBySession[sessionId] = status
                             }
