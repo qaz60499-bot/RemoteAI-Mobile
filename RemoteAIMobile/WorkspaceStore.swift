@@ -584,6 +584,7 @@ final class WorkspaceStore: ObservableObject {
             DiagnosticsLog.shared.record("project_load_offline", fields: ["project": projectAlias, "cachedCount": String(projectConversationsByAlias[projectAlias, default: []].count)], level: "WARN")
             return
         }
+        let previouslyAcceptedItems = projectConversationsByAlias[projectAlias, default: []]
         do {
             var page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, forceRefresh: force)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
@@ -611,6 +612,76 @@ final class WorkspaceStore: ObservableObject {
                 }
             }
             guard page.isAuthoritativeLiveDOM else {
+                // Windows can already hold a complete last-known Project catalog while
+                // the live ChatGPT sidebar is still mounting or unavailable. Drain that
+                // stable cache generation across every page instead of returning after
+                // the first 50 rows. A page-local snapshot id used to make large
+                // Projects look complete on the phone even though Windows had more.
+                if page.state == .staleCache,
+                   let staleSnapshotId = page.snapshotId,
+                   !page.items.isEmpty {
+                    var staleItems = page.items
+                    var seenIds = Set(staleItems.map(\.id))
+                    var nextCursor = page.nextCursor
+                    var hasMore = page.hasMore
+                    var seenCursors = Set<String>()
+                    var pagingStoppedEarly = false
+
+                    while hasMore, let cursor = nextCursor {
+                        guard seenCursors.insert(cursor).inserted else {
+                            pagingStoppedEarly = true
+                            break
+                        }
+                        do {
+                            let nextPage = try await transport.listProjectConversations(
+                                machineId: machine.id,
+                                projectAlias: projectAlias,
+                                limit: 50,
+                                cursor: cursor,
+                                forceRefresh: false
+                            )
+                            guard generation == lifecycleGeneration,
+                                  revision == projectConversationRevisions[projectAlias, default: 0],
+                                  machine.state == .online,
+                                  !isSuspended else { return }
+                            guard nextPage.state == .staleCache,
+                                  nextPage.snapshotId == staleSnapshotId else {
+                                pagingStoppedEarly = true
+                                break
+                            }
+                            for item in nextPage.items where seenIds.insert(item.id).inserted {
+                                staleItems.append(item)
+                            }
+                            nextCursor = nextPage.nextCursor
+                            hasMore = nextPage.hasMore
+                        } catch {
+                            pagingStoppedEarly = true
+                            break
+                        }
+                    }
+
+                    // Even if a later cache page is interrupted, never throw away the
+                    // verified rows already obtained. A subsequent refresh will resume
+                    // from a fresh stable generation.
+                    projectConversationsByAlias[projectAlias] = staleItems
+                    projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
+                    projectConversationSnapshotIds[projectAlias] = staleSnapshotId
+                    if let cursor = nextCursor { projectNextCursorByAlias[projectAlias] = cursor }
+                    else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
+                    projectHasMoreByAlias[projectAlias] = hasMore
+                    try? await cache.put(staleItems, key: "web.project.\(projectAlias).conversations")
+                    mergeProjectSessions(staleItems)
+                    errors["web.project.\(projectAlias)"] = nil
+                    DiagnosticsLog.shared.record("project_load_stale", fields: [
+                        "project": projectAlias,
+                        "count": String(staleItems.count),
+                        "source": page.source ?? "unknown",
+                        "hasMore": String(hasMore),
+                        "pagingStoppedEarly": String(pagingStoppedEarly),
+                    ], level: "WARN")
+                    return
+                }
+
                 let verifiedWindowsBootstrap = ["browser-dom-partial-title-hints", "browser-dom-partial-head-merge"].contains(page.source ?? "")
                     && projectConversationsByAlias[projectAlias, default: []].isEmpty
                     && !page.items.isEmpty
@@ -717,6 +788,33 @@ final class WorkspaceStore: ObservableObject {
                     pagingStoppedEarly = true
                     break
                 }
+            }
+
+            if pagingStoppedEarly {
+                // Never promote a half-paged snapshot to authoritative truth. A Project
+                // can change while page 2/3 is loading, or the browser bridge can drop a
+                // later page. Preserve the last accepted complete list when available;
+                // on first load show the verified prefix only as partial, without caching
+                // it as a final Project catalog.
+                if previouslyAcceptedItems.isEmpty {
+                    projectConversationsByAlias[projectAlias] = authoritativeItems
+                    projectConversationSnapshotStateByAlias[projectAlias] = .partialDOM
+                    if let cursor = nextCursor { projectNextCursorByAlias[projectAlias] = cursor }
+                    else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
+                    projectHasMoreByAlias[projectAlias] = hasMore
+                    mergeProjectSessions(authoritativeItems)
+                } else {
+                    projectConversationSnapshotStateByAlias[projectAlias] = .partialDOM
+                }
+                errors["web.project.\(projectAlias)"] = nil
+                DiagnosticsLog.shared.record("project_load_paging_incomplete", fields: [
+                    "project": projectAlias,
+                    "acceptedCount": String(previouslyAcceptedItems.count),
+                    "observedCount": String(authoritativeItems.count),
+                    "hasMore": String(hasMore),
+                    "durationMs": Self.durationMilliseconds(since: projectLoadStartedAt),
+                ], level: "WARN")
+                return
             }
 
             projectConversationsByAlias[projectAlias] = authoritativeItems

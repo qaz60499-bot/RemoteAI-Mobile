@@ -1351,6 +1351,98 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testStaleWindowsProjectCacheAutomaticallyLoadsAllPagesPastFiftyRows() async throws {
+        let mock = MockTransport(scenario: .staleWebCatalog, historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 125)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: false)
+
+        let rows = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(rows.count, 125, "A stable Windows cache must not truncate a large Project at the first 50 rows")
+        XCTAssertEqual(rows.first?.conversationAlias, "seed-0")
+        XCTAssertEqual(rows.last?.conversationAlias, "seed-124")
+        XCTAssertEqual(store.projectHasMoreByAlias["g-p-remoteai"], false)
+        let pageAttempts = await mock.actionAttemptCount("listProjectConversations")
+        XCTAssertGreaterThanOrEqual(pageAttempts, 3)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testProjectRefreshDoesNotCommitHalfPagedSnapshotWhenCatalogChangesMidRead() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 65)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 65)
+
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 125)
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 180_000_000)
+        let baselineAttempts = await mock.actionAttemptCount("listProjectConversations")
+        let refresh = Task { await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true) }
+        for _ in 0..<80 {
+            if await mock.actionAttemptCount("listProjectConversations") > baselineAttempts { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        // The first page has already been materialized with the 125-row snapshot but is
+        // delayed in transit. Mutating the server here makes page 2 belong to a different
+        // snapshot, which must never be committed as a mixed/complete catalog.
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 126)
+        await refresh.value
+
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 65, "A changed page-2 snapshot must preserve the last fully accepted Project list")
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .partialDOM)
+        XCTAssertNil(store.errors["web.project.g-p-remoteai"])
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 0)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testDesktopRegistrationDuringProjectRefreshCannotBeOverwrittenByOlderResponse() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"])
+
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 180_000_000)
+        let baselineAttempts = await mock.actionAttemptCount("listProjectConversations")
+        let refresh = Task { await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true) }
+        for _ in 0..<80 {
+            if await mock.actionAttemptCount("listProjectConversations") > baselineAttempts { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "web.chatgpt",
+            sessionId: "webconv-race-live",
+            type: "WEB_PAGE_REGISTERED",
+            payload: [
+                "localConversationId": .string("webconv-race-live"),
+                "canonicalUrl": .string("https://chatgpt.com/g/g-p-remoteai/c/race-live"),
+                "displayTitle": .string("Still running on desktop"),
+                "projectAlias": .string("g-p-remoteai"),
+                "conversationAlias": .string("race-live"),
+                "activeTabId": .number(73),
+            ],
+            createdAt: Date()
+        ), deliverLive: true)
+        await refresh.value
+
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.first?.conversationAlias, "race-live", "A stale refresh response must not erase a desktop Chat registered while that refresh was in flight")
+        XCTAssertTrue(store.projectConversationsByAlias["g-p-remoteai", default: []].contains(where: { $0.conversationAlias == "mock-1" }))
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 0)
+        await store.suspend()
+    }
+
+    @MainActor
     func testPhoneSendPromotesProjectConversationToHeadImmediately() async throws {
         let mock = MockTransport(scenario: .deltaOnlySend, historyCount: 0)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
