@@ -1663,6 +1663,10 @@ final class RemoteAIMobileTests: XCTestCase {
         ), deliverLive: true)
 
         XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"])
+        for _ in 0..<80 {
+            if store.sessions.contains(where: { $0.id == "webconv-desktop-live" }) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         let registeredSession = try XCTUnwrap(store.sessions.first(where: { $0.id == "webconv-desktop-live" }))
         XCTAssertEqual(registeredSession.projectAlias, "g-p-remoteai")
         XCTAssertEqual(registeredSession.title, "Desktop live chat")
