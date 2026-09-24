@@ -175,7 +175,7 @@ final class DiagnosticsLog: ObservableObject {
         loadAndPrune()
     }
 
-    static func catalogDigests(_ ids: [String]) -> (identity: String, order: String) {
+    nonisolated static func catalogDigests(_ ids: [String]) -> (identity: String, order: String) {
         func digest(_ values: [String]) -> String {
             var data = Data("remoteai-catalog-v1\n".utf8)
             for value in values {
