@@ -356,9 +356,9 @@ final class WorkspaceStore: ObservableObject {
         }
         if !force {
             let webRunActive = sessions.contains { session in
-                session.instanceId == "web.chatgpt" && (session.state == .busy || session.state == .waiting)
+                session.projectAlias?.isEmpty == false && (session.state == .busy || session.state == .waiting)
             } || liveRunStatusBySession.keys.contains { sessionId in
-                sessions.contains { $0.id == sessionId && $0.instanceId == "web.chatgpt" }
+                sessions.contains { $0.id == sessionId && $0.projectAlias?.isEmpty == false }
             }
             if webRunActive {
                 DiagnosticsLog.shared.record("projects_refresh_deferred_active_chat", fields: ["cachedCount": String(webProjects.count)])
@@ -2524,7 +2524,7 @@ final class WorkspaceStore: ObservableObject {
         var promotedIds = Set<String>()
         var promotedAliases = Set<String>()
 
-        for session in sessions where session.instanceId == "web.chatgpt" && sameWebProjectAlias(session.projectAlias, projectAlias) {
+        for session in sessions where sameWebProjectAlias(session.projectAlias, projectAlias) {
             guard let canonicalURL = session.canonicalUrl, !canonicalURL.isEmpty else { continue }
             let sessionAlias = webConversationAlias(from: canonicalURL)
             let prior = providerById[session.id]
@@ -2591,8 +2591,7 @@ final class WorkspaceStore: ObservableObject {
     @discardableResult
     private func reconcileProjectConversationActivityFromSessions(_ remote: [SessionDescriptor]) -> Set<String> {
         let projectSessions = remote.filter {
-            $0.instanceId == "web.chatgpt"
-                && $0.projectAlias?.isEmpty == false
+            $0.projectAlias?.isEmpty == false
                 && $0.canonicalUrl?.isEmpty == false
         }
         guard !projectSessions.isEmpty else { return [] }
