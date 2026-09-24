@@ -662,20 +662,41 @@ final class WorkspaceStore: ObservableObject {
                         }
                     }
 
-                    // Even if a later cache page is interrupted, never throw away the
-                    // verified rows already obtained. A subsequent refresh will resume
-                    // from a fresh stable generation.
+                    if !previouslyAcceptedItems.isEmpty {
+                        // A stale Windows catalog is recovery evidence, never deletion
+                        // authority. Keep every row the phone already accepted and use
+                        // stale data only to prepend a verified newest head or repair
+                        // titles. This prevents a transient bridge outage from visibly
+                        // shrinking a complete Project list.
+                        projectConversationsByAlias[projectAlias] = previouslyAcceptedItems
+                        let mergedHead = mergeConversationVerifiedStaleHead(staleItems, projectAlias: projectAlias)
+                        let repairedTitles = mergeConversationTitleHints(staleItems, projectAlias: projectAlias)
+                        projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
+                        let preservedItems = projectConversationsByAlias[projectAlias] ?? previouslyAcceptedItems
+                        mergeProjectSessions(preservedItems)
+                        errors["web.project.\(projectAlias)"] = nil
+                        DiagnosticsLog.shared.record("project_load_stale_preserved", fields: [
+                            "project": projectAlias,
+                            "acceptedCount": String(previouslyAcceptedItems.count),
+                            "staleCount": String(staleItems.count),
+                            "visibleCount": String(preservedItems.count),
+                            "mergedHead": String(mergedHead),
+                            "repairedTitles": String(repairedTitles),
+                            "pagingStoppedEarly": String(pagingStoppedEarly),
+                        ], level: "WARN")
+                        return
+                    }
+
+                    // Fresh-phone bootstrap: there is no accepted local list to protect,
+                    // so expose the complete stable Windows cache generation in memory.
+                    // It remains non-authoritative and is not written into the durable
+                    // phone cache.
                     projectConversationsByAlias[projectAlias] = staleItems
                     projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
                     projectConversationSnapshotIds[projectAlias] = staleSnapshotId
                     if let cursor = nextCursor { projectNextCursorByAlias[projectAlias] = cursor }
                     else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
                     projectHasMoreByAlias[projectAlias] = hasMore
-                    // A Windows last-known-good snapshot is safe to display and
-                    // page in memory, but it is still non-authoritative. Do not replace
-                    // the phone's durable authoritative cache with a stale remote
-                    // bootstrap; a later live DOM refresh must remain able to distinguish
-                    // verified phone truth from fallback Windows state.
                     mergeProjectSessions(staleItems)
                     errors["web.project.\(projectAlias)"] = nil
                     DiagnosticsLog.shared.record("project_load_stale", fields: [
@@ -2314,7 +2335,7 @@ final class WorkspaceStore: ObservableObject {
         guard let current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
         let currentAliases = Set(current.compactMap(\.conversationAlias))
         guard !currentAliases.isEmpty else { return false }
-        let validIncoming = incoming.filter { $0.projectAlias == projectAlias && $0.conversationAlias != nil }
+        let validIncoming = incoming.filter { sameWebProjectAlias($0.projectAlias, projectAlias) && $0.conversationAlias != nil }
         guard let firstKnownIndex = validIncoming.firstIndex(where: { row in
             row.conversationAlias.map(currentAliases.contains) ?? false
         }), firstKnownIndex > 0 else { return false }
@@ -2340,7 +2361,7 @@ final class WorkspaceStore: ObservableObject {
     private func mergeConversationTitleHints(_ hints: [WebConversationDescriptor], projectAlias: String) -> Bool {
         guard var current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
         let byAlias = Dictionary(uniqueKeysWithValues: hints.compactMap { hint -> (String, WebConversationDescriptor)? in
-            guard let alias = hint.conversationAlias, hint.projectAlias == projectAlias else { return nil }
+            guard let alias = hint.conversationAlias, sameWebProjectAlias(hint.projectAlias, projectAlias) else { return nil }
             return (alias, hint)
         })
         var changed = false

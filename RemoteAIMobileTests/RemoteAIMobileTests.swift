@@ -1716,6 +1716,35 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testStaleProjectRefreshCannotShrinkPreviouslyAcceptedConversationList() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 3)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-0", "seed-1", "seed-2"]
+        )
+
+        // Simulate a Windows last-known-good catalog lagging behind the phone's
+        // already accepted complete live snapshot.
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
+        await mock.setScenario(.staleWebCatalog)
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-0", "seed-1", "seed-2"],
+            "A stale Windows refresh must never delete rows from the phone's previously accepted Project list"
+        )
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .staleCache)
+        await store.suspend()
+    }
+
+    @MainActor
     func testVerifiedStaleProjectHeadShowsNewestRegisteredChatWithoutDeletingCachedTail() async throws {
         let mock = MockTransport(historyCount: 1)
         let cache = try SQLiteStore.inMemory()
