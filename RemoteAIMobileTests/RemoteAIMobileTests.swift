@@ -2190,19 +2190,29 @@ final class RemoteAIMobileTests: XCTestCase {
     func testConversationPaginationRejectsSnapshotChange() async throws {
         let mock = MockTransport(historyCount: 1)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 65)
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 120_000_000)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
         await store.start()
-        await store.loadProjectConversations(projectAlias: "g-p-remoteai")
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 30)
+
+        let firstRefresh = Task { @MainActor in
+            await store.loadProjectConversations(projectAlias: "g-p-remoteai")
+        }
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("listProjectConversations") >= 1 { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        // The first page was already formed from the 65-row snapshot. Change the
+        // backing list before page 2 so its snapshot id cannot be mixed into page 1.
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 66)
+        await firstRefresh.value
+
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 50, "A page from a different server snapshot must not be merged")
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .partialDOM)
         XCTAssertEqual(store.projectHasMoreByAlias["g-p-remoteai"], true)
 
-        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 66)
-        await store.loadMoreProjectConversations(projectAlias: "g-p-remoteai")
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 30, "A page from a different server snapshot must not be merged")
-        XCTAssertNotNil(store.errors["web.project.g-p-remoteai"])
-
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 0)
         await store.loadProjectConversations(projectAlias: "g-p-remoteai")
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 30)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 66)
         XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .authoritativeLiveDOM)
         XCTAssertNil(store.errors["web.project.g-p-remoteai"])
         await store.suspend()

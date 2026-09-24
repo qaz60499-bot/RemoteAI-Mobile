@@ -669,7 +669,11 @@ final class WorkspaceStore: ObservableObject {
                     if let cursor = nextCursor { projectNextCursorByAlias[projectAlias] = cursor }
                     else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
                     projectHasMoreByAlias[projectAlias] = hasMore
-                    try? await cache.put(staleItems, key: "web.project.\(projectAlias).conversations")
+                    // A Windows last-known-good snapshot is safe to display and
+                    // page in memory, but it is still non-authoritative. Do not replace
+                    // the phone's durable authoritative cache with a stale remote
+                    // bootstrap; a later live DOM refresh must remain able to distinguish
+                    // verified phone truth from fallback Windows state.
                     mergeProjectSessions(staleItems)
                     errors["web.project.\(projectAlias)"] = nil
                     DiagnosticsLog.shared.record("project_load_stale", fields: [
