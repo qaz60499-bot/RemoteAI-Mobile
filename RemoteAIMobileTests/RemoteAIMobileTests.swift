@@ -1100,6 +1100,65 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testLiveWebRegistrationAndBusyStateCannotBeErasedByConcurrentOlderSessionRefresh() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+
+        await mock.setResponseDelay(action: "listSessions", nanoseconds: 250_000_000)
+        async let staleRefresh: Void = store.refreshSessions(runtime: runtime, instance: instance)
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        let registeredAt = Date()
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: instance.id,
+            sessionId: "webconv-race-live",
+            type: "WEB_PAGE_REGISTERED",
+            payload: [
+                "localConversationId": .string("webconv-race-live"),
+                "canonicalUrl": .string("https://chatgpt.com/g/g-p-remoteai/c/race-live"),
+                "displayTitle": .string("Race live"),
+                "projectAlias": .string("g-p-remoteai"),
+                "conversationAlias": .string("race-live"),
+            ],
+            createdAt: registeredAt
+        ), deliverLive: true)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1202,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: instance.id,
+            sessionId: "webconv-race-live",
+            type: "GENERATION_STARTED",
+            payload: ["provider": .string("chatgpt-web")],
+            createdAt: registeredAt.addingTimeInterval(0.1)
+        ), deliverLive: true)
+
+        await staleRefresh
+
+        let live = try XCTUnwrap(store.sessions.first(where: { $0.id == "webconv-race-live" }))
+        XCTAssertEqual(live.projectAlias, "g-p-remoteai")
+        XCTAssertEqual(live.state, .busy, "A stale listSessions response must not roll a newer live run back or delete it")
+        XCTAssertEqual(
+            store.displayedProjectConversations(projectAlias: "g-p-remoteai").first?.conversationAlias,
+            "race-live",
+            "The in-progress desktop Chat must stay visible even if an older catalog request finishes afterward"
+        )
+        await store.suspend()
+    }
+
+    @MainActor
     func testProjectRefreshSkippedBeforeOnlineRetriesOnceConnectivityRecovers() async throws {
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
@@ -1756,6 +1815,35 @@ final class RemoteAIMobileTests: XCTestCase {
             "A stale Windows refresh must never delete rows from the phone's previously accepted Project list"
         )
         XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .staleCache)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testVerifiedStaleProjectCatalogExpandsPreviouslyTruncatedPhoneCacheWithoutDeletingRows() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 50)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 50)
+
+        // Model an installed older build whose accepted phone cache stopped at page 1,
+        // while Windows already holds the full verified Project catalog. Stale recovery
+        // may add positive membership evidence, but it must not delete/reorder the 50
+        // rows the phone previously accepted.
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 125)
+        await mock.setScenario(.staleWebCatalog)
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+
+        let merged = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(merged.count, 125, "A verified Windows cache must be allowed to fill rows missing from an older truncated phone cache")
+        XCTAssertEqual(Array(merged.prefix(50)).map(\.conversationAlias), (0..<50).map { "seed-\($0)" }, "Stale recovery must preserve the relative order of every previously accepted phone row")
+        XCTAssertEqual(merged.last?.conversationAlias, "seed-124")
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .staleCache)
+        let cached: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
+        XCTAssertEqual(cached?.count, 125, "Recovered positive membership must survive app restart instead of falling back to the old 50-row cache")
         await store.suspend()
     }
 

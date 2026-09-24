@@ -664,15 +664,19 @@ final class WorkspaceStore: ObservableObject {
 
                     if !previouslyAcceptedItems.isEmpty {
                         // A stale Windows catalog is recovery evidence, never deletion
-                        // authority. Keep every row the phone already accepted and use
-                        // stale data only to prepend a verified newest head or repair
-                        // titles. This prevents a transient bridge outage from visibly
-                        // shrinking a complete Project list.
+                        // authority. Preserve every row and the relative order the phone
+                        // already accepted, but do not let that protection freeze an old
+                        // truncated cache forever: verified Windows identities may be
+                        // inserted into the gaps/tail without deleting or reordering any
+                        // existing phone rows.
                         projectConversationsByAlias[projectAlias] = previouslyAcceptedItems
-                        let mergedHead = mergeConversationVerifiedStaleHead(staleItems, projectAlias: projectAlias)
+                        let addedVerifiedRows = mergeConversationVerifiedStaleCatalog(staleItems, projectAlias: projectAlias)
                         let repairedTitles = mergeConversationTitleHints(staleItems, projectAlias: projectAlias)
                         projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
                         let preservedItems = projectConversationsByAlias[projectAlias] ?? previouslyAcceptedItems
+                        if addedVerifiedRows > 0 || repairedTitles {
+                            try? await cache.put(preservedItems, key: "web.project.\(projectAlias).conversations")
+                        }
                         mergeProjectSessions(preservedItems)
                         errors["web.project.\(projectAlias)"] = nil
                         DiagnosticsLog.shared.record("project_load_stale_preserved", fields: [
@@ -680,7 +684,7 @@ final class WorkspaceStore: ObservableObject {
                             "acceptedCount": String(previouslyAcceptedItems.count),
                             "staleCount": String(staleItems.count),
                             "visibleCount": String(preservedItems.count),
-                            "mergedHead": String(mergedHead),
+                            "addedVerifiedRows": String(addedVerifiedRows),
                             "repairedTitles": String(repairedTitles),
                             "pagingStoppedEarly": String(pagingStoppedEarly),
                         ], level: "WARN")
@@ -983,7 +987,7 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, revision == sessionRevisions[instance.id, default: 0], machine.state == .online, !isSuspended else { return }
             sessions.removeAll { $0.instanceId == instance.id }
             sessions.append(contentsOf: remote)
-            sessions.sort { $0.orderingDate > $1.orderingDate }
+            sortSessionsCanonical()
 
             // listSessions carries durable Agent-side Project identity and titles.
             // Repair safe metadata in already-loaded rows without reordering them.
@@ -2148,9 +2152,10 @@ final class WorkspaceStore: ObservableObject {
         do {
             let remote = try await transport.listSessions(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId)
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
-            if let resolved = remote.first(where: { $0.id == sessionId }) {
+            if let resolved = remote.first(where: { $0.id == sessionId }),
+               !sessions.contains(where: { $0.id == sessionId }) {
                 sessions.append(resolved)
-                sessions.sort { $0.orderingDate > $1.orderingDate }
+                sortSessionsCanonical()
                 await persistMetadata()
             }
         } catch {
@@ -2169,7 +2174,16 @@ final class WorkspaceStore: ObservableObject {
             updatedAt: updatedAt,
             lastActivityAt: updatedAt
         ))
-        sessions.sort { $0.orderingDate > $1.orderingDate }
+        sortSessionsCanonical()
+    }
+
+    private static func sessionOrdersBefore(_ lhs: SessionDescriptor, _ rhs: SessionDescriptor) -> Bool {
+        if lhs.orderingDate != rhs.orderingDate { return lhs.orderingDate > rhs.orderingDate }
+        return lhs.id < rhs.id
+    }
+
+    private func sortSessionsCanonical() {
+        sessions.sort(by: Self.sessionOrdersBefore)
     }
 
     private func markSessionActivity(_ sessionId: String, at: Date) {
@@ -2357,6 +2371,59 @@ final class WorkspaceStore: ObservableObject {
         return true
     }
 
+    /// Add positive membership evidence from a complete/stable Windows cache without
+    /// granting stale data deletion or reorder authority. Existing phone rows keep their
+    /// relative order; missing verified rows are inserted beside the closest stale-order
+    /// anchor when possible, otherwise appended. Rows without a stable conversation alias
+    /// are placeholders and never expand the phone catalog.
+    @discardableResult
+    private func mergeConversationVerifiedStaleCatalog(_ incoming: [WebConversationDescriptor], projectAlias: String) -> Int {
+        guard var current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return 0 }
+        let validIncoming = incoming.filter { sameWebProjectAlias($0.projectAlias, projectAlias) && $0.conversationAlias != nil }
+        guard !validIncoming.isEmpty else { return 0 }
+
+        var knownAliases = Set(current.compactMap(\.conversationAlias))
+        var added = 0
+
+        for incomingIndex in validIncoming.indices {
+            let row = validIncoming[incomingIndex]
+            guard let alias = row.conversationAlias, !knownAliases.contains(alias) else { continue }
+
+            var insertionIndex: Int?
+            if incomingIndex > validIncoming.startIndex {
+                var priorIndex = validIncoming.index(before: incomingIndex)
+                while true {
+                    if let priorAlias = validIncoming[priorIndex].conversationAlias,
+                       let currentIndex = current.firstIndex(where: { $0.conversationAlias == priorAlias }) {
+                        insertionIndex = current.index(after: currentIndex)
+                        break
+                    }
+                    if priorIndex == validIncoming.startIndex { break }
+                    priorIndex = validIncoming.index(before: priorIndex)
+                }
+            }
+
+            if insertionIndex == nil {
+                var nextIndex = validIncoming.index(after: incomingIndex)
+                while nextIndex < validIncoming.endIndex {
+                    if let nextAlias = validIncoming[nextIndex].conversationAlias,
+                       let currentIndex = current.firstIndex(where: { $0.conversationAlias == nextAlias }) {
+                        insertionIndex = currentIndex
+                        break
+                    }
+                    nextIndex = validIncoming.index(after: nextIndex)
+                }
+            }
+
+            current.insert(row, at: insertionIndex ?? current.endIndex)
+            knownAliases.insert(alias)
+            added += 1
+        }
+
+        if added > 0 { projectConversationsByAlias[projectAlias] = current }
+        return added
+    }
+
     @discardableResult
     private func mergeConversationTitleHints(_ hints: [WebConversationDescriptor], projectAlias: String) -> Bool {
         guard var current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
@@ -2409,7 +2476,7 @@ final class WorkspaceStore: ObservableObject {
             sessions.removeAll { $0.id == session.id }
             sessions.append(session)
         }
-        sessions.sort { $0.orderingDate > $1.orderingDate }
+        sortSessionsCanonical()
     }
 
     private func webConversationAlias(from canonicalURL: String?) -> String? {
@@ -2648,7 +2715,7 @@ final class WorkspaceStore: ObservableObject {
                 canonicalUrl: canonicalUrl,
                 lastActivityAt: nil
             ))
-            sessions.sort { $0.orderingDate > $1.orderingDate }
+            sortSessionsCanonical()
         }
 
         var rows = projectConversationsByAlias[projectAlias, default: []]
@@ -3019,6 +3086,18 @@ final class WorkspaceStore: ObservableObject {
             return
         }
 
+        let runEventTypes = ["MESSAGE_UPDATED", "MESSAGE_ADDED", "TOOL_STARTED", "TOOL_FINISHED", "GENERATION_STARTED", "GENERATION_STOPPED"]
+        let sessionCatalogMutatingEventTypes = Set(runEventTypes + [
+            "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS",
+            "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED",
+        ])
+        if sessionCatalogMutatingEventTypes.contains(event.type) {
+            // A listSessions request that started before this live event is stale by
+            // definition. Without bumping the revision, its late response can delete a
+            // newly registered desktop Chat or roll Busy/lastActivityAt back to idle.
+            sessionRevisions[event.instanceId, default: 0] &+= 1
+        }
+
         sessionRouteHints[sessionId] = (event.machineId, event.runtimeId, event.instanceId)
         if event.type == "WEB_BINDING_CHANGED"
             || (event.type == "SESSION_STATUS" && event.payload["providerSurface"]?.boolValue == true) {
@@ -3034,7 +3113,6 @@ final class WorkspaceStore: ObservableObject {
                 (assistantStreams[sessionId] ?? previousStream)?.performance.apply.add((StreamPerformance.now - applyBegan) * 1000)
             }
         }
-        let runEventTypes = ["MESSAGE_UPDATED", "MESSAGE_ADDED", "TOOL_STARTED", "TOOL_FINISHED", "GENERATION_STARTED", "GENERATION_STOPPED"]
         let isAssistantDelta = event.type == "MESSAGE_UPDATED" && event.payload["contentDelta"]?.stringValue != nil
         let isHistoricalProgressEvent = isAssistantDelta
             || event.type == "TOOL_STARTED"
