@@ -859,11 +859,14 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended else { return }
             mergeProjectSessions(authoritativeItems)
             errors["web.project.\(projectAlias)"] = nil
+            let catalogDigests = DiagnosticsLog.catalogDigests(authoritativeItems.map(\.localConversationId))
             DiagnosticsLog.shared.record("project_load_ok", fields: [
                 "project": projectAlias,
                 "count": String(authoritativeItems.count),
                 "hasMore": String(hasMore),
                 "pagingStoppedEarly": String(pagingStoppedEarly),
+                "identityDigest": catalogDigests.identity,
+                "orderDigest": catalogDigests.order,
                 "durationMs": Self.durationMilliseconds(since: projectLoadStartedAt),
             ])
         } catch {

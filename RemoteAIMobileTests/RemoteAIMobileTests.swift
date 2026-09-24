@@ -2197,6 +2197,15 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(remote.values.contains("sensitive provider text"))
     }
 
+    func testProjectCatalogDigestsSeparateMembershipFromOrdering() {
+        let first = DiagnosticsLog.catalogDigests(["webconv-b", "webconv-a", "webconv-c"])
+        let reordered = DiagnosticsLog.catalogDigests(["webconv-a", "webconv-b", "webconv-c"])
+        XCTAssertEqual(first.identity, reordered.identity, "Membership digest must ignore row ordering")
+        XCTAssertNotEqual(first.order, reordered.order, "Order digest must detect a changed visible/provider order")
+        XCTAssertEqual(first.identity.count, 64)
+        XCTAssertEqual(first.order.count, 64)
+    }
+
     @MainActor
     func testDiagnosticsLogFiltersSensitiveFieldsAndKeepsSafeOperationalMetadata() throws {
         let log = DiagnosticsLog.shared

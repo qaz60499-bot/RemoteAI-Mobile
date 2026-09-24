@@ -155,7 +155,8 @@ final class DiagnosticsLog: ObservableObject {
         "cachedcount", "count", "attachments", "attachmentcount", "build", "finalbytes", "finalchars",
         "canonicalequal", "firstvisiblems", "firstdeltaafterstreaminitms", "visibleupdateintervalp50ms",
         "visibleupdateintervalp95ms", "flushtoframep95ms", "mainthreadstallsover100ms", "reconnectattempt",
-        "agentconnected", "browserconnected", "storagedegraded", "presentationcoalesced"
+        "agentconnected", "browserconnected", "storagedegraded", "presentationcoalesced",
+        "identitydigest", "orderdigest"
     ]
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -172,6 +173,20 @@ final class DiagnosticsLog: ObservableObject {
         encoder.dateEncodingStrategy = .iso8601
         decoder.dateDecodingStrategy = .iso8601
         loadAndPrune()
+    }
+
+    static func catalogDigests(_ ids: [String]) -> (identity: String, order: String) {
+        func digest(_ values: [String]) -> String {
+            var data = Data("remoteai-catalog-v1\n".utf8)
+            for value in values {
+                let bytes = Array(value.utf8)
+                data.append(Data("\(bytes.count):".utf8))
+                data.append(contentsOf: bytes)
+                data.append(0x0a)
+            }
+            return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+        return (digest(ids.sorted()), digest(ids))
     }
 
     var text: String {
