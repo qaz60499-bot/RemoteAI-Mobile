@@ -3313,6 +3313,10 @@ final class WorkspaceStore: ObservableObject {
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             setSessionState(sessionId, .busy)
             liveRunStatusBySession[sessionId] = "ChatGPT 正在处理…"
+            DiagnosticsLog.shared.record("generation_state_applied", fields: [
+                "state": SessionState.busy.rawValue,
+                "sequence": String(event.sequence),
+            ])
         case "GENERATION_STOPPED":
             if event.payload["ok"]?.boolValue == false {
                 // A provider can terminate a Web generation after exposing only a DOM
@@ -3323,6 +3327,10 @@ final class WorkspaceStore: ObservableObject {
                 discardStreamingPlaceholder(sessionId: sessionId)
                 await settleRunningToolRows(sessionId: sessionId)
                 setSessionState(sessionId, .error)
+                DiagnosticsLog.shared.record("generation_state_applied", fields: [
+                    "state": SessionState.error.rawValue,
+                    "sequence": String(event.sequence),
+                ])
                 liveRunStatusBySession.removeValue(forKey: sessionId)
                 clearLiveRunActivity(sessionId: sessionId)
                 let code = event.payload["errorCode"]?.stringValue ?? "PROVIDER_UNAVAILABLE"
@@ -3337,6 +3345,10 @@ final class WorkspaceStore: ObservableObject {
             } else {
                 flushStreaming(sessionId: sessionId)
                 setSessionState(sessionId, .idle)
+                DiagnosticsLog.shared.record("generation_state_applied", fields: [
+                    "state": SessionState.idle.rawValue,
+                    "sequence": String(event.sequence),
+                ])
                 liveRunStatusBySession.removeValue(forKey: sessionId)
                 clearLiveRunActivity(sessionId: sessionId)
                 errors[sessionId] = nil
