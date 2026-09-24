@@ -2152,6 +2152,11 @@ final class WorkspaceStore: ObservableObject {
     private func mergeProjectSessions(_ items: [WebConversationDescriptor]) {
         for item in items {
             var session = item.session
+            // Project discovery itself proves that this conversation belongs to the
+            // ChatGPT Web runtime. Instance catalog loading is intentionally lazy, so
+            // remember the route here instead of requiring listInstances to have run
+            // before status/history reconciliation can recover a desktop-only run.
+            sessionRouteHints[session.id] = (machine.id, "runtime.web", session.instanceId)
             if let existing = sessions.first(where: { $0.id == session.id }) {
                 // Project discovery is a navigation snapshot, not a run-state authority.
                 // Do not let a sidebar refresh erase a live busy/error state or a newer
