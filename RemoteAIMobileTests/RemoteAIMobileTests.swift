@@ -1238,7 +1238,16 @@ final class RemoteAIMobileTests: XCTestCase {
         let finalConversationCount = await mock.projectConversationCount("g-p-remoteai")
         XCTAssertEqual(createConversationAttempts, 1)
         XCTAssertEqual(finalConversationCount, 2, "Server Project must gain exactly one conversation")
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 2)
+        XCTAssertEqual(
+            store.displayedProjectConversations(projectAlias: "g-p-remoteai").count,
+            2,
+            "The newly created Chat must be immediately visible through the activity overlay without mutating the provider pagination backing"
+        )
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.count,
+            1,
+            "Phone creation must not fabricate provider membership or clear pagination state before the next authoritative sidebar refresh"
+        )
         await store.suspend()
     }
 
@@ -1276,8 +1285,10 @@ final class RemoteAIMobileTests: XCTestCase {
         await staleConversationRefresh.value
         let serverConversationCount = await mock.projectConversationCount("g-p-remoteai")
         XCTAssertEqual(serverConversationCount, 2)
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.filter { $0.id == createdConversation.id }.count, 1)
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.first?.id, createdConversation.id, "A stale conversation page must not overwrite the newly created conversation")
+        let visibleRows = store.displayedProjectConversations(projectAlias: "g-p-remoteai")
+        XCTAssertEqual(visibleRows.filter { $0.id == createdConversation.id }.count, 1)
+        XCTAssertEqual(visibleRows.first?.id, createdConversation.id, "A stale conversation page must not hide the newly created conversation from the visible activity head")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"], "The stale race must not mutate provider pagination backing")
         await store.suspend()
     }
 
@@ -2230,8 +2241,10 @@ final class RemoteAIMobileTests: XCTestCase {
         let createdConversationResult = await createConversationTask.value
         let createdConversation = try XCTUnwrap(createdConversationResult)
         await refreshConversationTask.value
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.filter { $0.id == createdConversation.id }.count, 1)
-        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.first?.id, createdConversation.id, "A refresh launched during create must not erase the committed conversation")
+        let visibleRows = store.displayedProjectConversations(projectAlias: "g-p-remoteai")
+        XCTAssertEqual(visibleRows.filter { $0.id == createdConversation.id }.count, 1)
+        XCTAssertEqual(visibleRows.first?.id, createdConversation.id, "A refresh launched during create must not hide the committed conversation from the activity head")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["mock-1"], "The provider backing must remain authoritative until the new Chat is observed in a complete sidebar snapshot")
         await store.suspend()
     }
 
