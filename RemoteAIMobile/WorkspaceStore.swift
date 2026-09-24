@@ -868,6 +868,10 @@ final class WorkspaceStore: ObservableObject {
             for remoteUser in page.items where remoteUser.role == .user {
                 await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
             }
+            if route.runtimeId == "runtime.antigravity",
+               sessions.first(where: { $0.id == sessionId })?.state != .busy {
+                await reconcileAntigravityAuthoritativeAssistantWindow(page.items, sessionId: sessionId)
+            }
             try? await cache.upsertMessages(page.items)
             merge(page.items, into: sessionId)
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: page.items.last?.createdAt ?? Date())
@@ -3357,6 +3361,41 @@ final class WorkspaceStore: ObservableObject {
         }) else { return }
         messagesBySession[sessionId]?.removeAll { $0.id == optimistic.id }
         try? await cache.deleteMessage(id: optimistic.id)
+    }
+
+    static func staleAntigravityAssistantIDs(local: [ChatMessage], authoritative: [ChatMessage]) -> Set<String> {
+        let authoritativeAssistants = authoritative.filter { $0.role == .assistant && $0.kind == .text }
+        guard !authoritativeAssistants.isEmpty,
+              let lower = authoritative.map(\.createdAt).min(),
+              let upper = authoritative.map(\.createdAt).max() else { return [] }
+        let authoritativeIDs = Set(authoritativeAssistants.map(\.id))
+        // Live RemoteAI builds before the canonical transcript fix could persist an
+        // intermediate Antigravity planner response under a random local message id.
+        // Once the provider is idle, recent history is the authoritative transcript.
+        // Limit pruning to assistant rows inside that exact recent-history time window;
+        // user/optimistic rows and older paginated history are intentionally untouched.
+        let paddedLower = lower.addingTimeInterval(-2)
+        let paddedUpper = upper.addingTimeInterval(2)
+        return Set(local.compactMap { message in
+            guard message.role == .assistant,
+                  message.kind == .text,
+                  message.createdAt >= paddedLower,
+                  message.createdAt <= paddedUpper,
+                  !authoritativeIDs.contains(message.id) else { return nil }
+            return message.id
+        })
+    }
+
+    private func reconcileAntigravityAuthoritativeAssistantWindow(_ authoritative: [ChatMessage], sessionId: String) async {
+        let local = messagesBySession[sessionId, default: []]
+        let staleIDs = Self.staleAntigravityAssistantIDs(local: local, authoritative: authoritative)
+        guard !staleIDs.isEmpty else { return }
+        messagesBySession[sessionId]?.removeAll { staleIDs.contains($0.id) }
+        for id in staleIDs { try? await cache.deleteMessage(id: id) }
+        DiagnosticsLog.shared.record("antigravity_history_reconciled", fields: [
+            "session": sessionId,
+            "removedAssistantRows": String(staleIDs.count),
+        ])
     }
 
     private func merge(_ incoming: [ChatMessage], into sessionId: String) {

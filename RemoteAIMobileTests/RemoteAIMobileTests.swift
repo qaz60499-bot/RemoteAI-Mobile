@@ -1593,6 +1593,26 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.suspend()
     }
 
+    func testAntigravityAuthoritativeHistoryWindowPrunesOnlyStaleAssistantRows() {
+        let base = Date(timeIntervalSince1970: 1_790_167_500)
+        let authoritative = [
+            ChatMessage(id: "ag-user", sessionId: "ag", sequence: nil, role: .user, kind: .text, text: "question", toolName: nil, toolStatus: nil, detail: nil, createdAt: base),
+            ChatMessage(id: "ag-final-1", sessionId: "ag", sequence: nil, role: .assistant, kind: .text, text: "first canonical", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(6)),
+            ChatMessage(id: "ag-final-2", sessionId: "ag", sequence: nil, role: .assistant, kind: .text, text: "latest canonical", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(20)),
+        ]
+        let local = [
+            ChatMessage(id: "very-old", sessionId: "ag", sequence: 1, role: .assistant, kind: .text, text: "keep old page", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(-30)),
+            ChatMessage(id: "ag-final-1", sessionId: "ag", sequence: 2, role: .assistant, kind: .text, text: "first canonical", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(6)),
+            ChatMessage(id: "legacy-random-final", sessionId: "ag", sequence: 3, role: .assistant, kind: .text, text: "stale planner reply", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(7.3)),
+            ChatMessage(id: "optimistic-user", sessionId: "ag", sequence: nil, role: .user, kind: .text, text: "keep user", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(8)),
+        ]
+
+        XCTAssertEqual(
+            WorkspaceStore.staleAntigravityAssistantIDs(local: local, authoritative: authoritative),
+            Set(["legacy-random-final"])
+        )
+    }
+
     func testLongMessageRenderingPolicyKeepsChatRowsBounded() {
         let huge = String(repeating: "RemoteAI diagnostics line\n", count: 8_000)
         XCTAssertTrue(MessageRenderingPolicy.isLarge(huge))
