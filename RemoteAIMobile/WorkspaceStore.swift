@@ -3596,12 +3596,24 @@ final class WorkspaceStore: ObservableObject {
                     recentSystemNotice = "Windows Agent 已重新连上 Relay，正在补同步当前会话。"
                 }
             case .connecting, .reconnecting:
-                desktopAgentConnected = false
-                systemTransportOfflineChannels.insert("windows-agent")
-                if machine.state != .online { machine.state = .connecting }
-                connectionPhase = .windowsReconnecting
-                errors["connection"] = "Windows Agent 正在重新连接 Relay；手机到 Relay 本身仍保持连接。"
-                recentSystemNotice = "Windows Agent 暂时离线，RemoteAI 正在等待它重新上线；不会把这次状态误报成 Relay 断线。"
+                if machine.state != .online {
+                    // During initial connection there is no previously authenticated
+                    // command-capable path to preserve, so surface the reconnect state.
+                    desktopAgentConnected = false
+                    systemTransportOfflineChannels.insert("windows-agent")
+                    machine.state = .connecting
+                    connectionPhase = .windowsReconnecting
+                    errors["connection"] = "Windows Agent 正在重新连接 Relay；手机到 Relay 本身仍保持连接。"
+                } else {
+                    // The Relay keeps reliable device->Agent commands queued during the
+                    // short Windows 1006 grace window, and CloudflareTransport deliberately
+                    // keeps agentOnline command-capable until that grace expires. Do not
+                    // turn a 1-4 second self-healing reconnect into a visible disconnect
+                    // banner or an orange "Agent offline" line in an active chat.
+                    desktopAgentConnected = true
+                    connectionPhase = .online
+                    errors["connection"] = nil
+                }
             case .offline:
                 desktopAgentConnected = false
                 systemTransportOfflineChannels.insert("windows-agent")
@@ -3663,12 +3675,21 @@ final class WorkspaceStore: ObservableObject {
 
         if state == "offline" {
             systemTransportOfflineChannels.insert(channel)
-            recentSystemNotice = "\(label) 于 \(time) 断开，RemoteAI 正在自动恢复连接。"
+            // Windows Relay status events are durable diagnostics. A brief Agent-side
+            // 1006 cannot reach the phone until the Agent is already connected again,
+            // while the live Relay health path separately applies a 12-second grace.
+            // Recording the historical event as a user-visible banner therefore makes
+            // successful self-healing look like a fresh disconnect.
+            if channel != "relay" {
+                recentSystemNotice = "\(label) 于 \(time) 断开，RemoteAI 正在自动恢复连接。"
+            }
             DiagnosticsLog.shared.record("remote_transport_offline", fields: ["channel": channel, "at": time], level: "WARN")
             return
         }
         if state == "online", systemTransportOfflineChannels.remove(channel) != nil {
-            recentSystemNotice = "\(label) 已于 \(time) 恢复；刚刚发生过一次断连，当前会话正在补同步。"
+            if channel != "relay" {
+                recentSystemNotice = "\(label) 已于 \(time) 恢复；刚刚发生过一次断连，当前会话正在补同步。"
+            }
             DiagnosticsLog.shared.record("remote_transport_recovered", fields: ["channel": channel, "at": time])
             if channel == "browser-bridge" {
                 desktopBrowserConnected = true
@@ -3704,6 +3725,8 @@ final class WorkspaceStore: ObservableObject {
         if lower.contains("analyzing image") || lower.contains("analysing image") { return "正在分析图片…" }
         if lower.contains("generated image ready") || lower.contains("image ready") { return "图片已生成，正在同步…" }
         if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return "正在生成图片…" }
+        if lower.contains("responding") { return "正在生成回答…" }
+        if lower == "response complete" || lower == "response completed" || lower == "response finished" { return "回答已生成，正在确认同步…" }
         if lower.contains("writing") || lower.contains("generating") { return "正在生成回答…" }
         return trimmed
     }
@@ -3720,6 +3743,8 @@ final class WorkspaceStore: ObservableObject {
         if lower.contains("generated image ready") || lower.contains("image ready") { return true }
         if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return true }
         if lower == "generation finished" || lower == "generation complete" { return true }
+        if lower == "response complete" || lower == "response completed" || lower == "response finished" { return true }
+        if lower == "chatgpt is responding" || lower == "chatgpt responding" || lower == "responding" { return true }
         if lower.contains("writing") || lower == "generating" || lower.hasPrefix("generating answer") { return true }
         if trimmed.hasPrefix("思考中")
             || trimmed.hasPrefix("正在搜索网页")

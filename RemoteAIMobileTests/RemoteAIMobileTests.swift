@@ -953,7 +953,7 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testTransportStatusSurvivesFastDisconnectRecoveryAsVisibleNotice() async throws {
+    func testFastWindowsRelayDisconnectRecoveryStaysOutOfUserVisibleNotices() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 1)
         let store = WorkspaceStore(transport: mock, cache: cache)
@@ -972,11 +972,8 @@ final class RemoteAIMobileTests: XCTestCase {
             payload: ["channel": .string("relay"), "state": .string("offline")],
             createdAt: now
         ), deliverLive: true)
-        for _ in 0..<40 where store.recentSystemNotice == nil {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTAssertTrue(store.recentSystemNotice?.contains("Relay") == true)
-        XCTAssertTrue(store.recentSystemNotice?.contains("断开") == true)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertNil(store.recentSystemNotice, "A durable Windows Relay offline event is historical evidence, not a fresh phone-visible disconnect")
 
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
@@ -990,17 +987,8 @@ final class RemoteAIMobileTests: XCTestCase {
             payload: ["channel": .string("relay"), "state": .string("online")],
             createdAt: now.addingTimeInterval(1.2)
         ), deliverLive: true)
-        for _ in 0..<40 where store.recentSystemNotice?.contains("已于") != true {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTAssertTrue(store.recentSystemNotice?.contains("已于") == true)
-        XCTAssertTrue(store.recentSystemNotice?.contains("恢复") == true)
-        let recoveredNotice = try XCTUnwrap(store.recentSystemNotice)
         try await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertEqual(store.recentSystemNotice, recoveredNotice, "A fast recovered disconnect must remain visible until the user dismisses it")
-
-        store.clearRecentSystemNotice()
-        XCTAssertNil(store.recentSystemNotice)
+        XCTAssertNil(store.recentSystemNotice, "A fast recovered Windows Relay 1006 should remain silent when the live health path recovered inside its grace window")
         await store.suspend()
     }
 
@@ -1015,13 +1003,13 @@ final class RemoteAIMobileTests: XCTestCase {
 
         await mock.injectHealth(TransportHealthEvent(channel: .relay, state: .online, at: now, detail: nil))
         await mock.injectHealth(TransportHealthEvent(channel: .agent, state: .reconnecting, at: now.addingTimeInterval(0.1), detail: "test reconnect"))
-        for _ in 0..<40 where store.connectionPhase != .windowsReconnecting {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTAssertEqual(store.connectionPhase, .windowsReconnecting)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(store.connectionPhase, .online, "A short Agent reconnect must not flash a user-visible connection failure while Relay remains command-capable")
         XCTAssertEqual(store.machine.state, .online, "Short Agent reconnects stay command-capable through the durable Relay grace window")
         XCTAssertEqual(store.desktopRelayConnected, true, "Agent loss must not be represented as Relay loss")
-        XCTAssertEqual(store.desktopAgentConnected, false)
+        XCTAssertEqual(store.desktopAgentConnected, true, "Presentation remains effectively online until the Agent grace window is actually exhausted")
+        XCTAssertNil(store.errors["connection"])
+        XCTAssertNil(store.recentSystemNotice)
         let sequenceDuringAgentReconnect = try await cache.lastSequence()
         XCTAssertEqual(sequenceDuringAgentReconnect, initialSequence, "Raw Relay health must not pollute the durable RemoteEvent cursor")
 
@@ -3128,16 +3116,46 @@ final class RemoteAIMobileTests: XCTestCase {
             ],
             createdAt: now.addingTimeInterval(2)
         ), deliverLive: true)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1203,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]),
+                "summary": .string("ChatGPT is responding")
+            ],
+            createdAt: now.addingTimeInterval(3)
+        ), deliverLive: true)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1204,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]),
+                "summary": .string("Response complete")
+            ],
+            createdAt: now.addingTimeInterval(4)
+        ), deliverLive: true)
 
         for _ in 0..<80 {
-            if store.liveRunStatusBySession["photo-upload"] == "正在读取网页内容…" { break }
+            if store.liveRunStatusBySession["photo-upload"] == "回答已生成，正在确认同步…" { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         let rows = store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" }
-        XCTAssertTrue(rows.isEmpty, "Generic ChatGPT Web process transitions must stay out of the conversation transcript")
-        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "正在读取网页内容…")
+        XCTAssertTrue(rows.isEmpty, "Generic ChatGPT Web process transitions, including responding/response-complete companion states, must stay out of the conversation transcript")
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "回答已生成，正在确认同步…")
         let activity = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.lastActivityAt)
-        XCTAssertGreaterThanOrEqual(activity, now.addingTimeInterval(2))
+        XCTAssertGreaterThanOrEqual(activity, now.addingTimeInterval(4))
         await store.suspend()
     }
 
