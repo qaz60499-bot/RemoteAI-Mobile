@@ -2589,13 +2589,14 @@ final class WorkspaceStore: ObservableObject {
         for session in sessions where sameWebProjectAlias(session.projectAlias, projectAlias) {
             guard let canonicalURL = session.canonicalUrl, !canonicalURL.isEmpty else { continue }
             let sessionAlias = webConversationAlias(from: canonicalURL)
+            let active = session.state == .busy || session.state == .waiting
+            if isProvisionalWebConversationAlias(sessionAlias), !active { continue }
             let prior = providerById[session.id]
                 ?? providerRows.first(where: {
                     guard let sessionAlias else { return false }
                     return normalizedWebConversationAlias($0.conversationAlias) == sessionAlias
                         || webConversationAlias(from: $0.canonicalUrl) == sessionAlias
                 })
-            let active = session.state == .busy || session.state == .waiting
             let activityAt = session.lastActivityAt ?? (active ? session.updatedAt : nil)
 
             if let prior {
