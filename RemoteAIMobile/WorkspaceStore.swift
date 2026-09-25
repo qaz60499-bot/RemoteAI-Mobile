@@ -2814,6 +2814,20 @@ final class WorkspaceStore: ObservableObject {
             for event in Array(incompleteAssistantStreams.values) { _ = await restoreAssistantStream(through: event) }
             let nextSyncState = current >= head && errors["sync"] == nil && incompleteAssistantStreams.isEmpty ? "synced" : "stale"
             if syncState != nextSyncState { syncState = nextSyncState }
+
+            // A websocket cursor can be fully caught up even when the browser observer
+            // missed one terminal Web event. Reconcile a bounded set of still-Busy Web
+            // sessions through the Agent's authoritative bound-tab status probe so a
+            // Project row cannot remain BUSY forever after desktop ChatGPT is already idle.
+            let busyWebSessions = sessions.filter { session in
+                guard session.state == .busy || session.state == .waiting,
+                      let route = routeForSession(session.id) else { return false }
+                return route.runtimeId == "runtime.web"
+            }.prefix(3)
+            for session in busyWebSessions {
+                guard generation == lifecycleGeneration, transport === activeTransport, !isSuspended else { return }
+                _ = await refreshVisibleSessionStatus(session.id)
+            }
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, !isSuspended else { return }
             if syncState != "stale" { syncState = "stale" }
