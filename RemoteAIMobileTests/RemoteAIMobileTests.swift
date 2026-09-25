@@ -1490,6 +1490,14 @@ final class RemoteAIMobileTests: XCTestCase {
         let rows = store.displayedProjectConversations(projectAlias: "g-p-remoteai")
         XCTAssertEqual(rows.count, 1, "Percent-encoded and decoded aliases are the same ChatGPT conversation identity")
         XCTAssertEqual(rows.first?.localConversationId, "provider-local-id", "Prefer the provider-backed row while overlaying live activity")
+
+        if let index = store.sessions.firstIndex(where: { $0.id == "activity-local-id" }) {
+            store.sessions[index].state = .idle
+        }
+        XCTAssertTrue(
+            store.displayedProjectConversations(projectAlias: "g-p-remoteai").isEmpty,
+            "A detached idle local-chatgpt placeholder from the Build 38 cache must not remain visible as a real Project chat"
+        )
         await store.suspend()
     }
 

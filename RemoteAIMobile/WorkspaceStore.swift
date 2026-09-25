@@ -2499,6 +2499,11 @@ final class WorkspaceStore: ObservableObject {
         return value.lowercased()
     }
 
+    private func isProvisionalWebConversationAlias(_ raw: String?) -> Bool {
+        guard let value = normalizedWebConversationAlias(raw) else { return false }
+        return value.hasPrefix("web:") || value.hasPrefix("local-chatgpt:")
+    }
+
     private func webConversationAlias(from canonicalURL: String?) -> String? {
         guard let canonicalURL,
               let url = URL(string: canonicalURL) else { return nil }
@@ -2553,7 +2558,23 @@ final class WorkspaceStore: ObservableObject {
     /// durable Windows/phone activity owns the visible recent-activity head. Keep those
     /// authorities separate so reordering never truncates a large Project.
     func displayedProjectConversations(projectAlias: String) -> [WebConversationDescriptor] {
-        let providerRows = projectConversationsByAlias[projectAlias, default: []]
+        let providerRows = projectConversationsByAlias[projectAlias, default: []].filter { row in
+            let provisional = isProvisionalWebConversationAlias(row.conversationAlias)
+                || isProvisionalWebConversationAlias(webConversationAlias(from: row.canonicalUrl))
+            guard provisional else { return true }
+            // Build 38 caches can contain detached local-chatgpt:/WEB: rows created
+            // before provider ID promotion. They are not durable conversations. Keep a
+            // provisional row visible only while an exact matching session is actively
+            // running; otherwise hide it immediately, even before the live refresh.
+            let rowAlias = normalizedWebConversationAlias(row.conversationAlias)
+                ?? webConversationAlias(from: row.canonicalUrl)
+            return sessions.contains { session in
+                guard session.state == .busy || session.state == .waiting else { return false }
+                if session.id == row.localConversationId { return true }
+                guard sameWebProjectAlias(session.projectAlias, projectAlias), let rowAlias else { return false }
+                return webConversationAlias(from: session.canonicalUrl) == rowAlias
+            }
+        }
         // Do not construct a unique-key Dictionary here. Historical provider snapshots
         // can legitimately contain two local IDs for the same ChatGPT conversation
         // identity during a SPA/local->provider ID transition.
