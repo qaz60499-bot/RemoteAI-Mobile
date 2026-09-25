@@ -595,7 +595,12 @@ extension SessionState {
         case "running", "busy", "generating": return .busy
         case "waiting": return .waiting
         case "sleeping": return .sleeping
-        case "interrupted": return .error
+        // "interrupted" is an Agent-lifecycle recovery marker, not a current
+        // provider failure. Rendering every historical restart marker as a red Error
+        // makes healthy old chats look broken until each one is opened and reconciled.
+        // The server-side loadRecentMessages path still sees the raw interrupted state
+        // and performs authoritative recovery when that chat is opened.
+        case "interrupted": return .idle
         default: return raw.lowercased().contains("error") || raw.lowercased().contains("fail") ? .error : .idle
         }
     }

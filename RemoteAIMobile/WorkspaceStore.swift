@@ -259,7 +259,7 @@ final class WorkspaceStore: ObservableObject {
             hasMoreBySession.removeAll()
             machine.state = .offline
             connectionPhase = .pairingExpired
-            errors["connection"] = "Not paired — scan the Windows pairing code to load your real runtimes and ChatGPT Projects."
+            errors["connection"] = "Not paired ? scan the Windows pairing code to load your real runtimes and ChatGPT Projects."
             return false
         }
         let activeTransport = transport
@@ -581,7 +581,7 @@ final class WorkspaceStore: ObservableObject {
         let projectLoadStartedAt = Date()
         guard machine.state == .online else {
             if projectConversationsByAlias[projectAlias, default: []].isEmpty {
-                errors["web.project.\(projectAlias)"] = "PC Offline — connect to Windows to load this Project's conversations."
+                errors["web.project.\(projectAlias)"] = "PC Offline ? connect to Windows to load this Project's conversations."
             }
             DiagnosticsLog.shared.record("project_load_offline", fields: ["project": projectAlias, "cachedCount": String(projectConversationsByAlias[projectAlias, default: []].count)], level: "WARN")
             return
@@ -931,7 +931,7 @@ final class WorkspaceStore: ObservableObject {
         defer { creatingWebConversations.remove(scope) }
         let generation = lifecycleGeneration
         guard machine.state == .online else {
-            errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = "PC Offline — new conversations require the Windows browser runtime."
+            errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = "PC Offline ? new conversations require the Windows browser runtime."
             return nil
         }
         let activeTransport = transport
@@ -1139,10 +1139,10 @@ final class WorkspaceStore: ObservableObject {
                 desktopStatusUpdatedAt = Date()
                 if !browserConnected {
                     systemTransportOfflineChannels.insert("browser-bridge")
-                    recentSystemNotice = "电脑端 Agent 在线，但 Browser Bridge 已断开；RemoteAI 正在等待浏览器控制恢复。"
+                    recentSystemNotice = "??? Agent ???? Browser Bridge ????RemoteAI ????????????"
                 } else {
                     let recovered = systemTransportOfflineChannels.remove("browser-bridge") != nil || previous == false
-                    if recovered { recentSystemNotice = "电脑端 Browser Bridge 已恢复，当前会话正在补同步。" }
+                    if recovered { recentSystemNotice = "??? Browser Bridge ??????????????" }
                 }
             }
             if staleIdleSnapshot {
@@ -1169,8 +1169,8 @@ final class WorkspaceStore: ObservableObject {
                     if liveRunStatusBySession[sessionId] != label { liveRunStatusBySession[sessionId] = label }
                 } else if liveRunStatusBySession[sessionId] == nil {
                     liveRunStatusBySession[sessionId] = route.runtimeId == "runtime.web"
-                        ? "电脑端 ChatGPT 仍在运行…"
-                        : "电脑端任务仍在运行…"
+                        ? "??? ChatGPT ?????"
+                        : "??????????"
                 }
             } else if snapshot.state == .idle {
                 if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
@@ -1339,7 +1339,7 @@ final class WorkspaceStore: ObservableObject {
         DiagnosticsLog.shared.record("send_begin", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "hasInput": String(!trimmed.isEmpty), "attachments": String(attachments.count), "commandId": commandId.uuidString])
         guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
         guard attachments.count <= 8, attachments.allSatisfy({ $0.sizeBytes > 0 && $0.sizeBytes <= 20 * 1024 * 1024 }) else {
-            errors[sessionId] = "最多一次发送 8 个附件，每个附件不能超过 20MB。"
+            errors[sessionId] = "?????? 8 ???????????? 20MB?"
             return false
         }
         let activeTransport = transport
@@ -1382,8 +1382,8 @@ final class WorkspaceStore: ObservableObject {
             guard recoveredConnectedTransport else {
                 if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
                 errors[sessionId] = attachments.isEmpty
-                    ? "PC Offline — draft saved. Tap Send after reconnecting."
-                    : "PC Offline — 附件需要连接 Windows 后才能上传。"
+                    ? "PC Offline ? draft saved. Tap Send after reconnecting."
+                    : "PC Offline ? ?????? Windows ??????"
                 DiagnosticsLog.shared.record("send_offline", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString], level: "WARN")
                 return false
             }
@@ -1453,8 +1453,8 @@ final class WorkspaceStore: ObservableObject {
                 promoteProjectConversationActivity(sessionId: sessionId, at: confirmedSendAt)
             }
             liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
-                ? "已发送，等待 ChatGPT 响应…"
-                : "已发送，等待远端响应…"
+                ? "?????? ChatGPT ???"
+                : "???????????"
             // A confirmed browser send is not the end of synchronization. Immediately
             // reconcile the authoritative event delta so a missed websocket user echo,
             // generation/progress event, or fast assistant final cannot leave the phone stale.
@@ -1512,8 +1512,8 @@ final class WorkspaceStore: ObservableObject {
                                 promoteProjectConversationActivity(sessionId: sessionId, at: recoveredSendAt)
                             }
                             liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
-                                ? "连接已恢复，等待 ChatGPT 响应…"
-                                : "连接已恢复，等待远端响应…"
+                                ? "???????? ChatGPT ???"
+                                : "?????????????"
                         }
                         DiagnosticsLog.shared.record("send_recovered_after_disconnect", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)])
                         return true
@@ -1594,8 +1594,8 @@ final class WorkspaceStore: ObservableObject {
                         setSessionState(sessionId, .busy)
                         markLiveRunActivity(sessionId: sessionId, at: Date())
                         liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
-                            ? "已确认发送，等待 ChatGPT 响应…"
-                            : "已确认发送，等待远端响应…"
+                            ? "???????? ChatGPT ???"
+                            : "?????????????"
                     }
                     DiagnosticsLog.shared.record("send_reconciled_delivery", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString])
                     return true
@@ -1629,7 +1629,7 @@ final class WorkspaceStore: ObservableObject {
         guard commandSendsInFlight.insert(commandId).inserted else { return }
         defer { commandSendsInFlight.remove(commandId) }
         guard machine.state == .online else {
-            errors[message.sessionId] = "PC Offline — reconnect before retrying this unknown delivery."
+            errors[message.sessionId] = "PC Offline ? reconnect before retrying this unknown delivery."
             return
         }
         let generation = lifecycleGeneration
@@ -1660,7 +1660,7 @@ final class WorkspaceStore: ObservableObject {
         } catch let error as TransportError where Self.isRecoverableCommandTransportError(error) {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
             commandStates[commandId] = .unknown
-            errors[message.sessionId] = "Windows 已接收或连接刚发生切换，RemoteAI 会继续使用同一个 command ID 查询最终结果，不会重复发送到 ChatGPT。"
+            errors[message.sessionId] = "Windows ????????????RemoteAI ???????? command ID ?????????????? ChatGPT?"
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
             commandStates[commandId] = .failed
@@ -1686,7 +1686,7 @@ final class WorkspaceStore: ObservableObject {
 
     private func performStop(runtimeId: String, instanceId: String, sessionId: String) async -> Bool {
         guard machine.state == .online else {
-            errors[sessionId] = "PC Offline — stop will not be queued blindly."
+            errors[sessionId] = "PC Offline ? stop will not be queued blindly."
             return false
         }
         let generation = lifecycleGeneration
@@ -1731,7 +1731,7 @@ final class WorkspaceStore: ObservableObject {
             payload["model"] = .string(model)
         }
         guard machine.state == .online else {
-            errors[instance.id] = "PC Offline — new sessions are not queued automatically."
+            errors[instance.id] = "PC Offline ? new sessions are not queued automatically."
             return false
         }
         let activeTransport = transport
@@ -2047,16 +2047,16 @@ final class WorkspaceStore: ObservableObject {
             case .pairingRequired:
                 isPaired = false
                 connectionPhase = .pairingExpired
-                errors["connection"] = "Pairing expired / Repair required — scan the current Windows pairing QR code."
+                errors["connection"] = "Pairing expired / Repair required ? scan the current Windows pairing QR code."
                 connectionMonitorTask?.cancel()
                 connectionMonitorTask = nil
             case .offline:
                 desktopAgentConnected = false
                 connectionPhase = .windowsOffline
-                errors["connection"] = "Windows Agent offline — Relay is reachable but the RemoteAI Agent is not online."
+                errors["connection"] = "Windows Agent offline ? Relay is reachable but the RemoteAI Agent is not online."
             case .timeout:
                 connectionPhase = .timedOut
-                errors["connection"] = "Connection timed out — check Relay reachability and the Windows Agent."
+                errors["connection"] = "Connection timed out ? check Relay reachability and the Windows Agent."
             default:
                 connectionPhase = .relayError
                 errors["connection"] = transportError.localizedDescription
@@ -2304,9 +2304,9 @@ final class WorkspaceStore: ObservableObject {
             InstanceDescriptor(id: "codex.linux", runtimeId: "runtime.codex", name: "Linux Codex", subtitle: nil)
         ]
         sessions = [
-            SessionDescriptor(id: "photo-upload", instanceId: "photo", title: "上传性能优化", state: .idle, updatedAt: Date()),
-            SessionDescriptor(id: "photo-ios", instanceId: "photo", title: "手机 APP", state: .idle, updatedAt: Date()),
-            SessionDescriptor(id: "excel-permission", instanceId: "excel", title: "权限测试", state: .idle, updatedAt: Date()),
+            SessionDescriptor(id: "photo-upload", instanceId: "photo", title: "??????", state: .idle, updatedAt: Date()),
+            SessionDescriptor(id: "photo-ios", instanceId: "photo", title: "?? APP", state: .idle, updatedAt: Date()),
+            SessionDescriptor(id: "excel-permission", instanceId: "excel", title: "????", state: .idle, updatedAt: Date()),
             SessionDescriptor(id: "codex6-a", instanceId: "codex.6", title: "Session A", state: .idle, updatedAt: Date())
         ]
     }
@@ -2482,14 +2482,30 @@ final class WorkspaceStore: ObservableObject {
         sortSessionsCanonical()
     }
 
+    private func normalizedWebConversationAlias(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        // ChatGPT can expose the same transient conversation identity both as
+        // "local-chatgpt%3A..." and "local-chatgpt:...". URL/path decoding differs
+        // depending on where the identity came from, so string equality alone can
+        // render one provider chat multiple times. Decode repeatedly but boundedly,
+        // then compare through one canonical case-insensitive identity.
+        var value = trimmed
+        for _ in 0..<2 {
+            guard let decoded = value.removingPercentEncoding, decoded != value else { break }
+            value = decoded
+        }
+        return value.lowercased()
+    }
+
     private func webConversationAlias(from canonicalURL: String?) -> String? {
         guard let canonicalURL,
               let url = URL(string: canonicalURL) else { return nil }
         let parts = url.path.split(separator: "/").map(String.init)
         guard let marker = parts.lastIndex(of: "c"),
               parts.indices.contains(marker + 1) else { return nil }
-        let alias = parts[marker + 1].trimmingCharacters(in: .whitespacesAndNewlines)
-        return alias.isEmpty ? nil : alias
+        return normalizedWebConversationAlias(parts[marker + 1])
     }
 
     private func webProjectBaseId(from alias: String?) -> String? {
@@ -2513,12 +2529,37 @@ final class WorkspaceStore: ObservableObject {
         return leftBase == rightBase
     }
 
+    private func webConversationIdentity(
+        localConversationId: String,
+        conversationAlias: String?,
+        canonicalURL: String?
+    ) -> String {
+        if let alias = normalizedWebConversationAlias(conversationAlias)
+            ?? webConversationAlias(from: canonicalURL) {
+            return "alias:\(alias)"
+        }
+        return "local:\(localConversationId.lowercased())"
+    }
+
+    private func webConversationIdentity(_ row: WebConversationDescriptor) -> String {
+        webConversationIdentity(
+            localConversationId: row.localConversationId,
+            conversationAlias: row.conversationAlias,
+            canonicalURL: row.canonicalUrl
+        )
+    }
+
     /// The complete ChatGPT sidebar snapshot owns membership and pagination, while
     /// durable Windows/phone activity owns the visible recent-activity head. Keep those
     /// authorities separate so reordering never truncates a large Project.
     func displayedProjectConversations(projectAlias: String) -> [WebConversationDescriptor] {
         let providerRows = projectConversationsByAlias[projectAlias, default: []]
-        let providerById = Dictionary(uniqueKeysWithValues: providerRows.map { ($0.localConversationId, $0) })
+        // Do not construct a unique-key Dictionary here. Historical provider snapshots
+        // can legitimately contain two local IDs for the same ChatGPT conversation
+        // identity during a SPA/local->provider ID transition.
+        let providerById = providerRows.reduce(into: [String: WebConversationDescriptor]()) {
+            if $0[$1.localConversationId] == nil { $0[$1.localConversationId] = $1 }
+        }
 
         var activityRows: [(descriptor: WebConversationDescriptor, activityAt: Date)] = []
         var promotedIds = Set<String>()
@@ -2528,7 +2569,11 @@ final class WorkspaceStore: ObservableObject {
             guard let canonicalURL = session.canonicalUrl, !canonicalURL.isEmpty else { continue }
             let sessionAlias = webConversationAlias(from: canonicalURL)
             let prior = providerById[session.id]
-                ?? providerRows.first(where: { sessionAlias != nil && $0.conversationAlias == sessionAlias })
+                ?? providerRows.first(where: {
+                    guard let sessionAlias else { return false }
+                    return normalizedWebConversationAlias($0.conversationAlias) == sessionAlias
+                        || webConversationAlias(from: $0.canonicalUrl) == sessionAlias
+                })
             let active = session.state == .busy || session.state == .waiting
             let activityAt = session.lastActivityAt ?? (active ? session.updatedAt : nil)
 
@@ -2550,7 +2595,10 @@ final class WorkspaceStore: ObservableObject {
                 )
                 activityRows.append((row, activityAt))
                 promotedIds.insert(prior.localConversationId)
-                if let alias = row.conversationAlias { promotedAliases.insert(alias) }
+                if let alias = normalizedWebConversationAlias(row.conversationAlias)
+                    ?? webConversationAlias(from: row.canonicalUrl) {
+                    promotedAliases.insert(alias)
+                }
                 continue
             }
 
@@ -2582,10 +2630,22 @@ final class WorkspaceStore: ObservableObject {
 
         let providerTail = providerRows.filter { row in
             if promotedIds.contains(row.localConversationId) { return false }
-            if let alias = row.conversationAlias, promotedAliases.contains(alias) { return false }
+            if let alias = normalizedWebConversationAlias(row.conversationAlias)
+                ?? webConversationAlias(from: row.canonicalUrl),
+               promotedAliases.contains(alias) {
+                return false
+            }
             return true
         }
-        return activityRows.map { $0.descriptor } + providerTail
+
+        // Final presentation-level identity collapse. This intentionally leaves the
+        // provider backing snapshot untouched (pagination/order authority), but prevents
+        // one chat from rendering several times when Windows and ChatGPT temporarily
+        // disagree about localConversationId or percent-encoded conversationAlias.
+        var seen = Set<String>()
+        return (activityRows.map { $0.descriptor } + providerTail).filter { row in
+            seen.insert(webConversationIdentity(row)).inserted
+        }
     }
 
     @discardableResult
@@ -2613,7 +2673,9 @@ final class WorkspaceStore: ObservableObject {
                 let sessionAlias = webConversationAlias(from: session.canonicalUrl)
                 guard let index = rows.firstIndex(where: { row in
                     row.localConversationId == session.id
-                        || (sessionAlias != nil && row.conversationAlias == sessionAlias)
+                        || (sessionAlias != nil
+                            && (normalizedWebConversationAlias(row.conversationAlias) == sessionAlias
+                                || webConversationAlias(from: row.canonicalUrl) == sessionAlias))
                 }) else {
                     // Missing active rows are exposed by displayedProjectConversations.
                     // Do not mutate the provider-ordered backing snapshot merely because
@@ -3012,11 +3074,11 @@ final class WorkspaceStore: ObservableObject {
                         if suppressEventPresentation {
                             switch event.type {
                             case "GENERATION_STARTED":
-                                coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                                coalescedSessionPresentation[sessionId] = (true, "ChatGPT ?????", event.createdAt)
                             case "MESSAGE_UPDATED" where event.payload["partial"]?.boolValue != false:
-                                coalescedSessionPresentation[sessionId] = (true, "正在生成回答…", event.createdAt)
+                                coalescedSessionPresentation[sessionId] = (true, "???????", event.createdAt)
                             case "TOOL_STARTED", "TOOL_FINISHED":
-                                coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                                coalescedSessionPresentation[sessionId] = (true, "ChatGPT ?????", event.createdAt)
                             case "MESSAGE_ADDED" where event.payload["role"]?.stringValue == "assistant":
                                 coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
                             case "GENERATION_STOPPED" where event.payload["ok"]?.boolValue != false:
@@ -3279,10 +3341,10 @@ final class WorkspaceStore: ObservableObject {
                 // Code Tool, DevSpace-style work, etc. remain visible as compact timeline
                 // rows so the phone still mirrors real desktop work without flooding chat.
                 let displayDetail = completed
-                    ? "回答已生成"
-                    : detail.map(webProcessStatusLabel) ?? "ChatGPT 正在处理…"
+                    ? "?????"
+                    : detail.map(webProcessStatusLabel) ?? "ChatGPT ?????"
                 liveRunStatusBySession[sessionId] = completed
-                    ? "回答已生成，正在确认同步…"
+                    ? "?????????????"
                     : displayDetail
 
                 if completed || isTransientWebProcessDetail(detail) {
@@ -3320,12 +3382,12 @@ final class WorkspaceStore: ObservableObject {
             let message = ChatMessage(id: messageId, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: displayDetail, createdAt: event.createdAt)
             merge([message], into: sessionId)
             try? await cache.upsertMessages([message])
-            liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
+            liveRunStatusBySession[sessionId] = completed ? "\(toolName) ??????????" : "???? \(toolName)?"
         case "GENERATION_STARTED":
             if suppressTransientPresentation { return }
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             setSessionState(sessionId, .busy)
-            liveRunStatusBySession[sessionId] = "ChatGPT 正在处理…"
+            liveRunStatusBySession[sessionId] = "ChatGPT ?????"
             DiagnosticsLog.shared.record("generation_state_applied", fields: [
                 "state": SessionState.busy.rawValue,
                 "sequence": String(event.sequence),
@@ -3351,9 +3413,9 @@ final class WorkspaceStore: ObservableObject {
                 if let message, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     errors[sessionId] = message
                 } else if code == "PROVIDER_RATE_LIMITED" {
-                    errors[sessionId] = "ChatGPT 请求过快，当前会话已被临时限流。本次回答未完成，RemoteAI 没有保存截断内容，请稍后重试。"
+                    errors[sessionId] = "ChatGPT ????????????????????????RemoteAI ???????????????"
                 } else {
-                    errors[sessionId] = "ChatGPT 本次生成未完成（\(code)）。RemoteAI 没有保存截断回答。"
+                    errors[sessionId] = "ChatGPT ????????\(code)??RemoteAI ?????????"
                 }
             } else {
                 flushStreaming(sessionId: sessionId)
@@ -3372,7 +3434,7 @@ final class WorkspaceStore: ObservableObject {
                 let issue: RemoteProviderSurfaceIssue? = degraded ? RemoteProviderSurfaceIssue(
                     code: event.payload["code"]?.stringValue ?? "PROVIDER_UNAVAILABLE",
                     state: event.payload["providerState"]?.stringValue ?? "degraded",
-                    message: event.payload["message"]?.stringValue ?? "ChatGPT 网页当前不可用，RemoteAI 正在等待恢复。",
+                    message: event.payload["message"]?.stringValue ?? "ChatGPT ????????RemoteAI ???????",
                     retryable: event.payload["retryable"]?.boolValue == true,
                     at: event.payload["at"]?.stringValue.flatMap(RemoteAIDate.parse)
                 ) : nil
@@ -3387,16 +3449,16 @@ final class WorkspaceStore: ObservableObject {
                 webBindingDetachedSessions.insert(sessionId)
                 switch reason {
                 case "tabClosed":
-                    recentSystemNotice = "电脑端对应的 ChatGPT 标签页已关闭；RemoteAI 会在需要时重新打开并绑定该会话。"
+                    recentSystemNotice = "?????? ChatGPT ???????RemoteAI ????????????????"
                 case "conversationContextChanged":
-                    recentSystemNotice = "电脑端 ChatGPT 标签页已切换到其他对话；手机当前会话不会跟着串线，RemoteAI 会按原会话身份重新绑定。"
+                    recentSystemNotice = "??? ChatGPT ?????????????????????????RemoteAI ????????????"
                 case "projectContextChanged":
-                    recentSystemNotice = "电脑端 ChatGPT 标签页已切换到其他 Project；手机当前 Project/Chat 身份保持不变。"
+                    recentSystemNotice = "??? ChatGPT ????????? Project????? Project/Chat ???????"
                 default:
-                    recentSystemNotice = "电脑端 ChatGPT 标签页绑定发生变化；RemoteAI 正在重新核对当前会话。"
+                    recentSystemNotice = "??? ChatGPT ??????????RemoteAI ???????????"
                 }
             } else if activeTabId != nil, webBindingDetachedSessions.remove(sessionId) != nil {
-                recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。"
+                recentSystemNotice = "??? ChatGPT ????????????????????"
             }
             await requestMetadataRefresh()
         case "WEB_PAGE_REGISTERED":
@@ -3421,7 +3483,7 @@ final class WorkspaceStore: ObservableObject {
     private func applyWebProviderSurfaceIssue(sessionId: String, issue: RemoteProviderSurfaceIssue?) {
         if let issue {
             let message = issue.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? "ChatGPT 网页当前不可用，RemoteAI 正在等待恢复。"
+                ? "ChatGPT ????????RemoteAI ???????"
                 : issue.message
             let previousMessage = webProviderIssueMessageBySession[sessionId]
             let previousState = webProviderIssueStateBySession[sessionId]
@@ -3451,12 +3513,12 @@ final class WorkspaceStore: ObservableObject {
         if liveRunStatusBySession[sessionId] == previousMessage {
             let currentState = sessions.first(where: { $0.id == sessionId })?.state
             if currentState == .busy || currentState == .waiting {
-                liveRunStatusBySession[sessionId] = "ChatGPT 网页已恢复，正在继续处理…"
+                liveRunStatusBySession[sessionId] = "ChatGPT ?????????????"
             } else {
                 liveRunStatusBySession.removeValue(forKey: sessionId)
             }
         }
-        recentSystemNotice = "电脑端 ChatGPT 网页已恢复；当前会话正在补同步。"
+        recentSystemNotice = "??? ChatGPT ????????????????"
         DiagnosticsLog.shared.record("web_provider_surface_recovered", fields: [
             "session": sessionId,
             "previousState": previousState,
@@ -3476,7 +3538,7 @@ final class WorkspaceStore: ObservableObject {
             if event.state == .online {
                 let recovered = systemTransportOfflineChannels.remove("device-relay") != nil
                 if recovered && !wasOnline {
-                    recentSystemNotice = "手机到 Cloudflare Relay 的连接已恢复；正在核对 Windows Agent 和当前会话。"
+                    recentSystemNotice = "??? Cloudflare Relay ??????????? Windows Agent ??????"
                 }
                 return
             }
@@ -3487,10 +3549,10 @@ final class WorkspaceStore: ObservableObject {
                 connectionPhase = .reconnecting
             }
             if event.state == .offline {
-                errors["connection"] = "Cloudflare Relay 连接已断开，RemoteAI 正在重连；已确认的命令和事件游标会保留。"
-                recentSystemNotice = "手机到 Cloudflare Relay 的连接已断开，正在自动重连。"
+                errors["connection"] = "Cloudflare Relay ??????RemoteAI ????????????????????"
+                recentSystemNotice = "??? Cloudflare Relay ??????????????"
             } else if connectionPhase == .reconnecting {
-                errors["connection"] = "Cloudflare Relay 正在重连；Windows Agent 状态将于 Relay 恢复后重新核对。"
+                errors["connection"] = "Cloudflare Relay ?????Windows Agent ???? Relay ????????"
             }
 
         case .agent:
@@ -3509,22 +3571,22 @@ final class WorkspaceStore: ObservableObject {
                     errors["connection"] = nil
                 }
                 if recovered {
-                    recentSystemNotice = "Windows Agent 已重新连上 Relay，正在补同步当前会话。"
+                    recentSystemNotice = "Windows Agent ????? Relay???????????"
                 }
             case .connecting, .reconnecting:
                 desktopAgentConnected = false
                 systemTransportOfflineChannels.insert("windows-agent")
                 if machine.state != .online { machine.state = .connecting }
                 connectionPhase = .windowsReconnecting
-                errors["connection"] = "Windows Agent 正在重新连接 Relay；手机到 Relay 本身仍保持连接。"
-                recentSystemNotice = "Windows Agent 暂时离线，RemoteAI 正在等待它重新上线；不会把这次状态误报成 Relay 断线。"
+                errors["connection"] = "Windows Agent ?????? Relay???? Relay ????????"
+                recentSystemNotice = "Windows Agent ?????RemoteAI ???????????????????? Relay ???"
             case .offline:
                 desktopAgentConnected = false
                 systemTransportOfflineChannels.insert("windows-agent")
                 machine.state = .offline
                 connectionPhase = .windowsOffline
-                errors["connection"] = "Windows Agent 离线 — 手机仍连接 Cloudflare Relay，将在电脑恢复后自动补同步。"
-                recentSystemNotice = "Windows Agent 已确认离线；Cloudflare Relay 连接仍会保持，电脑恢复后会自动继续。"
+                errors["connection"] = "Windows Agent ?? ? ????? Cloudflare Relay??????????????"
+                recentSystemNotice = "Windows Agent ??????Cloudflare Relay ??????????????????"
             }
         }
     }
@@ -3557,11 +3619,11 @@ final class WorkspaceStore: ObservableObject {
 
         if snapshot.browserConnected == false {
             systemTransportOfflineChannels.insert("browser-bridge")
-            recentSystemNotice = "电脑端 Agent 已连接，但 Browser Bridge 当前离线；手机仍会保持连接并等待浏览器控制恢复。"
+            recentSystemNotice = "??? Agent ????? Browser Bridge ????????????????????????"
         } else if snapshot.browserConnected == true {
             let hadOfflineMarker = systemTransportOfflineChannels.remove("browser-bridge") != nil
             if previousBrowser == false || hadOfflineMarker {
-                recentSystemNotice = "电脑端 Browser Bridge 已恢复，当前会话正在补同步。"
+                recentSystemNotice = "??? Browser Bridge ??????????????"
                 scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "browser-status-recovered")
             }
         }
@@ -3572,19 +3634,19 @@ final class WorkspaceStore: ObservableObject {
         let state = event.payload["state"]?.stringValue?.lowercased() ?? "unknown"
         let label: String
         switch channel {
-        case "browser-bridge": label = "电脑端 Browser Bridge"
-        default: label = "电脑端 Relay"
+        case "browser-bridge": label = "??? Browser Bridge"
+        default: label = "??? Relay"
         }
         let time = event.createdAt.formatted(date: .omitted, time: .standard)
 
         if state == "offline" {
             systemTransportOfflineChannels.insert(channel)
-            recentSystemNotice = "\(label) 于 \(time) 断开，RemoteAI 正在自动恢复连接。"
+            recentSystemNotice = "\(label) ? \(time) ???RemoteAI ?????????"
             DiagnosticsLog.shared.record("remote_transport_offline", fields: ["channel": channel, "at": time], level: "WARN")
             return
         }
         if state == "online", systemTransportOfflineChannels.remove(channel) != nil {
-            recentSystemNotice = "\(label) 已于 \(time) 恢复；刚刚发生过一次断连，当前会话正在补同步。"
+            recentSystemNotice = "\(label) ?? \(time) ???????????????????????"
             DiagnosticsLog.shared.record("remote_transport_recovered", fields: ["channel": channel, "at": time])
             if channel == "browser-bridge" {
                 desktopBrowserConnected = true
@@ -3596,31 +3658,31 @@ final class WorkspaceStore: ObservableObject {
     private func processStatusLabel(for content: String) -> String {
         // This is a status label, not an answer classifier. Do not lowercase and
         // repeatedly scan an ever-growing answer on MainActor for every event.
-        guard content.utf8.count <= 512 else { return "正在生成回答…" }
+        guard content.utf8.count <= 512 else { return "???????" }
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "正在生成回答…" }
+        guard !trimmed.isEmpty else { return "???????" }
         let lower = trimmed.lowercased()
-        if lower == "thinking" || lower.hasPrefix("thinking ") { return "思考中…" }
-        if lower.contains("analyzing image") || lower.contains("analysing image") { return "正在分析图片…" }
-        if lower.contains("generated image ready") || lower.contains("image ready") { return "图片已生成，正在同步…" }
-        if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return "正在生成图片…" }
-        if lower.contains("searching the web") || lower == "searching" { return "正在搜索网页…" }
+        if lower == "thinking" || lower.hasPrefix("thinking ") { return "????" }
+        if lower.contains("analyzing image") || lower.contains("analysing image") { return "???????" }
+        if lower.contains("generated image ready") || lower.contains("image ready") { return "???????????" }
+        if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return "???????" }
+        if lower.contains("searching the web") || lower == "searching" { return "???????" }
         if lower.contains("reading") && trimmed.count < 120 { return trimmed }
         if !trimmed.contains("\n"), trimmed.count <= 80 { return trimmed }
-        return "正在生成回答…"
+        return "???????"
     }
 
     private func webProcessStatusLabel(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "ChatGPT 正在处理…" }
+        guard !trimmed.isEmpty else { return "ChatGPT ?????" }
         let lower = trimmed.lowercased()
-        if lower == "thinking" || lower.hasPrefix("thinking ") { return "思考中…" }
-        if lower.contains("searching") || lower.contains("search the web") { return "正在搜索网页…" }
-        if lower.contains("reading") || lower.contains("browsing") { return "正在读取网页内容…" }
-        if lower.contains("analyzing image") || lower.contains("analysing image") { return "正在分析图片…" }
-        if lower.contains("generated image ready") || lower.contains("image ready") { return "图片已生成，正在同步…" }
-        if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return "正在生成图片…" }
-        if lower.contains("writing") || lower.contains("generating") { return "正在生成回答…" }
+        if lower == "thinking" || lower.hasPrefix("thinking ") { return "????" }
+        if lower.contains("searching") || lower.contains("search the web") { return "???????" }
+        if lower.contains("reading") || lower.contains("browsing") { return "?????????" }
+        if lower.contains("analyzing image") || lower.contains("analysing image") { return "???????" }
+        if lower.contains("generated image ready") || lower.contains("image ready") { return "???????????" }
+        if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return "???????" }
+        if lower.contains("writing") || lower.contains("generating") { return "???????" }
         return trimmed
     }
 
@@ -3637,15 +3699,15 @@ final class WorkspaceStore: ObservableObject {
         if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return true }
         if lower == "generation finished" || lower == "generation complete" { return true }
         if lower.contains("writing") || lower == "generating" || lower.hasPrefix("generating answer") { return true }
-        if trimmed.hasPrefix("思考中")
-            || trimmed.hasPrefix("正在搜索网页")
-            || trimmed.hasPrefix("正在读取网页内容")
-            || trimmed.hasPrefix("正在分析图片")
-            || trimmed.hasPrefix("图片已生成，正在同步")
-            || trimmed.hasPrefix("正在生成图片")
-            || trimmed.hasPrefix("正在生成回答")
-            || trimmed.hasPrefix("ChatGPT 正在处理")
-            || trimmed.hasPrefix("回答已生成") {
+        if trimmed.hasPrefix("???")
+            || trimmed.hasPrefix("??????")
+            || trimmed.hasPrefix("????????")
+            || trimmed.hasPrefix("??????")
+            || trimmed.hasPrefix("??????????")
+            || trimmed.hasPrefix("??????")
+            || trimmed.hasPrefix("??????")
+            || trimmed.hasPrefix("ChatGPT ????")
+            || trimmed.hasPrefix("?????") {
             return true
         }
         return false

@@ -38,8 +38,9 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(partialSuccess.shouldReportError)
     }
 
-    func testInterruptedServerSessionMapsToErrorUntilAuthoritativeRecovery() {
-        XCTAssertEqual(SessionState.server("interrupted"), .error)
+    func testInterruptedServerSessionIsNeutralUntilAuthoritativeRecovery() {
+        XCTAssertEqual(SessionState.server("interrupted"), .idle, "Agent restart recovery markers must not make historical chats look like current provider failures")
+        XCTAssertEqual(SessionState.server("error"), .error)
         XCTAssertEqual(SessionState.server("generating"), .busy)
         XCTAssertEqual(SessionState.server("idle"), .idle)
     }
@@ -248,7 +249,7 @@ final class RemoteAIMobileTests: XCTestCase {
             WebProjectDescriptor(
                 projectAlias: "g-p-order-\(index)",
                 projectId: "id-\(index)",
-                displayName: index.isMultiple(of: 3) ? "项目 \(index)" : "Project \(index)",
+                displayName: index.isMultiple(of: 3) ? "?? \(index)" : "Project \(index)",
                 canonicalUrl: "https://chatgpt.com/g/g-p-order-\(index)/project",
                 lastSeenAt: Date(timeIntervalSince1970: TimeInterval(1_700_000_000 + index)),
                 lastOpenedAt: nil
@@ -975,7 +976,7 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertTrue(store.recentSystemNotice?.contains("Relay") == true)
-        XCTAssertTrue(store.recentSystemNotice?.contains("断开") == true)
+        XCTAssertTrue(store.recentSystemNotice?.contains("??") == true)
 
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
@@ -989,11 +990,11 @@ final class RemoteAIMobileTests: XCTestCase {
             payload: ["channel": .string("relay"), "state": .string("online")],
             createdAt: now.addingTimeInterval(1.2)
         ), deliverLive: true)
-        for _ in 0..<40 where store.recentSystemNotice?.contains("已于") != true {
+        for _ in 0..<40 where store.recentSystemNotice?.contains("??") != true {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
-        XCTAssertTrue(store.recentSystemNotice?.contains("已于") == true)
-        XCTAssertTrue(store.recentSystemNotice?.contains("恢复") == true)
+        XCTAssertTrue(store.recentSystemNotice?.contains("??") == true)
+        XCTAssertTrue(store.recentSystemNotice?.contains("??") == true)
         let recoveredNotice = try XCTUnwrap(store.recentSystemNotice)
         try await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(store.recentSystemNotice, recoveredNotice, "A fast recovered disconnect must remain visible until the user dismisses it")
@@ -1453,6 +1454,42 @@ final class RemoteAIMobileTests: XCTestCase {
             ["seed-2", "seed-0", "seed-1"],
             "A desktop-modified Chat must move to the visible recent-activity head"
         )
+        await store.suspend()
+    }
+
+    @MainActor
+    func testDisplayedProjectConversationsCollapseEncodedAndDecodedConversationAliases() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+
+        let now = Date()
+        store.projectConversationsByAlias["g-p-remoteai"] = [
+            WebConversationDescriptor(
+                localConversationId: "provider-local-id",
+                canonicalUrl: "https://chatgpt.com/g/g-p-remoteai/c/local-chatgpt%3Aabc-123",
+                projectId: "remoteai",
+                displayTitle: "Same chat from provider",
+                projectAlias: "g-p-remoteai",
+                conversationAlias: "local-chatgpt%3Aabc-123",
+                lastVisited: now,
+                updatedAt: now
+            )
+        ]
+        store.sessions.append(SessionDescriptor(
+            id: "activity-local-id",
+            instanceId: "web.chatgpt",
+            title: "Same chat from activity",
+            state: .busy,
+            updatedAt: now.addingTimeInterval(1),
+            projectAlias: "g-p-remoteai",
+            canonicalUrl: "https://chatgpt.com/g/g-p-remoteai/c/local-chatgpt:abc-123",
+            lastActivityAt: now.addingTimeInterval(1)
+        ))
+
+        let rows = store.displayedProjectConversations(projectAlias: "g-p-remoteai")
+        XCTAssertEqual(rows.count, 1, "Percent-encoded and decoded aliases are the same ChatGPT conversation identity")
+        XCTAssertEqual(rows.first?.localConversationId, "provider-local-id", "Prefer the provider-backed row while overlaying live activity")
         await store.suspend()
     }
 
@@ -1968,7 +2005,7 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertTrue(MessageRenderingPolicy.isLarge(huge))
         let inline = MessageRenderingPolicy.inlineText(huge)
         XCTAssertLessThan(inline.utf8.count, 16 * 1024)
-        XCTAssertTrue(inline.contains("长消息已折叠"))
+        XCTAssertTrue(inline.contains("??????"))
         XCTAssertEqual(MessageRenderingPolicy.inlineText("short answer"), "short answer")
     }
 
@@ -1983,7 +2020,7 @@ final class RemoteAIMobileTests: XCTestCase {
     func testRenderCacheReusesUnchangedContentAndInvalidatesStreamingAndTools() {
         let cache = MessageRenderCache()
         var message = ChatMessage(id: "same", sessionId: "long-chat", sequence: 1, role: .assistant, kind: .text,
-                                  text: String(repeating: "日志 abc\n", count: 20_000), toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
+                                  text: String(repeating: "?? abc\n", count: 20_000), toolName: nil, toolStatus: nil, detail: nil, createdAt: Date())
         let first = cache.content(for: message)
         XCTAssertTrue(cache.content(for: message) === first)
         XCTAssertEqual(first.displayText, message.text)
@@ -2046,67 +2083,67 @@ final class RemoteAIMobileTests: XCTestCase {
 
     func testFlattenedWritingEditBlockBecomesOneCopyableSegment() {
         let text = """
-        下面是下一窗口的精确续跑提示词。
+        ????????????????
 
         Edit
 
         @DevSpace
 
-        请实际接管并继续执行项目：
+        ?????????????
 
         D:\\wendangcodex\\boss-helper-low-risk
 
-        这是当前尚未完成的同一 BOSS Production Batch。
+        ??????????? BOSS Production Batch?
         """
         let segments = MessageContentSegment.parse(text)
 
         XCTAssertEqual(segments.count, 2)
         XCTAssertFalse(segments[0].isEditBlock)
-        XCTAssertEqual(segments[0].text.trimmingCharacters(in: .whitespacesAndNewlines), "下面是下一窗口的精确续跑提示词。")
+        XCTAssertEqual(segments[0].text.trimmingCharacters(in: .whitespacesAndNewlines), "????????????????")
         XCTAssertTrue(segments[1].isEditBlock)
         XCTAssertEqual(
             segments[1].text,
-            "@DevSpace\n\n请实际接管并继续执行项目：\n\nD:\\wendangcodex\\boss-helper-low-risk\n\n这是当前尚未完成的同一 BOSS Production Batch。"
+            "@DevSpace\n\n?????????????\n\nD:\\wendangcodex\\boss-helper-low-risk\n\n??????????? BOSS Production Batch?"
         )
     }
 
     func testFlattenedWritingEditBlockWithoutBlankLineAfterLabelIsCopyable() {
         let text = """
-        下面是续跑提示词。
+        ?????????
 
         Edit
         @DevSpace
 
-        请继续当前项目，不要重新开始。
+        ???????????????
         """
         let segments = MessageContentSegment.parse(text)
 
         XCTAssertEqual(segments.count, 2)
         XCTAssertFalse(segments[0].isEditBlock)
         XCTAssertTrue(segments[1].isEditBlock)
-        XCTAssertEqual(segments[1].text, "@DevSpace\n\n请继续当前项目，不要重新开始。")
+        XCTAssertEqual(segments[1].text, "@DevSpace\n\n???????????????")
     }
 
     func testFlattenedContinuationPromptWithoutEditLabelBecomesCopyableBlock() {
         let text = """
-        下面是下一窗口的提示词，请直接复制。
+        ??????????????????
 
-        请继续实际接管：
+        ????????
         D:\\wendangcodex\\RemoteAI-Mobile
 
-        这不是新任务，不要重新诊断。必须以当前真实磁盘、Git 和真机状态为唯一事实源继续。
-        请继续完成 Codex 审计、测试和交付。
+        ????????????????????????Git ??????????????
+        ????? Codex ?????????
         """
         let segments = MessageContentSegment.parse(text)
 
         XCTAssertEqual(segments.count, 1)
         XCTAssertTrue(segments[0].isEditBlock)
-        XCTAssertTrue(segments[0].text.hasPrefix("请继续实际接管："))
+        XCTAssertTrue(segments[0].text.hasPrefix("????????"))
         XCTAssertTrue(segments[0].text.contains("RemoteAI-Mobile"))
     }
 
     func testOrdinaryLongAnswerWithoutEditLabelIsNotMisclassified() {
-        let text = String(repeating: "这是普通说明文字，不包含接管指令或 Codex 续跑要求。", count: 80)
+        let text = String(repeating: "????????????????? Codex ?????", count: 80)
         let segments = MessageContentSegment.parse(text)
 
         XCTAssertFalse(segments.contains(where: \.isEditBlock))
@@ -2176,7 +2213,7 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.suspend()
         await store.loadProjectConversations(projectAlias: "g-p-photo")
         XCTAssertTrue(store.projectConversationsByAlias["g-p-photo", default: []].isEmpty)
-        XCTAssertEqual(store.errors["web.project.g-p-photo"], "PC Offline — connect to Windows to load this Project's conversations.")
+        XCTAssertEqual(store.errors["web.project.g-p-photo"], "PC Offline ? connect to Windows to load this Project's conversations.")
 
         await store.resumeFromForeground()
         XCTAssertEqual(store.machine.state, .online)
@@ -2587,7 +2624,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let serverUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "delivery-committed")
         XCTAssertEqual(serverUserCount, 1)
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "delivery-committed" }.count, 1)
-        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "已确认发送，等待 ChatGPT 响应…")
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "???????? ChatGPT ???")
         let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
         XCTAssertNil(pending)
         await store.suspend()
@@ -2962,7 +2999,7 @@ final class RemoteAIMobileTests: XCTestCase {
             if visible == content { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "正在生成回答…")
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "???????")
         XCTAssertEqual(store.messagesBySession["photo-upload"]?.first(where: { $0.id == "large-stream" })?.text, content)
         XCTAssertEqual(store.sessions.first?.id, "photo-upload")
         await store.suspend()
@@ -3085,12 +3122,12 @@ final class RemoteAIMobileTests: XCTestCase {
         ), deliverLive: true)
 
         for _ in 0..<80 {
-            if store.liveRunStatusBySession["photo-upload"] == "正在读取网页内容…" { break }
+            if store.liveRunStatusBySession["photo-upload"] == "?????????" { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         let rows = store.messagesBySession["photo-upload", default: []].filter { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" }
         XCTAssertTrue(rows.isEmpty, "Generic ChatGPT Web process transitions must stay out of the conversation transcript")
-        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "正在读取网页内容…")
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "?????????")
         let activity = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.lastActivityAt)
         XCTAssertGreaterThanOrEqual(activity, now.addingTimeInterval(2))
         await store.suspend()
@@ -3124,7 +3161,7 @@ final class RemoteAIMobileTests: XCTestCase {
             if store.liveRunStatusBySession["photo-upload"] != nil { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "图片已生成，正在同步…")
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "???????????")
         XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains {
             $0.kind == .toolEvent && $0.toolName == "ChatGPT Web"
         }, "Generated-image browser status should remain a single transient status line")
@@ -3232,7 +3269,7 @@ final class RemoteAIMobileTests: XCTestCase {
                 "state": .string("degraded"),
                 "providerState": .string("connection-lost"),
                 "code": .string("PROVIDER_UNAVAILABLE"),
-                "message": .string("电脑端 ChatGPT 网页连接已中断；Windows Agent 仍在线，RemoteAI 正在等待 ChatGPT 恢复。"),
+                "message": .string("??? ChatGPT ????????Windows Agent ????RemoteAI ???? ChatGPT ???"),
                 "retryable": .bool(true),
                 "at": .string(RemoteAIDate.string(now))
             ],
@@ -3243,7 +3280,7 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
-        XCTAssertEqual(store.errors["photo-upload"], "电脑端 ChatGPT 网页连接已中断；Windows Agent 仍在线，RemoteAI 正在等待 ChatGPT 恢复。")
+        XCTAssertEqual(store.errors["photo-upload"], "??? ChatGPT ????????Windows Agent ????RemoteAI ???? ChatGPT ???")
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "An idle provider outage must not look like an active generation")
 
         await mock.injectEvent(RemoteEvent(
@@ -3269,7 +3306,7 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertNil(store.errors["photo-upload"])
-        XCTAssertTrue(store.recentSystemNotice?.contains("ChatGPT 网页已恢复") == true)
+        XCTAssertTrue(store.recentSystemNotice?.contains("ChatGPT ?????") == true)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
         await store.suspend()
     }
@@ -3298,10 +3335,10 @@ final class RemoteAIMobileTests: XCTestCase {
             ],
             createdAt: now
         ), deliverLive: true)
-        for _ in 0..<80 where store.recentSystemNotice?.contains("不会跟着串线") != true {
+        for _ in 0..<80 where store.recentSystemNotice?.contains("??????") != true {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertTrue(store.recentSystemNotice?.contains("不会跟着串线") == true)
+        XCTAssertTrue(store.recentSystemNotice?.contains("??????") == true)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
 
         await mock.injectEvent(RemoteEvent(
@@ -3319,10 +3356,10 @@ final class RemoteAIMobileTests: XCTestCase {
             ],
             createdAt: now.addingTimeInterval(1)
         ), deliverLive: true)
-        for _ in 0..<80 where store.recentSystemNotice?.contains("已重新绑定") != true {
+        for _ in 0..<80 where store.recentSystemNotice?.contains("?????") != true {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertTrue(store.recentSystemNotice?.contains("已重新绑定") == true)
+        XCTAssertTrue(store.recentSystemNotice?.contains("?????") == true)
         await store.suspend()
     }
 
@@ -3339,15 +3376,15 @@ final class RemoteAIMobileTests: XCTestCase {
         await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1203, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "TOOL_STARTED", payload: ["tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]), "summary": .string("Thinking")], createdAt: now.addingTimeInterval(0.015)), deliverLive: true)
         try await Task.sleep(nanoseconds: 180_000_000)
         XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.role == .assistant && $0.toolStatus == "Streaming" && $0.text == "REMOTEAI_PARTIAL_" })
-        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "思考中…")
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "????")
         XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.kind == .toolEvent && $0.toolName == "ChatGPT Web" })
 
         await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1204, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "TOOL_FINISHED", payload: ["tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]), "summary": .string("Generation finished")], createdAt: now.addingTimeInterval(0.018)), deliverLive: true)
         for _ in 0..<80 {
-            if store.liveRunStatusBySession["photo-upload"] == "回答已生成，正在确认同步…" { break }
+            if store.liveRunStatusBySession["photo-upload"] == "?????????????" { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "回答已生成，正在确认同步…")
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "?????????????")
 
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
