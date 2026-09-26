@@ -1852,6 +1852,61 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testVerifiedStaleProjectCatalogRepairsSameAgeNonSyntheticTitleAndPersistsIt() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)
+        await mock.setProjectConversationTitle(alias: "g-p-remoteai", conversationAlias: "seed-0", title: "test")
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        let accepted = try XCTUnwrap(store.projectConversationsByAlias["g-p-remoteai"]?.first)
+        XCTAssertEqual(accepted.displayTitle, "test")
+
+        // Windows has newer title metadata for the exact same provider identity, but
+        // the live ChatGPT Project DOM is partial so membership/order must stay stale.
+        // A non-placeholder old phone title must still converge when the verified hint
+        // is at least as recent as the accepted descriptor.
+        await mock.setProjectConversationTitle(alias: "g-p-remoteai", conversationAlias: "seed-0", title: "回复数字888")
+        await mock.setScenario(.staleWebCatalog)
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.first?.displayTitle, "回复数字888")
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .staleCache)
+        let cached: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
+        XCTAssertEqual(cached?.first?.displayTitle, "回复数字888", "Title-only convergence must survive a cold app restart")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testOlderVerifiedStaleTitleCannotRegressNewerPhoneMetadata() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)
+        let cache = try SQLiteStore.inMemory()
+        let future = Date().addingTimeInterval(120)
+        let newerPhoneRow = WebConversationDescriptor(
+            localConversationId: "webconv-seed-0",
+            canonicalUrl: "https://chatgpt.com/g/g-p-remoteai/c/seed-0",
+            projectId: nil,
+            displayTitle: "Newer phone title",
+            projectAlias: "g-p-remoteai",
+            conversationAlias: "seed-0",
+            lastVisited: future,
+            updatedAt: future
+        )
+        try await cache.put([newerPhoneRow], key: "web.project.g-p-remoteai.conversations")
+        await mock.setProjectConversationTitle(alias: "g-p-remoteai", conversationAlias: "seed-0", title: "Older Windows title")
+        await mock.setScenario(.staleWebCatalog)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.first?.displayTitle, "Newer phone title")
+        await store.suspend()
+    }
+
+    @MainActor
     func testVerifiedStaleProjectCatalogExpandsPreviouslyTruncatedPhoneCacheWithoutDeletingRows() async throws {
         let mock = MockTransport(historyCount: 1)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 50)

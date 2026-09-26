@@ -2438,9 +2438,17 @@ final class WorkspaceStore: ObservableObject {
         for index in current.indices {
             guard let alias = current[index].conversationAlias,
                   let hint = byAlias[alias],
-                  isSyntheticConversationTitle(current[index].displayTitle, conversationAlias: alias),
                   !isSyntheticConversationTitle(hint.displayTitle, conversationAlias: alias) else { continue }
             let prior = current[index]
+            // A verified Windows stale catalog may carry fresher title metadata for the
+            // exact same conversation even while its membership/order snapshot cannot
+            // safely replace the phone's accepted Project list. Do not freeze an older
+            // non-placeholder title (for example "test") across cold starts. Accept a
+            // different provider-backed title only when it is at least as recent as the
+            // cached row; placeholder titles remain repairable regardless of timestamp.
+            let shouldRepairTitle = isSyntheticConversationTitle(prior.displayTitle, conversationAlias: alias)
+                || (hint.displayTitle != prior.displayTitle && hint.updatedAt >= prior.updatedAt)
+            guard shouldRepairTitle else { continue }
             current[index] = WebConversationDescriptor(
                 localConversationId: prior.localConversationId,
                 canonicalUrl: prior.canonicalUrl,
