@@ -267,10 +267,27 @@ actor CloudflareTransport: Transport {
             return
         }
         guard frame.kind == "ENCRYPTED", let key = PairingKeyStore.sharedKey(machineId: config.machineId, keychain: keychain) else { return }
-        let encrypted = try JSONValue.object(frame.body).decode(EncryptedRelayBody.self)
-        let clear = try PayloadCrypto.decrypt(encrypted, keyData: key, machineId: config.machineId, deviceId: deviceId, messageId: frame.messageId)
-        guard clear.count <= maxInboundFrameBytes else { throw TransportError.frameTooLarge }
-        let payload = try ProtocolSecurity.decodeDecryptedPayload(clear, expectedMachineId: config.machineId)
+        let payload: DecryptedRelayPayload
+        do {
+            let encrypted = try JSONValue.object(frame.body).decode(EncryptedRelayBody.self)
+            let clear = try PayloadCrypto.decrypt(encrypted, keyData: key, machineId: config.machineId, deviceId: deviceId, messageId: frame.messageId)
+            guard clear.count <= maxInboundFrameBytes else { throw TransportError.frameTooLarge }
+            payload = try ProtocolSecurity.decodeDecryptedPayload(clear, expectedMachineId: config.machineId)
+        } catch {
+            // Reliable Relay replay can outlive an app reinstall/pairing epoch or be
+            // left behind when Durable Object storage temporarily degrades. Treat one
+            // authenticated-path ciphertext that cannot be decoded as poisoned backlog,
+            // not as a reason to tear down the healthy WebSocket. ACKing only the exact
+            // relay message removes the poison row; the payload itself is discarded and
+            // therefore cannot mutate local state.
+            guard Self.shouldQuarantineInboundEncryptedFrame(error) else { throw error }
+            await recordDiagnostic("relay_replayed_frame_quarantined", fields: [
+                "messageId": frame.messageId,
+                "errorType": String(describing: type(of: error)),
+            ], level: "WARN")
+            try? await sendRelayDeliveryAck(frame.messageId, direction: "to-device")
+            return
+        }
         let firstDelivery = inboundReplayGuard.accept(frame.messageId)
         // Durable relay frames are retained across 1006 until this device ACKs the
         // exact relay message id. ACK only after the encrypted payload validates; if
@@ -293,6 +310,16 @@ actor CloudflareTransport: Transport {
         }
         if payload.kind == "error", let error = payload.error {
             failAllPending(with: TransportError.remote(error.code, error.message))
+        }
+    }
+
+    static func shouldQuarantineInboundEncryptedFrame(_ error: Error) -> Bool {
+        guard let transportError = error as? TransportError else { return false }
+        switch transportError {
+        case .malformedData, .frameTooLarge:
+            return true
+        default:
+            return false
         }
     }
 
