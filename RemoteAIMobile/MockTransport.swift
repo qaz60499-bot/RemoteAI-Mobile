@@ -41,6 +41,12 @@ actor MockTransport: Transport {
 
     init(scenario: MockScenario = .normal, historyCount: Int = 1200, stressChars: Int = 0, stressChunkDelayMilliseconds: Int = 50) {
         self.scenario = scenario
+        let eventPipe = AsyncStream<RemoteEvent>.makeStream()
+        self.continuation = eventPipe.continuation
+        self.stream = eventPipe.stream
+        let healthPipe = AsyncStream<TransportHealthEvent>.makeStream()
+        self.healthContinuation = healthPipe.continuation
+        self.healthEventStream = healthPipe.stream
         self.stressChars = [10_000, 30_000, 50_000, 100_000, 150_000].contains(stressChars) ? stressChars : 0
         let boundedStressDelay = min(500, max(20, stressChunkDelayMilliseconds))
         self.stressChunkDelayNanoseconds = UInt64(boundedStressDelay) * 1_000_000
