@@ -195,11 +195,41 @@ struct InstanceView: View {
     @State private var createdWebSession: SessionDescriptor?
     @State private var openCreatedWebSession = false
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
+    private var isAntigravity: Bool { runtime.id == "runtime.antigravity" }
+    private var supportsProjects: Bool { isChatGPTWeb || isAntigravity }
     private var visibleProjects: [WebProjectDescriptor] {
         // Cache contains only previously accepted Project snapshots. Render it
         // immediately while the live DOM refresh runs so opening Web never starts with
         // a blank list on a slow account. Legacy/mock rows are purged by WorkspaceStore.
-        store.webProjects
+        if isChatGPTWeb {
+            return store.webProjects
+        }
+        if isAntigravity {
+            var map: [String: (count: Int, lastOpened: Date?)] = [:]
+            for s in store.sessions where s.instanceId == instance.id {
+                if let alias = s.projectAlias, !alias.isEmpty {
+                    let current = map[alias] ?? (count: 0, lastOpened: nil)
+                    let date = s.orderingDate
+                    let maxDate = current.lastOpened.map { max($0, date) } ?? date
+                    map[alias] = (count: current.count + 1, lastOpened: maxDate)
+                }
+            }
+            if map["googleac"] == nil {
+                map["googleac"] = (count: 0, lastOpened: Date())
+            }
+            return map.map { (alias, info) in
+                WebProjectDescriptor(
+                    projectAlias: alias,
+                    projectId: alias,
+                    displayName: alias,
+                    canonicalUrl: nil,
+                    conversationCount: info.count,
+                    lastOpenedAt: info.lastOpened,
+                    lastSeenAt: info.lastOpened
+                )
+            }.sorted { ($0.lastOpenedAt ?? .distantPast) > ($1.lastOpenedAt ?? .distantPast) }
+        }
+        return []
     }
     private var filteredProjects: [WebProjectDescriptor] {
         let query = projectSearch.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -209,9 +239,9 @@ struct InstanceView: View {
 
     var body: some View {
         List {
-            if isChatGPTWeb {
+            if supportsProjects {
                 Section {
-                    Button { newProject = true } label: { Label("新建 ChatGPT Project", systemImage: "folder.badge.plus") }
+                    if isChatGPTWeb { Button { newProject = true } label: { Label("新建 ChatGPT Project", systemImage: "folder.badge.plus") } }
                     TextField("搜索 Project", text: $projectSearch)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled(true)
@@ -241,13 +271,13 @@ struct InstanceView: View {
                         }
                     }
                 } header: {
-                    Text("ChatGPT Projects")
+                    Text(isChatGPTWeb ? "ChatGPT Projects" : "Antigravity Projects")
                 } footer: {
                     Text("点进某个 Project 后才加载该 Project 的历史对话；不会启动时遍历全部历史。")
                 }
                 if let error = store.errors["web.projects"] { Section { ErrorBanner(text: error) { store.clearError(sessionId: "web.projects") } } }
                 Section {
-                    Button {
+                    if isChatGPTWeb { Button {
                         guard !creatingWebChat else { return }
                         creatingWebChat = true
                         Task {
@@ -264,7 +294,7 @@ struct InstanceView: View {
                             Label(creatingWebChat ? "正在新建对话…" : "新建普通 ChatGPT 对话", systemImage: "plus.circle.fill")
                         }
                     }
-                    .disabled(creatingWebChat || store.machine.state != .online)
+                    .disabled(creatingWebChat || store.machine.state != .online) } else { Button { newSession = true } label: { Label("新建普通 Antigravity 对话", systemImage: "plus.circle.fill") } }
                     ForEach(store.sessions.filter { $0.instanceId == instance.id && $0.projectAlias == nil }.sorted { $0.orderingDate > $1.orderingDate }) { session in
                         NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
                     }
@@ -611,11 +641,17 @@ struct ChatView: View {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                                 didInitialScrollToBottom = true
                             }
-                        } else if !userBrowsingHistory {
+                        } else if !userBrowsingHistory || messages.last?.role == .user {
+                            userBrowsingHistory = false
                             withAnimation(.easeOut(duration: 0.18)) {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                             }
                         }
+                    }
+                    .onChange(of: session.id) { _ in
+                        didInitialScrollToBottom = false
+                        userBrowsingHistory = false
+                        isAtBottom = true
                     }
 
                     if didInitialScrollToBottom, !isAtBottom, !messages.isEmpty {
