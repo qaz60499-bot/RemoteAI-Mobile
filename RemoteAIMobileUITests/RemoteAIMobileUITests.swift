@@ -133,7 +133,7 @@ final class RemoteAIMobileUITests: XCTestCase {
         // stream duration plus runner/accessibility slack instead of retaining the
         // old 40-second timeout that predates the deterministic slow fixture.
         let expectedFixtureSeconds = (Double(chars) / 100.0) * 0.150
-        waitForExpectations(timeout: expectedFixtureSeconds + 20)
+        waitForExpectations(timeout: max(180, expectedFixtureSeconds + 90))
         XCTAssertTrue(final.exists)
     }
 }

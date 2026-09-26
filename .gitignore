@@ -23,6 +23,7 @@ pairing-secret*
 
 # Local shell/device artifacts
 NUL
+.delivery/
 
 # macOS
 .DS_Store
