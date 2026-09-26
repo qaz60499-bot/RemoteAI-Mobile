@@ -34,9 +34,20 @@ actor CloudflareTransport: Transport {
     private var agentOnline = false
     private var agentReconnectPending = false
 
-    init(config: RemoteAIConfig, session: URLSession = .shared, keychain: KeychainStore = .shared) {
+    static func relaySessionConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        // Do not inherit a device-wide HTTP/SOCKS proxy for the Relay WebSocket.
+        // A loopback proxy can complete TLS but still tear down upgraded WebSockets,
+        // leaving RemoteAI in an endless reconnect loop. This remains scoped to the
+        // RemoteAI Relay session and does not change other apps or VPN rules.
+        configuration.connectionProxyDictionary = [:]
+        configuration.waitsForConnectivity = true
+        return configuration
+    }
+
+    init(config: RemoteAIConfig, session: URLSession? = nil, keychain: KeychainStore = .shared) {
         self.config = config
-        self.session = session
+        self.session = session ?? URLSession(configuration: Self.relaySessionConfiguration())
         self.keychain = keychain
 
         // Relay may deliver a durable encrypted event immediately after the socket is

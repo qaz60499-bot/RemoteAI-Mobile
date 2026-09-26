@@ -30,4 +30,11 @@ final class CloudflareTransportPoisonReplayTests: XCTestCase {
             )
         )
     }
+
+    func testRelaySessionDoesNotInheritSystemProxy() {
+        let configuration = CloudflareTransport.relaySessionConfiguration()
+        XCTAssertNotNil(configuration.connectionProxyDictionary)
+        XCTAssertTrue(configuration.connectionProxyDictionary?.isEmpty == true)
+        XCTAssertTrue(configuration.waitsForConnectivity)
+    }
 }
