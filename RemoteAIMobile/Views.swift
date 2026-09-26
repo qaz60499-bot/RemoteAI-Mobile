@@ -222,10 +222,10 @@ struct InstanceView: View {
                     projectAlias: alias,
                     projectId: alias,
                     displayName: alias,
-                    canonicalUrl: nil,
-                    conversationCount: info.count,
+                    canonicalUrl: "antigravity://project/\(alias)",
+                    lastSeenAt: info.lastOpened,
                     lastOpenedAt: info.lastOpened,
-                    lastSeenAt: info.lastOpened
+                    // active project
                 )
             }.sorted { ($0.lastOpenedAt ?? .distantPast) > ($1.lastOpenedAt ?? .distantPast) }
         }
