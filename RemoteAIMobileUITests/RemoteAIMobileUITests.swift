@@ -31,7 +31,7 @@ final class RemoteAIMobileUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 3))
         app.staticTexts["上传性能优化"].tap()
         XCTAssertTrue(app.buttons["Attachments"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.buttons["Stop"].exists)
+        XCTAssertFalse(app.buttons["Stop"].exists, "A completed cached conversation must not show Stop")
     }
 
     func testConversationOpensAtLatestAndOffersReturnToBottomAfterBrowsingHistory() throws {
