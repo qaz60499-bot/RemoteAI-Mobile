@@ -1071,6 +1071,9 @@ final class WorkspaceStore: ObservableObject {
             }
             try? await cache.upsertMessages(page.items)
             merge(page.items, into: sessionId)
+            if route.runtimeId == "runtime.web" {
+                await collapseWebTranscriptArtifacts(sessionId: sessionId)
+            }
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: page.items.last?.createdAt ?? Date())
             await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
             if hasMoreBySession[sessionId] != page.hasMore {
@@ -1173,8 +1176,13 @@ final class WorkspaceStore: ObservableObject {
                         : "电脑端任务仍在运行…"
                 }
             } else if snapshot.state == .idle {
+                // getSessionStatus is authoritative recovery evidence. If the live
+                // GENERATION_STOPPED / MESSAGE_ADDED push was lost, do not leave the
+                // old streaming placeholder or "正在生成回答" banner pinned forever.
+                discardStreamingPlaceholder(sessionId: sessionId)
                 if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
                 liveRunActivityAtBySession.removeValue(forKey: sessionId)
+                await settleRunningToolRows(sessionId: sessionId)
             }
             if route.runtimeId == "runtime.web" {
                 // SESSION_STATUS push is the fast path. The authoritative session-status
@@ -3821,6 +3829,134 @@ final class WorkspaceStore: ObservableObject {
     private func flushAllStreaming() {
         for sessionId in Array(streamingBuffers.keys) { flushStreaming(sessionId: sessionId) }
         flushTask = nil
+    }
+
+    private func normalizedWebTranscriptUserText(_ value: String) -> String {
+        var text = value.replacingOccurrences(
+            of: #"\r?\n(?:Worked|Thought)\s+for\s+[^\r\n]+\s*$"#,
+            with: "",
+            options: .regularExpression
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let lines = text.components(separatedBy: .newlines)
+        guard lines.count > 1 else { return text }
+
+        let processPattern = #"^(?:thinking|reasoning|deep thinking|investigat(?:ing|ed)\b|inspect(?:ing|ed)\b|clarif(?:ying|ied)\b|repair(?:ing|ed)\b|fix(?:ing|ed)\b|analy[sz](?:ing|ed)\b|review(?:ing|ed)\b|search(?:ing|ed)\b|read(?:ing)?\b|edit(?:ing|ed)\b|patch(?:ing|ed)\b|test(?:ing|ed)\b|verif(?:ying|ied)\b|validat(?:ing|ed)\b|build(?:ing|t)\b|packag(?:ing|ed)\b|explor(?:ing|ed)\b|assess(?:ing|ed)\b|using tool\b|tool call\b|web search\b|思考|深度思考|分析|检查|调查|澄清|修复|搜索|读取|编辑|测试|验证|构建|打包)(?:\s|$)"#
+        var cut = lines.count
+        for index in 1..<lines.count {
+            let current = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
+            if current.isEmpty { continue }
+            let next = index + 1 < lines.count
+                ? lines[index + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
+            let previousBlank = lines[index - 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let repeatedStatus = !next.isEmpty && current.compare(next, options: .caseInsensitive) == .orderedSame
+            let processLine = current.range(of: processPattern, options: [.regularExpression, .caseInsensitive]) != nil
+            let networkError = current.range(
+                of: #"^A network error occurred\. Please check your connection and try again\.?$"#,
+                options: [.regularExpression, .caseInsensitive]
+            ) != nil
+            if (processLine && (repeatedStatus || previousBlank)) || networkError {
+                cut = index
+                break
+            }
+        }
+        if cut < lines.count {
+            text = lines[..<cut].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text
+    }
+
+    private func collapseWebTranscriptArtifacts(sessionId: String) async {
+        guard var list = messagesBySession[sessionId], !list.isEmpty else { return }
+        var removeIDs = Set<String>()
+
+        // Accessibility-only ChatGPT transcripts can append reasoning duration and
+        // live process labels underneath the user body. Normalize the first contaminated
+        // copy in place, then remove only adjacent duplicates created by the same chrome.
+        // Exact repeated user prompts without any chrome are intentionally preserved.
+        var changedUsers: [ChatMessage] = []
+        var lastKeptUserIndex: Int?
+        var contaminatedUserIDs = Set<String>()
+        for index in list.indices {
+            guard list[index].role == .user else {
+                lastKeptUserIndex = nil
+                continue
+            }
+            let raw = list[index].text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalized = normalizedWebTranscriptUserText(raw)
+            let contaminated = !normalized.isEmpty && normalized != raw
+            if contaminated {
+                list[index].text = normalized
+                contaminatedUserIDs.insert(list[index].id)
+                changedUsers.append(list[index])
+            }
+            if let previousIndex = lastKeptUserIndex {
+                let previous = list[previousIndex]
+                let previousNormalized = normalizedWebTranscriptUserText(previous.text)
+                if !normalized.isEmpty,
+                   previousNormalized == normalized,
+                   previous.attachments.isEmpty,
+                   list[index].attachments.isEmpty,
+                   (contaminated || contaminatedUserIDs.contains(previous.id)) {
+                    removeIDs.insert(list[index].id)
+                    continue
+                }
+            }
+            lastKeptUserIndex = index
+        }
+
+        // A stale accessibility fallback could also surface another chat's short title
+        // as a second adjacent assistant bubble. Restrict cleanup to a title that is
+        // already known in the local session catalog and follows a substantial answer.
+        let otherSessionTitles = Set(sessions
+            .filter { $0.id != sessionId }
+            .map { $0.title.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && $0.count <= 80 })
+        if list.count > 1 {
+            for index in 1..<list.count {
+                let previous = list[index - 1]
+                let current = list[index]
+                guard previous.role == .assistant,
+                      current.role == .assistant,
+                      previous.kind == .text,
+                      current.kind == .text,
+                      previous.toolStatus != "Streaming",
+                      current.toolStatus != "Streaming" else { continue }
+                let previousText = previous.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let currentText = current.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if currentText.count <= 80,
+                   previousText.count >= 160,
+                   otherSessionTitles.contains(currentText) {
+                    removeIDs.insert(current.id)
+                    continue
+                }
+                // Canonical DOM reconciliation can arrive as a longer adjacent row.
+                // Keep only the complete version inside one assistant-only run window.
+                if currentText.count > previousText.count, currentText.hasPrefix(previousText) {
+                    removeIDs.insert(previous.id)
+                } else if previousText.count > currentText.count, previousText.hasPrefix(currentText) {
+                    removeIDs.insert(current.id)
+                }
+            }
+        }
+
+        let persistedUserChanges = changedUsers.filter { !removeIDs.contains($0.id) }
+        if !removeIDs.isEmpty {
+            list.removeAll { removeIDs.contains($0.id) }
+        }
+        guard !removeIDs.isEmpty || !persistedUserChanges.isEmpty else { return }
+        messagesBySession[sessionId] = list
+        if !persistedUserChanges.isEmpty {
+            try? await cache.upsertMessages(persistedUserChanges)
+        }
+        for messageID in removeIDs {
+            try? await cache.deleteMessage(id: messageID)
+        }
+        DiagnosticsLog.shared.record("web_transcript_artifacts_collapsed", fields: [
+            "session": sessionId,
+            "removed": String(removeIDs.count),
+            "normalizedUsers": String(persistedUserChanges.count),
+        ])
     }
 
     private func discardStreamingPlaceholder(sessionId: String) {
