@@ -19,6 +19,7 @@ actor MockTransport: Transport {
     private var history: [String: [ServerMessage]] = [:]
     private var eventLog: [RemoteEvent] = []
     private var sessions: [ServerSession] = []
+    private var sessionStatusOverrides: [String: String] = [:]
     private var webProjects: [WebProjectDescriptor] = []
     private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
@@ -125,6 +126,7 @@ actor MockTransport: Transport {
         await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "GENERATION_STOPPED", payload: [:])
     }
     func setScenario(_ value: MockScenario) { scenario = value }
+    func setSessionStatus(_ sessionId: String, status: String) { sessionStatusOverrides[sessionId] = status }
     func setSequence(_ value: Int64) { sequence = max(0, value) }
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
     func setRequestDelay(action: String, nanoseconds: UInt64) { requestDelayNanoseconds[action] = nanoseconds }
@@ -520,7 +522,7 @@ actor MockTransport: Transport {
             }
             response = success([
                 "sessionId": .string(sessionId),
-                "status": .string(active ? "generating" : (stored?.status ?? "idle")),
+                "status": .string(sessionStatusOverrides[sessionId] ?? (active ? "generating" : (stored?.status ?? "idle"))),
                 "browserConnected": .bool(true),
                 "metadata": .object(metadata)
             ])

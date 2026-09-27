@@ -102,6 +102,26 @@ final class AssistantStreamTests: XCTestCase {
     }
 
     @MainActor
+    func testLateToolFinishedCannotReviveStoppedWebRun() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await mock.injectEvent(event(1201, type: "GENERATION_STARTED", payload: [:]), deliverLive: true)
+        await mock.injectEvent(event(1202, type: "TOOL_STARTED", payload: ["tool": .string("ChatGPT Web"), "summary": .string("Thinking")]), deliverLive: true)
+        await mock.injectEvent(event(1203, type: "GENERATION_STOPPED", payload: ["ok": .bool(true), "confirmedIdle": .bool(true)]), deliverLive: true)
+        await mock.injectEvent(event(1204, type: "TOOL_FINISHED", payload: ["tool": .string("ChatGPT Web"), "summary": .string("Generation finished")]), deliverLive: true)
+        for _ in 0..<100 {
+            if (try? await cache.lastSequence()) == 1204 { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.toolStatus == "Running" })
+        await store.suspend()
+    }
+
+    @MainActor
     func testOnlineQuietSocketDetectsMissingFinalAndRecoversWithoutReconnect() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 1)

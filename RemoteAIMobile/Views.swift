@@ -544,7 +544,8 @@ struct ChatView: View {
         currentSession.lastProgressAt ?? currentSession.lastActivityAt
     }
     private var isGenerating: Bool {
-        currentSessionState == .busy
+        if currentSessionState == .error { return false }
+        return currentSessionState == .busy
             || currentSessionState == .waiting
             || store.liveRunStatusBySession[session.id] != nil
     }
@@ -679,7 +680,7 @@ struct ChatView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) { VStack(spacing: 1) { Text(instance.name).font(.subheadline.weight(.semibold)); Text(session.title).font(.caption2).foregroundColor(.secondary); Text(store.machine.state.rawValue).font(.caption2).foregroundColor(store.machine.state == .online ? .green : .secondary) } }
-            ToolbarItem(placement: .navigationBarTrailing) { if store.machine.state == .online { Button("Stop") { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } }.font(.caption) } }
+            ToolbarItem(placement: .navigationBarTrailing) { if store.machine.state == .online && isGenerating { Button("Stop") { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } }.font(.caption) } }
         }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {

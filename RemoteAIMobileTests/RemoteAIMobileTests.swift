@@ -3503,6 +3503,29 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testWebErrorStatusPollClearsMissedTerminalRunPresentation() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: 1201, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: "GENERATION_STARTED", payload: [:], createdAt: now), deliverLive: true)
+        for _ in 0..<80 where store.liveRunStatusBySession["photo-upload"] == nil {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+
+        await mock.setSessionStatus("photo-upload", status: "error")
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .error)
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.toolStatus == "Streaming" })
+        await store.suspend()
+    }
+
+    @MainActor
     func testVisibleSessionSynchronizationRecoversMissedLiveAssistantWithoutReopen() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)

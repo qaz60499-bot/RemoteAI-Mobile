@@ -18,6 +18,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var liveRunStatusBySession: [String: String] = [:]
     @Published private(set) var deltaRecoveryDisplayMessagesBySession: [String: [ChatMessage]]? = nil
     private var liveRunActivityAtBySession: [String: Date] = [:]
+    private var terminalWebRuns = Set<String>()
     @Published var hasLoadedWebProjects = false
     @Published var attachmentTransferBySession: [String: AttachmentTransferProgress] = [:]
     @Published var commandStates: [UUID: CommandState] = [:]
@@ -251,6 +252,7 @@ final class WorkspaceStore: ObservableObject {
             projectConversationLoadingByAlias.removeAll()
             liveRunStatusBySession.removeAll()
             liveRunActivityAtBySession.removeAll()
+            terminalWebRuns.removeAll()
             webProjectsSnapshotId = nil
             projectConversationSnapshotIds.removeAll()
             lastWebProjectsRefreshAt = nil
@@ -1073,6 +1075,15 @@ final class WorkspaceStore: ObservableObject {
             merge(page.items, into: sessionId)
             if route.runtimeId == "runtime.web" {
                 await collapseWebTranscriptArtifacts(sessionId: sessionId)
+                // A successful authoritative history read proves that this exact web
+                // conversation is available again, even if the WEB_BINDING_CHANGED
+                // recovery push was missed while the phone was backgrounded. Do not
+                // leave an old "switched Project/conversation" banner pinned forever.
+                if webBindingDetachedSessions.remove(sessionId) != nil,
+                   (recentSystemNotice?.contains("ChatGPT 标签页") == true
+                       || recentSystemNotice?.contains("标签页绑定") == true) {
+                    recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机已补同步最新状态。"
+                }
             }
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: page.items.last?.createdAt ?? Date())
             await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
@@ -1105,6 +1116,7 @@ final class WorkspaceStore: ObservableObject {
 
     private func refreshVisibleSessionStatus(_ sessionId: String) async -> RemoteSessionStatusSnapshot? {
         guard let route = routeForSession(sessionId), machine.state == .online, !isSuspended else { return nil }
+        let requestStartedAt = Date()
         do {
             let snapshot = try await transport.sessionStatus(
                 machineId: machine.id,
@@ -1117,7 +1129,12 @@ final class WorkspaceStore: ObservableObject {
             let remoteEvidenceAt = [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
             let staleIdleSnapshot: Bool
             if snapshot.state == .idle, let liveActivityAt {
-                staleIdleSnapshot = remoteEvidenceAt.map { $0 < liveActivityAt } ?? true
+                // A Web idle poll started after the last live frame is authoritative.
+                // Agent progress timestamps may remain older than that frame when the
+                // terminal push was missed, so they cannot veto this recovery read.
+                staleIdleSnapshot = route.runtimeId == "runtime.web"
+                    ? liveActivityAt > requestStartedAt
+                    : (remoteEvidenceAt.map { $0 < liveActivityAt } ?? true)
             } else {
                 staleIdleSnapshot = false
             }
@@ -1157,6 +1174,7 @@ final class WorkspaceStore: ObservableObject {
                 return nil
             }
             if snapshot.state == .busy || snapshot.state == .waiting {
+                if route.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
                 let activeAt = snapshot.lastProgressAt ?? snapshot.lastActivityAt ?? Date()
                 markLiveRunActivity(sessionId: sessionId, at: activeAt)
                 if route.runtimeId == "runtime.web" {
@@ -1175,13 +1193,14 @@ final class WorkspaceStore: ObservableObject {
                         ? "电脑端 ChatGPT 仍在运行…"
                         : "电脑端任务仍在运行…"
                 }
-            } else if snapshot.state == .idle {
+            } else if snapshot.state == .idle || snapshot.state == .error {
+                if route.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
                 // getSessionStatus is authoritative recovery evidence. If the live
                 // GENERATION_STOPPED / MESSAGE_ADDED push was lost, do not leave the
                 // old streaming placeholder or "正在生成回答" banner pinned forever.
                 discardStreamingPlaceholder(sessionId: sessionId)
                 if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
-                liveRunActivityAtBySession.removeValue(forKey: sessionId)
+                clearLiveRunActivity(sessionId: sessionId)
                 await settleRunningToolRows(sessionId: sessionId)
             }
             if route.runtimeId == "runtime.web" {
@@ -1832,6 +1851,7 @@ final class WorkspaceStore: ObservableObject {
         projectConversationSnapshotStateByAlias.removeAll()
         projectConversationLoadingByAlias.removeAll()
         liveRunStatusBySession.removeAll()
+        terminalWebRuns.removeAll()
         liveRunActivityAtBySession.removeAll()
         webProviderIssueMessageBySession.removeAll()
         webProviderIssueStateBySession.removeAll()
@@ -3116,7 +3136,9 @@ final class WorkspaceStore: ObservableObject {
                             case "MESSAGE_UPDATED" where event.payload["partial"]?.boolValue != false:
                                 coalescedSessionPresentation[sessionId] = (true, "正在生成回答…", event.createdAt)
                             case "TOOL_STARTED", "TOOL_FINISHED":
-                                coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                                if coalescedSessionPresentation[sessionId]?.active != false {
+                                    coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                                }
                             case "MESSAGE_ADDED" where event.payload["role"]?.stringValue == "assistant":
                                 coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
                             case "GENERATION_STOPPED" where event.payload["ok"]?.boolValue != false:
@@ -3205,7 +3227,7 @@ final class WorkspaceStore: ObservableObject {
         let runEventTypes = ["MESSAGE_UPDATED", "MESSAGE_ADDED", "TOOL_STARTED", "TOOL_FINISHED", "GENERATION_STARTED", "GENERATION_STOPPED"]
         let sessionCatalogMutatingEventTypes = Set(runEventTypes + [
             "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS",
-            "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED",
+            "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED", "MESSAGE_REMOVED",
         ])
         if sessionCatalogMutatingEventTypes.contains(event.type) {
             // A listSessions request that started before this live event is stale by
@@ -3262,7 +3284,13 @@ final class WorkspaceStore: ObservableObject {
         }
 
         switch event.type {
+        case "MESSAGE_REMOVED":
+            if let messageID = event.payload["messageId"]?.stringValue {
+                messagesBySession[sessionId]?.removeAll { $0.id == messageID }
+                try? await cache.deleteMessage(id: messageID)
+            }
         case "MESSAGE_UPDATED" where event.payload["partial"]?.boolValue != false || event.payload["messageId"]?.stringValue == nil:
+            if event.runtimeId == "runtime.web", terminalWebRuns.contains(sessionId) { return }
             let content: String
             if let delta = event.payload["contentDelta"]?.stringValue {
                 guard let streamId = event.payload["streamId"]?.stringValue,
@@ -3320,6 +3348,7 @@ final class WorkspaceStore: ObservableObject {
             if let server = try? JSONValue.object(event.payload).decode(ServerMessage.self) {
                 let base = server.chatMessage
                 if base.role == .assistant {
+                    if event.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
                     if let stream = assistantStreams[sessionId] {
                         let reconciledAt = StreamPerformance.now
                         let canonicalEqual = stream.text == base.text
@@ -3357,6 +3386,10 @@ final class WorkspaceStore: ObservableObject {
             // remains authoritative, while suppressing this UI-only work avoids dozens
             // of ObservableObject invalidations when reconnecting after a short gap.
             if suppressTransientPresentation { return }
+            if event.runtimeId == "runtime.web", terminalWebRuns.contains(sessionId) {
+                await settleRunningToolRows(sessionId: sessionId, toolName: "ChatGPT Web")
+                return
+            }
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             let completed = event.type == "TOOL_FINISHED"
             if !completed { setSessionState(sessionId, .busy) }
@@ -3422,6 +3455,7 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.upsertMessages([message])
             liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
         case "GENERATION_STARTED":
+            if event.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
             if suppressTransientPresentation { return }
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             setSessionState(sessionId, .busy)
@@ -3431,6 +3465,7 @@ final class WorkspaceStore: ObservableObject {
                 "sequence": String(event.sequence),
             ])
         case "GENERATION_STOPPED":
+            if event.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
             if event.payload["ok"]?.boolValue == false {
                 // A provider can terminate a Web generation after exposing only a DOM
                 // prefix (for example when ChatGPT shows a strong rate-limit banner).
@@ -3506,6 +3541,10 @@ final class WorkspaceStore: ObservableObject {
             // on the phone immediately instead of waiting for generation completion or
             // a later Project DOM scan.
             await applyWebPageRegistrationEvent(event, sessionId: sessionId, suppressPresentation: suppressTransientPresentation)
+            if event.payload["activeTabId"]?.intValue != nil,
+               webBindingDetachedSessions.remove(sessionId) != nil {
+                recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。"
+            }
             await requestMetadataRefresh()
         case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "WEB_PAGE_UNREGISTERED":
             await requestMetadataRefresh()
@@ -3753,6 +3792,7 @@ final class WorkspaceStore: ObservableObject {
         guard !trimmed.isEmpty else { return true }
         let lower = trimmed.lowercased()
         if lower == "thinking" || lower.hasPrefix("thinking ") { return true }
+        if lower.hasPrefix("loading older messages") || lower == "stopped thinking" { return true }
         if lower.contains("searching") || lower.contains("search the web") { return true }
         if lower.contains("reading") || lower.contains("browsing") { return true }
         if lower.contains("analyzing image") || lower.contains("analysing image") { return true }
@@ -3852,7 +3892,7 @@ final class WorkspaceStore: ObservableObject {
             let repeatedStatus = !next.isEmpty && current.compare(next, options: .caseInsensitive) == .orderedSame
             let processLine = current.range(of: processPattern, options: [.regularExpression, .caseInsensitive]) != nil
             let networkError = current.range(
-                of: #"^(?:A network error occurred\. Please check your connection and try again\.?|Our systems are thinking a bit more about this request before responding\.?|Resume stream unavailable|(?:Worked|Thought)\s+for\s+[.…]+)$"#,
+                of: #"^(?:A network error occurred\. Please check your connection and try again\.?|Our systems are thinking a bit more about this request before responding\.?|Resume stream unavailable|Stopped thinking|Loading older messages[.…]*|(?:Worked|Thought)\s+for\s+[.…]+)$"#,
                 options: [.regularExpression, .caseInsensitive]
             ) != nil
             if (processLine && (repeatedStatus || previousBlank)) || networkError {
@@ -4049,6 +4089,7 @@ final class WorkspaceStore: ObservableObject {
         }
 
         discardStreamingPlaceholder(sessionId: sessionId)
+        terminalWebRuns.insert(sessionId)
         if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
         clearLiveRunActivity(sessionId: sessionId)
         setSessionState(sessionId, .idle)
