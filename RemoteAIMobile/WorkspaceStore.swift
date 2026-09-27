@@ -3840,7 +3840,7 @@ final class WorkspaceStore: ObservableObject {
         let lines = text.components(separatedBy: .newlines)
         guard lines.count > 1 else { return text }
 
-        let processPattern = #"^(?:thinking|reasoning|deep thinking|investigat(?:ing|ed)\b|inspect(?:ing|ed)\b|clarif(?:ying|ied)\b|repair(?:ing|ed)\b|fix(?:ing|ed)\b|analy[sz](?:ing|ed)\b|review(?:ing|ed)\b|search(?:ing|ed)\b|read(?:ing)?\b|edit(?:ing|ed)\b|patch(?:ing|ed)\b|test(?:ing|ed)\b|verif(?:ying|ied)\b|validat(?:ing|ed)\b|build(?:ing|t)\b|packag(?:ing|ed)\b|explor(?:ing|ed)\b|assess(?:ing|ed)\b|using tool\b|tool call\b|web search\b|思考|深度思考|分析|检查|调查|澄清|修复|搜索|读取|编辑|测试|验证|构建|打包)(?:\s|$)"#
+        let processPattern = #"^(?:thinking|reasoning|deep thinking|investigat(?:ing|ed)\b|inspect(?:ing|ed)\b|clarif(?:ying|ied)\b|repair(?:ing|ed)\b|fix(?:ing|ed)\b|continu(?:ing|ed)\b|resum(?:ing|ed)\b|analy[sz](?:ing|ed)\b|review(?:ing|ed)\b|search(?:ing|ed)\b|read(?:ing)?\b|edit(?:ing|ed)\b|patch(?:ing|ed)\b|test(?:ing|ed)\b|verif(?:ying|ied)\b|validat(?:ing|ed)\b|build(?:ing|t)\b|packag(?:ing|ed)\b|explor(?:ing|ed)\b|assess(?:ing|ed)\b|using tool\b|tool call\b|web search\b|思考|深度思考|分析|检查|调查|澄清|修复|搜索|读取|编辑|测试|验证|构建|打包)(?:\s|$)"#
         var cut = lines.count
         for index in 1..<lines.count {
             let current = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3852,7 +3852,7 @@ final class WorkspaceStore: ObservableObject {
             let repeatedStatus = !next.isEmpty && current.compare(next, options: .caseInsensitive) == .orderedSame
             let processLine = current.range(of: processPattern, options: [.regularExpression, .caseInsensitive]) != nil
             let networkError = current.range(
-                of: #"^A network error occurred\. Please check your connection and try again\.?$"#,
+                of: #"^(?:A network error occurred\. Please check your connection and try again\.?|Our systems are thinking a bit more about this request before responding\.?|Resume stream unavailable|(?:Worked|Thought)\s+for\s+[.…]+)$"#,
                 options: [.regularExpression, .caseInsensitive]
             ) != nil
             if (processLine && (repeatedStatus || previousBlank)) || networkError {
