@@ -1129,12 +1129,11 @@ final class WorkspaceStore: ObservableObject {
             let remoteEvidenceAt = [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
             let staleIdleSnapshot: Bool
             if snapshot.state == .idle, let liveActivityAt {
-                // A Web idle poll started after the last live frame is authoritative.
-                // Agent progress timestamps may remain older than that frame when the
-                // terminal push was missed, so they cannot veto this recovery read.
-                staleIdleSnapshot = route.runtimeId == "runtime.web"
-                    ? liveActivityAt > requestStartedAt
-                    : (remoteEvidenceAt.map { $0 < liveActivityAt } ?? true)
+                // A poll that began before a newer live frame, or whose remote activity
+                // evidence predates that frame, cannot end the newer run. History will
+                // still settle a missed terminal once its final answer is visible.
+                staleIdleSnapshot = liveActivityAt > requestStartedAt
+                    || (remoteEvidenceAt.map { $0 < liveActivityAt } ?? true)
             } else {
                 staleIdleSnapshot = false
             }
