@@ -3386,13 +3386,7 @@ final class WorkspaceStore: ObservableObject {
             // remains authoritative, while suppressing this UI-only work avoids dozens
             // of ObservableObject invalidations when reconnecting after a short gap.
             if suppressTransientPresentation { return }
-            if event.runtimeId == "runtime.web", terminalWebRuns.contains(sessionId) {
-                await settleRunningToolRows(sessionId: sessionId, toolName: "ChatGPT Web")
-                return
-            }
-            markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             let completed = event.type == "TOOL_FINISHED"
-            if !completed { setSessionState(sessionId, .busy) }
             let toolValue = event.payload["tool"]
             let toolObject = toolValue?.objectValue
             let rawToolName = toolValue?.stringValue ?? toolObject?["name"]?.stringValue ?? toolObject?["type"]?.stringValue ?? "Tool"
@@ -3403,6 +3397,13 @@ final class WorkspaceStore: ObservableObject {
             case "web_search": toolName = "Web Search"
             default: toolName = rawToolName
             }
+            let terminalWebRun = event.runtimeId == "runtime.web" && terminalWebRuns.contains(sessionId)
+            if terminalWebRun && (!completed || rawToolName == "ChatGPT Web") {
+                await settleRunningToolRows(sessionId: sessionId, toolName: toolName)
+                return
+            }
+            if !terminalWebRun { markLiveRunActivity(sessionId: sessionId, at: event.createdAt) }
+            if !completed { setSessionState(sessionId, .busy) }
             let detail = event.payload["summary"]?.stringValue
                 ?? toolObject?["summary"]?.stringValue
                 ?? event.payload["provider"]?.stringValue
@@ -3453,7 +3454,9 @@ final class WorkspaceStore: ObservableObject {
             let message = ChatMessage(id: messageId, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: displayDetail, createdAt: event.createdAt)
             merge([message], into: sessionId)
             try? await cache.upsertMessages([message])
-            liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
+            if !terminalWebRun {
+                liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
+            }
         case "GENERATION_STARTED":
             if event.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
             if suppressTransientPresentation { return }
