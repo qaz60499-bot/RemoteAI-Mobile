@@ -3895,8 +3895,8 @@ final class WorkspaceStore: ObservableObject {
                 let previousNormalized = normalizedWebTranscriptUserText(previous.text)
                 if !normalized.isEmpty,
                    previousNormalized == normalized,
-                   previous.attachments.isEmpty,
-                   list[index].attachments.isEmpty,
+                   (previous.attachments ?? []).isEmpty,
+                   (list[index].attachments ?? []).isEmpty,
                    (contaminated || contaminatedUserIDs.contains(previous.id)) {
                     removeIDs.insert(list[index].id)
                     continue
