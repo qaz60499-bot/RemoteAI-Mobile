@@ -3910,7 +3910,7 @@ final class WorkspaceStore: ObservableObject {
 
     private func collapseWebTranscriptArtifacts(sessionId: String) async {
         guard var list = messagesBySession[sessionId], !list.isEmpty else { return }
-        var removeIDs = Set<String>()
+        var removeIDs = Self.adjacentExactWebAssistantDuplicateIDs(list)
 
         // Accessibility-only ChatGPT transcripts can append reasoning duration and
         // live process labels underneath the user body. Normalize the first contaminated
@@ -4140,6 +4140,31 @@ final class WorkspaceStore: ObservableObject {
         }) else { return }
         messagesBySession[sessionId]?.removeAll { $0.id == optimistic.id }
         try? await cache.deleteMessage(id: optimistic.id)
+    }
+
+    static func adjacentExactWebAssistantDuplicateIDs(_ messages: [ChatMessage]) -> Set<String> {
+        guard messages.count > 1 else { return [] }
+        var removeIDs = Set<String>()
+        for index in 1..<messages.count {
+            let previous = messages[index - 1]
+            let current = messages[index]
+            guard previous.role == .assistant,
+                  current.role == .assistant,
+                  previous.kind == .text,
+                  current.kind == .text,
+                  previous.toolStatus != "Streaming",
+                  current.toolStatus != "Streaming" else { continue }
+            let previousText = previous.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let currentText = current.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !previousText.isEmpty,
+                  previousText == currentText,
+                  (previous.attachments ?? []) == (current.attachments ?? []) else { continue }
+            // The provider can re-materialize the same final answer under a new DOM
+            // message id after reconnect/history reconciliation. Keep the newest
+            // canonical row; a real repeated answer would have a user turn between it.
+            removeIDs.insert(previous.id)
+        }
+        return removeIDs
     }
 
     static func staleAntigravityAssistantIDs(local: [ChatMessage], authoritative: [ChatMessage]) -> Set<String> {

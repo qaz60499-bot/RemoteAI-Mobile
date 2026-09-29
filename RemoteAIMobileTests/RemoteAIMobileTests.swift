@@ -2051,6 +2051,21 @@ final class RemoteAIMobileTests: XCTestCase {
         )
     }
 
+    func testWebTranscriptReconciliationCollapsesOnlyAdjacentExactAssistantDuplicates() {
+        let base = Date(timeIntervalSince1970: 1_790_167_600)
+        let rows = [
+            ChatMessage(id: "a-old", sessionId: "web", sequence: 10, role: .assistant, kind: .text, text: "same final", toolName: nil, toolStatus: nil, detail: nil, createdAt: base),
+            ChatMessage(id: "a-new", sessionId: "web", sequence: 11, role: .assistant, kind: .text, text: "same final", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(1)),
+            ChatMessage(id: "user", sessionId: "web", sequence: 12, role: .user, kind: .text, text: "again", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(2)),
+            ChatMessage(id: "a-legit", sessionId: "web", sequence: 13, role: .assistant, kind: .text, text: "same final", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(3)),
+        ]
+
+        XCTAssertEqual(
+            WorkspaceStore.adjacentExactWebAssistantDuplicateIDs(rows),
+            Set(["a-old"])
+        )
+    }
+
     func testLongMessageRenderingPolicyKeepsChatRowsBounded() {
         let huge = String(repeating: "RemoteAI diagnostics line\n", count: 8_000)
         XCTAssertTrue(MessageRenderingPolicy.isLarge(huge))
