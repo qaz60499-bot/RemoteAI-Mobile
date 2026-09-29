@@ -2051,6 +2051,7 @@ final class RemoteAIMobileTests: XCTestCase {
         )
     }
 
+    @MainActor
     func testWebTranscriptReconciliationCollapsesOnlyAdjacentExactAssistantDuplicates() {
         let base = Date(timeIntervalSince1970: 1_790_167_600)
         let rows = [
