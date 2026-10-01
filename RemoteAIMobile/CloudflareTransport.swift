@@ -31,6 +31,7 @@ actor CloudflareTransport: Transport {
     private var heartbeatTask: Task<Void, Never>?
     private var agentOfflineTask: Task<Void, Never>?
     private var awaitingPongMessageId: String?
+    private var lastInboundFrameAt: Date?
     private var agentOnline = false
     private var agentReconnectPending = false
 
@@ -41,7 +42,7 @@ actor CloudflareTransport: Transport {
         // leaving RemoteAI in an endless reconnect loop. This remains scoped to the
         // RemoteAI Relay session and does not change other apps or VPN rules.
         configuration.connectionProxyDictionary = [:]
-        configuration.waitsForConnectivity = true
+        configuration.waitsForConnectivity = false
         return configuration
     }
 
@@ -105,6 +106,7 @@ actor CloudflareTransport: Transport {
             let relayAgentOnline = try await waitForRelayReady(task, deviceId: deviceId)
             guard socket === task else { throw TransportError.disconnected }
             connected = true
+            lastInboundFrameAt = Date()
             agentOnline = relayAgentOnline
             agentReconnectPending = false
             agentOfflineTask?.cancel()
@@ -141,6 +143,7 @@ actor CloudflareTransport: Transport {
         agentOfflineTask?.cancel()
         agentOfflineTask = nil
         awaitingPongMessageId = nil
+        lastInboundFrameAt = nil
         let active = socket
         socket = nil
         active?.cancel(with: .goingAway, reason: nil)
@@ -163,7 +166,7 @@ actor CloudflareTransport: Transport {
             return replayed
         }
         guard connected, socket != nil else { throw TransportError.offline }
-        guard agentOnline else { throw TransportError.offline }
+        guard agentOnline || command.action == "getStatus" else { throw TransportError.offline }
         guard pending[command.commandId] == nil else { throw TransportError.replayDetected }
         let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
         guard let key = PairingKeyStore.sharedKey(machineId: config.machineId, keychain: keychain) else { throw TransportError.pairingRequired }
@@ -222,6 +225,7 @@ actor CloudflareTransport: Transport {
         try ProtocolSecurity.validate(frame, expectedMachineId: config.machineId)
         if frame.kind == "ACK" {
             guard frame.deviceId == nil || frame.deviceId == deviceId else { throw TransportError.malformedData }
+            lastInboundFrameAt = Date()
             if let code = frame.body["error"]?.stringValue {
                 let message = frame.body["message"]?.stringValue ?? "Windows rejected this device."
                 if code == "UNAUTHORIZED_DEVICE" {
@@ -269,6 +273,7 @@ actor CloudflareTransport: Transport {
             return
         }
         try ProtocolSecurity.validate(frame, expectedMachineId: config.machineId, expectedDeviceId: deviceId)
+        lastInboundFrameAt = Date()
         if frame.kind == "PING" {
             try await sendFrame(RelayFrame(v: 1, kind: "PONG", machineId: config.machineId, deviceId: deviceId, messageId: frame.messageId, body: ["at": .number(Date().timeIntervalSince1970 * 1000)]))
             return
@@ -350,6 +355,7 @@ actor CloudflareTransport: Transport {
                 let deviceId = try PairingKeyStore.deviceId(keychain: keychain)
                 let messageId = UUID().uuidString
                 awaitingPongMessageId = messageId
+                let pingSentAt = Date()
                 try await sendFrame(RelayFrame(
                     v: 1,
                     kind: "PING",
@@ -360,10 +366,23 @@ actor CloudflareTransport: Transport {
                 ))
                 try? await Task.sleep(nanoseconds: heartbeatTimeoutNanoseconds)
                 guard !Task.isCancelled, connected, socket === activeSocket else { return }
-                if awaitingPongMessageId == messageId {
+                if Self.shouldReconnectAfterHeartbeatTimeout(
+                    awaitingPongMessageId: awaitingPongMessageId,
+                    expectedMessageId: messageId,
+                    lastInboundFrameAt: lastInboundFrameAt,
+                    pingSentAt: pingSentAt
+                ) {
                     await recordDiagnostic("relay_heartbeat_timeout", fields: ["messageId": messageId], level: "WARN")
                     closeActiveSocket(activeSocket, pendingError: TransportError.disconnected)
                     return
+                }
+                if awaitingPongMessageId == messageId {
+                    // Any authenticated inbound Relay traffic after this ping proves
+                    // the WebSocket is alive even if an optional PONG was delayed or
+                    // skipped. Mirror the Windows transport behavior and avoid turning
+                    // an active stream into a false reconnect cycle.
+                    awaitingPongMessageId = nil
+                    await recordDiagnostic("relay_heartbeat_satisfied_by_inbound_traffic", fields: ["messageId": messageId])
                 }
             } catch {
                 guard connected, socket === activeSocket else { return }
@@ -372,6 +391,17 @@ actor CloudflareTransport: Transport {
                 return
             }
         }
+    }
+
+    static func shouldReconnectAfterHeartbeatTimeout(
+        awaitingPongMessageId: String?,
+        expectedMessageId: String,
+        lastInboundFrameAt: Date?,
+        pingSentAt: Date
+    ) -> Bool {
+        guard awaitingPongMessageId == expectedMessageId else { return false }
+        if let lastInboundFrameAt, lastInboundFrameAt > pingSentAt { return false }
+        return true
     }
 
     private func scheduleAgentOfflineConfirmation() {
@@ -413,6 +443,7 @@ actor CloudflareTransport: Transport {
         agentOfflineTask?.cancel()
         agentOfflineTask = nil
         awaitingPongMessageId = nil
+        lastInboundFrameAt = nil
         socket = nil
         publishHealth(channel: .relay, state: .offline, detail: String(describing: type(of: pendingError)))
         activeSocket.cancel(with: .goingAway, reason: nil)
