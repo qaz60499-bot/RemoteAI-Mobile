@@ -3007,18 +3007,6 @@ final class RemoteAIMobileTests: XCTestCase {
             $0.kind == .toolEvent && $0.toolName == "ChatGPT Web"
         }, "Recovered generic ChatGPT Web search/thinking status must stay transient instead of creating transcript rows")
 
-        let historyAfterTerminalHint = await mock.actionAttemptCount("loadRecentMessages")
-        try await Task.sleep(nanoseconds: 2_600_000_000)
-        await store.synchronizeVisibleSession("photo-upload")
-        let historyAfterSecondTerminalHint = await mock.actionAttemptCount("loadRecentMessages")
-        XCTAssertEqual(
-            historyAfterSecondTerminalHint,
-            historyAfterTerminalHint,
-            "An evidence-poor idle hint must not turn into periodic long-history polling when the recovered live run still has no newer final."
-        )
-        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
-        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
-
         await mock.appendHistoryMessage(ServerMessage(messageId: "current-final", sessionId: "photo-upload", role: "assistant", content: "current final", externalId: nil, createdAt: now.addingTimeInterval(1)))
         await store.loadSession("photo-upload")
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "A final newer than the current run boundary must settle progress")

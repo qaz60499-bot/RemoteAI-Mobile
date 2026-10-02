@@ -74,7 +74,6 @@ final class WorkspaceStore: ObservableObject {
     private var sessionLoads = Set<String>()
     private var visibleSessionSyncAt: [String: Date] = [:]
     private var visibleSessionHistorySyncAt: [String: Date] = [:]
-    private var evidencePoorTerminalHistoryRecoveries = Set<String>()
     private var systemTransportOfflineChannels = Set<String>()
     private var webProviderIssueMessageBySession: [String: String] = [:]
     private var webProviderIssueStateBySession: [String: String] = [:]
@@ -1292,13 +1291,8 @@ final class WorkspaceStore: ObservableObject {
         let remoteEvidenceAt = remoteStatus.flatMap { snapshot in
             [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
         }
-        let evidencePoorIdleTransition = active
-            && remoteStatus?.state == .idle
-            && remoteEvidenceAt == nil
-            && liveRunActivityAtBySession[sessionId] != nil
         let terminalTransition = active
             && remoteStatus.map { $0.state == .idle || $0.state == .error } == true
-            && (!evidencePoorIdleTransition || !evidencePoorTerminalHistoryRecoveries.contains(sessionId))
         let missedTerminalActivity = !stillActive
             && remoteEvidenceAt.map { remoteAt in
                 knownActivityBeforeStatus.map { remoteAt > $0 } ?? true
@@ -1317,19 +1311,7 @@ final class WorkspaceStore: ObservableObject {
             || terminalTransition
             || missedTerminalActivity
         if historyDue {
-            let historySyncBefore = visibleSessionHistorySyncAt[sessionId]
             await loadSession(sessionId)
-            if evidencePoorIdleTransition {
-                let historySyncAfter = visibleSessionHistorySyncAt[sessionId]
-                let recovered = historySyncAfter.map { after in
-                    historySyncBefore.map { after > $0 } ?? true
-                } == true
-                if recovered, liveRunActivityAtBySession[sessionId] != nil {
-                    evidencePoorTerminalHistoryRecoveries.insert(sessionId)
-                } else if !recovered {
-                    evidencePoorTerminalHistoryRecoveries.remove(sessionId)
-                }
-            }
         }
     }
 
@@ -3112,7 +3094,6 @@ final class WorkspaceStore: ObservableObject {
                     authoritativeResyncProjectAliases.formUnion(projectConversationsByAlias.keys)
                     visibleSessionSyncAt.removeAll()
                     visibleSessionHistorySyncAt.removeAll()
-                    evidencePoorTerminalHistoryRecoveries.removeAll()
                     metadataRefreshDeferredForDelta = true
                     DiagnosticsLog.shared.record("delta_recovery_fast_forward", fields: [
                         "cursor": String(previousCursor),
@@ -3966,12 +3947,10 @@ final class WorkspaceStore: ObservableObject {
     private func markLiveRunActivity(sessionId: String, at: Date) {
         if let current = liveRunActivityAtBySession[sessionId], current >= at { return }
         liveRunActivityAtBySession[sessionId] = at
-        evidencePoorTerminalHistoryRecoveries.remove(sessionId)
     }
 
     private func clearLiveRunActivity(sessionId: String) {
         liveRunActivityAtBySession.removeValue(forKey: sessionId)
-        evidencePoorTerminalHistoryRecoveries.remove(sessionId)
     }
 
     private func bufferStreaming(sessionId: String, id: String, content: String, attachments: [MessageAttachment], sequence: Int64, deferPresentation: Bool = false) {
