@@ -74,6 +74,7 @@ final class WorkspaceStore: ObservableObject {
     private var sessionLoads = Set<String>()
     private var visibleSessionSyncAt: [String: Date] = [:]
     private var visibleSessionHistorySyncAt: [String: Date] = [:]
+    private var evidencePoorTerminalHistoryRecoveries = Set<String>()
     private var systemTransportOfflineChannels = Set<String>()
     private var webProviderIssueMessageBySession: [String: String] = [:]
     private var webProviderIssueStateBySession: [String: String] = [:]
@@ -1148,18 +1149,21 @@ final class WorkspaceStore: ObservableObject {
             let remoteEvidenceAt = [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
             let staleIdleSnapshot: Bool
             if snapshot.state == .idle, let liveActivityAt {
-                // A poll that began before a newer live frame, or whose remote activity
-                // evidence predates that frame, cannot end the newer run. History will
-                // still settle a missed terminal once its final answer is visible.
+                // A poll that began before a newer live frame, or whose explicit remote
+                // activity evidence predates that frame, cannot end the newer run.
                 staleIdleSnapshot = liveActivityAt > requestStartedAt
                     || (remoteEvidenceAt.map { $0 < liveActivityAt } ?? false)
             } else {
                 staleIdleSnapshot = false
             }
+            let evidencePoorIdleSnapshot = snapshot.state == .idle
+                && liveActivityAt != nil
+                && remoteEvidenceAt == nil
+                && !staleIdleSnapshot
             if let index = sessions.firstIndex(where: { $0.id == sessionId }) {
                 let current = sessions[index]
                 var updated = current
-                if !staleIdleSnapshot {
+                if !staleIdleSnapshot && !evidencePoorIdleSnapshot {
                     updated.state = snapshot.state
                     updated.lastProgressStatus = snapshot.lastProgressStatus
                     updated.lastProgressAt = snapshot.lastProgressAt
@@ -1215,14 +1219,25 @@ final class WorkspaceStore: ObservableObject {
                         : "电脑端任务仍在运行…"
                 }
             } else if snapshot.state == .idle || snapshot.state == .error {
-                if route.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
-                // getSessionStatus is authoritative recovery evidence. If the live
-                // GENERATION_STOPPED / MESSAGE_ADDED push was lost, do not leave the
-                // old streaming placeholder or "正在生成回答" banner pinned forever.
-                discardStreamingPlaceholder(sessionId: sessionId)
-                if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
-                clearLiveRunActivity(sessionId: sessionId)
-                await settleRunningToolRows(sessionId: sessionId)
+                if evidencePoorIdleSnapshot {
+                    // A fresh idle poll with no remote activity timestamp is a terminal
+                    // hint, not enough evidence by itself to erase a newer recovered live
+                    // boundary. The visible-session reconciler performs one authoritative
+                    // history read; only a final newer than that boundary may settle it.
+                    DiagnosticsLog.shared.record("evidence_poor_terminal_history_required", fields: [
+                        "session": sessionId,
+                        "liveActivityAt": liveActivityAt?.ISO8601Format() ?? "unknown",
+                    ])
+                } else {
+                    if route.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
+                    // getSessionStatus is authoritative recovery evidence. If the live
+                    // GENERATION_STOPPED / MESSAGE_ADDED push was lost, do not leave the
+                    // old streaming placeholder or "正在生成回答" banner pinned forever.
+                    discardStreamingPlaceholder(sessionId: sessionId)
+                    if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
+                    clearLiveRunActivity(sessionId: sessionId)
+                    await settleRunningToolRows(sessionId: sessionId)
+                }
             }
             if route.runtimeId == "runtime.web" {
                 // SESSION_STATUS push is the fast path. The authoritative session-status
@@ -1282,10 +1297,16 @@ final class WorkspaceStore: ObservableObject {
         guard machine.state == .online, !isSuspended else { return }
 
         let stillActive = remoteStatus.map { $0.state == .busy || $0.state == .waiting } ?? active
-        let terminalTransition = active && remoteStatus.map { $0.state == .idle || $0.state == .error } == true
         let remoteEvidenceAt = remoteStatus.flatMap { snapshot in
             [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
         }
+        let evidencePoorIdleTransition = active
+            && remoteStatus?.state == .idle
+            && remoteEvidenceAt == nil
+            && liveRunActivityAtBySession[sessionId] != nil
+        let terminalTransition = active
+            && remoteStatus.map { $0.state == .idle || $0.state == .error } == true
+            && (!evidencePoorIdleTransition || !evidencePoorTerminalHistoryRecoveries.contains(sessionId))
         let missedTerminalActivity = !stillActive
             && remoteEvidenceAt.map { remoteAt in
                 knownActivityBeforeStatus.map { remoteAt > $0 } ?? true
@@ -1304,7 +1325,19 @@ final class WorkspaceStore: ObservableObject {
             || terminalTransition
             || missedTerminalActivity
         if historyDue {
+            let historySyncBefore = visibleSessionHistorySyncAt[sessionId]
             await loadSession(sessionId)
+            if evidencePoorIdleTransition {
+                let historySyncAfter = visibleSessionHistorySyncAt[sessionId]
+                let recovered = historySyncAfter.map { after in
+                    historySyncBefore.map { after > $0 } ?? true
+                } == true
+                if recovered, liveRunActivityAtBySession[sessionId] != nil {
+                    evidencePoorTerminalHistoryRecoveries.insert(sessionId)
+                } else if !recovered {
+                    evidencePoorTerminalHistoryRecoveries.remove(sessionId)
+                }
+            }
         }
     }
 
@@ -3087,6 +3120,7 @@ final class WorkspaceStore: ObservableObject {
                     authoritativeResyncProjectAliases.formUnion(projectConversationsByAlias.keys)
                     visibleSessionSyncAt.removeAll()
                     visibleSessionHistorySyncAt.removeAll()
+                    evidencePoorTerminalHistoryRecoveries.removeAll()
                     metadataRefreshDeferredForDelta = true
                     DiagnosticsLog.shared.record("delta_recovery_fast_forward", fields: [
                         "cursor": String(previousCursor),
@@ -3940,10 +3974,12 @@ final class WorkspaceStore: ObservableObject {
     private func markLiveRunActivity(sessionId: String, at: Date) {
         if let current = liveRunActivityAtBySession[sessionId], current >= at { return }
         liveRunActivityAtBySession[sessionId] = at
+        evidencePoorTerminalHistoryRecoveries.remove(sessionId)
     }
 
     private func clearLiveRunActivity(sessionId: String) {
         liveRunActivityAtBySession.removeValue(forKey: sessionId)
+        evidencePoorTerminalHistoryRecoveries.remove(sessionId)
     }
 
     private func bufferStreaming(sessionId: String, id: String, content: String, attachments: [MessageAttachment], sequence: Int64, deferPresentation: Bool = false) {
