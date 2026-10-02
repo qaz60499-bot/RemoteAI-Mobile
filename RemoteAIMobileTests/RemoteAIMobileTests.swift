@@ -681,7 +681,12 @@ final class RemoteAIMobileTests: XCTestCase {
                 machineId: "my-pc",
                 runtimeId: "runtime.system",
                 instanceId: "agent",
-                sessionId: nil,
+                // MockTransport's Codable fixture omits nil optional keys, while the
+                // strict production delta wire shape always includes sessionId (null
+                // for machine-level events). Use a benign session id here so this test
+                // exercises WorkspaceStore's delta presentation rule rather than the
+                // mock encoder's key omission.
+                sessionId: "photo-upload",
                 type: "TRANSPORT_STATUS",
                 payload: ["channel": .string("browser-bridge"), "state": .string("offline")],
                 createdAt: historicalBase.addingTimeInterval(Double(offset) / 100.0)
