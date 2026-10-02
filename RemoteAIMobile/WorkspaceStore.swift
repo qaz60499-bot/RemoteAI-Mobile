@@ -1189,7 +1189,11 @@ final class WorkspaceStore: ObservableObject {
                     "liveActivityAt": liveActivityAt?.ISO8601Format() ?? "unknown",
                     "remoteEvidenceAt": remoteEvidenceAt?.ISO8601Format() ?? "missing",
                 ], level: "WARN")
-                return nil
+                // Do not apply an evidence-poor idle poll directly over newer live
+                // activity, but still return it to the visible-session reconciler as a
+                // terminal suspicion. That path performs one authoritative history read;
+                // only a real final there is allowed to settle the active run.
+                return snapshot
             }
             if snapshot.state == .busy || snapshot.state == .waiting {
                 if route.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
