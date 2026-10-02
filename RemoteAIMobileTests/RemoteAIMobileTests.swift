@@ -3231,6 +3231,119 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testStaticAIDisclaimerChromeIsIgnoredAsProgress() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]),
+                "summary": .string("It's AI and can make mistakes. Check improve info.")
+            ],
+            createdAt: now
+        ), deliverLive: true)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains {
+            $0.kind == .toolEvent && $0.toolName == "ChatGPT Web"
+        })
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebAssistantFinalStripsTrailingStaticAIDisclaimerChrome() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+        let polluted = ServerMessage(
+            messageId: "assistant-disclaimer-footer",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "Final answer body.\n\nChatGPT said:\nIt's AI and can make mistakes. Check important info.",
+            externalId: nil,
+            createdAt: now
+        )
+        let payload = try XCTUnwrap(try JSONValue.encode(polluted).objectValue)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1202,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: payload,
+            createdAt: now
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.messagesBySession["photo-upload", default: []].contains(where: { $0.id == "assistant-disclaimer-footer" }) { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(
+            store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "assistant-disclaimer-footer" })?.text,
+            "Final answer body."
+        )
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebAssistantFinalPreservesQuotedDisclaimerInsideAnswer() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+        let quotedText = "The page once displayed: It's AI and can make mistakes. Check important info.\nThat quotation is part of the answer."
+        let quoted = ServerMessage(
+            messageId: "assistant-disclaimer-quoted",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: quotedText,
+            externalId: nil,
+            createdAt: now
+        )
+        let payload = try XCTUnwrap(try JSONValue.encode(quoted).objectValue)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1203,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: payload,
+            createdAt: now
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.messagesBySession["photo-upload", default: []].contains(where: { $0.id == "assistant-disclaimer-quoted" }) { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(
+            store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "assistant-disclaimer-quoted" })?.text,
+            quotedText
+        )
+        await store.suspend()
+    }
+
+    @MainActor
     func testGeneratedImageReadyProgressIsLocalizedAndRemainsVisibleUntilTerminalEvent() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)

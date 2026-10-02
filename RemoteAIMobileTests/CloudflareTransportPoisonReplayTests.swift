@@ -35,6 +35,36 @@ final class CloudflareTransportPoisonReplayTests: XCTestCase {
         let configuration = CloudflareTransport.relaySessionConfiguration()
         XCTAssertNotNil(configuration.connectionProxyDictionary)
         XCTAssertTrue(configuration.connectionProxyDictionary?.isEmpty == true)
-        XCTAssertTrue(configuration.waitsForConnectivity)
+        XCTAssertFalse(configuration.waitsForConnectivity)
+    }
+
+    func testHeartbeatTimeoutReconnectsWhenNoInboundTrafficArrivesAfterPing() {
+        let pingSentAt = Date()
+        XCTAssertTrue(CloudflareTransport.shouldReconnectAfterHeartbeatTimeout(
+            awaitingPongMessageId: "ping-1",
+            expectedMessageId: "ping-1",
+            lastInboundFrameAt: pingSentAt.addingTimeInterval(-1),
+            pingSentAt: pingSentAt
+        ))
+    }
+
+    func testHeartbeatTimeoutKeepsSocketWhenAuthenticatedInboundTrafficArrivesAfterPing() {
+        let pingSentAt = Date()
+        XCTAssertFalse(CloudflareTransport.shouldReconnectAfterHeartbeatTimeout(
+            awaitingPongMessageId: "ping-1",
+            expectedMessageId: "ping-1",
+            lastInboundFrameAt: pingSentAt.addingTimeInterval(0.25),
+            pingSentAt: pingSentAt
+        ))
+    }
+
+    func testHeartbeatTimeoutIsAlreadySatisfiedWhenPongClearedAwaitingId() {
+        let pingSentAt = Date()
+        XCTAssertFalse(CloudflareTransport.shouldReconnectAfterHeartbeatTimeout(
+            awaitingPongMessageId: nil,
+            expectedMessageId: "ping-1",
+            lastInboundFrameAt: nil,
+            pingSentAt: pingSentAt
+        ))
     }
 }
