@@ -1134,9 +1134,9 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func refreshVisibleSessionStatus(_ sessionId: String, staleProtectionStartedAt: Date? = nil) async -> RemoteSessionStatusSnapshot? {
+    private func refreshVisibleSessionStatus(_ sessionId: String, rejectEvidencePoorIdle: Bool = false) async -> RemoteSessionStatusSnapshot? {
         guard let route = routeForSession(sessionId), machine.state == .online, !isSuspended else { return nil }
-        let requestStartedAt = staleProtectionStartedAt ?? Date()
+        let requestStartedAt = Date()
         do {
             let snapshot = try await transport.sessionStatus(
                 machineId: machine.id,
@@ -1152,18 +1152,14 @@ final class WorkspaceStore: ObservableObject {
                 // A poll that began before a newer live frame, or whose explicit remote
                 // activity evidence predates that frame, cannot end the newer run.
                 staleIdleSnapshot = liveActivityAt > requestStartedAt
-                    || (remoteEvidenceAt.map { $0 < liveActivityAt } ?? false)
+                    || (remoteEvidenceAt.map { $0 < liveActivityAt } ?? rejectEvidencePoorIdle)
             } else {
                 staleIdleSnapshot = false
             }
-            let evidencePoorIdleSnapshot = snapshot.state == .idle
-                && liveActivityAt != nil
-                && remoteEvidenceAt == nil
-                && !staleIdleSnapshot
             if let index = sessions.firstIndex(where: { $0.id == sessionId }) {
                 let current = sessions[index]
                 var updated = current
-                if !staleIdleSnapshot && !evidencePoorIdleSnapshot {
+                if !staleIdleSnapshot {
                     updated.state = snapshot.state
                     updated.lastProgressStatus = snapshot.lastProgressStatus
                     updated.lastProgressAt = snapshot.lastProgressAt
@@ -1219,25 +1215,14 @@ final class WorkspaceStore: ObservableObject {
                         : "电脑端任务仍在运行…"
                 }
             } else if snapshot.state == .idle || snapshot.state == .error {
-                if evidencePoorIdleSnapshot {
-                    // A fresh idle poll with no remote activity timestamp is a terminal
-                    // hint, not enough evidence by itself to erase a newer recovered live
-                    // boundary. The visible-session reconciler performs one authoritative
-                    // history read; only a final newer than that boundary may settle it.
-                    DiagnosticsLog.shared.record("evidence_poor_terminal_history_required", fields: [
-                        "session": sessionId,
-                        "liveActivityAt": liveActivityAt?.ISO8601Format() ?? "unknown",
-                    ])
-                } else {
-                    if route.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
-                    // getSessionStatus is authoritative recovery evidence. If the live
-                    // GENERATION_STOPPED / MESSAGE_ADDED push was lost, do not leave the
-                    // old streaming placeholder or "正在生成回答" banner pinned forever.
-                    discardStreamingPlaceholder(sessionId: sessionId)
-                    if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
-                    clearLiveRunActivity(sessionId: sessionId)
-                    await settleRunningToolRows(sessionId: sessionId)
-                }
+                if route.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
+                // getSessionStatus is authoritative recovery evidence. If the live
+                // GENERATION_STOPPED / MESSAGE_ADDED push was lost, do not leave the
+                // old streaming placeholder or "正在生成回答" banner pinned forever.
+                discardStreamingPlaceholder(sessionId: sessionId)
+                if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
+                clearLiveRunActivity(sessionId: sessionId)
+                await settleRunningToolRows(sessionId: sessionId)
             }
             if route.runtimeId == "runtime.web" {
                 // SESSION_STATUS push is the fast path. The authoritative session-status
@@ -1288,12 +1273,19 @@ final class WorkspaceStore: ObservableObject {
         // probe already detects a quiet cursor gap. Do not issue getChangesAfterCursor
         // on every 2.5-second visible-chat tick; only repair when lifecycle/stream state
         // says recovery is actually needed.
+        let liveActivityBeforeRecovery = liveRunActivityAtBySession[sessionId]
         if force || syncState == "stale" || !incompleteAssistantStreams.isEmpty {
             await recoverDelta()
             guard machine.state == .online, !isSuspended, !deltaRecoveryInFlight else { return }
         }
+        let recoveredLiveActivityDuringSync: Bool
+        if let after = liveRunActivityAtBySession[sessionId] {
+            recoveredLiveActivityDuringSync = liveActivityBeforeRecovery.map { after > $0 } ?? true
+        } else {
+            recoveredLiveActivityDuringSync = false
+        }
 
-        let remoteStatus = await refreshVisibleSessionStatus(sessionId, staleProtectionStartedAt: now)
+        let remoteStatus = await refreshVisibleSessionStatus(sessionId, rejectEvidencePoorIdle: recoveredLiveActivityDuringSync)
         guard machine.state == .online, !isSuspended else { return }
 
         let stillActive = remoteStatus.map { $0.state == .busy || $0.state == .waiting } ?? active
