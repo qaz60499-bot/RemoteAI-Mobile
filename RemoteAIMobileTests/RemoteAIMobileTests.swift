@@ -3848,11 +3848,7 @@ final class RemoteAIMobileTests: XCTestCase {
             externalId: nil,
             createdAt: now.addingTimeInterval(1)
         ))
-        await mock.setSessionStatus(
-            "photo-upload",
-            status: "idle",
-            lastActivityAt: now.addingTimeInterval(2)
-        )
+        await mock.setSessionStatus("photo-upload", status: "idle")
 
         await store.synchronizeVisibleSession("photo-upload")
 
@@ -3860,6 +3856,90 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(historyAfter, historyBefore + 1)
         XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.id == "missed-terminal-final" })
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testStaleIdlePollStartedBeforeNewerLiveFrameCannotEndRunOrReloadHistory() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        // Match an already-open ChatView: history is authoritative and has a watermark.
+        await store.loadSession("photo-upload")
+        let historyBefore = await mock.actionAttemptCount("loadRecentMessages")
+        await mock.setResponseDelay(action: "getSessionStatus", nanoseconds: 500_000_000)
+
+        // The idle snapshot is captured first, then a newer live frame arrives while the
+        // response is delayed. That old poll must not roll the new run back to idle or
+        // cause a long-history recovery read.
+        async let synchronization: Void = store.synchronizeVisibleSession("photo-upload")
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let liveAt = Date()
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: liveAt
+        ), deliverLive: true)
+        for _ in 0..<20 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .busy {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        await synchronization
+
+        let historyAfter = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertEqual(historyAfter, historyBefore)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testIdleStatusWithExplicitlyOlderRemoteEvidenceCannotEndNewerLiveRun() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let liveAt = Date()
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: liveAt
+        ), deliverLive: true)
+        for _ in 0..<80 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .busy {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        await store.loadSession("photo-upload")
+        let historyBefore = await mock.actionAttemptCount("loadRecentMessages")
+        await mock.setSessionStatus(
+            "photo-upload",
+            status: "idle",
+            lastActivityAt: liveAt.addingTimeInterval(-5)
+        )
+
+        await store.synchronizeVisibleSession("photo-upload")
+
+        let historyAfter = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertEqual(historyAfter, historyBefore)
         await store.suspend()
     }
 

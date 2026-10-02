@@ -1152,7 +1152,7 @@ final class WorkspaceStore: ObservableObject {
                 // evidence predates that frame, cannot end the newer run. History will
                 // still settle a missed terminal once its final answer is visible.
                 staleIdleSnapshot = liveActivityAt > requestStartedAt
-                    || (remoteEvidenceAt.map { $0 < liveActivityAt } ?? true)
+                    || (remoteEvidenceAt.map { $0 < liveActivityAt } ?? false)
             } else {
                 staleIdleSnapshot = false
             }
@@ -1189,11 +1189,10 @@ final class WorkspaceStore: ObservableObject {
                     "liveActivityAt": liveActivityAt?.ISO8601Format() ?? "unknown",
                     "remoteEvidenceAt": remoteEvidenceAt?.ISO8601Format() ?? "missing",
                 ], level: "WARN")
-                // Do not apply an evidence-poor idle poll directly over newer live
-                // activity, but still return it to the visible-session reconciler as a
-                // terminal suspicion. That path performs one authoritative history read;
-                // only a real final there is allowed to settle the active run.
-                return snapshot
+                // This poll is provably older than newer live activity. Ignore it
+                // completely so it cannot create a false terminal transition or trigger
+                // repeated authoritative history recovery while the newer run is active.
+                return nil
             }
             if snapshot.state == .busy || snapshot.state == .waiting {
                 if route.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
