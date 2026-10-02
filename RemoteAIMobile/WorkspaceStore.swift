@@ -3229,7 +3229,10 @@ final class WorkspaceStore: ObservableObject {
 
     private func applyEvent(_ event: RemoteEvent, suppressTransientPresentation: Bool = false) async {
         if event.type == "TRANSPORT_STATUS" {
-            applyTransportStatusEvent(event)
+            // Historical delta recovery can contain many old Relay/Browser status
+            // transitions. Replaying them into live transport state makes the phone
+            // oscillate offline/online even though the current socket is healthy.
+            if !suppressTransientPresentation { applyTransportStatusEvent(event) }
             return
         }
         guard let sessionId = event.sessionId else {
@@ -3364,6 +3367,15 @@ final class WorkspaceStore: ObservableObject {
                 var base = server.chatMessage
                 if event.runtimeId == "runtime.web" {
                     base = Self.normalizedWebAssistantMessage(base)
+                    // Static ChatGPT chrome can occasionally arrive as an assistant
+                    // event after accessibility fallback parsing. If normalization
+                    // removes the entire body and there is no generated attachment,
+                    // ignore it completely.
+                    if base.role == .assistant,
+                       base.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       base.attachments.isEmpty {
+                        return
+                    }
                 }
                 if base.role == .assistant {
                     if event.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
@@ -3816,7 +3828,11 @@ final class WorkspaceStore: ObservableObject {
         if lower == "check important info" || lower == "check important info."
             || lower == "check improve info" || lower == "check improve info." { return true }
         let compact = lower.replacingOccurrences(of: "’", with: "'")
-        return compact == "ai can make mistakes"
+        return compact == "can make mistakes"
+            || compact == "can make mistakes."
+            || compact.hasPrefix("can make mistakes. check important info")
+            || compact.hasPrefix("can make mistakes. check improve info")
+            || compact == "ai can make mistakes"
             || compact == "ai can make mistakes."
             || compact == "it's ai and can make mistakes"
             || compact == "it's ai and can make mistakes."
@@ -3834,7 +3850,7 @@ final class WorkspaceStore: ObservableObject {
         // ChatGPT's accessibility transcript can append static browser chrome after the
         // actual assistant answer. Strip only an exact trailing footer boundary so an
         // answer that quotes the same sentence in its body is preserved.
-        let footerPattern = #"(?:^|\r?\n)\s*(?:(?:ChatGPT said|ChatGPT 说)\s*[：:]?\s*(?:\r?\n)\s*)?(?:(?:It['’]?s\s+)?AI|ChatGPT)(?:\s+and)?\s+can make mistakes(?:\.\s*Check\s+(?:important|improve)\s+info\.?)?\s*$"#
+        let footerPattern = #"(?:^|\r?\n)\s*(?:(?:ChatGPT said|ChatGPT 说)\s*[：:]?\s*(?:\r?\n)\s*)?(?:(?:(?:It['’]?s\s+)?AI|ChatGPT)(?:\s+and)?\s+)?can make mistakes(?:\.\s*Check\s+(?:important|improve)\s+info\.?)?\s*$"#
         guard let range = trimmed.range(
             of: footerPattern,
             options: [.regularExpression, .caseInsensitive]

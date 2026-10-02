@@ -664,6 +664,37 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testLargeDeltaRecoveryDoesNotReplayHistoricalTransportStateIntoLiveUI() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        XCTAssertEqual(try await cache.lastSequence(), 1200)
+
+        let historicalBase = Date().addingTimeInterval(-30)
+        for offset in 1...12 {
+            await mock.injectEvent(RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: Int64(1200 + offset),
+                machineId: "my-pc",
+                runtimeId: "runtime.system",
+                instanceId: "agent",
+                sessionId: nil,
+                type: "TRANSPORT_STATUS",
+                payload: ["channel": .string("browser-bridge"), "state": .string("offline")],
+                createdAt: historicalBase.addingTimeInterval(Double(offset) / 100.0)
+            ))
+        }
+
+        await store.verifyOnlineSyncHead()
+
+        XCTAssertEqual(try await cache.lastSequence(), 1212)
+        XCTAssertNil(store.recentSystemNotice, "Historical transport events inside a coalesced delta page must not overwrite current live connectivity presentation")
+        await store.suspend()
+    }
+
+    @MainActor
     func testStableSessionReconciliationDoesNotRepublishUnchangedTranscript() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
@@ -3299,6 +3330,42 @@ final class RemoteAIMobileTests: XCTestCase {
             store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "assistant-disclaimer-footer" })?.text,
             "Final answer body."
         )
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebAssistantChromeOnlyBareDisclaimerIsIgnored() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+        let chromeOnly = ServerMessage(
+            messageId: "assistant-bare-disclaimer",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "can make mistakes. Check important info.",
+            externalId: nil,
+            createdAt: now
+        )
+        let payload = try XCTUnwrap(try JSONValue.encode(chromeOnly).objectValue)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: payload,
+            createdAt: now
+        ), deliverLive: true)
+
+        try await Task.sleep(nanoseconds: 80_000_000)
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains {
+            $0.id == "assistant-bare-disclaimer"
+        })
         await store.suspend()
     }
 
