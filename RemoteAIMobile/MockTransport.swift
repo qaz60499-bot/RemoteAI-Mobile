@@ -20,6 +20,7 @@ actor MockTransport: Transport {
     private var eventLog: [RemoteEvent] = []
     private var sessions: [ServerSession] = []
     private var sessionStatusOverrides: [String: String] = [:]
+    private var sessionStatusActivityOverrides: [String: Date] = [:]
     private var webProjects: [WebProjectDescriptor] = []
     private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
@@ -126,7 +127,14 @@ actor MockTransport: Transport {
         await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "GENERATION_STOPPED", payload: [:])
     }
     func setScenario(_ value: MockScenario) { scenario = value }
-    func setSessionStatus(_ sessionId: String, status: String) { sessionStatusOverrides[sessionId] = status }
+    func setSessionStatus(_ sessionId: String, status: String, lastActivityAt: Date? = nil) {
+        sessionStatusOverrides[sessionId] = status
+        if let lastActivityAt {
+            sessionStatusActivityOverrides[sessionId] = lastActivityAt
+        } else {
+            sessionStatusActivityOverrides.removeValue(forKey: sessionId)
+        }
+    }
     func setSequence(_ value: Int64) { sequence = max(0, value) }
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
     func setRequestDelay(action: String, nanoseconds: UInt64) { requestDelayNanoseconds[action] = nanoseconds }
@@ -514,7 +522,9 @@ actor MockTransport: Transport {
             let last = history[sessionId, default: []].last
             let active = last?.role == "user"
             var metadata = stored?.metadata ?? [:]
-            if active {
+            if let statusActivityAt = sessionStatusActivityOverrides[sessionId] {
+                metadata["lastActivityAt"] = .string(RemoteAIDate.string(statusActivityAt))
+            } else if active {
                 let now = Date()
                 metadata["lastActivityAt"] = .string(RemoteAIDate.string(now))
                 metadata["lastProgressStatus"] = .string("Thinking")

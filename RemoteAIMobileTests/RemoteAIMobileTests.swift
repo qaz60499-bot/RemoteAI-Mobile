@@ -3848,7 +3848,11 @@ final class RemoteAIMobileTests: XCTestCase {
             externalId: nil,
             createdAt: now.addingTimeInterval(1)
         ))
-        await mock.setSessionStatus("photo-upload", status: "idle")
+        await mock.setSessionStatus(
+            "photo-upload",
+            status: "idle",
+            lastActivityAt: now.addingTimeInterval(2)
+        )
 
         await store.synchronizeVisibleSession("photo-upload")
 
