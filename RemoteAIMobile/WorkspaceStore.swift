@@ -3167,7 +3167,13 @@ final class WorkspaceStore: ObservableObject {
                             coalescedSessionPresentation.removeValue(forKey: sessionId)
                         }
                     }
-                    await applyEvent(event, suppressTransientPresentation: suppressEventPresentation)
+                    // TRANSPORT_STATUS in getChangesAfterCursor is historical replay evidence,
+                    // not current connectivity. Re-applying it makes a healthy phone flash
+                    // offline/recovered while catching up. Live websocket/health callbacks are
+                    // the only authority allowed to mutate current transport presentation.
+                    if event.type != "TRANSPORT_STATUS" {
+                        await applyEvent(event, suppressTransientPresentation: suppressEventPresentation)
+                    }
                     cursor = event.sequence
                     try? await cache.setLastSequence(cursor)
                 }

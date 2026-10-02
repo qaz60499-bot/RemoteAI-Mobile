@@ -664,7 +664,7 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testLargeDeltaRecoveryDoesNotReplayHistoricalTransportStateIntoLiveUI() async throws {
+    func testDeltaRecoveryDoesNotReplayHistoricalTransportStateIntoLiveUI() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
@@ -672,7 +672,7 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(try await cache.lastSequence(), 1200)
 
         let historicalBase = Date().addingTimeInterval(-30)
-        for offset in 1...12 {
+        for offset in 1...7 {
             await mock.injectEvent(RemoteEvent(
                 protocolVersion: 1,
                 eventId: UUID(),
@@ -689,8 +689,8 @@ final class RemoteAIMobileTests: XCTestCase {
 
         await store.verifyOnlineSyncHead()
 
-        XCTAssertEqual(try await cache.lastSequence(), 1212)
-        XCTAssertNil(store.recentSystemNotice, "Historical transport events inside a coalesced delta page must not overwrite current live connectivity presentation")
+        XCTAssertEqual(try await cache.lastSequence(), 1207)
+        XCTAssertNil(store.recentSystemNotice, "Historical transport events from any delta page must not overwrite current live connectivity presentation")
         await store.suspend()
     }
 
