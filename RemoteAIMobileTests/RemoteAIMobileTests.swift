@@ -669,7 +669,8 @@ final class RemoteAIMobileTests: XCTestCase {
         let mock = MockTransport(historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
-        XCTAssertEqual(try await cache.lastSequence(), 1200)
+        let initialSequence = try await cache.lastSequence()
+        XCTAssertEqual(initialSequence, 1200)
 
         let historicalBase = Date().addingTimeInterval(-30)
         for offset in 1...7 {
@@ -689,7 +690,8 @@ final class RemoteAIMobileTests: XCTestCase {
 
         await store.verifyOnlineSyncHead()
 
-        XCTAssertEqual(try await cache.lastSequence(), 1207)
+        let recoveredSequence = try await cache.lastSequence()
+        XCTAssertEqual(recoveredSequence, 1207)
         XCTAssertNil(store.recentSystemNotice, "Historical transport events from any delta page must not overwrite current live connectivity presentation")
         await store.suspend()
     }
