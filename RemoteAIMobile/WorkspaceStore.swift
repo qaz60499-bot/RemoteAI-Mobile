@@ -3379,7 +3379,7 @@ final class WorkspaceStore: ObservableObject {
                     // ignore it completely.
                     if base.role == .assistant,
                        base.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                       base.attachments.isEmpty {
+                       (base.attachments ?? []).isEmpty {
                         return
                     }
                 }
