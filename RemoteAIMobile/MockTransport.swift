@@ -110,6 +110,11 @@ actor MockTransport: Transport {
         stressStarted = true
         do { try await Task.sleep(nanoseconds: 750_000_000) } catch { return }
         let streamId = "stress-\(stressChars)"
+        // Keep the mock status endpoint consistent with the live frames it emits.
+        // Production Browser status reports generating while these frames are live;
+        // returning idle here would make the visible-session reconciler correctly
+        // terminate the stream and turn this UI fixture into a false failure.
+        sessionStatusOverrides[sessionId] = "generating"
         await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "GENERATION_STARTED", payload: [:])
         let startSequence = sequence + 1
         await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "MESSAGE_UPDATED", payload: ["streamId": .string(streamId), "revision": .number(0), "content": .string(""), "partial": .bool(true)])
@@ -125,6 +130,7 @@ actor MockTransport: Transport {
         history[sessionId, default: []].append(final)
         await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "MESSAGE_ADDED", payload: (try? JSONValue.encode(final).objectValue) ?? [:])
         await emit(runtimeId: "runtime.web", instanceId: "photo", sessionId: sessionId, type: "GENERATION_STOPPED", payload: [:])
+        sessionStatusOverrides[sessionId] = "idle"
     }
     func setScenario(_ value: MockScenario) { scenario = value }
     func setSessionStatus(_ sessionId: String, status: String, lastActivityAt: Date? = nil) {
