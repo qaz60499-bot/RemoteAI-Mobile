@@ -1133,9 +1133,9 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func refreshVisibleSessionStatus(_ sessionId: String) async -> RemoteSessionStatusSnapshot? {
+    private func refreshVisibleSessionStatus(_ sessionId: String, staleProtectionStartedAt: Date? = nil) async -> RemoteSessionStatusSnapshot? {
         guard let route = routeForSession(sessionId), machine.state == .online, !isSuspended else { return nil }
-        let requestStartedAt = Date()
+        let requestStartedAt = staleProtectionStartedAt ?? Date()
         do {
             let snapshot = try await transport.sessionStatus(
                 machineId: machine.id,
@@ -1278,7 +1278,7 @@ final class WorkspaceStore: ObservableObject {
             guard machine.state == .online, !isSuspended, !deltaRecoveryInFlight else { return }
         }
 
-        let remoteStatus = await refreshVisibleSessionStatus(sessionId)
+        let remoteStatus = await refreshVisibleSessionStatus(sessionId, staleProtectionStartedAt: now)
         guard machine.state == .online, !isSuspended else { return }
 
         let stillActive = remoteStatus.map { $0.state == .busy || $0.state == .waiting } ?? active
