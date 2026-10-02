@@ -2652,7 +2652,7 @@ final class WorkspaceStore: ObservableObject {
             let activityAt = session.lastActivityAt ?? session.updatedAt
 
             if let prior {
-                guard let activityAt, active || activityAt > prior.updatedAt else { continue }
+                guard active || activityAt > prior.updatedAt else { continue }
                 let title = isSyntheticConversationTitle(prior.displayTitle, conversationAlias: prior.conversationAlias)
                     && !isSyntheticConversationTitle(session.title, conversationAlias: sessionAlias)
                     ? session.title
@@ -2679,7 +2679,6 @@ final class WorkspaceStore: ObservableObject {
             // A desktop Chat can start running before ChatGPT lazily mounts its sidebar
             // row. Session identity is enough to show it immediately without changing
             // the complete provider-backed list or its pagination state.
-            guard let activityAt else { continue }
             let row = WebConversationDescriptor(
                 localConversationId: session.id,
                 canonicalUrl: canonicalURL,
