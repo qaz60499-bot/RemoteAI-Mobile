@@ -80,8 +80,6 @@ final class WorkspaceStore: ObservableObject {
     private var webBindingDetachedSessions = Set<String>()
     private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 2.5
     private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 20
-    private static let activeVisibleSessionHistorySyncMinimumInterval: TimeInterval = 10
-    private static let idleVisibleSessionHistorySyncMinimumInterval: TimeInterval = 30
     private static let connectionMonitorIntervalNanoseconds: UInt64 = 500_000_000
     static func streamingFlushDelayNanoseconds(forByteCount bytes: Int) -> UInt64 {
         // Keep Build 27 visibly faster than Build 26 without forcing the main thread
@@ -344,6 +342,7 @@ final class WorkspaceStore: ObservableObject {
         lifecycleGeneration &+= 1
         machine.state = .connecting
         connectionPhase = .reconnecting
+        await transport.disconnect()
         if startInProgress {
             restartAfterStart = true
             return
@@ -1028,6 +1027,16 @@ final class WorkspaceStore: ObservableObject {
 
         if messagesBySession[sessionId] == nil {
             var local = (try? await cache.recentMessages(sessionId: sessionId, limit: 50)) ?? []
+            var normalizedCachedAssistantMessages: [ChatMessage] = []
+            if routeForSession(sessionId)?.runtimeId == "runtime.web" {
+                for index in local.indices where local[index].role == .assistant && local[index].kind == .text {
+                    let normalized = Self.normalizedWebAssistantMessage(local[index])
+                    if normalized.text != local[index].text {
+                        local[index] = normalized
+                        normalizedCachedAssistantMessages.append(normalized)
+                    }
+                }
+            }
             // ChatGPT Web process transitions are transient status signals, not transcript
             // messages. Older builds persisted every Thinking/Reading/Generating transition
             // as a tool row, which can flood the conversation after an upgrade. Hide those
@@ -1036,6 +1045,9 @@ final class WorkspaceStore: ObservableObject {
                 $0.kind == .toolEvent
                     && $0.toolName == "ChatGPT Web"
                     && isTransientWebProcessDetail($0.detail)
+            }
+            if !normalizedCachedAssistantMessages.isEmpty {
+                try? await cache.upsertMessages(normalizedCachedAssistantMessages)
             }
             if sessions.first(where: { $0.id == sessionId })?.state != .busy {
                 var changed = false
@@ -1063,16 +1075,19 @@ final class WorkspaceStore: ObservableObject {
         do {
             let page = try await transport.loadRecent(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, limit: 50)
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
-            await reconcilePendingUnknownCommands(with: page.items, sessionId: sessionId)
-            for remoteUser in page.items where remoteUser.role == .user {
+            let authoritativeItems = route.runtimeId == "runtime.web"
+                ? page.items.map(Self.normalizedWebAssistantMessage)
+                : page.items
+            await reconcilePendingUnknownCommands(with: authoritativeItems, sessionId: sessionId)
+            for remoteUser in authoritativeItems where remoteUser.role == .user {
                 await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
             }
             if route.runtimeId == "runtime.antigravity",
                sessions.first(where: { $0.id == sessionId })?.state != .busy {
-                await reconcileAntigravityAuthoritativeAssistantWindow(page.items, sessionId: sessionId)
+                await reconcileAntigravityAuthoritativeAssistantWindow(authoritativeItems, sessionId: sessionId)
             }
-            try? await cache.upsertMessages(page.items)
-            merge(page.items, into: sessionId)
+            try? await cache.upsertMessages(authoritativeItems)
+            merge(authoritativeItems, into: sessionId)
             if route.runtimeId == "runtime.web" {
                 await collapseWebTranscriptArtifacts(sessionId: sessionId)
                 // A successful authoritative history read proves that this exact web
@@ -1085,8 +1100,8 @@ final class WorkspaceStore: ObservableObject {
                     recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机已补同步最新状态。"
                 }
             }
-            ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: page.items.last?.createdAt ?? Date())
-            await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
+            ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: authoritativeItems.last?.createdAt ?? Date())
+            await settleRunStateIfAuthoritativeFinalExists(authoritativeItems, sessionId: sessionId)
             if hasMoreBySession[sessionId] != page.hasMore {
                 hasMoreBySession[sessionId] = page.hasMore
             }
@@ -1098,6 +1113,10 @@ final class WorkspaceStore: ObservableObject {
                errors[sessionId] != nil {
                 errors.removeValue(forKey: sessionId)
             }
+            // A successful authoritative history read is the recovery watermark for
+            // this visible conversation. Periodic status probes must not immediately
+            // reload the same long transcript again unless later evidence invalidates it.
+            visibleSessionHistorySyncAt[sessionId] = Date()
         } catch {
             guard generation == lifecycleGeneration, !isSuspended else { return }
             let hasUsableLocalHistory = !messagesBySession[sessionId, default: []].isEmpty
@@ -1228,8 +1247,14 @@ final class WorkspaceStore: ObservableObject {
         guard machine.state == .online, !isSuspended else { return }
         guard !sessionLoads.contains(sessionId) else { return }
 
-        let active = sessions.first(where: { $0.id == sessionId }).map { $0.state == .busy || $0.state == .waiting } == true
+        let sessionBeforeStatus = sessions.first(where: { $0.id == sessionId })
+        let active = sessionBeforeStatus.map { $0.state == .busy || $0.state == .waiting } == true
             || liveRunStatusBySession[sessionId] != nil
+        let knownActivityBeforeStatus = [
+            sessionBeforeStatus?.lastActivityAt,
+            sessionBeforeStatus?.updatedAt,
+            liveRunActivityAtBySession[sessionId],
+        ].compactMap { $0 }.max()
         let minimumInterval = active
             ? Self.activeVisibleSessionSyncMinimumInterval
             : Self.idleVisibleSessionSyncMinimumInterval
@@ -1241,23 +1266,41 @@ final class WorkspaceStore: ObservableObject {
         }
         visibleSessionSyncAt[sessionId] = now
 
-        await recoverDelta()
-        guard machine.state == .online, !isSuspended, !deltaRecoveryInFlight else { return }
+        // WebSocket push is the primary event path and the global 15-second sync-head
+        // probe already detects a quiet cursor gap. Do not issue getChangesAfterCursor
+        // on every 2.5-second visible-chat tick; only repair when lifecycle/stream state
+        // says recovery is actually needed.
+        if force || syncState == "stale" || !incompleteAssistantStreams.isEmpty {
+            await recoverDelta()
+            guard machine.state == .online, !isSuspended, !deltaRecoveryInFlight else { return }
+        }
+
         let remoteStatus = await refreshVisibleSessionStatus(sessionId)
         guard machine.state == .online, !isSuspended else { return }
 
-        // During a proven active run, delta + getSessionStatus are enough for fast
-        // progress. A full DOM/history reconciliation remains a slower fail-safe so the
-        // mobile client does not hammer the Relay every 1.5s while ChatGPT is thinking.
         let stillActive = remoteStatus.map { $0.state == .busy || $0.state == .waiting } ?? active
-        let historyNow = Date()
-        let historyMinimumInterval = stillActive
-            ? Self.activeVisibleSessionHistorySyncMinimumInterval
-            : Self.idleVisibleSessionHistorySyncMinimumInterval
+        let terminalTransition = active && remoteStatus.map { $0.state == .idle || $0.state == .error } == true
+        let remoteEvidenceAt = remoteStatus.flatMap { snapshot in
+            [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
+        }
+        let missedTerminalActivity = !stillActive
+            && remoteEvidenceAt.map { remoteAt in
+                knownActivityBeforeStatus.map { remoteAt > $0 } ?? true
+            } == true
+
+        // Full history/DOM reconciliation is intentionally evidence-driven. Re-reading
+        // and re-merging the latest 50 messages on a fixed 10/30-second timer makes long
+        // contexts stutter even though push/cursor state is healthy. Reload only when:
+        // - the user/lifecycle explicitly forces reconciliation,
+        // - the prior authoritative history watermark was invalidated (for example a
+        //   large cursor fast-forward clears it),
+        // - an active run became terminal, so a missed final must be recovered, or
+        // - terminal status proves newer remote activity than the phone has observed.
         let historyDue = force
-            || visibleSessionHistorySyncAt[sessionId].map { historyNow.timeIntervalSince($0) >= historyMinimumInterval } != false
+            || visibleSessionHistorySyncAt[sessionId] == nil
+            || terminalTransition
+            || missedTerminalActivity
         if historyDue {
-            visibleSessionHistorySyncAt[sessionId] = historyNow
             await loadSession(sessionId)
         }
     }
@@ -2032,7 +2075,7 @@ final class WorkspaceStore: ObservableObject {
                         self.applyConnectionFailure(error)
                         if (error as? TransportError) == .pairingRequired { break }
                     }
-                } else if self.desktopAgentConnected == true && self.machine.state != .online {
+                } else if self.machine.state != .online {
                     // The phone can remain connected to Relay while the Windows Agent
                     // reconnects. When Relay announces agent-online, authenticate over
                     // the retained socket instead of needlessly reopening WebSocket.
@@ -2351,7 +2394,7 @@ final class WorkspaceStore: ObservableObject {
         guard let current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
         let currentAliases = Set(current.compactMap(\.conversationAlias))
         guard !currentAliases.isEmpty else { return false }
-        let validIncoming = incoming.filter { $0.projectAlias == projectAlias && $0.conversationAlias != nil }
+        let validIncoming = incoming.filter { sameWebProjectAlias($0.projectAlias, projectAlias) && $0.conversationAlias != nil }
         guard let firstKnownIndex = validIncoming.firstIndex(where: { row in
             row.conversationAlias.map(currentAliases.contains) ?? false
         }), firstKnownIndex > 0 else { return false }
@@ -2632,10 +2675,10 @@ final class WorkspaceStore: ObservableObject {
                     return normalizedWebConversationAlias($0.conversationAlias) == sessionAlias
                         || webConversationAlias(from: $0.canonicalUrl) == sessionAlias
                 })
-            let activityAt = session.lastActivityAt ?? (active ? session.updatedAt : nil)
+            let activityAt = session.lastActivityAt ?? session.updatedAt
 
             if let prior {
-                guard let activityAt, active || activityAt > prior.updatedAt else { continue }
+                guard active || activityAt > prior.updatedAt else { continue }
                 let title = isSyntheticConversationTitle(prior.displayTitle, conversationAlias: prior.conversationAlias)
                     && !isSyntheticConversationTitle(session.title, conversationAlias: sessionAlias)
                     ? session.title
@@ -2662,7 +2705,6 @@ final class WorkspaceStore: ObservableObject {
             // A desktop Chat can start running before ChatGPT lazily mounts its sidebar
             // row. Session identity is enough to show it immediately without changing
             // the complete provider-backed list or its pagination state.
-            guard let activityAt else { continue }
             let row = WebConversationDescriptor(
                 localConversationId: session.id,
                 canonicalUrl: canonicalURL,
@@ -3151,7 +3193,13 @@ final class WorkspaceStore: ObservableObject {
                             coalescedSessionPresentation.removeValue(forKey: sessionId)
                         }
                     }
-                    await applyEvent(event, suppressTransientPresentation: suppressEventPresentation)
+                    // TRANSPORT_STATUS in getChangesAfterCursor is historical replay evidence,
+                    // not current connectivity. Re-applying it makes a healthy phone flash
+                    // offline/recovered while catching up. Live websocket/health callbacks are
+                    // the only authority allowed to mutate current transport presentation.
+                    if event.type != "TRANSPORT_STATUS" {
+                        await applyEvent(event, suppressTransientPresentation: suppressEventPresentation)
+                    }
                     cursor = event.sequence
                     try? await cache.setLastSequence(cursor)
                 }
@@ -3213,7 +3261,10 @@ final class WorkspaceStore: ObservableObject {
 
     private func applyEvent(_ event: RemoteEvent, suppressTransientPresentation: Bool = false) async {
         if event.type == "TRANSPORT_STATUS" {
-            applyTransportStatusEvent(event)
+            // Historical delta recovery can contain many old Relay/Browser status
+            // transitions. Replaying them into live transport state makes the phone
+            // oscillate offline/online even though the current socket is healthy.
+            if !suppressTransientPresentation { applyTransportStatusEvent(event) }
             return
         }
         guard let sessionId = event.sessionId else {
@@ -3345,7 +3396,20 @@ final class WorkspaceStore: ObservableObject {
             }
         case "MESSAGE_ADDED", "MESSAGE_UPDATED":
             if let server = try? JSONValue.object(event.payload).decode(ServerMessage.self) {
-                let base = server.chatMessage
+                var base = server.chatMessage
+                if event.runtimeId == "runtime.web" {
+                    base = Self.normalizedWebAssistantMessage(base)
+                    // Static ChatGPT chrome can occasionally arrive as an assistant
+                    // event after accessibility fallback parsing. If normalization
+                    // removes the entire body and there is no generated attachment,
+                    // ignore it completely: it is neither a final answer nor a valid
+                    // terminal boundary for the mobile run.
+                    if base.role == .assistant,
+                       base.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       (base.attachments ?? []).isEmpty {
+                        return
+                    }
+                }
                 if base.role == .assistant {
                     if event.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
                     if let stream = assistantStreams[sessionId] {
@@ -3407,6 +3471,7 @@ final class WorkspaceStore: ObservableObject {
                 ?? toolObject?["summary"]?.stringValue
                 ?? event.payload["provider"]?.stringValue
             if rawToolName == "ChatGPT Web" {
+                if isNonProcessWebChromeDetail(detail) { return }
                 // Browser animation/status noise (Thinking, Reading, Generating...) is a
                 // single live line. Substantive execution stages such as Executing tests,
                 // Code Tool, DevSpace-style work, etc. remain visible as compact timeline
@@ -3786,6 +3851,51 @@ final class WorkspaceStore: ObservableObject {
         if lower == "response complete" || lower == "response completed" || lower == "response finished" { return "回答已生成，正在确认同步…" }
         if lower.contains("writing") || lower.contains("generating") { return "正在生成回答…" }
         return trimmed
+    }
+
+    private func isNonProcessWebChromeDetail(_ raw: String?) -> Bool {
+        guard let raw else { return false }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+        if lower == "check important info" || lower == "check important info."
+            || lower == "check improve info" || lower == "check improve info." { return true }
+        let compact = lower.replacingOccurrences(of: "’", with: "'")
+        return compact == "can make mistakes"
+            || compact == "can make mistakes."
+            || compact.hasPrefix("can make mistakes. check important info")
+            || compact.hasPrefix("can make mistakes. check improve info")
+            || compact == "ai can make mistakes"
+            || compact == "ai can make mistakes."
+            || compact == "it's ai and can make mistakes"
+            || compact == "it's ai and can make mistakes."
+            || compact.hasPrefix("ai can make mistakes. check important info")
+            || compact.hasPrefix("ai can make mistakes. check improve info")
+            || compact.hasPrefix("it's ai and can make mistakes. check important info")
+            || compact.hasPrefix("it's ai and can make mistakes. check improve info")
+            || compact.hasPrefix("chatgpt can make mistakes. check important info")
+            || compact.hasPrefix("chatgpt can make mistakes. check improve info")
+    }
+
+    private static func normalizedWebAssistantChromeText(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        // ChatGPT's accessibility transcript can append static browser chrome after the
+        // actual assistant answer. Strip only an exact trailing footer boundary so an
+        // answer that quotes the same sentence in its body is preserved.
+        let footerPattern = #"(?:^|\r?\n)\s*(?:(?:ChatGPT said|ChatGPT 说)\s*[：:]?\s*(?:\r?\n)\s*)?(?:(?:(?:It['’]?s\s+)?AI|ChatGPT)(?:\s+and)?\s+)?can make mistakes(?:\.\s*Check\s+(?:important|improve)\s+info\.?)?\s*$"#
+        guard let range = trimmed.range(
+            of: footerPattern,
+            options: [.regularExpression, .caseInsensitive]
+        ) else { return trimmed }
+        return String(trimmed[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func normalizedWebAssistantMessage(_ message: ChatMessage) -> ChatMessage {
+        guard message.role == .assistant, message.kind == .text else { return message }
+        var normalized = message
+        normalized.text = normalizedWebAssistantChromeText(message.text)
+        return normalized
     }
 
     private func isTransientWebProcessDetail(_ raw: String?) -> Bool {

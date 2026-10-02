@@ -664,6 +664,44 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testDeltaRecoveryDoesNotReplayHistoricalTransportStateIntoLiveUI() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let initialSequence = try await cache.lastSequence()
+        XCTAssertEqual(initialSequence, 1200)
+
+        let historicalBase = Date().addingTimeInterval(-30)
+        for offset in 1...7 {
+            await mock.injectEvent(RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: Int64(1200 + offset),
+                machineId: "my-pc",
+                runtimeId: "runtime.system",
+                instanceId: "agent",
+                // MockTransport's Codable fixture omits nil optional keys, while the
+                // strict production delta wire shape always includes sessionId (null
+                // for machine-level events). Use a benign session id here so this test
+                // exercises WorkspaceStore's delta presentation rule rather than the
+                // mock encoder's key omission.
+                sessionId: "photo-upload",
+                type: "TRANSPORT_STATUS",
+                payload: ["channel": .string("browser-bridge"), "state": .string("offline")],
+                createdAt: historicalBase.addingTimeInterval(Double(offset) / 100.0)
+            ))
+        }
+
+        await store.verifyOnlineSyncHead()
+
+        let recoveredSequence = try await cache.lastSequence()
+        XCTAssertEqual(recoveredSequence, 1207)
+        XCTAssertNil(store.recentSystemNotice, "Historical transport events from any delta page must not overwrite current live connectivity presentation")
+        await store.suspend()
+    }
+
+    @MainActor
     func testStableSessionReconciliationDoesNotRepublishUnchangedTranscript() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
@@ -3231,6 +3269,155 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testStaticAIDisclaimerChromeIsIgnoredAsProgress() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("chatgpt-web-live-process"), "name": .string("ChatGPT Web")]),
+                "summary": .string("It's AI and can make mistakes. Check improve info.")
+            ],
+            createdAt: now
+        ), deliverLive: true)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains {
+            $0.kind == .toolEvent && $0.toolName == "ChatGPT Web"
+        })
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebAssistantFinalStripsTrailingStaticAIDisclaimerChrome() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+        let polluted = ServerMessage(
+            messageId: "assistant-disclaimer-footer",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "Final answer body.\n\nChatGPT said:\nIt's AI and can make mistakes. Check important info.",
+            externalId: nil,
+            createdAt: now
+        )
+        let payload = try XCTUnwrap(try JSONValue.encode(polluted).objectValue)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: payload,
+            createdAt: now
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.messagesBySession["photo-upload", default: []].contains(where: { $0.id == "assistant-disclaimer-footer" }) { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(
+            store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "assistant-disclaimer-footer" })?.text,
+            "Final answer body."
+        )
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebAssistantChromeOnlyBareDisclaimerIsIgnored() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+        let chromeOnly = ServerMessage(
+            messageId: "assistant-bare-disclaimer",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "can make mistakes. Check important info.",
+            externalId: nil,
+            createdAt: now
+        )
+        let payload = try XCTUnwrap(try JSONValue.encode(chromeOnly).objectValue)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: payload,
+            createdAt: now
+        ), deliverLive: true)
+
+        try await Task.sleep(nanoseconds: 80_000_000)
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains {
+            $0.id == "assistant-bare-disclaimer"
+        })
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebAssistantFinalPreservesQuotedDisclaimerInsideAnswer() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+        let quotedText = "The page once displayed: It's AI and can make mistakes. Check important info.\nThat quotation is part of the answer."
+        let quoted = ServerMessage(
+            messageId: "assistant-disclaimer-quoted",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: quotedText,
+            externalId: nil,
+            createdAt: now
+        )
+        let payload = try XCTUnwrap(try JSONValue.encode(quoted).objectValue)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: payload,
+            createdAt: now
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            if store.messagesBySession["photo-upload", default: []].contains(where: { $0.id == "assistant-disclaimer-quoted" }) { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(
+            store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "assistant-disclaimer-quoted" })?.text,
+            quotedText
+        )
+        await store.suspend()
+    }
+
+    @MainActor
     func testGeneratedImageReadyProgressIsLocalizedAndRemainsVisibleUntilTerminalEvent() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
@@ -3573,6 +3760,102 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.id == "missed-live-final" })
         await store.synchronizeVisibleSession("photo-upload", force: true)
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "missed-live-final" }.count, 1)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testVisibleSessionSynchronizationDoesNotLoopCursorAndHistoryWhileRunStaysActive() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: now
+        ), deliverLive: true)
+        for _ in 0..<80 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .busy {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        await mock.setSessionStatus("photo-upload", status: "generating")
+        // ChatView performs one authoritative history load when it first opens.
+        // The periodic visible-session tick must not reload it again while push is healthy.
+        await store.loadSession("photo-upload")
+
+        let deltaBefore = await mock.actionAttemptCount("getChangesAfterCursor")
+        let historyBefore = await mock.actionAttemptCount("loadRecentMessages")
+        await store.synchronizeVisibleSession("photo-upload")
+
+        let deltaAfter = await mock.actionAttemptCount("getChangesAfterCursor")
+        let historyAfter = await mock.actionAttemptCount("loadRecentMessages")
+        let statusAttempts = await mock.actionAttemptCount("getSessionStatus")
+        XCTAssertEqual(
+            deltaAfter,
+            deltaBefore,
+            "A healthy live run must not poll the durable cursor every 2.5 seconds."
+        )
+        XCTAssertEqual(
+            historyAfter,
+            historyBefore,
+            "A healthy live run must not reload and re-merge the full recent transcript on a timer."
+        )
+        XCTAssertGreaterThan(statusAttempts, 0)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testVisibleSessionTerminalStatusTriggersHistoryRecoveryWithoutPeriodicHistoryLoop() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let now = Date()
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: now
+        ), deliverLive: true)
+        for _ in 0..<80 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .busy {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        // Establish the same history watermark that ChatView has after opening.
+        await store.loadSession("photo-upload")
+        let historyBefore = await mock.actionAttemptCount("loadRecentMessages")
+
+        await mock.appendHistoryMessage(ServerMessage(
+            messageId: "missed-terminal-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "terminal recovered from authoritative history",
+            externalId: nil,
+            createdAt: now.addingTimeInterval(1)
+        ))
+        await mock.setSessionStatus("photo-upload", status: "idle")
+
+        await store.synchronizeVisibleSession("photo-upload")
+
+        let historyAfter = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(historyAfter, historyBefore + 1)
+        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.id == "missed-terminal-final" })
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
         await store.suspend()
     }
 
