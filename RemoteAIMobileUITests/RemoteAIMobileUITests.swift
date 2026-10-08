@@ -51,6 +51,9 @@ final class RemoteAIMobileUITests: XCTestCase {
         app.swipeDown()
         let returnToLatest = app.buttons["回到最新消息"]
         XCTAssertTrue(returnToLatest.waitForExistence(timeout: 3), "Browsing older messages should expose a compact return-to-latest control")
+        XCTAssertFalse(latest.isHittable, "A deliberate swipe must actually expose older history, not only toggle the button")
+        app.swipeUp()
+        XCTAssertTrue(returnToLatest.exists, "A subsequent vertical swipe must not resume automatic bottom-follow")
         returnToLatest.tap()
         XCTAssertTrue(latest.waitForExistence(timeout: 3))
         XCTAssertTrue(latest.isHittable)

@@ -622,7 +622,9 @@ struct ChatView: View {
                                 // messages. Mark that intent immediately instead of relying
                                 // only on LazyVStack bottom-sentinel disappearance, which may
                                 // be delayed while the sentinel remains retained offscreen.
-                                if value.translation.height > 8 {
+                                // A deliberate vertical swipe owns history browsing in either direction.
+                                // Do not let live tool events or streaming updates steal scroll position.
+                                if abs(value.translation.height) > 8 {
                                     userBrowsingHistory = true
                                     isAtBottom = false
                                 }
@@ -642,7 +644,7 @@ struct ChatView: View {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                                 didInitialScrollToBottom = true
                             }
-                        } else if !userBrowsingHistory || messages.last?.role == .user {
+                        } else if !userBrowsingHistory {
                             userBrowsingHistory = false
                             withAnimation(.easeOut(duration: 0.18)) {
                                 proxy.scrollTo("bottom", anchor: .bottom)
@@ -1485,12 +1487,15 @@ struct MessageRow: View, Equatable {
                         .accessibilityLabel("复制整块")
                         .accessibilityIdentifier("tool-card-copy-whole")
                     }
+                    if let detail = message.detail, !detail.isEmpty {
+                        Text(renderContent.inlineDetail ?? detail)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.primary)
+                            .lineLimit(toolExpanded ? nil : 3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                     if toolExpanded, let detail = message.detail {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text(renderContent.inlineDetail ?? "")
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(.secondary)
-                                .textSelection(.enabled)
                             HStack(spacing: 12) {
                                 if MessageRenderingPolicy.isLarge(detail) {
                                     Button("查看全文") {
@@ -1560,7 +1565,6 @@ struct MessageRow: View, Equatable {
                                     }
                                     Text(segment.text)
                                         .font(.system(.body, design: .monospaced))
-                                        .textSelection(.enabled)
                                 }
                                 .padding(9)
                                 .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
@@ -1570,7 +1574,7 @@ struct MessageRow: View, Equatable {
                                     // bookkeeping is reserved for the full-text sheet.
                                     Text(segment.text)
                                 } else {
-                                    Text(segment.text).textSelection(.enabled)
+                                    Text(segment.text)
                                 }
                             }
                         }
@@ -1657,7 +1661,6 @@ struct MessageRow: View, Equatable {
                 Text(MessageRenderingPolicy.inlineText(segment.text))
             } else {
                 Text(segment.text)
-                    .textSelection(.enabled)
             }
         }
         .padding(10)
