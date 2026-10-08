@@ -3847,19 +3847,21 @@ final class WorkspaceStore: ObservableObject {
         return "正在生成回答…"
     }
 
-    private func webProcessStatusLabel(_ raw: String) -> String {
+    func webProcessStatusLabel(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "ChatGPT 正在处理…" }
         let lower = trimmed.lowercased()
-        if lower == "thinking" || lower.hasPrefix("thinking ") { return "思考中…" }
-        if lower.contains("searching") || lower.contains("search the web") { return "正在搜索网页…" }
-        if lower.contains("reading") || lower.contains("browsing") { return "正在读取网页内容…" }
-        if lower.contains("analyzing image") || lower.contains("analysing image") { return "正在分析图片…" }
-        if lower.contains("generated image ready") || lower.contains("image ready") { return "图片已生成，正在同步…" }
-        if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return "正在生成图片…" }
-        if lower.contains("responding") { return "正在生成回答…" }
+        if lower == "thinking" || lower == "thinking..." { return "思考中…" }
+        // Translate only generic chrome labels. Preserve English stage details like
+        // "Searching files and verifying the final reply" verbatim for the phone.
+        if lower == "searching" || lower == "searching the web" || lower == "search the web" { return "正在搜索网页…" }
+        if lower == "reading" || lower == "browsing" { return "正在读取网页内容…" }
+        if lower == "analyzing image" || lower == "analysing image" { return "正在分析图片…" }
+        if lower == "generated image ready" || lower == "image ready" { return "图片已生成，正在同步…" }
+        if lower == "generating image" || lower == "creating image" || lower == "drawing image" { return "正在生成图片…" }
+        if lower == "responding" || lower == "chatgpt is responding" { return "正在生成回答…" }
         if lower == "response complete" || lower == "response completed" || lower == "response finished" { return "回答已生成，正在确认同步…" }
-        if lower.contains("writing") || lower.contains("generating") { return "正在生成回答…" }
+        if lower == "writing" || lower == "generating" || lower == "generating answer" { return "正在生成回答…" }
         return trimmed
     }
 
@@ -3908,22 +3910,23 @@ final class WorkspaceStore: ObservableObject {
         return normalized
     }
 
-    private func isTransientWebProcessDetail(_ raw: String?) -> Bool {
+    func isTransientWebProcessDetail(_ raw: String?) -> Bool {
         guard let raw else { return true }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return true }
         let lower = trimmed.lowercased()
-        if lower == "thinking" || lower.hasPrefix("thinking ") { return true }
+        if lower == "thinking" || lower == "thinking..." { return true }
         if lower.hasPrefix("loading older messages") || lower == "stopped thinking" { return true }
-        if lower.contains("searching") || lower.contains("search the web") { return true }
-        if lower.contains("reading") || lower.contains("browsing") { return true }
-        if lower.contains("analyzing image") || lower.contains("analysing image") { return true }
-        if lower.contains("generated image ready") || lower.contains("image ready") { return true }
-        if lower.contains("generating image") || lower.contains("creating image") || lower.contains("drawing image") { return true }
+        // Do not mistake substantive execution summaries for UI-only chrome.
+        if lower == "searching" || lower == "searching the web" || lower == "search the web" { return true }
+        if lower == "reading" || lower == "browsing" { return true }
+        if lower == "analyzing image" || lower == "analysing image" { return true }
+        if lower == "generated image ready" || lower == "image ready" { return true }
+        if lower == "generating image" || lower == "creating image" || lower == "drawing image" { return true }
         if lower == "generation finished" || lower == "generation complete" { return true }
         if lower == "response complete" || lower == "response completed" || lower == "response finished" { return true }
         if lower == "chatgpt is responding" || lower == "chatgpt responding" || lower == "responding" { return true }
-        if lower.contains("writing") || lower == "generating" || lower.hasPrefix("generating answer") { return true }
+        if lower == "writing" || lower == "generating" || lower == "generating answer" { return true }
         if trimmed.hasPrefix("思考中")
             || trimmed.hasPrefix("正在搜索网页")
             || trimmed.hasPrefix("正在读取网页内容")

@@ -38,6 +38,25 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(partialSuccess.shouldReportError)
     }
 
+    @MainActor
+    func testDetailedChatGPTWebProcessStagesRemainVisible() throws {
+        let store = WorkspaceStore(transport: MockTransport(historyCount: 0), cache: try SQLiteStore.inMemory())
+        let examples = [
+            "Implemented web generation recovery, updated adapter tests, inspected build instructions, and ran all test suites",
+            "Ran integration tests and checked user update timing",
+            "Built executable package with periodic progress updates and validation",
+            "Searching the current source code and verifying a recovered final answer",
+            "Reading Windows Agent events and comparing the iPhone output"
+        ]
+        for detail in examples {
+            XCTAssertFalse(store.isTransientWebProcessDetail(detail), "Substantive process detail must not be hidden: \(detail)")
+            XCTAssertEqual(store.webProcessStatusLabel(detail), detail, "Details must not be reduced to a generic status label")
+        }
+        XCTAssertTrue(store.isTransientWebProcessDetail("Thinking"))
+        XCTAssertTrue(store.isTransientWebProcessDetail("Searching the web"))
+        XCTAssertFalse(store.isTransientWebProcessDetail("Searching project metadata"))
+    }
+
     func testInterruptedServerSessionIsNeutralUntilAuthoritativeRecovery() {
         XCTAssertEqual(SessionState.server("interrupted"), .idle, "Agent restart recovery markers must not make historical chats look like current provider failures")
         XCTAssertEqual(SessionState.server("error"), .error)
