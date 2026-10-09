@@ -124,9 +124,11 @@ final class RemoteAIMobileUITests: XCTestCase {
         app.launchEnvironment["REMOTEAI_UI_STRESS_CHARS"] = String(chars)
         app.launchEnvironment["REMOTEAI_UI_STRESS_DIRECT"] = "1"
         // Hosted-runner accessibility setup can consume tens of seconds before the
-        // composer interaction starts. Slow only this UI-test fixture so the stream
-        // is guaranteed to remain active while typing/scrolling are exercised.
-        app.launchEnvironment["REMOTEAI_UI_STRESS_CHUNK_MS"] = "150"
+        // composer interaction starts. The shorter 30k fixture can otherwise reach
+        // terminal before XCUI samples a second progress label on slow runners.
+        // Keep every assertion; lengthen only this deterministic test-only stream.
+        let fixtureChunkMilliseconds = chars <= 30_000 ? 250 : 150
+        app.launchEnvironment["REMOTEAI_UI_STRESS_CHUNK_MS"] = String(fixtureChunkMilliseconds)
         app.launch()
         let progress = app.staticTexts["assistant-stream-progress"]
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
@@ -136,7 +138,7 @@ final class RemoteAIMobileUITests: XCTestCase {
         // XCUI accessibility reads on hosted runners can each take several seconds.
         // Give the progress label enough time to be sampled at least twice while
         // the UI-only stream remains active for the interaction checks below.
-        waitForExpectations(timeout: 15)
+        waitForExpectations(timeout: 25)
         let composer = app.textViews["MessageComposer"]
         let typingBegan = ProcessInfo.processInfo.systemUptime
         composer.tap()
@@ -155,10 +157,10 @@ final class RemoteAIMobileUITests: XCTestCase {
         let final = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", marker)).firstMatch
         let finished = NSPredicate { _, _ in !progress.exists && final.exists }
         expectation(for: finished, evaluatedWith: nil)
-        // The UI-only fixture emits 100 characters every 150 ms. Budget the full
-        // stream duration plus runner/accessibility slack instead of retaining the
+        // The UI-only fixture emits 100 characters at the configured chunk interval.
+        // Budget its complete duration plus runner/accessibility slack instead of retaining the
         // old 40-second timeout that predates the deterministic slow fixture.
-        let expectedFixtureSeconds = (Double(chars) / 100.0) * 0.150
+        let expectedFixtureSeconds = (Double(chars) / 100.0) * (Double(fixtureChunkMilliseconds) / 1000.0)
         waitForExpectations(timeout: max(180, expectedFixtureSeconds + 90))
         XCTAssertTrue(final.exists)
     }
