@@ -78,6 +78,29 @@ final class RemoteAIMobileUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Send"].isHittable)
     }
 
+    func testTappingTranscriptDismissesKeyboardWithoutDiscardingDraft() throws {
+        let app = makeMockApp()
+        app.launch()
+        app.staticTexts["Web"].tap()
+        XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 3))
+        app.staticTexts["Photo SaaS"].tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 3))
+        app.staticTexts["上传性能优化"].tap()
+
+        let composer = app.textViews["MessageComposer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        composer.tap()
+        composer.typeText("unsent keyboard draft")
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+        let transcript = app.staticTexts["Mock assistant response 1200. This verifies long-history pagination without rendering everything at once."]
+        XCTAssertTrue(transcript.waitForExistence(timeout: 5))
+        transcript.tap()
+        let dismissed = NSPredicate(format: "exists == false")
+        expectation(for: dismissed, evaluatedWith: app.keyboards.firstMatch)
+        waitForExpectations(timeout: 5)
+        XCTAssertEqual(composer.value as? String, "unsent keyboard draft")
+    }
+
     func testPairingScreenHasManualAndQRPaths() throws {
         let app = makeMockApp()
         app.launch()

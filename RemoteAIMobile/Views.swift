@@ -616,6 +616,9 @@ struct ChatView: View {
                     }
                     .background(Color(.systemGroupedBackground))
                     .simultaneousGesture(
+                        TapGesture().onEnded { focused = false }
+                    )
+                    .simultaneousGesture(
                         DragGesture(minimumDistance: 8)
                             .onChanged { value in
                                 // A downward finger drag moves the transcript toward older
@@ -625,6 +628,7 @@ struct ChatView: View {
                                 // A deliberate vertical swipe owns history browsing in either direction.
                                 // Do not let live tool events or streaming updates steal scroll position.
                                 if abs(value.translation.height) > 8 {
+                                    focused = false
                                     userBrowsingHistory = true
                                     isAtBottom = false
                                 }
@@ -757,6 +761,7 @@ struct ChatView: View {
                 }
                 Composer(
                     draft: draft,
+                    focused: $focused,
                     attachments: $pendingAttachments,
                     enabled: store.machine.state == .online && !sending,
                     isGenerating: isGenerating,
@@ -812,7 +817,7 @@ struct ChatView: View {
                             }
                         }
                     }
-                ).focused($focused)
+                )
             }
         }
         .sheet(isPresented: $showPhotoPicker) {
@@ -922,6 +927,7 @@ final class ComposerDraft: ObservableObject {
 
 struct Composer: View {
     @ObservedObject var draft: ComposerDraft
+    let focused: FocusState<Bool>.Binding
     private var text: String { draft.text }
     @Binding var attachments: [PendingAttachment]
     let enabled: Bool
@@ -991,6 +997,7 @@ struct Composer: View {
                 .accessibilityLabel(isRecording ? "Stop voice input" : "Voice input")
 
                 TextEditor(text: $draft.text)
+                    .focused(focused)
                     .frame(minHeight: 36, maxHeight: 92)
                     .padding(.horizontal, 7).padding(.vertical, 2)
                     .background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground)))
