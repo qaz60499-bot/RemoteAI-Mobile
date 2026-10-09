@@ -42,6 +42,7 @@ final class PairingTests: XCTestCase {
         private let mode: Mode
         private var connected = false
         private var connectCalls = 0
+        private var executionDelayNanoseconds: UInt64 = 0
         private let healthEvents: AsyncStream<TransportHealthEvent>
         private let healthContinuation: AsyncStream<TransportHealthEvent>.Continuation
 
@@ -62,10 +63,13 @@ final class PairingTests: XCTestCase {
         func eventStream() async -> AsyncStream<RemoteEvent> { AsyncStream { _ in } }
         func healthStream() async -> AsyncStream<TransportHealthEvent> { healthEvents }
         func connectionCount() -> Int { connectCalls }
+        func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
+        func injectHealth(_ event: TransportHealthEvent) { healthContinuation.yield(event) }
         func forceDisconnect() { connected = false }
 
         func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
             guard connected else { throw TransportError.offline }
+            if executionDelayNanoseconds > 0 { try await Task.sleep(nanoseconds: executionDelayNanoseconds) }
             switch command.action {
             case "getStatus":
                 if mode == .statusTimeout { throw TransportError.timeout }
@@ -676,6 +680,52 @@ final class PairingTests: XCTestCase {
         XCTAssertEqual(store.connectionPhase, .online)
         let connectionCount = await transport.connectionCount()
         XCTAssertGreaterThanOrEqual(connectionCount, 2)
+        await store.suspend()
+    }
+
+    func testForegroundCallbacksAvoidUnnecessaryReconnectAndHideBriefStatusFlash() async throws {
+        let machineId = "machine-foreground-presentation-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x39, count: 32))
+        let transport = ConnectionScenarioTransport(mode: .normal)
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        await store.start()
+        XCTAssertEqual(store.machine.state, .online)
+        let initialConnects = await transport.connectionCount()
+        await store.resumeFromForeground()
+        let connectsAfterForeground = await transport.connectionCount()
+        XCTAssertEqual(connectsAfterForeground, initialConnects, "Duplicate foreground callbacks must not recycle an online socket")
+
+        await store.suspend()
+        await transport.setExecutionDelay(nanoseconds: 220_000_000)
+        let resuming = Task { await store.resumeFromForeground() }
+        try await Task.sleep(nanoseconds: 40_000_000)
+        XCTAssertTrue(store.deferringTransientConnectionPresentation)
+        XCTAssertEqual(store.displayedMachineState, .online, "Brief reconnect does not flash Offline")
+        XCTAssertFalse(store.shouldDisplayConnectionBanner)
+        await resuming.value
+        XCTAssertEqual(store.machine.state, .online)
+        XCTAssertFalse(store.deferringTransientConnectionPresentation)
+        await store.suspend()
+    }
+
+    func testSustainedRelayFailureBecomesVisibleAfterPresentationGrace() async throws {
+        let machineId = "machine-presentation-expiry-\(UUID().uuidString)"
+        defer { PairingKeyStore.deletePairing(machineId: machineId) }
+        try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x3A, count: 32))
+        let transport = ConnectionScenarioTransport(mode: .normal)
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        await store.start()
+        await transport.setExecutionDelay(nanoseconds: 2_700_000_000)
+        await transport.injectHealth(TransportHealthEvent(channel: .relay, state: .offline, at: Date(), detail: "test drop"))
+        try await Task.sleep(nanoseconds: 65_000_000)
+        XCTAssertTrue(store.deferringTransientConnectionPresentation)
+        XCTAssertFalse(store.shouldDisplayConnectionBanner, "Brief outage must remain visually silent")
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+        XCTAssertFalse(store.deferringTransientConnectionPresentation)
+        XCTAssertTrue(store.shouldDisplayConnectionBanner, "Persistent outage must become visible without lying about connectivity")
         await store.suspend()
     }
 

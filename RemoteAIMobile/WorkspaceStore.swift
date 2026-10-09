@@ -32,6 +32,15 @@ final class WorkspaceStore: ObservableObject {
     @Published var desktopRelayConnected: Bool?
     @Published var desktopAgentConnected: Bool?
     var desktopStatusUpdatedAt: Date?
+    @Published private(set) var deferringTransientConnectionPresentation = false
+
+    // UI-only grace: command gating and diagnostics still use authoritative state.
+    var displayedMachineState: MachineConnectionState {
+        deferringTransientConnectionPresentation && isPaired ? .online : machine.state
+    }
+    var shouldDisplayConnectionBanner: Bool {
+        !deferringTransientConnectionPresentation && (machine.state != .online || connectionPhase != .online)
+    }
 
     static let connectingStateMaxDuration: TimeInterval = 45
 
@@ -54,6 +63,25 @@ final class WorkspaceStore: ObservableObject {
     private var pairingInProgress = false
     private var lifecycleGeneration: UInt64 = 0
     private var isSuspended = false
+    private var wasOnlineBeforeBackground = false
+    private var connectionPresentationTask: Task<Void, Never>?
+    private static let connectionPresentationGraceNanoseconds: UInt64 = 1_800_000_000
+
+    private func deferTransientConnectionPresentation() {
+        connectionPresentationTask?.cancel()
+        deferringTransientConnectionPresentation = true
+        connectionPresentationTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.connectionPresentationGraceNanoseconds)
+            guard !Task.isCancelled else { return }
+            self?.endTransientConnectionPresentation()
+        }
+    }
+
+    private func endTransientConnectionPresentation() {
+        connectionPresentationTask?.cancel()
+        connectionPresentationTask = nil
+        deferringTransientConnectionPresentation = false
+    }
 
     // MainActor reentrancy means a second UI task can enter while the first request is
     // awaiting I/O. Keep per-operation gates at the Store boundary, not only in Views.
@@ -294,6 +322,7 @@ final class WorkspaceStore: ObservableObject {
             }
             machine.state = .online
             errors["connection"] = nil
+            endTransientConnectionPresentation()
             DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence)])
             startConnectionMonitor()
             scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "initial-online")
@@ -317,7 +346,10 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func suspend() async {
+        guard !isSuspended else { return }
+        wasOnlineBeforeBackground = machine.state == .online
         isSuspended = true
+        endTransientConnectionPresentation()
         lifecycleGeneration &+= 1
         restartAfterStart = false
         connectionMonitorTask?.cancel()
@@ -334,7 +366,11 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func resumeFromForeground() async {
+        // No preceding background: do not tear down a healthy cold-launch socket.
+        guard isSuspended else { return }
         isSuspended = false
+        if wasOnlineBeforeBackground { deferTransientConnectionPresentation() }
+        wasOnlineBeforeBackground = false
         // Pairing owns a separate relay websocket. Foreground callbacks must not
         // reopen the normal transport with the same stable deviceId while that
         // websocket is waiting for PAIR_CHALLENGE / PAIR_ACCEPT.
@@ -2071,6 +2107,7 @@ final class WorkspaceStore: ObservableObject {
                         self.machine.state = .online
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
+                        self.endTransientConnectionPresentation()
                         DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence), "source": "reconnect"])
                         self.scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "relay-reconnect")
                         // Reconcile the durable event gap before any catalog refresh. A
@@ -2100,6 +2137,7 @@ final class WorkspaceStore: ObservableObject {
                         self.machine.state = .online
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
+                        self.endTransientConnectionPresentation()
                         DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence), "source": "agent-recovered"])
                         self.scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "agent-recovered")
                         await self.recoverDelta(freshLatestSequence: authenticatedSequence)
@@ -2125,6 +2163,7 @@ final class WorkspaceStore: ObservableObject {
         if let transportError = error as? TransportError {
             switch transportError {
             case .pairingRequired:
+                endTransientConnectionPresentation()
                 isPaired = false
                 connectionPhase = .pairingExpired
                 errors["connection"] = "Pairing expired / Repair required — scan the current Windows pairing QR code."
@@ -3691,20 +3730,23 @@ final class WorkspaceStore: ObservableObject {
             desktopRelayConnected = event.state == .online
             if event.state == .online {
                 let recovered = systemTransportOfflineChannels.remove("device-relay") != nil
-                if recovered && !wasOnline {
+                if recovered && !wasOnline && !deferringTransientConnectionPresentation {
                     recentSystemNotice = "手机到 Cloudflare Relay 的连接已恢复；正在核对 Windows Agent 和当前会话。"
                 }
                 return
             }
             if event.state == .connecting { return }
             systemTransportOfflineChannels.insert("device-relay")
+            if machine.state == .online && event.state == .offline {
+                deferTransientConnectionPresentation()
+            }
             if machine.state == .online || connectionPhase == .online {
                 machine.state = .connecting
                 connectionPhase = .reconnecting
             }
             if event.state == .offline {
                 errors["connection"] = "Cloudflare Relay 连接已断开，RemoteAI 正在重连；已确认的命令和事件游标会保留。"
-                recentSystemNotice = "手机到 Cloudflare Relay 的连接已断开，正在自动重连。"
+                // A short 1006 remains in diagnostics; it need not flash a notice.
             } else if connectionPhase == .reconnecting {
                 errors["connection"] = "Cloudflare Relay 正在重连；Windows Agent 状态将于 Relay 恢复后重新核对。"
             }
@@ -3723,8 +3765,9 @@ final class WorkspaceStore: ObservableObject {
                     // forcing a second authentication/reconnect cycle.
                     connectionPhase = .online
                     errors["connection"] = nil
+                    endTransientConnectionPresentation()
                 }
-                if recovered {
+                if recovered && !deferringTransientConnectionPresentation {
                     recentSystemNotice = "Windows Agent 已重新连上 Relay，正在补同步当前会话。"
                 }
             case .connecting, .reconnecting:
@@ -3747,6 +3790,7 @@ final class WorkspaceStore: ObservableObject {
                     errors["connection"] = nil
                 }
             case .offline:
+                endTransientConnectionPresentation()
                 desktopAgentConnected = false
                 systemTransportOfflineChannels.insert("windows-agent")
                 machine.state = .offline

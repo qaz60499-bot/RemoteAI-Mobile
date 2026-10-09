@@ -35,8 +35,8 @@ struct RootView: View {
                         Image(systemName: "desktopcomputer").font(.title2)
                         VStack(alignment: .leading, spacing: 3) {
                             Text(store.machine.name).font(.headline)
-                            StatusLabel(text: store.machine.state.rawValue, active: store.machine.state == .online)
-                            if store.connectionPhase != .online {
+                            StatusLabel(text: store.displayedMachineState.rawValue, active: store.displayedMachineState == .online)
+                            if !store.deferringTransientConnectionPresentation && store.connectionPhase != .online {
                                 Text(store.connectionPhase.displayName).font(.caption2).foregroundColor(.secondary)
                             }
                         }
@@ -60,7 +60,7 @@ struct RootView: View {
                         }
                     }
                 }
-                if store.machine.state == .offline && store.isPaired {
+                if store.machine.state == .offline && !store.deferringTransientConnectionPresentation && store.isPaired {
                     Section {
                         Label("Cached workspaces remain available while the PC is offline.", systemImage: "wifi.slash").font(.footnote).foregroundColor(.secondary)
                         if let error = store.errors["connection"] { Text(error).font(.footnote).foregroundColor(.secondary) }
@@ -551,7 +551,7 @@ struct ChatView: View {
     }
     var body: some View {
         VStack(spacing: 0) {
-            if store.machine.state != .online || store.connectionPhase != .online {
+            if store.shouldDisplayConnectionBanner {
                 StatusBanner(
                     text: store.errors["connection"] ?? store.connectionPhase.displayName,
                     systemImage: "wifi.exclamationmark"
