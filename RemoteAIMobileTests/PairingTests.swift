@@ -708,6 +708,31 @@ final class PairingTests: XCTestCase {
         XCTAssertEqual(store.machine.state, .online)
         XCTAssertFalse(store.deferringTransientConnectionPresentation)
         await store.suspend()
+
+        // Real USB recovery takes several seconds for authenticated status. Keep its
+        // foreground display stable without delaying the actual transport reconnect.
+        await transport.setExecutionDelay(nanoseconds: 3_000_000_000)
+        let slowerResume = Task { await store.resumeFromForeground() }
+        try await Task.sleep(nanoseconds: 2_500_000_000)
+        XCTAssertTrue(store.deferringTransientConnectionPresentation)
+        XCTAssertEqual(store.displayedMachineState, .online)
+        XCTAssertFalse(store.shouldDisplayConnectionBanner)
+        await slowerResume.value
+        XCTAssertEqual(store.machine.state, .online)
+        XCTAssertFalse(store.deferringTransientConnectionPresentation)
+        await store.suspend()
+
+        // Foreground suppression is presentation-only and must expire if the
+        // authenticated reconnect truly remains unavailable beyond its grace.
+        await transport.setExecutionDelay(nanoseconds: 6_500_000_000)
+        let stalledResume = Task { await store.resumeFromForeground() }
+        try await Task.sleep(nanoseconds: 5_800_000_000)
+        XCTAssertFalse(store.deferringTransientConnectionPresentation)
+        XCTAssertNotEqual(store.machine.state, .online)
+        XCTAssertTrue(store.shouldDisplayConnectionBanner)
+        await stalledResume.value
+        XCTAssertEqual(store.machine.state, .online)
+        await store.suspend()
     }
 
     func testSustainedRelayFailureBecomesVisibleAfterPresentationGrace() async throws {
@@ -723,7 +748,7 @@ final class PairingTests: XCTestCase {
         try await Task.sleep(nanoseconds: 65_000_000)
         XCTAssertTrue(store.deferringTransientConnectionPresentation)
         XCTAssertFalse(store.shouldDisplayConnectionBanner, "Brief outage must remain visually silent")
-        try await Task.sleep(nanoseconds: 2_000_000_000)
+        try await Task.sleep(nanoseconds: 2_600_000_000)
         XCTAssertFalse(store.deferringTransientConnectionPresentation)
         XCTAssertTrue(store.shouldDisplayConnectionBanner, "Persistent outage must become visible without lying about connectivity")
         await store.suspend()

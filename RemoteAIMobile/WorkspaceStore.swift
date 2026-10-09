@@ -65,13 +65,14 @@ final class WorkspaceStore: ObservableObject {
     private var isSuspended = false
     private var wasOnlineBeforeBackground = false
     private var connectionPresentationTask: Task<Void, Never>?
-    private static let connectionPresentationGraceNanoseconds: UInt64 = 1_800_000_000
+    private static let relayPresentationGraceNanoseconds: UInt64 = 2_500_000_000
+    private static let foregroundPresentationGraceNanoseconds: UInt64 = 5_500_000_000
 
-    private func deferTransientConnectionPresentation() {
+    private func deferTransientConnectionPresentation(graceNanoseconds: UInt64) {
         connectionPresentationTask?.cancel()
         deferringTransientConnectionPresentation = true
         connectionPresentationTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: Self.connectionPresentationGraceNanoseconds)
+            try? await Task.sleep(nanoseconds: graceNanoseconds)
             guard !Task.isCancelled else { return }
             self?.endTransientConnectionPresentation()
         }
@@ -369,7 +370,9 @@ final class WorkspaceStore: ObservableObject {
         // No preceding background: do not tear down a healthy cold-launch socket.
         guard isSuspended else { return }
         isSuspended = false
-        if wasOnlineBeforeBackground { deferTransientConnectionPresentation() }
+        if wasOnlineBeforeBackground {
+            deferTransientConnectionPresentation(graceNanoseconds: Self.foregroundPresentationGraceNanoseconds)
+        }
         wasOnlineBeforeBackground = false
         // Pairing owns a separate relay websocket. Foreground callbacks must not
         // reopen the normal transport with the same stable deviceId while that
@@ -3738,7 +3741,7 @@ final class WorkspaceStore: ObservableObject {
             if event.state == .connecting { return }
             systemTransportOfflineChannels.insert("device-relay")
             if machine.state == .online && event.state == .offline {
-                deferTransientConnectionPresentation()
+                deferTransientConnectionPresentation(graceNanoseconds: Self.relayPresentationGraceNanoseconds)
             }
             if machine.state == .online || connectionPhase == .online {
                 machine.state = .connecting
