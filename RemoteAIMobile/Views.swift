@@ -208,7 +208,7 @@ struct InstanceView: View {
             return store.webProjects
         }
         if isAntigravity {
-            if !store.antigravityProjects.isEmpty { return store.antigravityProjects }
+            if store.hasLoadedAntigravityProjects { return store.antigravityProjects }
             var map: [String: (count: Int, lastOpened: Date?)] = [:]
             for s in store.sessions where s.instanceId == instance.id {
                 if let alias = s.projectAlias, !alias.isEmpty {
@@ -252,6 +252,11 @@ struct InstanceView: View {
                     if filteredProjects.isEmpty {
                         let query = projectSearch.trimmingCharacters(in: .whitespacesAndNewlines)
                         let projectStatus: String = {
+                            if isAntigravity {
+                                if store.errors["antigravity.projects"] != nil { return "Antigravity Projects 读取失败 — 下拉刷新重试" }
+                                if store.hasLoadedAntigravityProjects { return query.isEmpty ? "当前没有找到 Antigravity Projects" : "没有匹配的 Antigravity Project" }
+                                return "正在读取 Antigravity Projects…"
+                            }
                             if store.errors["web.projects"] != nil { return "Projects 读取失败 — 下拉刷新重试" }
                             if !query.isEmpty, store.hasLoadedWebProjects { return "没有匹配的 ChatGPT Project" }
                             if store.hasLoadedWebProjects { return "当前没有找到 ChatGPT Projects" }
@@ -549,7 +554,9 @@ struct WebProjectView: View {
             }
         )
         .task {
-            await refreshProjectContext(force: true)
+            // An automatic Project open should reuse the verified catalog and
+            // existing Web tab; only an explicit pull-to-refresh forces a DOM scan.
+            await refreshProjectContext(force: false)
             // Websocket events are the fast path, but a phone can miss the start of a
             // desktop run while backgrounded or reconnecting. Poll only the cheap Agent
             // session catalog while this Project view is visible; never open a browser
@@ -568,7 +575,7 @@ struct WebProjectView: View {
         }
         .onChange(of: scenePhase) { phase in
             guard phase == .active, store.machine.state == .online else { return }
-            Task { await refreshProjectContext(force: true) }
+            Task { await refreshProjectContext(force: false) }
         }
         .onChange(of: store.machine.state) { state in
             guard state == .online else { return }

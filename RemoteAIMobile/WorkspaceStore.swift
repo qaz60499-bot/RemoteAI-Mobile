@@ -10,6 +10,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var messagesBySession: [String: [ChatMessage]] = [:]
     @Published var webProjects: [WebProjectDescriptor] = []
     @Published var antigravityProjects: [WebProjectDescriptor] = []
+    @Published var hasLoadedAntigravityProjects = false
     @Published var projectConversationsByAlias: [String: [WebConversationDescriptor]] = [:]
     @Published var projectNextCursorByAlias: [String: String] = [:]
     @Published var projectHasMoreByAlias: [String: Bool] = [:]
@@ -397,6 +398,7 @@ final class WorkspaceStore: ObservableObject {
             let projects = try await transport.listAntigravityProjects(machineId: machine.id)
             guard generation == lifecycleGeneration, !isSuspended, machine.state == .online else { return }
             antigravityProjects = projects
+            hasLoadedAntigravityProjects = true
             errors["antigravity.projects"] = nil
         } catch {
             if generation == lifecycleGeneration, !isSuspended {
