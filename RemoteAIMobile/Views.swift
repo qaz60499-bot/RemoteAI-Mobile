@@ -618,6 +618,7 @@ struct ChatView: View {
     @State private var selectedModel = ""
     @State private var voiceBaseText = ""
     @State private var isAtBottom = true
+    @State private var latestScrollTask: Task<Void, Never>?
     @State private var didInitialScrollToBottom = false
     @State private var userBrowsingHistory = false
     @StateObject private var speechInput = SpeechInputController()
@@ -656,16 +657,33 @@ struct ChatView: View {
             || currentSessionState == .waiting
             || store.liveRunStatusBySession[session.id] != nil
     }
-    // LazyVStack estimates offscreen row heights. A single tail scroll may
-    // stop short when a long streaming row becomes the canonical final message.
-    // Resolve the real last row, then settle at the sentinel after layout.
+    // LazyVStack can underestimate many offscreen 2k-preview row heights.
+    // A one-shot scrollTo(lastID)/bottom sentinel still left XCTest at 72% in
+    // a 50k final despite the canonical message having arrived. Converge only
+    // when the user explicitly asks for latest or while tail-follow is active.
+    // Bound retries to 3.6 seconds, stop at the actual bottom sentinel, and
+    // never override a subsequent human drag into history.
     private func settleLatestScroll(_ proxy: ScrollViewProxy) {
+        latestScrollTask?.cancel()
         guard !userBrowsingHistory, let lastID = messages.last?.id else { return }
-        proxy.scrollTo(lastID, anchor: .bottom)
-        let currentSessionID = session.id
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(220)) {
-            guard session.id == currentSessionID, !userBrowsingHistory else { return }
-            proxy.scrollTo("bottom", anchor: .bottom)
+        let requestedSessionID = session.id
+        DiagnosticsLog.shared.record("latest_scroll_requested", fields: ["session": requestedSessionID])
+        // Materialize the true last LazyVStack row before measuring its bottom.
+        proxy.scrollTo(lastID, anchor: isAtBottom ? .bottom : .top)
+        latestScrollTask = Task { @MainActor in
+            for attempt in 0..<12 {
+                do { try await Task.sleep(nanoseconds: 300_000_000) }
+                catch { return }
+                guard !Task.isCancelled,
+                      session.id == requestedSessionID,
+                      !userBrowsingHistory else { return }
+                if isAtBottom { return }
+                // Recalibrate monotonically; alternating to lastID can jump backward.
+                proxy.scrollTo("bottom", anchor: .bottom)
+                if attempt.isMultiple(of: 4) {
+                    DiagnosticsLog.shared.record("latest_scroll_retry", fields: ["session": requestedSessionID, "attempt": String(attempt + 1)])
+                }
+            }
         }
     }
 
@@ -748,6 +766,7 @@ struct ChatView: View {
                                 // A deliberate vertical swipe owns history browsing in either direction.
                                 // Do not let live tool events or streaming updates steal scroll position.
                                 if abs(value.translation.height) > 8 {
+                                    latestScrollTask?.cancel()
                                     focused = false
                                     userBrowsingHistory = true
                                     isAtBottom = false
@@ -782,6 +801,7 @@ struct ChatView: View {
                         }
                     }
                     .onChange(of: session.id) { _ in
+                        latestScrollTask?.cancel()
                         didInitialScrollToBottom = false
                         userBrowsingHistory = false
                         isAtBottom = true
@@ -961,7 +981,7 @@ struct ChatView: View {
         .sheet(item: $textSelectionRequest) { request in
             TextSelectionSheet(text: request.text, monospaced: request.monospaced)
         }
-        .onDisappear { speechInput.stop() }
+        .onDisappear { latestScrollTask?.cancel(); speechInput.stop() }
         .onChange(of: scenePhase) { phase in
             if phase != .active {
                 speechInput.stop()
