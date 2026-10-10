@@ -9,6 +9,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var sessions: [SessionDescriptor] = []
     @Published var messagesBySession: [String: [ChatMessage]] = [:]
     @Published var webProjects: [WebProjectDescriptor] = []
+    @Published var antigravityProjects: [WebProjectDescriptor] = []
     @Published var projectConversationsByAlias: [String: [WebConversationDescriptor]] = [:]
     @Published var projectNextCursorByAlias: [String: String] = [:]
     @Published var projectHasMoreByAlias: [String: Bool] = [:]
@@ -387,6 +388,21 @@ final class WorkspaceStore: ObservableObject {
             return
         }
         await start()
+    }
+
+    func refreshAntigravityProjects() async {
+        guard machine.state == .online, !isSuspended else { return }
+        let generation = lifecycleGeneration
+        do {
+            let projects = try await transport.listAntigravityProjects(machineId: machine.id)
+            guard generation == lifecycleGeneration, !isSuspended, machine.state == .online else { return }
+            antigravityProjects = projects
+            errors["antigravity.projects"] = nil
+        } catch {
+            if generation == lifecycleGeneration, !isSuspended {
+                errors["antigravity.projects"] = error.localizedDescription
+            }
+        }
     }
 
     func refreshWebProjects(force: Bool = true) async {
@@ -1016,6 +1032,39 @@ final class WorkspaceStore: ObservableObject {
                 errors[projectAlias.map { "web.project.\($0)" } ?? "web.root"] = error.localizedDescription
             }
             return nil
+        }
+    }
+
+    func deleteSession(runtime: RuntimeDescriptor, instance: InstanceDescriptor, session: SessionDescriptor) async -> Bool {
+        // Until the other providers expose verified upstream deletion, do not
+        // offer a misleading phone-only operation for Web or Codex.
+        guard runtime.kind == .antigravity, session.instanceId == instance.id else { return false }
+        guard machine.state == .online else {
+            errors["instance.\(instance.id)"] = "PC Offline — cannot confirm upstream deletion."
+            return false
+        }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        let operationKey = "deleteSession.\(runtime.id).\(session.id)"
+        do {
+            let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
+            try await activeTransport.deleteSession(machineId: activeMachineId, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, commandId: commandId)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+            await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
+            sessionRevisions[instance.id, default: 0] &+= 1
+            sessions.removeAll { $0.id == session.id }
+            messagesBySession.removeValue(forKey: session.id)
+            liveRunStatusBySession.removeValue(forKey: session.id)
+            await persistMetadata()
+            errors["instance.\(instance.id)"] = nil
+            return true
+        } catch {
+            if generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended {
+                if !isUnknownDelivery(error) { await finishPendingOperation(key: operationKey, machineId: activeMachineId) }
+                errors["instance.\(instance.id)"] = error.localizedDescription
+            }
+            return false
         }
     }
 
@@ -1836,7 +1885,8 @@ final class WorkspaceStore: ObservableObject {
         runtime: RuntimeDescriptor,
         instance: InstanceDescriptor,
         title: String,
-        model: String = ""
+        model: String = "",
+        projectAlias: String? = nil
     ) async -> Bool {
         guard creatingSessions.insert(instance.id).inserted else { return false }
         defer { creatingSessions.remove(instance.id) }
@@ -1848,6 +1898,9 @@ final class WorkspaceStore: ObservableObject {
         if (runtime.kind == .codex || runtime.kind == .antigravity), !model.isEmpty {
             payload["model"] = .string(model)
         }
+        if runtime.kind == .antigravity, let projectAlias, !projectAlias.isEmpty {
+            payload["projectAlias"] = .string(projectAlias)
+        }
         guard machine.state == .online else {
             errors[instance.id] = "PC Offline — new sessions are not queued automatically."
             return false
@@ -1855,7 +1908,7 @@ final class WorkspaceStore: ObservableObject {
         let activeTransport = transport
         let activeMachineId = machine.id
         sessionRevisions[instance.id, default: 0] &+= 1
-        let operationKey = "createSession.\(runtime.id).\(instance.id).\(effectiveTitle).\(model)"
+        let operationKey = "createSession.\(runtime.id).\(instance.id).\(effectiveTitle).\(model).\(projectAlias ?? "")"
         do {
             let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
@@ -3328,7 +3381,7 @@ final class WorkspaceStore: ObservableObject {
 
         let runEventTypes = ["MESSAGE_UPDATED", "MESSAGE_ADDED", "TOOL_STARTED", "TOOL_FINISHED", "GENERATION_STARTED", "GENERATION_STOPPED"]
         let sessionCatalogMutatingEventTypes = Set(runEventTypes + [
-            "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS",
+            "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "SESSION_DELETED",
             "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED", "MESSAGE_REMOVED",
         ])
         if sessionCatalogMutatingEventTypes.contains(event.type) {
@@ -3386,6 +3439,11 @@ final class WorkspaceStore: ObservableObject {
         }
 
         switch event.type {
+        case "SESSION_DELETED":
+            sessions.removeAll { $0.id == sessionId }
+            messagesBySession.removeValue(forKey: sessionId)
+            liveRunStatusBySession.removeValue(forKey: sessionId)
+            await persistMetadata()
         case "MESSAGE_REMOVED":
             if let messageID = event.payload["messageId"]?.stringValue {
                 messagesBySession[sessionId]?.removeAll { $0.id == messageID }

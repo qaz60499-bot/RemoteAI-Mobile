@@ -265,6 +265,22 @@ extension Transport {
         return try? response.decode(ServerSession.self).descriptor
     }
 
+    func listAntigravityProjects(machineId: String) async throws -> [WebProjectDescriptor] {
+        let command = RemoteCommand.make(
+            machineId: machineId,
+            runtimeId: "runtime.antigravity",
+            instanceId: "antigravity.desktop",
+            action: "listProjects"
+        )
+        let response = try await requireSuccess(execute(command))
+        return try response.decode([WebProjectDescriptor].self)
+    }
+
+    func deleteSession(machineId: String, runtimeId: String, instanceId: String, sessionId: String, commandId: UUID = UUID()) async throws {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "deleteSession", commandId: commandId)
+        _ = try await requireSuccess(execute(command))
+    }
+
     func listProjectsResponse(machineId: String, forceRefresh: Bool = false) async throws -> WebProjectListResponse {
         let command = RemoteCommand.make(
             machineId: machineId,

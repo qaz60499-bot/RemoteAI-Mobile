@@ -12,7 +12,7 @@ enum ProtocolSecurity {
 
     static let eventTypes: Set<String> = [
         "COMMAND_RESULT", "COMMAND_REJECTED", "SYSTEM_STATUS", "RUNTIME_STATUS",
-        "INSTANCE_UPDATED", "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS",
+        "INSTANCE_UPDATED", "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "SESSION_DELETED",
         "MESSAGE_ADDED", "MESSAGE_UPDATED", "MESSAGE_REMOVED", "GENERATION_STARTED", "GENERATION_STOPPED",
         "PROGRESS", "SESSION_PROGRESS",
         "TOOL_STARTED", "TOOL_FINISHED", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_CONVERSATION_CREATED",
@@ -26,7 +26,7 @@ enum ProtocolSecurity {
         "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore", "readMessageAttachmentChunk",
         "getChangesAfterCursor",
         "registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation",
-        "listProjects", "listProjectConversations", "openProject", "createProject",
+        "listProjects", "listProjectConversations", "openProject", "createProject", "deleteSession",
         "beginAttachmentUpload", "uploadAttachmentChunk", "finishAttachmentUpload", "discardAttachmentUpload"
     ]
 

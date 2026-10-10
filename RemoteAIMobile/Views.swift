@@ -186,6 +186,7 @@ struct RuntimeView: View {
 
 struct InstanceView: View {
     @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.scenePhase) private var scenePhase
     let runtime: RuntimeDescriptor
     let instance: InstanceDescriptor
     @State private var newSession = false
@@ -194,6 +195,8 @@ struct InstanceView: View {
     @State private var creatingWebChat = false
     @State private var createdWebSession: SessionDescriptor?
     @State private var openCreatedWebSession = false
+    @State private var deleteCandidate: SessionDescriptor?
+    @State private var showingDeleteConfirmation = false
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
     private var isAntigravity: Bool { runtime.id == "runtime.antigravity" }
     private var supportsProjects: Bool { isChatGPTWeb || isAntigravity }
@@ -205,6 +208,7 @@ struct InstanceView: View {
             return store.webProjects
         }
         if isAntigravity {
+            if !store.antigravityProjects.isEmpty { return store.antigravityProjects }
             var map: [String: (count: Int, lastOpened: Date?)] = [:]
             for s in store.sessions where s.instanceId == instance.id {
                 if let alias = s.projectAlias, !alias.isEmpty {
@@ -275,7 +279,9 @@ struct InstanceView: View {
                 } footer: {
                     Text("点进某个 Project 后才加载该 Project 的历史对话；不会启动时遍历全部历史。")
                 }
-                if let error = store.errors["web.projects"] { Section { ErrorBanner(text: error) { store.clearError(sessionId: "web.projects") } } }
+                if let error = store.errors[isAntigravity ? "antigravity.projects" : "web.projects"] {
+                    Section { ErrorBanner(text: error) { store.clearError(sessionId: isAntigravity ? "antigravity.projects" : "web.projects") } }
+                }
                 Section {
                     if isChatGPTWeb { Button {
                         guard !creatingWebChat else { return }
@@ -297,6 +303,11 @@ struct InstanceView: View {
                     .disabled(creatingWebChat || store.machine.state != .online) } else { Button { newSession = true } label: { Label("新建普通 Antigravity 对话", systemImage: "plus.circle.fill") } }
                     ForEach(store.sessions.filter { $0.instanceId == instance.id && $0.projectAlias == nil }.sorted { $0.orderingDate > $1.orderingDate }) { session in
                         NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                if isAntigravity {
+                                    Button("删除", role: .destructive) { deleteCandidate = session; showingDeleteConfirmation = true }
+                                }
+                            }
                     }
                 } header: {
                     Text("Chats")
@@ -330,6 +341,13 @@ struct InstanceView: View {
             }
         )
         .sheet(isPresented: $newSession) { NewSessionView(runtime: runtime, instance: instance).environmentObject(store) }
+        .alert("删除电脑和手机上的 Antigravity 对话？", isPresented: $showingDeleteConfirmation) {
+            Button("取消", role: .cancel) { deleteCandidate = nil }
+            Button("删除对话", role: .destructive) {
+                if let session = deleteCandidate { Task { _ = await store.deleteSession(runtime: runtime, instance: instance, session: session) } }
+                deleteCandidate = nil
+            }
+        } message: { Text("这将请求 Windows 上的 Antigravity 删除原始对话，操作不可撤销。") }
         .sheet(isPresented: $newProject) { NewWebProjectView().environmentObject(store) }
         .task {
             if isChatGPTWeb {
@@ -340,6 +358,27 @@ struct InstanceView: View {
                 await store.refreshSessions(runtime: runtime, instance: instance)
             } else {
                 await store.refreshSessions(runtime: runtime, instance: instance)
+                if isAntigravity { await store.refreshAntigravityProjects() }
+            }
+            // Reconcile desktop-created/archived chats while this catalog is visible.
+            // Web discovery is more expensive, so poll its project catalog less often.
+            while !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: isChatGPTWeb ? 45_000_000_000 : 15_000_000_000) }
+                catch { break }
+                guard !Task.isCancelled else { break }
+                if scenePhase == .active, store.machine.state == .online {
+                    if isChatGPTWeb { await store.refreshWebProjects(force: false) }
+                    await store.refreshSessions(runtime: runtime, instance: instance)
+                    if isAntigravity { await store.refreshAntigravityProjects() }
+                }
+            }
+        }
+        .onChange(of: scenePhase) { phase in
+            guard phase == .active, store.machine.state == .online else { return }
+            Task {
+                if isChatGPTWeb { await store.refreshWebProjects(force: false) }
+                await store.refreshSessions(runtime: runtime, instance: instance)
+                if isAntigravity { await store.refreshAntigravityProjects() }
             }
         }
         .refreshable {
@@ -348,6 +387,7 @@ struct InstanceView: View {
                 await store.refreshSessions(runtime: runtime, instance: instance)
             } else {
                 await store.refreshSessions(runtime: runtime, instance: instance)
+                if isAntigravity { await store.refreshAntigravityProjects() }
             }
         }
     }
@@ -388,40 +428,72 @@ struct WebProjectView: View {
     @State private var creatingChat = false
     @State private var createdSession: SessionDescriptor?
     @State private var openCreatedSession = false
+    @State private var newAntigravitySession = false
+    @State private var deleteCandidate: SessionDescriptor?
+    @State private var showingDeleteConfirmation = false
 
+    private var isAntigravity: Bool { runtime.kind == .antigravity }
     private var rows: [WebConversationDescriptor] { store.displayedProjectConversations(projectAlias: project.projectAlias) }
+    private var antigravitySessions: [SessionDescriptor] {
+        store.sessions.filter { session in
+            guard session.instanceId == instance.id else { return false }
+            let alias = session.projectAlias ?? ""
+            return alias.caseInsensitiveCompare(project.projectAlias) == .orderedSame
+                || (project.projectAlias.caseInsensitiveCompare("googleac") == .orderedSame && alias.isEmpty)
+        }.sorted { $0.orderingDate > $1.orderingDate }
+    }
 
     private func refreshProjectContext(force: Bool) async {
         // Session status comes from the Windows Agent and does not require opening or
         // navigating a browser tab. Refresh it first so a desktop-only Busy/Waiting Chat
         // becomes visible even when its Project sidebar row has not mounted yet.
         await store.refreshSessions(runtime: runtime, instance: instance)
-        await store.loadProjectConversations(projectAlias: project.projectAlias, force: force)
+        // Antigravity chats are native Agent sessions, not ChatGPT browser conversations.
+        // Never fetch them through the Web-only project cache/transport path.
+        if !isAntigravity {
+            await store.loadProjectConversations(projectAlias: project.projectAlias, force: force)
+        }
     }
 
     var body: some View {
         List {
             Section {
-                Button {
-                    guard !creatingChat else { return }
-                    creatingChat = true
-                    Task {
-                        let created = await store.createWebConversation(projectAlias: project.projectAlias)
-                        creatingChat = false
-                        if let created {
-                            createdSession = created
-                            openCreatedSession = true
+                if isAntigravity {
+                    Button { newAntigravitySession = true } label: {
+                        Label("在此 Project 新建对话", systemImage: "plus.circle.fill")
+                    }.disabled(store.machine.state != .online)
+                } else {
+                    Button {
+                        guard !creatingChat else { return }
+                        creatingChat = true
+                        Task {
+                            let created = await store.createWebConversation(projectAlias: project.projectAlias)
+                            creatingChat = false
+                            if let created {
+                                createdSession = created
+                                openCreatedSession = true
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if creatingChat { ProgressView().controlSize(.small) }
+                            Label(creatingChat ? "正在新建对话…" : "在此 Project 新建对话", systemImage: "plus.circle.fill")
                         }
                     }
-                } label: {
-                    HStack(spacing: 8) {
-                        if creatingChat { ProgressView().controlSize(.small) }
-                        Label(creatingChat ? "正在新建对话…" : "在此 Project 新建对话", systemImage: "plus.circle.fill")
-                    }
+                    .disabled(creatingChat || store.machine.state != .online)
                 }
-                .disabled(creatingChat || store.machine.state != .online)
             }
             Section("最近对话") {
+                if isAntigravity {
+                    ForEach(antigravitySessions) { session in
+                        NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) {
+                            SessionRow(session: session)
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button("删除", role: .destructive) { deleteCandidate = session; showingDeleteConfirmation = true }
+                        }
+                    }
+                } else {
                 if store.projectConversationLoadingByAlias[project.projectAlias] == true {
                     HStack(spacing: 10) {
                         ProgressView()
@@ -448,10 +520,21 @@ struct WebProjectView: View {
                         Task { await store.loadMoreProjectConversations(projectAlias: project.projectAlias); loadingMore = false }
                     }.disabled(loadingMore)
                 }
+                }
             }
-            if let error = store.errors["web.project.\(project.projectAlias)"] { Section { ErrorBanner(text: error) { store.clearError(sessionId: "web.project.\(project.projectAlias)") } } }
+            if !isAntigravity, let error = store.errors["web.project.\(project.projectAlias)"] { Section { ErrorBanner(text: error) { store.clearError(sessionId: "web.project.\(project.projectAlias)") } } }
         }
         .remoteAITopBreathingRoom()
+        .sheet(isPresented: $newAntigravitySession) {
+            NewSessionView(runtime: runtime, instance: instance, projectAlias: project.projectAlias).environmentObject(store)
+        }
+        .alert("删除电脑和手机上的 Antigravity 对话？", isPresented: $showingDeleteConfirmation) {
+            Button("取消", role: .cancel) { deleteCandidate = nil }
+            Button("删除对话", role: .destructive) {
+                if let session = deleteCandidate { Task { _ = await store.deleteSession(runtime: runtime, instance: instance, session: session) } }
+                deleteCandidate = nil
+            }
+        } message: { Text("这将请求 Windows 上的 Antigravity 删除原始对话，操作不可撤销。") }
         .navigationTitle(project.displayName)
         .navigationBarTitleDisplayMode(.inline)
         .background(
@@ -2096,6 +2179,7 @@ struct NewSessionView: View {
     @Environment(\.dismiss) private var dismiss
     let runtime: RuntimeDescriptor
     let instance: InstanceDescriptor
+    var projectAlias: String? = nil
 
     @State private var title = ""
     @State private var model = ""
@@ -2164,7 +2248,8 @@ struct NewSessionView: View {
                                 runtime: runtime,
                                 instance: instance,
                                 title: title,
-                                model: model
+                                model: model,
+                                projectAlias: projectAlias
                             )
                             creating = false
                             if created { dismiss() }
