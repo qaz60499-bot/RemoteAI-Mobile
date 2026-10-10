@@ -1079,9 +1079,19 @@ final class WorkspaceStore: ObservableObject {
         do {
             let remote = try await transport.listSessions(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id)
             guard generation == lifecycleGeneration, revision == sessionRevisions[instance.id, default: 0], machine.state == .online, !isSuspended else { return }
-            sessions.removeAll { $0.instanceId == instance.id }
-            sessions.append(contentsOf: remote)
-            sortSessionsCanonical()
+            // An unchanged authoritative catalog must not invalidate every Chat row,
+            // disturb scroll position, or write the same SQLite metadata again.
+            // Keep the existing event revision guard above: a stale list response
+            // must never overwrite a newer session created by a live event.
+            let currentRows = sessions.filter { $0.instanceId == instance.id }
+            let remoteRows = remote.sorted(by: Self.sessionOrdersBefore)
+            let catalogChanged = currentRows != remoteRows
+            if catalogChanged {
+                var merged = sessions.filter { $0.instanceId != instance.id }
+                merged.append(contentsOf: remoteRows)
+                merged.sort(by: Self.sessionOrdersBefore)
+                sessions = merged
+            }
 
             // listSessions carries durable Agent-side Project identity and titles.
             // Repair safe metadata in already-loaded rows without reordering them.
@@ -1094,8 +1104,8 @@ final class WorkspaceStore: ObservableObject {
                     key: "web.project.\(alias).conversations"
                 )
             }
-            await persistMetadata()
-            errors["instance.\(instance.id)"] = nil
+            if catalogChanged || !reconciledProjects.isEmpty { await persistMetadata() }
+            if errors["instance.\(instance.id)"] != nil { errors["instance.\(instance.id)"] = nil }
         } catch {
             if generation == lifecycleGeneration, !isSuspended { errors["instance.\(instance.id)"] = error.localizedDescription }
         }
@@ -2252,17 +2262,23 @@ final class WorkspaceStore: ObservableObject {
         do {
             let rows = try await transport.listInstances(machineId: machine.id, runtimeId: runtime.id)
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
-            instances.removeAll { $0.runtimeId == runtime.id }
-            instances.append(contentsOf: rows)
-            instances.sort { lhs, rhs in
+            let orderInstances: (InstanceDescriptor, InstanceDescriptor) -> Bool = { lhs, rhs in
                 if lhs.runtimeId == rhs.runtimeId { return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending }
                 return lhs.runtimeId < rhs.runtimeId
+            }
+            let currentRows = instances.filter { $0.runtimeId == runtime.id }
+            let remoteRows = rows.sorted(by: orderInstances)
+            if currentRows != remoteRows {
+                var merged = instances.filter { $0.runtimeId != runtime.id }
+                merged.append(contentsOf: remoteRows)
+                merged.sort(by: orderInstances)
+                instances = merged
+                await persistMetadata()
             }
             // Instance discovery stays cheap. Session history is loaded only after the
             // user opens one instance, otherwise Codex1...Codex11 would all scan their
             // JSONL stores just to render this list.
-            errors["runtime.\(runtime.id)"] = nil
-            await persistMetadata()
+            if errors["runtime.\(runtime.id)"] != nil { errors["runtime.\(runtime.id)"] = nil }
         } catch {
             if generation == lifecycleGeneration, !isSuspended { errors["runtime.\(runtime.id)"] = error.localizedDescription }
         }
@@ -2294,12 +2310,14 @@ final class WorkspaceStore: ObservableObject {
         do {
             let remoteRuntimes = try await transport.listRuntimes(machineId: machine.id)
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
-            if !remoteRuntimes.isEmpty { runtimes = remoteRuntimes }
+            if !remoteRuntimes.isEmpty, runtimes != remoteRuntimes {
+                runtimes = remoteRuntimes
+                await persistMetadata()
+            }
             // Runtime instance discovery is intentionally lazy. Each RuntimeView
             // refreshes only the selected runtime, which keeps app launch and
             // reconnects from scanning every Codex workspace.
-            errors["sync"] = nil
-            await persistMetadata()
+            if errors["sync"] != nil { errors["sync"] = nil }
         } catch {
             if generation == lifecycleGeneration, !isSuspended { errors["sync"] = error.localizedDescription }
         }

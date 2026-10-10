@@ -1092,6 +1092,31 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testUnchangedCatalogRefreshDoesNotRepublishChatAndInstanceLists() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        XCTAssertFalse(store.sessions.filter { $0.instanceId == instance.id }.isEmpty)
+
+        var sessionPublications = 0
+        let sessionSubscription = store.$sessions.sink { _ in sessionPublications += 1 }
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        XCTAssertEqual(sessionPublications, 1, "An identical listSessions response must not invalidate all Chat rows")
+        sessionSubscription.cancel()
+
+        var instancePublications = 0
+        let instanceSubscription = store.$instances.sink { _ in instancePublications += 1 }
+        await store.refreshRuntime(runtime)
+        XCTAssertEqual(instancePublications, 1, "An identical listInstances response must not redraw Runtime navigation")
+        instanceSubscription.cancel()
+        await store.suspend()
+    }
+
+    @MainActor
     func testVisibleSessionPollingRecoversMissedWebProgressAndFinalWithoutPushEvents() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
