@@ -1679,6 +1679,7 @@ struct MessageRow: View, Equatable {
                                     }
                                     Text(segment.text)
                                         .font(.system(.body, design: .monospaced))
+                                        .accessibilityIdentifier("message-content-\(message.id)-\(segment.id)")
                                 }
                                 .padding(9)
                                 .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
@@ -1687,8 +1688,10 @@ struct MessageRow: View, Equatable {
                                     // Live text changes continuously; native selection
                                     // bookkeeping is reserved for the full-text sheet.
                                     Text(segment.text)
+                                        .accessibilityIdentifier("message-content-\(message.id)-\(segment.id)")
                                 } else {
                                     Text(segment.text)
+                                        .accessibilityIdentifier("message-content-\(message.id)-\(segment.id)")
                                 }
                             }
                         }
