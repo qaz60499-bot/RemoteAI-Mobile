@@ -41,7 +41,12 @@ final class WorkspaceStore: ObservableObject {
         deferringTransientConnectionPresentation && isPaired ? .online : machine.state
     }
     var shouldDisplayConnectionBanner: Bool {
-        !deferringTransientConnectionPresentation && (machine.state != .online || connectionPhase != .online)
+        guard !deferringTransientConnectionPresentation else { return false }
+        // Loading runtime metadata after Agent authentication is not a reconnect.
+        if machine.state == .online && (connectionPhase == .online || connectionPhase == .loadingRuntimes) {
+            return false
+        }
+        return true
     }
 
     static let connectingStateMaxDuration: TimeInterval = 45
@@ -267,7 +272,11 @@ final class WorkspaceStore: ObservableObject {
         }
         isPaired = PairingKeyStore.isPaired(machineId: machine.id)
         if !isPaired && !(transport is MockTransport) {
-            try? await cache.clearAll()
+            // A temporarily inaccessible Keychain item cannot authorize deleting
+            // cached conversations and drafts. Keep disk data untouched, while
+            // hiding it from the unpaired UI until authentication is restored.
+            // Explicit pairing to a different machine still clears stale data.
+            DiagnosticsLog.shared.record("pairing_key_unavailable_cache_preserved", level: "WARN")
             runtimes.removeAll()
             instances.removeAll()
             sessions.removeAll()

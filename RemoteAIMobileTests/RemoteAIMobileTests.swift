@@ -1609,19 +1609,20 @@ final class RemoteAIMobileTests: XCTestCase {
     @MainActor
     func testStaleWindowsProjectCacheAutomaticallyLoadsAllPagesPastFiftyRows() async throws {
         let mock = MockTransport(scenario: .staleWebCatalog, historyCount: 1)
-        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 125)
+        // Real Windows catalogs can exceed 250 rows while the live DOM mounts only 50.
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 264)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
         await store.start()
 
         await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: false)
 
         let rows = store.projectConversationsByAlias["g-p-remoteai"] ?? []
-        XCTAssertEqual(rows.count, 125, "A stable Windows cache must not truncate a large Project at the first 50 rows")
+        XCTAssertEqual(rows.count, 264, "A stable Windows cache must not truncate a large Project at the first 50 rows")
         XCTAssertEqual(rows.first?.conversationAlias, "seed-0")
-        XCTAssertEqual(rows.last?.conversationAlias, "seed-124")
+        XCTAssertEqual(rows.last?.conversationAlias, "seed-263")
         XCTAssertEqual(store.projectHasMoreByAlias["g-p-remoteai"], false)
         let pageAttempts = await mock.actionAttemptCount("listProjectConversations")
-        XCTAssertGreaterThanOrEqual(pageAttempts, 3)
+        XCTAssertGreaterThanOrEqual(pageAttempts, 6)
         await store.suspend()
     }
 

@@ -587,6 +587,32 @@ final class PairingTests: XCTestCase {
         }
     }
 
+    func testAuthenticatedRuntimeMetadataLoadingDoesNotShowOfflineBanner() throws {
+        let store = WorkspaceStore(transport: ConnectionScenarioTransport(mode: .normal), cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        store.connectionPhase = .loadingRuntimes
+        XCTAssertFalse(store.shouldDisplayConnectionBanner)
+        store.connectionPhase = .authenticating
+        XCTAssertTrue(store.shouldDisplayConnectionBanner)
+    }
+
+    func testUnavailablePairingKeyNeverDeletesExistingCache() async throws {
+        let machineId = "machine-no-key-\(UUID().uuidString)"
+        let cache = try SQLiteStore.inMemory()
+        try await cache.put("unsent draft", key: "draft.existing-chat")
+        try await cache.put(["existing-chat"], key: "web.project.existing.conversations.probe")
+        let store = WorkspaceStore(transport: ConnectionScenarioTransport(mode: .normal), cache: cache)
+        store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        let authenticated = await store.start()
+        XCTAssertFalse(authenticated)
+        XCTAssertFalse(store.isPaired)
+        XCTAssertEqual(store.connectionPhase, .pairingExpired)
+        let draft: String? = try await cache.get(String.self, key: "draft.existing-chat")
+        let records: [String]? = try await cache.get([String].self, key: "web.project.existing.conversations.probe")
+        XCTAssertEqual(draft, "unsent draft")
+        XCTAssertEqual(records, ["existing-chat"])
+    }
+
     func testConnectSuccessTransitionsToOnlineAfterAuthenticatedStatus() async throws {
         let machineId = "machine-connect-ok-\(UUID().uuidString)"
         defer { PairingKeyStore.deletePairing(machineId: machineId) }
