@@ -129,6 +129,7 @@ final class RemoteAIMobileUITests: XCTestCase {
         // Keep every assertion; lengthen only this deterministic test-only stream.
         let fixtureChunkMilliseconds = chars <= 30_000 ? 250 : 150
         app.launchEnvironment["REMOTEAI_UI_STRESS_CHUNK_MS"] = String(fixtureChunkMilliseconds)
+        let fixtureStartedAt = ProcessInfo.processInfo.systemUptime
         app.launch()
         let progress = app.staticTexts["assistant-stream-progress"]
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
@@ -159,10 +160,19 @@ final class RemoteAIMobileUITests: XCTestCase {
         // accessibility snapshot for 30 seconds under a long transcript.
         // The final is emitted only after every delta is appended by MockTransport.
         let final = app.staticTexts["message-content-stress-final-\(chars)-0"]
-        // The UI-only fixture emits 100 characters at the configured chunk interval.
-        // Budget its complete duration plus runner/accessibility slack instead of retaining the
-        // old 40-second timeout that predates the deterministic slow fixture.
+        // A query for a final-only accessibility element while SwiftUI is actively
+        // replacing a 30k/50k streaming row can stall XCTest's *entire* AX snapshot,
+        // not merely report that the final is absent. Earlier CI reached all live
+        // interaction assertions, then xcodebuild timed out inside this premature
+        // query. Keep the live progress/typing/scroll assertions above, but only
+        // inspect the terminal accessibility tree after this deterministic fixture
+        // has finished sending its 100-character chunks. No app code is changed and
+        // the actual final, idle Send button and retained draft remain mandatory.
         let expectedFixtureSeconds = (Double(chars) / 100.0) * (Double(fixtureChunkMilliseconds) / 1000.0)
+        let quietUntil = fixtureStartedAt + expectedFixtureSeconds + 12
+        let remaining = max(0, quietUntil - ProcessInfo.processInfo.systemUptime)
+        if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
+        print("STREAM_UI chars=\(chars) terminalQueryQuietWaitSeconds=\(remaining)")
         XCTAssertTrue(final.waitForExistence(timeout: max(180, expectedFixtureSeconds + 90)),
                       "The actual final message must replace the streaming row")
         XCTAssertTrue(final.label.contains(marker), "The rendered final message must have the expected contents")
