@@ -179,8 +179,11 @@ final class RemoteAIMobileUITests: XCTestCase {
         let remaining = max(0, quietUntil - ProcessInfo.processInfo.systemUptime)
         if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
         print("STREAM_UI chars=\(chars) terminalQueryQuietWaitSeconds=\(remaining)")
-        XCTAssertTrue(final.waitForExistence(timeout: max(180, expectedFixtureSeconds + 90)),
-                      "The actual final message must replace the streaming row")
+        // The fixture has already ended and drained above. A terminal message
+        // still offscreen after 30 seconds is a tail-follow UX regression, not
+        // a legitimate slow stream. Keep this failure explicit and bounded.
+        XCTAssertTrue(final.waitForExistence(timeout: 30),
+                      "The canonical final message must be visible after Return to Latest")
         XCTAssertTrue(final.label.contains(marker), "The rendered final message must have the expected contents")
         // The draft remains populated: "Send correction" changes to "Send"
         // only once the chat's authoritative generation state becomes idle.

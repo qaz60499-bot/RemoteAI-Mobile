@@ -656,6 +656,19 @@ struct ChatView: View {
             || currentSessionState == .waiting
             || store.liveRunStatusBySession[session.id] != nil
     }
+    // LazyVStack estimates offscreen row heights. A single tail scroll may
+    // stop short when a long streaming row becomes the canonical final message.
+    // Resolve the real last row, then settle at the sentinel after layout.
+    private func settleLatestScroll(_ proxy: ScrollViewProxy) {
+        guard !userBrowsingHistory, let lastID = messages.last?.id else { return }
+        proxy.scrollTo(lastID, anchor: .bottom)
+        let currentSessionID = session.id
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(220)) {
+            guard session.id == currentSessionID, !userBrowsingHistory else { return }
+            proxy.scrollTo("bottom", anchor: .bottom)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if store.shouldDisplayConnectionBanner {
@@ -756,10 +769,16 @@ struct ChatView: View {
                                 didInitialScrollToBottom = true
                             }
                         } else if !userBrowsingHistory {
-                            userBrowsingHistory = false
                             withAnimation(.easeOut(duration: 0.18)) {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                                settleLatestScroll(proxy)
                             }
+                        }
+                    }
+                    .onChange(of: isGenerating) { generating in
+                        // Final content can replace an existing ID. Follow once
+                        // more as the canonical row finishes its layout.
+                        if !generating, !userBrowsingHistory {
+                            settleLatestScroll(proxy)
                         }
                     }
                     .onChange(of: session.id) { _ in
@@ -772,7 +791,7 @@ struct ChatView: View {
                         Button {
                             userBrowsingHistory = false
                             withAnimation(.easeOut(duration: 0.18)) {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                                settleLatestScroll(proxy)
                             }
                         } label: {
                             Image(systemName: "arrow.down")
