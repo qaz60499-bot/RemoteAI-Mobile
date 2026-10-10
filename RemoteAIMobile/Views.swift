@@ -642,6 +642,14 @@ struct ChatView: View {
     private var generationProgressAt: Date? {
         currentSession.lastProgressAt ?? currentSession.lastActivityAt
     }
+    private var relevantSystemNotice: String? {
+        guard let notice = store.recentSystemNotice else { return nil }
+        // A browser-specific diagnostic must not appear inside Codex or Antigravity Chats.
+        if runtime.kind != .web && (notice.contains("ChatGPT") || notice.contains("Browser Bridge")) {
+            return nil
+        }
+        return notice
+    }
     private var isGenerating: Bool {
         if currentSessionState == .error { return false }
         return currentSessionState == .busy
@@ -659,7 +667,7 @@ struct ChatView: View {
             if let syncError = store.errors["sync"] {
                 StatusBanner(text: "同步异常：\(syncError)", systemImage: "arrow.triangle.2.circlepath")
             }
-            if let notice = store.recentSystemNotice {
+            if let notice = relevantSystemNotice {
                 StatusBanner(
                     text: notice,
                     systemImage: "desktopcomputer.and.arrow.down",
