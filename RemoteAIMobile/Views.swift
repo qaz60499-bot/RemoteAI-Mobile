@@ -661,8 +661,10 @@ struct ChatView: View {
     // A one-shot scrollTo(lastID)/bottom sentinel still left XCTest at 72% in
     // a 50k final despite the canonical message having arrived. Converge only
     // when the user explicitly asks for latest or while tail-follow is active.
-    // Bound retries to 3.6 seconds, stop at the actual bottom sentinel, and
-    // never override a subsequent human drag into history.
+    // Bound retries to 3.6 seconds and never override a human history drag.
+    // Do NOT use isAtBottom to short-circuit this loop: LazyVStack can keep
+    // the bottom sentinel retained and fire onAppear even when AX shows 80%
+    // scroll and Return to Latest remains visible (CI 38077422480).
     private func settleLatestScroll(_ proxy: ScrollViewProxy) {
         latestScrollTask?.cancel()
         guard !userBrowsingHistory, let lastID = messages.last?.id else { return }
@@ -677,8 +679,9 @@ struct ChatView: View {
                 guard !Task.isCancelled,
                       session.id == requestedSessionID,
                       !userBrowsingHistory else { return }
-                if isAtBottom { return }
-                // Recalibrate monotonically; alternating to lastID can jump backward.
+                // Recalibrate all bounded passes: isAtBottom is an inaccurate
+                // lifecycle hint until the last row's geometry settles.
+                // Alternating to lastID here can jump backward.
                 proxy.scrollTo("bottom", anchor: .bottom)
                 if attempt.isMultiple(of: 4) {
                     DiagnosticsLog.shared.record("latest_scroll_retry", fields: ["session": requestedSessionID, "attempt": String(attempt + 1)])
