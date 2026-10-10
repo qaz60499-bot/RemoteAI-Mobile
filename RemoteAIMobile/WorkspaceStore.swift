@@ -1038,9 +1038,9 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func deleteSession(runtime: RuntimeDescriptor, instance: InstanceDescriptor, session: SessionDescriptor) async -> Bool {
-        // Until the other providers expose verified upstream deletion, do not
-        // offer a misleading phone-only operation for Web or Codex.
-        guard runtime.kind == .antigravity, session.instanceId == instance.id else { return false }
+        // Only provider-backed Antigravity deletion and native Codex archiving
+        // are supported. Web must not be silently unregistered as if deleted.
+        guard (runtime.kind == .antigravity || runtime.kind == .codex), session.instanceId == instance.id else { return false }
         guard machine.state == .online else {
             errors["instance.\(instance.id)"] = "PC Offline — cannot confirm upstream deletion."
             return false

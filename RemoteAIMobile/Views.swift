@@ -328,6 +328,11 @@ struct InstanceView: View {
                 Section("历史会话") {
                     ForEach(store.sessions.filter { $0.instanceId == instance.id }.sorted { $0.orderingDate > $1.orderingDate }) { session in
                         NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                if runtime.kind == .codex {
+                                    Button("归档", role: .destructive) { deleteCandidate = session; showingDeleteConfirmation = true }
+                                }
+                            }
                     }
                 }
             }
@@ -346,13 +351,17 @@ struct InstanceView: View {
             }
         )
         .sheet(isPresented: $newSession) { NewSessionView(runtime: runtime, instance: instance).environmentObject(store) }
-        .alert("删除电脑和手机上的 Antigravity 对话？", isPresented: $showingDeleteConfirmation) {
+        .alert(runtime.kind == .codex ? "将此 Codex Chat 归档？" : "删除电脑和手机上的 Antigravity 对话？", isPresented: $showingDeleteConfirmation) {
             Button("取消", role: .cancel) { deleteCandidate = nil }
-            Button("删除对话", role: .destructive) {
+            Button(runtime.kind == .codex ? "归档对话" : "删除对话", role: .destructive) {
                 if let session = deleteCandidate { Task { _ = await store.deleteSession(runtime: runtime, instance: instance, session: session) } }
                 deleteCandidate = nil
             }
-        } message: { Text("这将请求 Windows 上的 Antigravity 删除原始对话，操作不可撤销。") }
+        } message: {
+            Text(runtime.kind == .codex
+                ? "将使用 Codex 原生归档接口，使此 Chat 从电脑和手机的活动会话列表移除；可在 Codex 归档中恢复。"
+                : "这将请求 Windows 上的 Antigravity 删除原始对话，操作不可撤销。")
+        }
         .sheet(isPresented: $newProject) { NewWebProjectView().environmentObject(store) }
         .task {
             if isChatGPTWeb {
