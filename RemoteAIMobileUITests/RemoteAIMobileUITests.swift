@@ -120,6 +120,9 @@ final class RemoteAIMobileUITests: XCTestCase {
     }
 
     private func verifyStreamingInteraction(chars: Int) throws {
+        // Shared macOS runner snapshots may outlive XCTest's default 120s per-case budget.
+        // The 30k/50k stress cases still assert live progress, typing, scrolling and final.
+        executionTimeAllowance = 240
         let app = makeMockApp()
         app.launchEnvironment["REMOTEAI_UI_STRESS_CHARS"] = String(chars)
         app.launchEnvironment["REMOTEAI_UI_STRESS_DIRECT"] = "1"
@@ -169,7 +172,10 @@ final class RemoteAIMobileUITests: XCTestCase {
         // has finished sending its 100-character chunks. No app code is changed and
         // the actual final, idle Send button and retained draft remain mandatory.
         let expectedFixtureSeconds = (Double(chars) / 100.0) * (Double(fixtureChunkMilliseconds) / 1000.0)
-        let quietUntil = fixtureStartedAt + expectedFixtureSeconds + 12
+        // The slower 30k fixture needs terminal event/render drain time before an AX query.
+        // The 50k fixture already passed with the existing 12-second buffer.
+        let terminalDrainSeconds = chars <= 30_000 ? 30.0 : 12.0
+        let quietUntil = fixtureStartedAt + expectedFixtureSeconds + terminalDrainSeconds
         let remaining = max(0, quietUntil - ProcessInfo.processInfo.systemUptime)
         if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
         print("STREAM_UI chars=\(chars) terminalQueryQuietWaitSeconds=\(remaining)")
