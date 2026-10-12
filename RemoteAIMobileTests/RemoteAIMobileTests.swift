@@ -3677,6 +3677,8 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertTrue(store.recentSystemNotice?.contains("不会跟着串线") == true)
+        XCTAssertNotNil(store.systemNotice(for: "photo-upload"))
+        XCTAssertNil(store.systemNotice(for: "unrelated-chat"))
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
 
         await mock.injectEvent(RemoteEvent(
@@ -3698,6 +3700,12 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertTrue(store.recentSystemNotice?.contains("已重新绑定") == true)
+        XCTAssertNotNil(store.systemNotice(for: "photo-upload"))
+        XCTAssertNil(store.systemNotice(for: "unrelated-chat"))
+        store.recentSystemNotice = "Global transport notice"
+        XCTAssertEqual(store.systemNotice(for: "unrelated-chat"), "Global transport notice")
+        store.clearRecentSystemNotice()
+        XCTAssertNil(store.systemNotice(for: "photo-upload"))
         await store.suspend()
     }
 

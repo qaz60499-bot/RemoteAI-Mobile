@@ -43,7 +43,10 @@ final class WorkspaceStore: ObservableObject {
     @Published var isPaired = false
     @Published var pairingStage: PairingStage?
     @Published var connectionPhase: ConnectionDiagnosticPhase = .relayConnecting
-    @Published var recentSystemNotice: String?
+    @Published var recentSystemNotice: String? {
+        didSet { if recentSystemNoticeSessionId != nil { recentSystemNoticeSessionId = nil } }
+    }
+    @Published private(set) var recentSystemNoticeSessionId: String?
     @Published var desktopBrowserConnected: Bool?
     @Published var desktopRelayConnected: Bool?
     @Published var desktopAgentConnected: Bool?
@@ -1383,7 +1386,7 @@ final class WorkspaceStore: ObservableObject {
                 if webBindingDetachedSessions.remove(sessionId) != nil,
                    (recentSystemNotice?.contains("ChatGPT 标签页") == true
                        || recentSystemNotice?.contains("标签页绑定") == true) {
-                    recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机已补同步最新状态。"
+                    setSessionSystemNotice("电脑端 ChatGPT 会话已重新绑定；手机已补同步最新状态。", sessionId: sessionId)
                 }
             }
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: authoritativeItems.last?.createdAt ?? Date())
@@ -3905,16 +3908,16 @@ final class WorkspaceStore: ObservableObject {
                 webBindingDetachedSessions.insert(sessionId)
                 switch reason {
                 case "tabClosed":
-                    recentSystemNotice = "电脑端对应的 ChatGPT 标签页已关闭；RemoteAI 会在需要时重新打开并绑定该会话。"
+                    setSessionSystemNotice("电脑端对应的 ChatGPT 标签页已关闭；RemoteAI 会在需要时重新打开并绑定该会话。", sessionId: sessionId)
                 case "conversationContextChanged":
-                    recentSystemNotice = "电脑端 ChatGPT 标签页已切换到其他对话；手机当前会话不会跟着串线，RemoteAI 会按原会话身份重新绑定。"
+                    setSessionSystemNotice("电脑端 ChatGPT 标签页已切换到其他对话；手机当前会话不会跟着串线，RemoteAI 会按原会话身份重新绑定。", sessionId: sessionId)
                 case "projectContextChanged":
-                    recentSystemNotice = "电脑端 ChatGPT 标签页已切换到其他 Project；手机当前 Project/Chat 身份保持不变。"
+                    setSessionSystemNotice("电脑端 ChatGPT 标签页已切换到其他 Project；手机当前 Project/Chat 身份保持不变。", sessionId: sessionId)
                 default:
-                    recentSystemNotice = "电脑端 ChatGPT 标签页绑定发生变化；RemoteAI 正在重新核对当前会话。"
+                    setSessionSystemNotice("电脑端 ChatGPT 标签页绑定发生变化；RemoteAI 正在重新核对当前会话。", sessionId: sessionId)
                 }
             } else if activeTabId != nil, webBindingDetachedSessions.remove(sessionId) != nil {
-                recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。"
+                setSessionSystemNotice("电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。", sessionId: sessionId)
             }
             await requestMetadataRefresh()
         case "WEB_PAGE_REGISTERED":
@@ -3926,7 +3929,7 @@ final class WorkspaceStore: ObservableObject {
             await applyWebPageRegistrationEvent(event, sessionId: sessionId, suppressPresentation: suppressTransientPresentation)
             if event.payload["activeTabId"]?.intValue != nil,
                webBindingDetachedSessions.remove(sessionId) != nil {
-                recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。"
+                setSessionSystemNotice("电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。", sessionId: sessionId)
             }
             await requestMetadataRefresh()
         case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "WEB_PAGE_UNREGISTERED":
@@ -3956,7 +3959,7 @@ final class WorkspaceStore: ObservableObject {
                 liveRunStatusBySession[sessionId] = message
             }
             if previousMessage != message || previousState != issue.state {
-                recentSystemNotice = message
+                setSessionSystemNotice(message, sessionId: sessionId)
                 DiagnosticsLog.shared.record("web_provider_surface_issue", fields: [
                     "session": sessionId,
                     "state": issue.state,
@@ -3978,11 +3981,21 @@ final class WorkspaceStore: ObservableObject {
                 liveRunStatusBySession.removeValue(forKey: sessionId)
             }
         }
-        recentSystemNotice = "电脑端 ChatGPT 网页已恢复；当前会话正在补同步。"
+        setSessionSystemNotice("电脑端 ChatGPT 网页已恢复；当前会话正在补同步。", sessionId: sessionId)
         DiagnosticsLog.shared.record("web_provider_surface_recovered", fields: [
             "session": sessionId,
             "previousState": previousState,
         ])
+    }
+
+    private func setSessionSystemNotice(_ notice: String, sessionId: String) {
+        recentSystemNotice = notice
+        recentSystemNoticeSessionId = sessionId
+    }
+
+    func systemNotice(for sessionId: String) -> String? {
+        guard recentSystemNoticeSessionId == nil || recentSystemNoticeSessionId == sessionId else { return nil }
+        return recentSystemNotice
     }
 
     func clearRecentSystemNotice() {

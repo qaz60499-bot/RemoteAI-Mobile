@@ -854,7 +854,7 @@ struct ChatView: View {
         currentSession.lastProgressAt ?? currentSession.lastActivityAt
     }
     private var relevantSystemNotice: String? {
-        guard let notice = store.recentSystemNotice else { return nil }
+        guard let notice = store.systemNotice(for: session.id) else { return nil }
         // A browser-specific diagnostic must not appear inside Codex or Antigravity Chats.
         if runtime.kind != .web && (notice.contains("ChatGPT") || notice.contains("Browser Bridge")) {
             return nil
