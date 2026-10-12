@@ -10,21 +10,31 @@ import run_candidate_ui_tests as runner
 
 
 class RecoveryGateTests(unittest.TestCase):
-    def exercise(self, outcomes, expect_error=None):
+    def exercise(self, outcomes, expect_error=None, method_name="testExample"):
         with tempfile.TemporaryDirectory() as directory:
             original = os.getcwd()
             os.chdir(directory)
             try:
                 pathlib.Path("RemoteAIMobileUITests").mkdir()
                 pathlib.Path("RemoteAIMobileUITests/Example.swift").write_text(
-                    "final class Example: XCTestCase { func testExample() {} }")
+                    f"final class Example: XCTestCase {{ func {method_name}() {{}} }}")
                 seen = []
                 def fake_test(command, evidence):
                     state = outcomes[len(seen)]
                     seen.append(evidence)
-                    (evidence / "xcodebuild.log").write_text("Test Case '-[Example testExample]'" if state == "started" else "")
+                    if state == "snapshot":
+                        (evidence / "xcodebuild.log").write_text(
+                            f"Test Case '-[RemoteAIMobileUITests.RemoteAIMobileUITests {method_name}]' started.\n"
+                            "Failed to get matching snapshots: Timed out while evaluating UI query.\n"
+                            "** TEST EXECUTE FAILED **\n")
+                    elif state == "failed":
+                        (evidence / "xcodebuild.log").write_text(
+                            "XCTAssertEqual failed: real test assertion\n** TEST EXECUTE FAILED **\n")
+                    else:
+                        (evidence / "xcodebuild.log").write_text(
+                            "Test Case '-[Example testExample]'" if state == "started" else "")
                     (evidence / "process.jsonl").write_text('{"pid":42}\n' if state == "app" else "")
-                    if state == "failed":
+                    if state in ("failed", "snapshot"):
                         raise subprocess.CalledProcessError(65, command)
                     if state != "success":
                         raise subprocess.TimeoutExpired(command, 300)
@@ -66,6 +76,26 @@ class RecoveryGateTests(unittest.TestCase):
 
     def test_assertion_failure_never_retries(self):
         seen, recoveries = self.exercise(["failed"], subprocess.CalledProcessError)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(recoveries, [])
+
+    def test_xcui_snapshot_timeout_retries_only_one_long_stream_test(self):
+        seen, recoveries = self.exercise(
+            ["snapshot", "success"], method_name="testLongStreamingExample")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(len(set(seen)), 2)
+        self.assertEqual(recoveries, [])
+
+    def test_xcui_snapshot_timeout_twice_fails(self):
+        seen, recoveries = self.exercise(
+            ["snapshot", "snapshot"], subprocess.CalledProcessError,
+            method_name="testLongStreamingExample")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(recoveries, [])
+
+    def test_snapshot_timeout_in_ordinary_ui_test_does_not_retry(self):
+        seen, recoveries = self.exercise(
+            ["snapshot"], subprocess.CalledProcessError)
         self.assertEqual(len(seen), 1)
         self.assertEqual(recoveries, [])
 

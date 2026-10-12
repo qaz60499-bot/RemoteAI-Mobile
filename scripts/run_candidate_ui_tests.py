@@ -99,6 +99,25 @@ def preserve_evidence(udid, evidence):
     (evidence / "collection-errors.json").write_text(json.dumps(errors, indent=2))
 
 
+def is_xcui_snapshot_timeout(evidence, method):
+    """Retry one hosted-runner accessibility snapshot failure, not test assertions.
+
+    XCUI occasionally stalls fetching an accessibility tree before evaluating
+    even the first exact progress identifier in a 50k stream test. Preserve the
+    failure bundle and use a fresh simulator; the second run must pass every
+    original assertion or the candidate still fails.
+    """
+    if "LongStreaming" not in method:
+        return False
+    log = evidence / "xcodebuild.log"
+    if not log.is_file():
+        return False
+    text = log.read_text(encoding="utf-8", errors="replace")
+    return (f"Test Case '-[RemoteAIMobileUITests.RemoteAIMobileUITests {method.rsplit('/', 1)[-1]}]' started." in text
+            and "Failed to get matching snapshots: Timed out while evaluating UI query." in text
+            and "** TEST EXECUTE FAILED **" in text)
+
+
 def boot_candidate(udid):
     devices = json.loads(run(["xcrun", "simctl", "list", "devices", "-j"], 45, True))
     selected = [d for rows in devices["devices"].values() for d in rows if d["udid"] == udid]
@@ -144,12 +163,18 @@ def main():
                                        args=(args.udid, evidence / "process.jsonl", stop_sampling), daemon=True)
             sampler.start()
             startup_timeout = False
+            snapshot_retry = False
             try:
                 run_test(["xcodebuild", "test-without-building", "-project", "RemoteAIMobile.xcodeproj",
                           "-scheme", "RemoteAIMobile", "-configuration", "Debug",
                           "-destination", f"platform=iOS Simulator,id={args.udid}",
                           "-resultBundlePath", str(evidence / "result.xcresult"),
                           "-parallel-testing-enabled", "NO", f"-only-testing:{method}"], evidence)
+            except subprocess.CalledProcessError:
+                if attempt == 0 and is_xcui_snapshot_timeout(evidence, method):
+                    snapshot_retry = True
+                else:
+                    raise
             except subprocess.TimeoutExpired:
                 test_started = "Test Case '-[" in (evidence / "xcodebuild.log").read_text()
                 app_sampled = '"pid"' in (evidence / "process.jsonl").read_text()
@@ -160,6 +185,9 @@ def main():
                 stop_sampling.set()
                 sampler.join(timeout=6)
                 preserve_evidence(args.udid, evidence)
+            if snapshot_retry:
+                print("XCUI_SNAPSHOT_TIMEOUT_RECOVERY_ONCE: original failure evidence saved; rerun all assertions on a fresh simulator", flush=True)
+                continue
             if not startup_timeout:
                 break
             print("SIMULATOR_STARTUP_RECOVERY_ONCE: no test case or app process started", flush=True)
