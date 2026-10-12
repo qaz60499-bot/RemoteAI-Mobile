@@ -27,6 +27,7 @@ enum ProtocolSecurity {
         "getChangesAfterCursor",
         "registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation",
         "listProjects", "listProjectConversations", "openProject", "createProject", "deleteSession",
+        "listOpenWebTabs", "inspectOpenWebTab", "manageOpenWebTab",
         "beginAttachmentUpload", "uploadAttachmentChunk", "finishAttachmentUpload", "discardAttachmentUpload"
     ]
 

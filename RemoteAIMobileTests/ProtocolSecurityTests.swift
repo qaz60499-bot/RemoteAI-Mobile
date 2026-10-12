@@ -22,6 +22,15 @@ final class ProtocolSecurityTests: XCTestCase {
         ]
     }
 
+    func testWebTabCommandsAreValidatedWithoutAllowingUnknownActions() throws {
+        for action in ["listOpenWebTabs", "inspectOpenWebTab", "manageOpenWebTab"] {
+            let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "web.chatgpt", action: action)
+            XCTAssertNoThrow(try ProtocolSecurity.validate(command, expectedMachineId: "my-pc"), "Rejected Web control: \(action)")
+        }
+        let unknown = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "deleteUnrelatedTab")
+        XCTAssertThrowsError(try ProtocolSecurity.validate(unknown, expectedMachineId: "my-pc"))
+    }
+
     private func validEventObject(sequence: Int64 = 11, eventId: String = "00000000-0000-0000-0000-000000000201", machineId: String = "my-pc") -> [String: Any] {
         [
             "protocolVersion": 1,
