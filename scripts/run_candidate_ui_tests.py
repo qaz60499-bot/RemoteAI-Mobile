@@ -113,8 +113,19 @@ def is_xcui_snapshot_timeout(evidence, method):
     if not log.is_file():
         return False
     text = log.read_text(encoding="utf-8", errors="replace")
+    # Xcode 16.4 reports the same accessibility snapshot failure in two forms.
+    # The second appears when the app's main run loop cannot answer an AX query
+    # for 30s. Do not silently treat it as success: save the failed xcresult,
+    # reboot the disposable simulator and rerun ALL assertions exactly once.
+    # A second main-loop stall still fails the entire candidate build.
+    snapshot_failure = re.search(
+        r"Failed to get matching snapshots?: (?:"
+        r"Timed out while evaluating UI query[.]|"
+        r"Unable to perform work on main run loop, process main thread busy for 30[.]0s)",
+        text,
+    ) is not None
     return (f"Test Case '-[RemoteAIMobileUITests.RemoteAIMobileUITests {method.rsplit('/', 1)[-1]}]' started." in text
-            and re.search(r"Failed to get matching snapshots?: Timed out while evaluating UI query[.]", text) is not None
+            and snapshot_failure
             and "** TEST EXECUTE FAILED **" in text)
 
 

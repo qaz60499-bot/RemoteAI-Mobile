@@ -22,11 +22,13 @@ class RecoveryGateTests(unittest.TestCase):
                 def fake_test(command, evidence):
                     state = outcomes[len(seen)]
                     seen.append(evidence)
-                    if state in ("snapshot", "snapshot-singular"):
+                    if state in ("snapshot", "snapshot-singular", "main-loop-busy"):
                         (evidence / "xcodebuild.log").write_text(
                             f"Test Case '-[RemoteAIMobileUITests.RemoteAIMobileUITests {method_name}]' started.\n"
-                            f"Failed to get matching {'snapshot' if state == 'snapshot-singular' else 'snapshots'}: Timed out while evaluating UI query.\n"
-                            "** TEST EXECUTE FAILED **\n")
+                            + (f"Failed to get matching snapshot: Unable to perform work on main run loop, process main thread busy for 30.0s\n"
+                               if state == "main-loop-busy" else
+                               f"Failed to get matching {'snapshot' if state == 'snapshot-singular' else 'snapshots'}: Timed out while evaluating UI query.\n")
+                            + "** TEST EXECUTE FAILED **\n")
                     elif state == "failed":
                         (evidence / "xcodebuild.log").write_text(
                             "XCTAssertEqual failed: real test assertion\n** TEST EXECUTE FAILED **\n")
@@ -34,7 +36,7 @@ class RecoveryGateTests(unittest.TestCase):
                         (evidence / "xcodebuild.log").write_text(
                             "Test Case '-[Example testExample]'" if state == "started" else "")
                     (evidence / "process.jsonl").write_text('{"pid":42}\n' if state == "app" else "")
-                    if state in ("failed", "snapshot", "snapshot-singular"):
+                    if state in ("failed", "snapshot", "snapshot-singular", "main-loop-busy"):
                         raise subprocess.CalledProcessError(65, command)
                     if state != "success":
                         raise subprocess.TimeoutExpired(command, 300)
@@ -105,6 +107,25 @@ class RecoveryGateTests(unittest.TestCase):
             ["snapshot-singular", "snapshot-singular"], subprocess.CalledProcessError,
             method_name="testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable")
         self.assertEqual(len(seen), 2)
+        self.assertEqual(recoveries, [])
+
+    def test_main_run_loop_busy_snapshot_retries_once_on_long_stream(self):
+        seen, recoveries = self.exercise(
+            ["main-loop-busy", "success"], method_name="testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(len(set(seen)), 2)
+        self.assertEqual(recoveries, [])
+
+    def test_repeated_main_run_loop_busy_still_fails_candidate(self):
+        seen, recoveries = self.exercise(
+            ["main-loop-busy", "main-loop-busy"], subprocess.CalledProcessError,
+            method_name="testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(recoveries, [])
+
+    def test_main_run_loop_busy_in_ordinary_test_does_not_retry(self):
+        seen, recoveries = self.exercise(["main-loop-busy"], subprocess.CalledProcessError)
+        self.assertEqual(len(seen), 1)
         self.assertEqual(recoveries, [])
 
     def test_snapshot_timeout_in_ordinary_ui_test_does_not_retry(self):
