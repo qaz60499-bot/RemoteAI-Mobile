@@ -11,11 +11,18 @@ final class WorkspaceStore: ObservableObject {
     @Published var webProjects: [WebProjectDescriptor] = []
     @Published var openWebTabs: [OpenWebTab] = []
     @Published var hasLoadedOpenWebTabs = false
+    @Published private(set) var refreshingOpenWebTabs = false
+    @Published private(set) var closedWebTabs: [OpenWebTab] = []
+    @Published private(set) var lastOpenWebTabsCheckAt: Date?
+    @Published private(set) var openWebTabsQueryFailed = false
     @Published private(set) var managingWebTabIds = Set<Int>()
     @Published var webTabDiagnosesById: [Int: WebTabDiagnosis] = [:]
+    @Published private(set) var webTabLastSuccessfulCheckAt: [Int: Date] = [:]
     @Published var webTabActionNotesById: [Int: String] = [:]
     @Published var recentWebTabNotices: [String] = []
     private var explicitlyClosedWebTabIDs = Set<Int>()
+    private var inspectingWebTabIds = Set<Int>()
+    private var webTabInspectionTask: Task<Void, Never>?
     @Published var antigravityProjects: [WebProjectDescriptor] = []
     @Published var hasLoadedAntigravityProjects = false
     @Published var projectConversationsByAlias: [String: [WebConversationDescriptor]] = [:]
@@ -426,7 +433,14 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func refreshOpenWebTabs() async {
-        guard machine.state == .online, !isSuspended else { return }
+        guard !refreshingOpenWebTabs else { return }
+        guard machine.state == .online, !isSuspended else {
+            openWebTabsQueryFailed = true
+            errors["web.tabs"] = "Windows 未连接，当前打开标签数量未知。"
+            return
+        }
+        refreshingOpenWebTabs = true
+        defer { refreshingOpenWebTabs = false }
         let generation = lifecycleGeneration
         do {
             let tabs = try await transport.listOpenWebTabs(machineId: machine.id)
@@ -436,6 +450,8 @@ final class WorkspaceStore: ObservableObject {
             if hasLoadedOpenWebTabs {
                 let currentIDs = Set(tabs.map(\.id))
                 for old in openWebTabs where !currentIDs.contains(old.id) {
+                    closedWebTabs.removeAll { $0.id == old.id }
+                    closedWebTabs.insert(old, at: 0)
                     let intentional = explicitlyClosedWebTabIDs.remove(old.id) != nil
                     let text = intentional
                         ? "已关闭：\(old.title)（只关闭网页，未删除历史）"
@@ -444,28 +460,87 @@ final class WorkspaceStore: ObservableObject {
                 }
                 recentWebTabNotices = Array(recentWebTabNotices.prefix(5))
             }
-            openWebTabs = tabs
+            closedWebTabs.removeAll { old in tabs.contains { $0.id == old.id || (old.sessionId != nil && $0.sessionId == old.sessionId) } }
+            closedWebTabs = Array(closedWebTabs.prefix(20))
+            for old in openWebTabs where !tabs.contains(where: { $0.id == old.id && $0.canonicalUrl == old.canonicalUrl }) {
+                webTabDiagnosesById.removeValue(forKey: old.id)
+                webTabLastSuccessfulCheckAt.removeValue(forKey: old.id)
+            }
+            if openWebTabs != tabs { openWebTabs = tabs }
             hasLoadedOpenWebTabs = true
+            lastOpenWebTabsCheckAt = Date()
+            openWebTabsQueryFailed = false
             errors["web.tabs"] = nil
+            // Two bounded read-only workers; no navigation, injection or reload.
+            // Inventory stays responsive even when a page cannot answer.
+            webTabInspectionTask?.cancel()
+            webTabInspectionTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                await withTaskGroup(of: Void.self) { group in
+                    for lane in 0..<2 {
+                        group.addTask { @MainActor [weak self] in
+                            for index in stride(from: lane, to: tabs.count, by: 2) {
+                                guard let self, generation == self.lifecycleGeneration, !Task.isCancelled, !self.isSuspended else { return }
+                                await self.inspectOpenWebTab(tabs[index])
+                            }
+                        }
+                    }
+                }
+            }
         } catch {
             if generation == lifecycleGeneration, !isSuspended {
+                openWebTabsQueryFailed = true
                 errors["web.tabs"] = error.localizedDescription
             }
         }
     }
 
     func inspectOpenWebTab(_ tab: OpenWebTab) async {
+        guard inspectingWebTabIds.insert(tab.id).inserted else { return }
+        defer { inspectingWebTabIds.remove(tab.id) }
+        let generation = lifecycleGeneration
         guard machine.state == .online, !isSuspended else {
             errors["web.tabs"] = "Windows 未连接，无法验证 Chrome 网页是否正常。"
             return
         }
         do {
             let diagnosis = try await transport.inspectOpenWebTab(machineId: machine.id, tab: tab)
-            webTabDiagnosesById[tab.id] = diagnosis
-            errors["web.tabs"] = nil
+            guard diagnosis.tabId == tab.id else { throw TransportError.malformedData }
+            guard generation == lifecycleGeneration, !isSuspended,
+                  openWebTabs.contains(where: { $0.id == tab.id && $0.canonicalUrl == tab.canonicalUrl }) else { return }
+            if webTabDiagnosesById[tab.id] != diagnosis { webTabDiagnosesById[tab.id] = diagnosis }
+            webTabLastSuccessfulCheckAt[tab.id] = diagnosis.observedAt.flatMap(RemoteAIDate.parse) ?? Date()
         } catch {
             // This is a failed status check, not proof of a failed page load.
-            errors["web.tabs"] = "网页状态无法确认：\(error.localizedDescription)"
+            guard generation == lifecycleGeneration, !isSuspended,
+                  openWebTabs.contains(where: { $0.id == tab.id && $0.canonicalUrl == tab.canonicalUrl }) else { return }
+            webTabDiagnosesById[tab.id] = WebTabDiagnosis(tabId: tab.id,
+                state: (error as? TransportError) == .timeout ? "timeout" : "bridge-unavailable",
+                issueCode: nil, issueMessage: "状态检测失败，不能判定页面已关闭：\(error.localizedDescription)",
+                observedAt: nil, generating: nil, composerReady: nil, draftPresent: nil, pendingUploads: nil, busy: nil)
+        }
+    }
+
+    func enterOpenWebTab(_ tab: OpenWebTab) async -> WebTabEntry? {
+        guard machine.state == .online, !isSuspended, managingWebTabIds.insert(tab.id).inserted else { return nil }
+        defer { managingWebTabIds.remove(tab.id) }
+        let generation = lifecycleGeneration
+        do {
+            webTabActionNotesById[tab.id] = "正在核对原标签和会话身份…"
+            let entry = try await transport.enterOpenWebTab(machineId: machine.id, tab: tab)
+            guard generation == lifecycleGeneration, !isSuspended, entry.tabId == tab.id,
+                  (entry.conversation != nil) != (entry.project != nil) else { return nil }
+            if let conversation = entry.conversation {
+                mergeProjectSessions([conversation])
+                await persistMetadata()
+            }
+            webTabDiagnosesById[tab.id] = entry.diagnosis
+            webTabActionNotesById[tab.id] = "身份已确认，复用电脑现有标签"
+            return entry
+        } catch {
+            errors["web.tabs"] = "进入失败：\(error.localizedDescription)"
+            webTabActionNotesById[tab.id] = "进入未确认，未新建其他对话"
+            return nil
         }
     }
 
@@ -505,6 +580,11 @@ final class WorkspaceStore: ObservableObject {
                 // Check only the selected page after a short settle period.
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 await inspectOpenWebTab(tab)
+                if webTabDiagnosesById[tab.id]?.state == "ready" {
+                    webTabActionNotesById[tab.id] = "操作完成：已确认原网页可用"
+                } else {
+                    webTabActionNotesById[tab.id] = "刷新命令已发送，但尚未确认恢复；请查看网页状态与原因"
+                }
             }
         } catch {
             errors["web.tabs"] = "网页操作未确认：\(error.localizedDescription)"

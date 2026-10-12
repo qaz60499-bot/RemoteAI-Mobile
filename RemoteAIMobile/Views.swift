@@ -199,9 +199,16 @@ struct InstanceView: View {
     @State private var showingDeleteConfirmation = false
     @State private var closingWebTab: OpenWebTab?
     @State private var showingCloseWebTabConfirmation = false
+    @State private var enteredWebProject: WebProjectDescriptor?
+    @State private var openEnteredWebProject = false
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
     private var isAntigravity: Bool { runtime.id == "runtime.antigravity" }
     private var supportsProjects: Bool { isChatGPTWeb || isAntigravity }
+    private var abnormalWebTabCount: Int {
+        store.openWebTabs.filter { tab in
+            store.webTabDiagnosesById[tab.id].map { !["ready", "generating", "loading"].contains($0.state) } ?? false
+        }.count
+    }
     private func webTabStatus(_ tab: OpenWebTab) -> String {
         if tab.busy { return "Agent 正在生成回复 · 禁止重载与关闭" }
         if let report = store.webTabDiagnosesById[tab.id] {
@@ -215,6 +222,8 @@ struct InstanceView: View {
             case "unresponsive": return "标签仍存在，但页面脚本未响应"
             case "closed": return "标签已被关闭或不存在"
             case "navigated": return "标签已跳转，不再是原页面"
+            case "bridge-unavailable": return "Browser Bridge 暂时无法访问，网页状态未知"
+            case "timeout": return "状态检测超时，不能判定网页已关闭"
             default: return "状态未明确：\(report.state)"
             }
         }
@@ -265,7 +274,10 @@ struct InstanceView: View {
         List {
             if isChatGPTWeb {
                 Section {
-                    if !store.hasLoadedOpenWebTabs {
+                    if store.openWebTabsQueryFailed {
+                        Text("Chrome 查询失败，当前打开数量未知；保留上次已确认的列表。")
+                            .font(.caption).foregroundColor(.secondary)
+                    } else if !store.hasLoadedOpenWebTabs {
                         Text("正在读取电脑 Chrome 当前打开的 ChatGPT 标签页…")
                             .font(.caption).foregroundColor(.secondary)
                     } else if store.openWebTabs.isEmpty {
@@ -277,7 +289,28 @@ struct InstanceView: View {
                             Image(systemName: tab.isChat ? "bubble.left.and.bubble.right" : "folder")
                                 .foregroundColor(.secondary)
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(tab.title).font(.subheadline).lineLimit(2)
+                                Button {
+                                    Task {
+                                        if let entry = await store.enterOpenWebTab(tab) {
+                                            if let conversation = entry.conversation {
+                                                createdWebSession = store.sessions.first { $0.id == conversation.id } ?? conversation.session
+                                                openCreatedWebSession = true
+                                            } else if let project = entry.project {
+                                                enteredWebProject = project
+                                                openEnteredWebProject = true
+                                            }
+                                        }
+                                    }
+                                } label: {
+                                    Text(tab.title).font(.subheadline).lineLimit(2)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(store.machine.state != .online || store.managingWebTabIds.contains(tab.id))
+                                Text(tab.pageType + (tab.projectTitle.map { " · Project：\($0)" } ?? tab.projectAlias.map { " · Project：\($0)" } ?? ""))
+                                    .font(.caption2).foregroundColor(.secondary)
+                                if let chatTitle = tab.chatTitle, chatTitle != tab.title {
+                                    Text("Chat：\(chatTitle)").font(.caption2).foregroundColor(.secondary)
+                                }
                                 Text(tab.busy ? "正在生成 · 不可关闭/刷新" : (tab.loading ? "网页加载中" : (tab.active ? "电脑当前标签页" : "后台标签页")))
                                     .font(.caption2).foregroundColor(.secondary)
                                 Text(webTabStatus(tab))
@@ -289,9 +322,9 @@ struct InstanceView: View {
                                     if let code = diagnosis.issueCode, !code.isEmpty {
                                         Text("错误代码：\(code)").font(.caption2).foregroundColor(.secondary)
                                     }
-                                    if let observed = diagnosis.observedAt.flatMap(RemoteAIDate.parse) {
-                                        FixedTimestamp(date: observed, prefix: "最后检测")
-                                    }
+                                }
+                                if let observed = store.webTabLastSuccessfulCheckAt[tab.id] {
+                                    FixedTimestamp(date: observed, prefix: "最后成功检查")
                                 }
                                 if let note = store.webTabActionNotesById[tab.id] {
                                     Text("最近操作：\(note)").font(.caption2).foregroundColor(.secondary)
@@ -337,6 +370,32 @@ struct InstanceView: View {
                     } label: {
                         Label("更新实际打开的标签页列表", systemImage: "arrow.clockwise")
                     }
+                    .disabled(store.refreshingOpenWebTabs)
+                    if let checkedAt = store.lastOpenWebTabsCheckAt {
+                        FixedTimestamp(date: checkedAt, prefix: "最后成功读取标签列表")
+                    }
+                    ForEach(store.closedWebTabs) { tab in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("标签已关闭：\(tab.title)").font(.caption)
+                            if let sessionId = tab.sessionId {
+                                Button("重新打开原 Chat") {
+                                    Task { await store.reopenClosedWebConversation(sessionId: sessionId) }
+                                }
+                            } else if let alias = tab.projectAlias, !tab.isChat {
+                                Button("重新打开原 Project") {
+                                    Task {
+                                        do {
+                                            try await store.transport.openProject(machineId: store.machine.id, projectAlias: alias)
+                                            await store.refreshOpenWebTabs()
+                                        } catch { store.errors["web.tabs"] = "重新打开失败：\(error.localizedDescription)" }
+                                    }
+                                }
+                            } else {
+                                Text("尚未确认对应会话身份，不能安全重新打开。")
+                                    .font(.caption2).foregroundColor(.secondary)
+                            }
+                        }
+                    }
                     ForEach(store.recentWebTabNotices, id: \.self) { notice in
                         Text(notice).font(.caption2).foregroundColor(.secondary)
                     }
@@ -344,7 +403,9 @@ struct InstanceView: View {
                         ErrorBanner(text: error) { store.clearError(sessionId: "web.tabs") }
                     }
                 } header: {
-                    Text("已打开 Web Chat \(store.openWebTabs.filter { $0.isChat }.count) · 网页标签 \(store.openWebTabs.count)")
+                    Text(store.openWebTabsQueryFailed || !store.hasLoadedOpenWebTabs
+                         ? "实际打开数量未知"
+                         : "网页标签 \(store.openWebTabs.count) · 实际 Chat \(store.openWebTabs.filter { $0.isChat }.count) · 异常 \(abnormalWebTabCount)")
                 } footer: {
                     Text("状态区分 Chrome 标签存在、页面可操作、ChatGPT 错误和连接不可验证；检测不会发送消息。关闭只关闭标签页，不删除历史。")
                 }
@@ -460,6 +521,11 @@ struct InstanceView: View {
                         isActive: $openCreatedWebSession
                     ) { EmptyView() }
                     .hidden()
+                }
+                if let enteredWebProject {
+                    NavigationLink(destination: WebProjectView(runtime: runtime, instance: instance, project: enteredWebProject),
+                                   isActive: $openEnteredWebProject) { EmptyView() }
+                        .hidden()
                 }
             }
         )

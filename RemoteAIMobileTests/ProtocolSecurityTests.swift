@@ -89,7 +89,7 @@ final class ProtocolSecurityTests: XCTestCase {
     }
 
     func testWebSendDeliveryErrorsAreAcceptedProtocolCodes() throws {
-        for code in ["WEB_SEND_NOT_ACCEPTED", "WEB_SEND_DELIVERY_UNKNOWN"] {
+        for code in ["WEB_SEND_NOT_ACCEPTED", "WEB_SEND_DELIVERY_UNKNOWN", "SESSION_BUSY", "CONVERSATION_ACCESS_DENIED"] {
             let object: [String: Any] = [
                 "kind": "error",
                 "error": ["code": code, "message": "delivery state", "retryable": code == "WEB_SEND_NOT_ACCEPTED"]

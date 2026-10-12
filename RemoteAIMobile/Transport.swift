@@ -169,7 +169,7 @@ extension RemoteCommand {
     }
 }
 
-struct WebTabDiagnosis: Decodable {
+struct WebTabDiagnosis: Decodable, Equatable {
     let tabId: Int
     let state: String
     let issueCode: String?
@@ -182,7 +182,7 @@ struct WebTabDiagnosis: Decodable {
     let busy: Bool?
 }
 
-struct OpenWebTab: Decodable, Identifiable {
+struct OpenWebTab: Decodable, Identifiable, Equatable {
     let tabId: Int
     let title: String
     let canonicalUrl: String
@@ -191,9 +191,25 @@ struct OpenWebTab: Decodable, Identifiable {
     let kind: String
     let sessionId: String?
     let busy: Bool
+    var conversationId: String? = nil
+    var projectAlias: String? = nil
+    var projectId: String? = nil
+    var projectTitle: String? = nil
+    var chatTitle: String? = nil
 
     var id: Int { tabId }
     var isChat: Bool { kind.contains("conversation") || sessionId != nil }
+    var pageType: String {
+        if isChat { return projectAlias == nil ? "普通 Chat" : "Project 内 Chat" }
+        return kind == "project-root" ? "Project" : "其他网页"
+    }
+}
+
+struct WebTabEntry: Decodable {
+    let tabId: Int
+    let conversation: WebConversationDescriptor?
+    let project: WebProjectDescriptor?
+    let diagnosis: WebTabDiagnosis
 }
 
 extension Transport {
@@ -337,6 +353,15 @@ extension Transport {
             "sessionId": tab.sessionId.map(JSONValue.string) ?? .null
         ], commandId: commandId)
         _ = try await requireSuccess(execute(command))
+    }
+
+    func enterOpenWebTab(machineId: String, tab: OpenWebTab) async throws -> WebTabEntry {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt",
+            action: "manageOpenWebTab", payload: [
+                "tabId": .number(Double(tab.tabId)), "expectedUrl": .string(tab.canonicalUrl),
+                "operation": .string("enter"), "sessionId": tab.sessionId.map(JSONValue.string) ?? .null
+            ])
+        return try await requireSuccess(execute(command)).decode(WebTabEntry.self)
     }
 
     func listProjectsResponse(machineId: String, forceRefresh: Bool = false) async throws -> WebProjectListResponse {
