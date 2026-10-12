@@ -197,9 +197,29 @@ struct InstanceView: View {
     @State private var openCreatedWebSession = false
     @State private var deleteCandidate: SessionDescriptor?
     @State private var showingDeleteConfirmation = false
+    @State private var closingWebTab: OpenWebTab?
+    @State private var showingCloseWebTabConfirmation = false
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
     private var isAntigravity: Bool { runtime.id == "runtime.antigravity" }
     private var supportsProjects: Bool { isChatGPTWeb || isAntigravity }
+    private func webTabStatus(_ tab: OpenWebTab) -> String {
+        if tab.busy { return "Agent 正在生成回复 · 禁止重载与关闭" }
+        if let report = store.webTabDiagnosesById[tab.id] {
+            switch report.state {
+            case "ready": return "网页可操作：已检测到输入框（不代表消息发送成功）"
+            case "generating": return "网页正在生成回复"
+            case "loading": return "Chrome 正在加载网页，尚未确认完成"
+            case "provider-error": return "ChatGPT 网页报告错误"
+            case "retry-visible": return "网页出现 Try Again，回复可能加载失败"
+            case "not-ready": return "Chrome 已加载，但输入框或主要页面尚未就绪"
+            case "unresponsive": return "标签仍存在，但页面脚本未响应"
+            case "closed": return "标签已被关闭或不存在"
+            case "navigated": return "标签已跳转，不再是原页面"
+            default: return "状态未明确：\(report.state)"
+            }
+        }
+        return tab.loading ? "Chrome 加载中，网页健康状态未检测" : "Chrome 标签存在 · 网页健康状态未检测"
+    }
     private var visibleProjects: [WebProjectDescriptor] {
         // Cache contains only previously accepted Project snapshots. Render it
         // immediately while the live DOM refresh runs so opening Web never starts with
@@ -243,6 +263,92 @@ struct InstanceView: View {
 
     var body: some View {
         List {
+            if isChatGPTWeb {
+                Section {
+                    if !store.hasLoadedOpenWebTabs {
+                        Text("正在读取电脑 Chrome 当前打开的 ChatGPT 标签页…")
+                            .font(.caption).foregroundColor(.secondary)
+                    } else if store.openWebTabs.isEmpty {
+                        Text("电脑 Chrome 当前没有打开 ChatGPT 标签页。")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    ForEach(store.openWebTabs) { tab in
+                        HStack(spacing: 10) {
+                            Image(systemName: tab.isChat ? "bubble.left.and.bubble.right" : "folder")
+                                .foregroundColor(.secondary)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(tab.title).font(.subheadline).lineLimit(2)
+                                Text(tab.busy ? "正在生成 · 不可关闭/刷新" : (tab.loading ? "网页加载中" : (tab.active ? "电脑当前标签页" : "后台标签页")))
+                                    .font(.caption2).foregroundColor(.secondary)
+                                Text(webTabStatus(tab))
+                                    .font(.caption2).foregroundColor(.secondary)
+                                if let diagnosis = store.webTabDiagnosesById[tab.id] {
+                                    if let issue = diagnosis.issueMessage, !issue.isEmpty {
+                                        Text("原因：\(issue)").font(.caption2).foregroundColor(.secondary)
+                                    }
+                                    if let code = diagnosis.issueCode, !code.isEmpty {
+                                        Text("错误代码：\(code)").font(.caption2).foregroundColor(.secondary)
+                                    }
+                                    if let observed = diagnosis.observedAt.flatMap(RemoteAIDate.parse) {
+                                        FixedTimestamp(date: observed, prefix: "最后检测")
+                                    }
+                                }
+                                if let note = store.webTabActionNotesById[tab.id] {
+                                    Text("最近操作：\(note)").font(.caption2).foregroundColor(.secondary)
+                                }
+                            }
+                            Spacer(minLength: 4)
+                            Menu {
+                                Button {
+                                    Task { await store.inspectOpenWebTab(tab) }
+                                } label: {
+                                    Label("检测网页实际状态", systemImage: "stethoscope")
+                                }
+                                Button {
+                                    Task { await store.manageOpenWebTab(tab, operation: "hardReload") }
+                                } label: {
+                                    Label("强制重载（绕过缓存）", systemImage: "arrow.triangle.2.circlepath")
+                                }
+                                Button {
+                                    Task { await store.manageOpenWebTab(tab, operation: "reopen") }
+                                } label: {
+                                    Label("重新打开此网页（复用标签）", systemImage: "arrow.up.forward.app")
+                                }
+                                Button {
+                                    Task { await store.manageOpenWebTab(tab, operation: "reload") }
+                                } label: {
+                                    Label("刷新此标签页", systemImage: "arrow.clockwise")
+                                }
+                                Button(role: .destructive) {
+                                    closingWebTab = tab
+                                    showingCloseWebTabConfirmation = true
+                                } label: {
+                                    Label("关闭此标签页", systemImage: "xmark.circle")
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis.circle").font(.title3)
+                            }
+                            .disabled(tab.busy || store.machine.state != .online || store.managingWebTabIds.contains(tab.id))
+                        }
+                        .padding(.vertical, 3)
+                    }
+                    Button {
+                        Task { await store.refreshOpenWebTabs() }
+                    } label: {
+                        Label("更新实际打开的标签页列表", systemImage: "arrow.clockwise")
+                    }
+                    ForEach(store.recentWebTabNotices, id: \.self) { notice in
+                        Text(notice).font(.caption2).foregroundColor(.secondary)
+                    }
+                    if let error = store.errors["web.tabs"] {
+                        ErrorBanner(text: error) { store.clearError(sessionId: "web.tabs") }
+                    }
+                } header: {
+                    Text("已打开 Web Chat \(store.openWebTabs.filter { $0.isChat }.count) · 网页标签 \(store.openWebTabs.count)")
+                } footer: {
+                    Text("状态区分 Chrome 标签存在、页面可操作、ChatGPT 错误和连接不可验证；检测不会发送消息。关闭只关闭标签页，不删除历史。")
+                }
+            }
             if supportsProjects {
                 Section {
                     if isChatGPTWeb { Button { newProject = true } label: { Label("新建 ChatGPT Project", systemImage: "folder.badge.plus") } }
@@ -308,6 +414,13 @@ struct InstanceView: View {
                     .disabled(creatingWebChat || store.machine.state != .online) } else { Button { newSession = true } label: { Label("新建普通 Antigravity 对话", systemImage: "plus.circle.fill") } }
                     ForEach(store.sessions.filter { $0.instanceId == instance.id && $0.projectAlias == nil }.sorted { $0.orderingDate > $1.orderingDate }) { session in
                         NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
+                            .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                                if isChatGPTWeb {
+                                    Button("重开网页") {
+                                        Task { await store.reopenClosedWebConversation(sessionId: session.id) }
+                                    }.tint(.accentColor)
+                                }
+                            }
                             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                 if isAntigravity {
                                     Button("删除", role: .destructive) { deleteCandidate = session; showingDeleteConfirmation = true }
@@ -317,7 +430,7 @@ struct InstanceView: View {
                 } header: {
                     Text("Chats")
                 } footer: {
-                    Text("Projects 固定显示在 Chats 上方；普通对话与 Project 对话不会混在一起。")
+                    Text("Projects 固定显示在 Chats 上方。若原网页已关闭，可向右滑动 Chat 行选择‘重开网页’，沿用旧会话，不新建对话。")
                 }
             } else {
                 Section {
@@ -362,12 +475,24 @@ struct InstanceView: View {
                 ? "将使用 Codex 原生归档接口，使此 Chat 从电脑和手机的活动会话列表移除；可在 Codex 归档中恢复。"
                 : "这将请求 Windows 上的 Antigravity 删除原始对话，操作不可撤销。")
         }
+        .confirmationDialog("关闭这个 Chrome 标签页？", isPresented: $showingCloseWebTabConfirmation) {
+            Button("取消", role: .cancel) { closingWebTab = nil }
+            Button("仅关闭标签页", role: .destructive) {
+                if let tab = closingWebTab {
+                    Task { await store.manageOpenWebTab(tab, operation: "close") }
+                }
+                closingWebTab = nil
+            }
+        } message: {
+            Text("不会删除 ChatGPT 历史记录或 RemoteAI 会话数据。关闭之前会再次核对实际网页地址，防止误关其他 Chat。")
+        }
         .sheet(isPresented: $newProject) { NewWebProjectView().environmentObject(store) }
         .task {
             if isChatGPTWeb {
                 // Projects are the primary navigation surface here. Show the last
                 // verified Windows/iOS cache first, then let WorkspaceStore schedule
                 // the authoritative DOM refresh without blocking initial navigation.
+                await store.refreshOpenWebTabs()
                 await store.refreshWebProjects(force: false)
                 await store.refreshSessions(runtime: runtime, instance: instance)
             } else {
@@ -381,7 +506,10 @@ struct InstanceView: View {
                 catch { break }
                 guard !Task.isCancelled else { break }
                 if scenePhase == .active, store.machine.state == .online {
-                    if isChatGPTWeb { await store.refreshWebProjects(force: false) }
+                    if isChatGPTWeb {
+                        await store.refreshOpenWebTabs()
+                        await store.refreshWebProjects(force: false)
+                    }
                     await store.refreshSessions(runtime: runtime, instance: instance)
                     if isAntigravity { await store.refreshAntigravityProjects() }
                 }
@@ -390,13 +518,17 @@ struct InstanceView: View {
         .onChange(of: scenePhase) { phase in
             guard phase == .active, store.machine.state == .online else { return }
             Task {
-                if isChatGPTWeb { await store.refreshWebProjects(force: false) }
+                if isChatGPTWeb {
+                    await store.refreshOpenWebTabs()
+                    await store.refreshWebProjects(force: false)
+                }
                 await store.refreshSessions(runtime: runtime, instance: instance)
                 if isAntigravity { await store.refreshAntigravityProjects() }
             }
         }
         .refreshable {
             if isChatGPTWeb {
+                await store.refreshOpenWebTabs()
                 await store.refreshWebProjects(force: true)
                 await store.refreshSessions(runtime: runtime, instance: instance)
             } else {
@@ -425,9 +557,17 @@ struct SessionRow: View {
                 Text(session.title)
                 FixedTimestamp(date: session.updatedAt, prefix: "最后更新")
                 FixedTimestamp(date: session.lastActivityAt ?? session.updatedAt, prefix: "最后进行")
+                if session.instanceId == "antigravity.desktop",
+                   session.state == .busy || session.state == .waiting,
+                   let progress = session.lastProgressStatus, !progress.isEmpty {
+                    Text(progress).font(.caption2).foregroundColor(.secondary).lineLimit(2)
+                }
             }
             Spacer()
-            Text(session.state.rawValue).font(.caption).foregroundColor(session.state == .error ? .red : .secondary)
+            Text(session.instanceId == "antigravity.desktop" && (session.state == .busy || session.state == .waiting)
+                ? "侧边栏执行中" : session.state.rawValue)
+                .font(.caption)
+                .foregroundColor(session.state == .error ? .red : .secondary)
         }
     }
 }
@@ -525,6 +665,11 @@ struct WebProjectView: View {
                     let resolvedSession = store.sessions.first(where: { $0.id == conversation.localConversationId }) ?? conversation.session
                     NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: resolvedSession)) {
                         SessionRow(session: resolvedSession)
+                    }
+                    .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                        Button("重开网页") {
+                            Task { await store.reopenClosedWebConversation(sessionId: resolvedSession.id) }
+                        }.tint(.accentColor)
                     }
                 }
                 if store.projectHasMoreByAlias[project.projectAlias] == true {
@@ -828,11 +973,15 @@ struct ChatView: View {
                                     .font(.caption2)
                                     .foregroundColor(.orange)
                             } else if let progressAt = generationProgressAt {
-                                Text("电脑端进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 可直接发送新指令纠正方向")
+                                Text(runtime.kind == .antigravity
+                                    ? "侧边栏进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 等待完成，或手动点击 Stop；发送不会自动打断"
+                                    : "电脑端进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 可直接发送新指令纠正方向")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                             } else {
-                                Text("可直接发送新指令纠正方向；也可以先停止。")
+                                Text(runtime.kind == .antigravity
+                                    ? "电脑端侧边栏正在执行；请等待完成，或手动点击 Stop。"
+                                    : "可直接发送新指令纠正方向；也可以先停止。")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                             }
@@ -878,6 +1027,10 @@ struct ChatView: View {
                     toggleVoice: { toggleVoiceInput() },
                     stop: { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } },
                     send: {
+                        if runtime.kind == .antigravity && isGenerating {
+                            attachmentError = "Antigravity 电脑侧边栏仍在执行。为避免打乱任务顺序，本次未发送、草稿已保留。请等待完成，或先手动点击 Stop。"
+                            return
+                        }
                         if speechInput.isRecording { speechInput.stop() }
                         let text = input
                         let attachments = pendingAttachments
@@ -1424,7 +1577,16 @@ final class MessageRenderContent: NSObject {
         displayText = message.displayText
         attachments = message.resolvedAttachments
         isLarge = MessageRenderingPolicy.isLarge(displayText)
-        segments = MessageContentSegment.parse(MessageRenderingPolicy.inlineText(displayText))
+        let inlinePreview = MessageRenderingPolicy.inlineText(displayText)
+        // A collapsed long-history bubble is a preview, not a full Markdown view.
+        // Parsing thousands of repeated inline fences/styles into many Text nodes
+        // inflates SwiftUI layout and XCTest/VoiceOver accessibility snapshots.
+        // Preserve existing Edit-block extraction and short-message formatting.
+        if isLarge && displayText.range(of: "Edit", options: .caseInsensitive) == nil {
+            segments = [MessageContentSegment(id: 0, text: inlinePreview, isCode: false, language: nil)]
+        } else {
+            segments = MessageContentSegment.parse(inlinePreview)
+        }
         preservedEditBlocks = isLarge ? MessageContentSegment.editBlocks(in: displayText) : []
         inlineDetail = message.detail.map { MessageRenderingPolicy.inlineText($0) }
     }

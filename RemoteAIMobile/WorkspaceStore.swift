@@ -9,6 +9,13 @@ final class WorkspaceStore: ObservableObject {
     @Published var sessions: [SessionDescriptor] = []
     @Published var messagesBySession: [String: [ChatMessage]] = [:]
     @Published var webProjects: [WebProjectDescriptor] = []
+    @Published var openWebTabs: [OpenWebTab] = []
+    @Published var hasLoadedOpenWebTabs = false
+    @Published private(set) var managingWebTabIds = Set<Int>()
+    @Published var webTabDiagnosesById: [Int: WebTabDiagnosis] = [:]
+    @Published var webTabActionNotesById: [Int: String] = [:]
+    @Published var recentWebTabNotices: [String] = []
+    private var explicitlyClosedWebTabIDs = Set<Int>()
     @Published var antigravityProjects: [WebProjectDescriptor] = []
     @Published var hasLoadedAntigravityProjects = false
     @Published var projectConversationsByAlias: [String: [WebConversationDescriptor]] = [:]
@@ -41,7 +48,13 @@ final class WorkspaceStore: ObservableObject {
         deferringTransientConnectionPresentation && isPaired ? .online : machine.state
     }
     var shouldDisplayConnectionBanner: Bool {
-        !deferringTransientConnectionPresentation && (machine.state != .online || connectionPhase != .online)
+        guard !deferringTransientConnectionPresentation else { return false }
+        // An authenticated Agent is already usable. Refreshing slow runtime metadata
+        // is not a transport failure and should not flash a reconnect banner.
+        if machine.state == .online && (connectionPhase == .online || connectionPhase == .loadingRuntimes) {
+            return false
+        }
+        return true
     }
 
     static let connectingStateMaxDuration: TimeInterval = 45
@@ -267,7 +280,12 @@ final class WorkspaceStore: ObservableObject {
         }
         isPaired = PairingKeyStore.isPaired(machineId: machine.id)
         if !isPaired && !(transport is MockTransport) {
-            try? await cache.clearAll()
+            // A locked/unavailable Keychain and an explicitly revoked pairing both
+            // report no usable key here. Neither is proof that cached conversations
+            // or drafts may be destroyed. Keep the disk cache intact; only hide its
+            // contents in this unpaired UI lifecycle. Re-pairing an actual different
+            // machine still follows the explicit cache reset in savePairing().
+            DiagnosticsLog.shared.record("pairing_key_unavailable_cache_preserved", level: "WARN")
             runtimes.removeAll()
             instances.removeAll()
             sessions.removeAll()
@@ -404,6 +422,94 @@ final class WorkspaceStore: ObservableObject {
             if generation == lifecycleGeneration, !isSuspended {
                 errors["antigravity.projects"] = error.localizedDescription
             }
+        }
+    }
+
+    func refreshOpenWebTabs() async {
+        guard machine.state == .online, !isSuspended else { return }
+        let generation = lifecycleGeneration
+        do {
+            let tabs = try await transport.listOpenWebTabs(machineId: machine.id)
+            guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+            // Only an authoritative Chrome inventory may establish disappearance.
+            // A network/bridge error never means a tab was closed.
+            if hasLoadedOpenWebTabs {
+                let currentIDs = Set(tabs.map(\.id))
+                for old in openWebTabs where !currentIDs.contains(old.id) {
+                    let intentional = explicitlyClosedWebTabIDs.remove(old.id) != nil
+                    let text = intentional
+                        ? "已关闭：\(old.title)（只关闭网页，未删除历史）"
+                        : "标签页已消失：\(old.title)；未收到本手机关闭确认，可能在电脑端关闭或被自动回收"
+                    recentWebTabNotices.insert(text, at: 0)
+                }
+                recentWebTabNotices = Array(recentWebTabNotices.prefix(5))
+            }
+            openWebTabs = tabs
+            hasLoadedOpenWebTabs = true
+            errors["web.tabs"] = nil
+        } catch {
+            if generation == lifecycleGeneration, !isSuspended {
+                errors["web.tabs"] = error.localizedDescription
+            }
+        }
+    }
+
+    func inspectOpenWebTab(_ tab: OpenWebTab) async {
+        guard machine.state == .online, !isSuspended else {
+            errors["web.tabs"] = "Windows 未连接，无法验证 Chrome 网页是否正常。"
+            return
+        }
+        do {
+            let diagnosis = try await transport.inspectOpenWebTab(machineId: machine.id, tab: tab)
+            webTabDiagnosesById[tab.id] = diagnosis
+            errors["web.tabs"] = nil
+        } catch {
+            // This is a failed status check, not proof of a failed page load.
+            errors["web.tabs"] = "网页状态无法确认：\(error.localizedDescription)"
+        }
+    }
+
+    func reopenClosedWebConversation(sessionId: String) async {
+        guard machine.state == .online, !isSuspended else { return }
+        do {
+            try await transport.reopenVerifiedWebConversation(machineId: machine.id, sessionId: sessionId)
+            recentWebTabNotices.insert("已请求重新打开原 Chat（不是新建 Chat）；请检查 Chrome 页面是否恢复。", at: 0)
+            recentWebTabNotices = Array(recentWebTabNotices.prefix(5))
+            await refreshOpenWebTabs()
+        } catch {
+            errors["web.tabs"] = "重新打开失败：\(error.localizedDescription)"
+        }
+    }
+
+    func manageOpenWebTab(_ tab: OpenWebTab, operation: String) async {
+        guard machine.state == .online, !isSuspended, ["close", "reload", "hardReload", "reopen"].contains(operation) else { return }
+        guard managingWebTabIds.insert(tab.id).inserted else { return }
+        defer { managingWebTabIds.remove(tab.id) }
+        guard !tab.busy else {
+            errors["web.tabs"] = "该 Chat 正在生成回复，不能关闭或刷新。"
+            return
+        }
+        do {
+            webTabDiagnosesById.removeValue(forKey: tab.id)
+            webTabActionNotesById[tab.id] = "正在执行操作，等待 Chrome 确认…"
+            try await transport.manageOpenWebTab(machineId: machine.id, tab: tab, operation: operation)
+            if operation == "close" {
+                explicitlyClosedWebTabIDs.insert(tab.id)
+                webTabActionNotesById[tab.id] = "Chrome 已接受关闭请求"
+            } else {
+                webTabActionNotesById[tab.id] = "Chrome 已接受页面操作；尚未验证加载完成"
+            }
+            await refreshOpenWebTabs()
+            if operation != "close" {
+                // A browser navigation acknowledgement is NOT health proof.
+                // Check only the selected page after a short settle period.
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                await inspectOpenWebTab(tab)
+            }
+        } catch {
+            errors["web.tabs"] = "网页操作未确认：\(error.localizedDescription)"
+            webTabActionNotesById[tab.id] = "操作未确认；不能判定页面已经刷新或关闭"
+            // Do not remove a tab from the UI on an unconfirmed browser action.
         }
     }
 

@@ -169,6 +169,33 @@ extension RemoteCommand {
     }
 }
 
+struct WebTabDiagnosis: Decodable {
+    let tabId: Int
+    let state: String
+    let issueCode: String?
+    let issueMessage: String?
+    let observedAt: String?
+    let generating: Bool?
+    let composerReady: Bool?
+    let draftPresent: Bool?
+    let pendingUploads: Bool?
+    let busy: Bool?
+}
+
+struct OpenWebTab: Decodable, Identifiable {
+    let tabId: Int
+    let title: String
+    let canonicalUrl: String
+    let active: Bool
+    let loading: Bool
+    let kind: String
+    let sessionId: String?
+    let busy: Bool
+
+    var id: Int { tabId }
+    var isChat: Bool { kind.contains("conversation") || sessionId != nil }
+}
+
 extension Transport {
     func healthStream() async -> AsyncStream<TransportHealthEvent> {
         AsyncStream { _ in }
@@ -278,6 +305,37 @@ extension Transport {
 
     func deleteSession(machineId: String, runtimeId: String, instanceId: String, sessionId: String, commandId: UUID = UUID()) async throws {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "deleteSession", commandId: commandId)
+        _ = try await requireSuccess(execute(command))
+    }
+
+    func listOpenWebTabs(machineId: String) async throws -> [OpenWebTab] {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "listOpenWebTabs")
+        let response = try await requireSuccess(execute(command))
+        return try response.decode([OpenWebTab].self)
+    }
+
+    func inspectOpenWebTab(machineId: String, tab: OpenWebTab) async throws -> WebTabDiagnosis {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt",
+            action: "inspectOpenWebTab", payload: [
+                "tabId": .number(Double(tab.tabId)),
+                "expectedUrl": .string(tab.canonicalUrl)
+            ])
+        return try await requireSuccess(execute(command)).decode(WebTabDiagnosis.self)
+    }
+
+    func reopenVerifiedWebConversation(machineId: String, sessionId: String) async throws {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web",
+            instanceId: "web.chatgpt", sessionId: sessionId, action: "resumeSession")
+        _ = try await requireSuccess(execute(command))
+    }
+
+    func manageOpenWebTab(machineId: String, tab: OpenWebTab, operation: String, commandId: UUID = UUID()) async throws {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "manageOpenWebTab", payload: [
+            "tabId": .number(Double(tab.tabId)),
+            "expectedUrl": .string(tab.canonicalUrl),
+            "operation": .string(operation),
+            "sessionId": tab.sessionId.map(JSONValue.string) ?? .null
+        ], commandId: commandId)
         _ = try await requireSuccess(execute(command))
     }
 
