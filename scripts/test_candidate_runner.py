@@ -22,10 +22,10 @@ class RecoveryGateTests(unittest.TestCase):
                 def fake_test(command, evidence):
                     state = outcomes[len(seen)]
                     seen.append(evidence)
-                    if state == "snapshot":
+                    if state in ("snapshot", "snapshot-singular"):
                         (evidence / "xcodebuild.log").write_text(
                             f"Test Case '-[RemoteAIMobileUITests.RemoteAIMobileUITests {method_name}]' started.\n"
-                            "Failed to get matching snapshots: Timed out while evaluating UI query.\n"
+                            f"Failed to get matching {'snapshot' if state == 'snapshot-singular' else 'snapshots'}: Timed out while evaluating UI query.\n"
                             "** TEST EXECUTE FAILED **\n")
                     elif state == "failed":
                         (evidence / "xcodebuild.log").write_text(
@@ -34,7 +34,7 @@ class RecoveryGateTests(unittest.TestCase):
                         (evidence / "xcodebuild.log").write_text(
                             "Test Case '-[Example testExample]'" if state == "started" else "")
                     (evidence / "process.jsonl").write_text('{"pid":42}\n' if state == "app" else "")
-                    if state in ("failed", "snapshot"):
+                    if state in ("failed", "snapshot", "snapshot-singular"):
                         raise subprocess.CalledProcessError(65, command)
                     if state != "success":
                         raise subprocess.TimeoutExpired(command, 300)
@@ -90,6 +90,20 @@ class RecoveryGateTests(unittest.TestCase):
         seen, recoveries = self.exercise(
             ["snapshot", "snapshot"], subprocess.CalledProcessError,
             method_name="testLongStreamingExample")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(recoveries, [])
+
+    def test_singular_snapshot_timeout_retries_only_once_and_30k_fixture(self):
+        seen, recoveries = self.exercise(
+            ["snapshot-singular", "success"], method_name="testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(len(set(seen)), 2)
+        self.assertEqual(recoveries, [])
+
+    def test_singular_snapshot_timeout_twice_still_fails(self):
+        seen, recoveries = self.exercise(
+            ["snapshot-singular", "snapshot-singular"], subprocess.CalledProcessError,
+            method_name="testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable")
         self.assertEqual(len(seen), 2)
         self.assertEqual(recoveries, [])
 

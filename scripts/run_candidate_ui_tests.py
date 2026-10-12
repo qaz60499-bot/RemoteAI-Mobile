@@ -102,8 +102,8 @@ def preserve_evidence(udid, evidence):
 def is_xcui_snapshot_timeout(evidence, method):
     """Retry one hosted-runner accessibility snapshot failure, not test assertions.
 
-    XCUI occasionally stalls fetching an accessibility tree before evaluating
-    even the first exact progress identifier in a 50k stream test. Preserve the
+    XCUI occasionally stalls fetching the accessibility tree while evaluating
+    the exact progress or final identifier in 30k/50k stream tests. Preserve the
     failure bundle and use a fresh simulator; the second run must pass every
     original assertion or the candidate still fails.
     """
@@ -114,7 +114,7 @@ def is_xcui_snapshot_timeout(evidence, method):
         return False
     text = log.read_text(encoding="utf-8", errors="replace")
     return (f"Test Case '-[RemoteAIMobileUITests.RemoteAIMobileUITests {method.rsplit('/', 1)[-1]}]' started." in text
-            and "Failed to get matching snapshots: Timed out while evaluating UI query." in text
+            and re.search(r"Failed to get matching snapshots?: Timed out while evaluating UI query[.]", text) is not None
             and "** TEST EXECUTE FAILED **" in text)
 
 
