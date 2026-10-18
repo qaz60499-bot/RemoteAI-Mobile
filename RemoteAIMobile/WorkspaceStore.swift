@@ -1273,9 +1273,11 @@ final class WorkspaceStore: ObservableObject {
             let currentById = Dictionary(uniqueKeysWithValues: currentRows.map { ($0.id, $0) })
             let remoteRows = remote.map { row in
                 var updated = row
-                if let known = currentById[row.id]?.backgroundTaskStatus,
-                   known.observedAt > (row.backgroundTaskStatus?.observedAt ?? .distantPast) {
+                if let current = currentById[row.id],
+                   let known = current.backgroundTaskStatus,
+                   known.observedAt >= (row.backgroundTaskStatus?.observedAt ?? .distantPast) {
                     updated.backgroundTaskStatus = known
+                    updated.backgroundTaskStatusReceivedAt = current.backgroundTaskStatusReceivedAt
                 }
                 return updated
             }.sorted(by: Self.sessionOrdersBefore)
@@ -1452,13 +1454,20 @@ final class WorkspaceStore: ObservableObject {
             if let index = sessions.firstIndex(where: { $0.id == sessionId }) {
                 let current = sessions[index]
                 var updated = current
-                let receivedBackgroundTaskStatus = snapshot.backgroundTaskStatus ?? BackgroundTaskStatusSnapshot(
-                    state: .unavailable,
-                    observedAt: requestStartedAt,
-                    error: "后台任务状态未提供"
-                )
-                if receivedBackgroundTaskStatus.observedAt >= (current.backgroundTaskStatus?.observedAt ?? .distantPast) {
-                    updated.backgroundTaskStatus = receivedBackgroundTaskStatus
+                if let receivedBackgroundTaskStatus = snapshot.backgroundTaskStatus {
+                    if current.backgroundTaskStatus == nil
+                        || receivedBackgroundTaskStatus.observedAt > (current.backgroundTaskStatus?.observedAt ?? .distantPast) {
+                        updated.backgroundTaskStatus = receivedBackgroundTaskStatus
+                        updated.backgroundTaskStatusReceivedAt = Date()
+                    }
+                } else if (current.instanceId == "antigravity.desktop" || current.backgroundTaskStatus != nil),
+                          requestStartedAt >= (current.backgroundTaskStatusReceivedAt ?? .distantPast) {
+                    updated.backgroundTaskStatus = BackgroundTaskStatusSnapshot(
+                        state: .unavailable,
+                        observedAt: current.backgroundTaskStatus?.observedAt ?? .distantPast,
+                        error: "后台任务状态未提供"
+                    )
+                    updated.backgroundTaskStatusReceivedAt = Date()
                 }
                 if !staleIdleSnapshot {
                     updated.state = snapshot.state
@@ -1534,25 +1543,27 @@ final class WorkspaceStore: ObservableObject {
             }
             return snapshot
         } catch let error as TransportError where error == .disconnected || error == .timeout || error == .offline {
-            markBackgroundTaskStatusUnavailable(sessionId, observedAt: requestStartedAt)
+            markBackgroundTaskStatusUnavailable(sessionId, requestStartedAt: requestStartedAt)
             DiagnosticsLog.shared.record("session_status_deferred", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
             return nil
         } catch {
-            markBackgroundTaskStatusUnavailable(sessionId, observedAt: requestStartedAt)
+            markBackgroundTaskStatusUnavailable(sessionId, requestStartedAt: requestStartedAt)
             DiagnosticsLog.shared.record("session_status_failed", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
             return nil
         }
     }
 
-    private func markBackgroundTaskStatusUnavailable(_ sessionId: String, observedAt: Date) {
+    private func markBackgroundTaskStatusUnavailable(_ sessionId: String, requestStartedAt: Date) {
         guard let index = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
-        let current = sessions[index].backgroundTaskStatus
-        guard observedAt >= (current?.observedAt ?? .distantPast) else { return }
+        let currentSession = sessions[index]
+        guard currentSession.instanceId == "antigravity.desktop" || currentSession.backgroundTaskStatus != nil else { return }
+        guard requestStartedAt >= (currentSession.backgroundTaskStatusReceivedAt ?? .distantPast) else { return }
         sessions[index].backgroundTaskStatus = BackgroundTaskStatusSnapshot(
             state: .unavailable,
-            observedAt: observedAt,
+            observedAt: currentSession.backgroundTaskStatus?.observedAt ?? .distantPast,
             error: "后台任务状态暂不可用"
         )
+        sessions[index].backgroundTaskStatusReceivedAt = Date()
     }
 
     /// Catch up a conversation that is currently visible on the phone. Websocket push

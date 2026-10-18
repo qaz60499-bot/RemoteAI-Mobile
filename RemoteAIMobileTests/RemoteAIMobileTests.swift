@@ -3584,6 +3584,33 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(server.descriptor.lastActivityAt, activity)
         XCTAssertEqual(server.descriptor.orderingDate, activity)
         XCTAssertNil(server.descriptor.backgroundTaskStatus, "Older session metadata must remain decodable and missing task state must stay unknown")
+        XCTAssertNil(server.descriptor.backgroundTaskStatusReceivedAt, "Missing task snapshots must not invent a local receipt time")
+    }
+
+    func testServerSessionDescriptorRecordsLocalReceiptForBackgroundTaskSnapshot() throws {
+        let observedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date().addingTimeInterval(-120))))
+        let snapshot = BackgroundTaskStatusSnapshot(
+            state: .available,
+            observedAt: observedAt,
+            tasks: [BackgroundTaskDescriptor(id: "task-1", title: "Task", status: .running, progress: nil)]
+        )
+        let server = ServerSession(
+            sessionId: "task-session",
+            runtimeId: "runtime.antigravity",
+            instanceId: "antigravity.desktop",
+            externalId: nil,
+            title: "Task Session",
+            canonicalUrl: nil,
+            status: "idle",
+            metadata: ["backgroundTaskStatus": (try JSONValue.encode(snapshot))],
+            createdAt: observedAt,
+            updatedAt: observedAt,
+            lastVisited: observedAt
+        )
+
+        let descriptor = server.descriptor
+        XCTAssertEqual(descriptor.backgroundTaskStatus, snapshot)
+        XCTAssertLessThan(abs(try XCTUnwrap(descriptor.backgroundTaskStatusReceivedAt).timeIntervalSinceNow), 2)
     }
 
     func testBackgroundTaskStatusDecodesContractAndRejectsMissingTaskList() throws {
@@ -4037,7 +4064,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
         await store.refreshSessions(runtime: runtime, instance: instance)
 
-        let initialObservedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date())))
+        let initialObservedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date().addingTimeInterval(-120))))
         await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
             state: .available,
             observedAt: initialObservedAt,
@@ -4048,6 +4075,33 @@ final class RemoteAIMobileTests: XCTestCase {
         var session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
         XCTAssertEqual(session.state, .idle, "A running background task must not make an idle conversation Busy")
         XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.status, .running)
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, initialObservedAt, "A server timestamp 120 seconds behind the phone must remain the source timestamp")
+        let initialReceipt = try XCTUnwrap(session.backgroundTaskStatusReceivedAt)
+        XCTAssertLessThan(abs(initialReceipt.timeIntervalSinceNow), 2, "Freshness must use the phone's local receipt time")
+
+        await mock.setBackgroundTaskStatus("photo-upload", snapshot: nil)
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.backgroundTaskStatus?.state, .unavailable)
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, initialObservedAt, "Unavailable status must retain the server time domain")
+        let unavailableReceipt = try XCTUnwrap(session.backgroundTaskStatusReceivedAt)
+        XCTAssertLessThan(abs(unavailableReceipt.timeIntervalSinceNow), 2)
+
+        let recoveredObservedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(initialObservedAt.addingTimeInterval(1))))
+        await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
+            state: .available,
+            observedAt: recoveredObservedAt,
+            tasks: [BackgroundTaskDescriptor(id: "task-1", title: "Background task", status: .waiting, progress: "Recovered")]
+        ))
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertEqual(session.backgroundTaskStatus?.state, .available, "A newer source snapshot must replace a local unavailable marker")
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, recoveredObservedAt)
+        XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.status, .waiting)
+        let recoveredReceipt = try XCTUnwrap(session.backgroundTaskStatusReceivedAt)
+        XCTAssertGreaterThan(recoveredReceipt, unavailableReceipt)
+        XCTAssertLessThan(abs(recoveredReceipt.timeIntervalSinceNow), 2)
 
         let liveAt = Date()
         await mock.injectEvent(RemoteEvent(
@@ -4067,7 +4121,7 @@ final class RemoteAIMobileTests: XCTestCase {
         }
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
 
-        let newerObservedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(max(Date(), initialObservedAt.addingTimeInterval(1)))))
+        let newerObservedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(recoveredObservedAt.addingTimeInterval(1))))
         await mock.setSessionStatus("photo-upload", status: "idle", lastActivityAt: liveAt.addingTimeInterval(-5))
         await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
             state: .available,
@@ -4080,6 +4134,8 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(session.state, .busy, "An evidence-poor Idle response must not end newer conversation activity")
         XCTAssertEqual(session.backgroundTaskStatus?.observedAt, newerObservedAt, "A newer background snapshot must still apply when session Idle is rejected")
         XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.progress, "Waiting for a slot")
+        let newerReceipt = try XCTUnwrap(session.backgroundTaskStatusReceivedAt)
+        XCTAssertLessThan(abs(newerReceipt.timeIntervalSinceNow), 2)
 
         await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
             state: .available,
@@ -4096,6 +4152,7 @@ final class RemoteAIMobileTests: XCTestCase {
         session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
         XCTAssertEqual(session.backgroundTaskStatus?.observedAt, newerObservedAt, "A catalog response must not erase a newer status snapshot")
         XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.progress, "Waiting for a slot")
+        XCTAssertEqual(session.backgroundTaskStatusReceivedAt, newerReceipt, "A catalog replay must not extend local receipt freshness")
         await store.suspend()
     }
 

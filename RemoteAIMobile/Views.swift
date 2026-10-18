@@ -628,6 +628,7 @@ struct SessionRow: View {
                 if session.instanceId == "antigravity.desktop" {
                     BackgroundTaskStatusView(
                         snapshot: session.backgroundTaskStatus,
+                        receivedAt: session.backgroundTaskStatusReceivedAt,
                         machineOnline: store.machine.state == .online,
                         sceneActive: scenePhase == .active,
                         compact: true
@@ -650,13 +651,14 @@ struct SessionRow: View {
 
 private struct BackgroundTaskStatusView: View {
     let snapshot: BackgroundTaskStatusSnapshot?
+    let receivedAt: Date?
     let machineOnline: Bool
     let sceneActive: Bool
     var compact = false
 
     private var isCurrent: Bool {
-        guard let snapshot, snapshot.state == .available, machineOnline, sceneActive else { return false }
-        let age = Date().timeIntervalSince(snapshot.observedAt)
+        guard let snapshot, let receivedAt, snapshot.state == .available, machineOnline, sceneActive else { return false }
+        let age = Date().timeIntervalSince(receivedAt)
         return age >= -60 && age <= 45
     }
 
@@ -692,12 +694,16 @@ private struct BackgroundTaskStatusView: View {
                 .lineLimit(2)
 
             if let snapshot, !compact {
-                if isCurrent {
-                    Text("状态已核对 · \(snapshot.observedAt.formatted(date: .omitted, time: .standard))")
+                if isCurrent, let receivedAt {
+                    Text("状态已核对 · \(receivedAt.formatted(date: .omitted, time: .standard))")
                         .font(.caption2)
                         .foregroundColor(.secondary)
+                } else if let receivedAt {
+                    Text("最后同步 \(receivedAt.formatted(date: .omitted, time: .standard))；连接恢复并刷新后核对")
+                        .font(.caption2)
+                        .foregroundColor(.orange)
                 } else {
-                    Text("最后同步 \(snapshot.observedAt.formatted(date: .omitted, time: .standard))；连接恢复并刷新后核对")
+                    Text("等待同步；刷新后核对任务状态")
                         .font(.caption2)
                         .foregroundColor(.orange)
                 }
@@ -1124,6 +1130,7 @@ struct ChatView: View {
                 if runtime.kind == .antigravity {
                     BackgroundTaskStatusView(
                         snapshot: currentSession.backgroundTaskStatus,
+                        receivedAt: currentSession.backgroundTaskStatusReceivedAt,
                         machineOnline: store.machine.state == .online,
                         sceneActive: scenePhase == .active
                     )

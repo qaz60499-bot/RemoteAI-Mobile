@@ -97,6 +97,7 @@ struct SessionDescriptor: Codable, Identifiable, Hashable {
     var lastProgressStatus: String? = nil
     var lastProgressAt: Date? = nil
     var backgroundTaskStatus: BackgroundTaskStatusSnapshot? = nil
+    var backgroundTaskStatusReceivedAt: Date? = nil
 
     var orderingDate: Date { max(updatedAt, lastActivityAt ?? updatedAt) }
 }
@@ -664,6 +665,9 @@ extension ServerInstance {
 extension ServerSession {
     var descriptor: SessionDescriptor {
         let persistedActivity = metadata["lastActivityAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+        let backgroundTaskStatus = metadata["backgroundTaskStatus"].flatMap {
+            try? $0.decode(BackgroundTaskStatusSnapshot.self)
+        }
         return SessionDescriptor(
             id: sessionId,
             instanceId: instanceId,
@@ -677,9 +681,8 @@ extension ServerSession {
             lastActivityAt: persistedActivity,
             lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
             lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse),
-            backgroundTaskStatus: metadata["backgroundTaskStatus"].flatMap {
-                try? $0.decode(BackgroundTaskStatusSnapshot.self)
-            }
+            backgroundTaskStatus: backgroundTaskStatus,
+            backgroundTaskStatusReceivedAt: backgroundTaskStatus == nil ? nil : Date()
         )
     }
 }
