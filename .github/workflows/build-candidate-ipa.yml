@@ -31,7 +31,11 @@ jobs:
     name: Candidate Test + Device IPA
     if: github.event_name == 'workflow_dispatch'
     runs-on: macos-15
-    timeout-minutes: 45
+    # Full candidate run 39132713116 exhausted 45 minutes after every UI
+    # case passed (the two stress cases needed the existing one-time retry).
+    # Include bounded simulator startup/evidence export and device packaging;
+    # individual test deadlines and all assertions remain unchanged.
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
