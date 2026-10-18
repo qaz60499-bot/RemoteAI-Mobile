@@ -493,6 +493,41 @@ struct InstanceView: View {
                 } footer: {
                     Text("Projects 固定显示在 Chats 上方。若原网页已关闭，可向右滑动 Chat 行选择‘重开网页’，沿用旧会话，不新建对话。")
                 }
+            } else if runtime.kind == .codex {
+                Section {
+                    Button { newSession = true } label: { Label("新建 Chat", systemImage: "plus.circle.fill") }
+                    TextField("搜索 Projects / Chats", text: $projectSearch)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled(true)
+                }
+                Section {
+                    ForEach(CodexDirectoryGroup.make(store.sessions.filter { $0.instanceId == instance.id }).filter {
+                        projectSearch.isEmpty || $0.path.localizedCaseInsensitiveContains(projectSearch)
+                            || $0.sessions.contains { $0.title.localizedCaseInsensitiveContains(projectSearch) }
+                    }) { group in
+                        NavigationLink(destination: CodexDirectoryChatsView(runtime: runtime, instance: instance,
+                                                                            directoryKey: group.id, path: group.path)) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Label(group.path.replacingOccurrences(of: "\\", with: "/").split(separator: "/").last.map(String.init) ?? group.path,
+                                      systemImage: "folder.fill")
+                                Text(group.path).font(.caption).foregroundColor(.secondary).lineLimit(2)
+                                Text("\(group.sessions.count) Chats").font(.caption2).foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                } header: { Text("Projects · 本地工作目录") } footer: {
+                    Text("根据 Codex 记录的真实工作目录分组；这是 RemoteAI 本地分组。进入后继续原 Thread，不创建替代会话。")
+                }
+                Section("Chats") {
+                    ForEach(store.sessions.filter {
+                        $0.instanceId == instance.id && $0.codexDirectoryKey == nil
+                            && (projectSearch.isEmpty || $0.title.localizedCaseInsensitiveContains(projectSearch))
+                    }.sorted { $0.orderingDate > $1.orderingDate }) { session in
+                        NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                Button("归档", role: .destructive) { deleteCandidate = session; showingDeleteConfirmation = true }
+                            }
+                    }
+                }
             } else {
                 Section {
                     Button { newSession = true } label: {
@@ -612,6 +647,54 @@ struct FixedTimestamp: View {
         Text("\(prefix) \(date.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()))")
             .font(.caption2)
             .foregroundColor(.secondary)
+    }
+}
+
+struct CodexDirectoryChatsView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    let runtime: RuntimeDescriptor
+    let instance: InstanceDescriptor
+    let directoryKey: String
+    let path: String
+    @State private var search = ""
+    @State private var archiveCandidate: SessionDescriptor?
+    @State private var showArchive = false
+
+    private var rows: [SessionDescriptor] {
+        store.sessions.filter {
+            $0.instanceId == instance.id && $0.codexDirectoryKey == directoryKey
+                && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search))
+        }.sorted { $0.orderingDate == $1.orderingDate ? $0.id < $1.id : $0.orderingDate > $1.orderingDate }
+    }
+
+    var body: some View {
+        List {
+            Section { Text(path).font(.caption).foregroundColor(.secondary) } footer: {
+                Text("RemoteAI 本地工作目录分组 · Chats 按最近活动排序")
+            }
+            Section("Chats") {
+                ForEach(rows) { session in
+                    NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) {
+                        SessionRow(session: session)
+                    }
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button("归档", role: .destructive) { archiveCandidate = session; showArchive = true }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Chats").navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $search, prompt: "搜索 Chat")
+        .refreshable { await store.refreshSessions(runtime: runtime, instance: instance) }
+        .alert("将此 Codex Chat 归档？", isPresented: $showArchive) {
+            Button("取消", role: .cancel) { archiveCandidate = nil }
+            Button("归档", role: .destructive) {
+                if let session = archiveCandidate {
+                    Task { _ = await store.deleteSession(runtime: runtime, instance: instance, session: session) }
+                }
+                archiveCandidate = nil
+            }
+        } message: { Text("使用 Codex 原生归档接口；可在 Codex 归档中恢复。") }
     }
 }
 

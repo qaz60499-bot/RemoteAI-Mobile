@@ -98,8 +98,37 @@ struct SessionDescriptor: Codable, Identifiable, Hashable {
     var lastProgressAt: Date? = nil
     var backgroundTaskStatus: BackgroundTaskStatusSnapshot? = nil
     var backgroundTaskStatusReceivedAt: Date? = nil
+    var workingDirectory: String? = nil
+    var threadId: String? = nil
 
     var orderingDate: Date { max(updatedAt, lastActivityAt ?? updatedAt) }
+
+    // Group only provider-recorded working directories. Titles are never identity.
+    var codexDirectoryKey: String? {
+        guard var path = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty else { return nil }
+        if path.hasPrefix("\\\\?\\") { path.removeFirst(4) }
+        let isWindows = path.contains("\\") || (path.count > 1 && path.dropFirst().first == ":")
+        path = path.replacingOccurrences(of: "\\", with: "/")
+        while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+        return isWindows ? path.lowercased() : path
+    }
+}
+
+struct CodexDirectoryGroup: Identifiable {
+    let id: String
+    let path: String
+    let sessions: [SessionDescriptor]
+    var latestActivity: Date { sessions.first?.orderingDate ?? .distantPast }
+
+    static func make(_ sessions: [SessionDescriptor]) -> [CodexDirectoryGroup] {
+        let grouped = Dictionary(grouping: sessions.filter { $0.codexDirectoryKey != nil },
+                                 by: { $0.codexDirectoryKey! })
+        return grouped.map { key, rows in
+            let ordered = rows.sorted { $0.orderingDate == $1.orderingDate ? $0.id < $1.id : $0.orderingDate > $1.orderingDate }
+            return CodexDirectoryGroup(id: key, path: ordered.first?.workingDirectory ?? key, sessions: ordered)
+        }.sorted { $0.latestActivity == $1.latestActivity ? $0.id < $1.id : $0.latestActivity > $1.latestActivity }
+    }
 }
 
 enum BackgroundTaskAvailability: String, Codable, Hashable {
@@ -682,7 +711,9 @@ extension ServerSession {
             lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
             lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse),
             backgroundTaskStatus: backgroundTaskStatus,
-            backgroundTaskStatusReceivedAt: backgroundTaskStatus == nil ? nil : Date()
+            backgroundTaskStatusReceivedAt: backgroundTaskStatus == nil ? nil : Date(),
+            workingDirectory: metadata["cwd"]?.stringValue,
+            threadId: externalId
         )
     }
 }
