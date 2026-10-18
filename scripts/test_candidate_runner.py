@@ -9,6 +9,32 @@ from unittest.mock import patch
 import run_candidate_ui_tests as runner
 
 
+class CpuDiagnosticsTests(unittest.TestCase):
+    def test_parse_ps_cpu_time_formats(self):
+        self.assertEqual(runner.parse_ps_cpu_time("1:02.50"), 62.5)
+        self.assertEqual(runner.parse_ps_cpu_time("2:03:04.25"), 7384.25)
+        self.assertEqual(runner.parse_ps_cpu_time("1-02:03:04"), 93784)
+
+    def test_parse_ps_cpu_time_rejects_unknown_format(self):
+        with self.assertRaises(ValueError):
+            runner.parse_ps_cpu_time("not-a-time")
+
+    def test_hang_trigger_requires_both_thresholds_and_fires_once(self):
+        trigger = runner.HighCPUHangTrigger(sampling_started=100.0)
+        self.assertEqual(trigger.observe(42, 0.0, 100.0), (None, None, False))
+        self.assertEqual(trigger.observe(42, 10.0, 110.0), (100.0, 10.0, False))
+        self.assertEqual(trigger.observe(42, 20.0, 120.0), (100.0, 10.0, True))
+        self.assertFalse(trigger.observe(42, 21.0, 121.0)[2])
+
+    def test_hang_trigger_requires_one_pid_to_sustain_high_cpu(self):
+        trigger = runner.HighCPUHangTrigger(sampling_started=90.0)
+        trigger.observe(42, 0.0, 90.0)
+        self.assertFalse(trigger.observe(42, 10.0, 100.0)[2])
+        self.assertFalse(trigger.observe(42, 10.5, 101.0)[2])  # 50% interval resets the streak.
+        self.assertFalse(trigger.observe(42, 19.5, 110.0)[2])  # Only 9 high-CPU seconds since reset.
+        self.assertTrue(trigger.observe(42, 20.5, 111.0)[2])
+
+
 class RecoveryGateTests(unittest.TestCase):
     def exercise(self, outcomes, expect_error=None, method_name="testExample"):
         with tempfile.TemporaryDirectory() as directory:

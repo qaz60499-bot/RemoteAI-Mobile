@@ -22,21 +22,112 @@ def run(command, timeout, capture=False):
                           stdout=subprocess.PIPE if capture else None).stdout
 
 
+def parse_ps_cpu_time(value):
+    """Convert ps time= cumulative CPU time to seconds."""
+    days = 0
+    if "-" in value:
+        day_part, value = value.split("-", 1)
+        days = int(day_part)
+    parts = value.split(":")
+    if len(parts) == 2:
+        hours, minutes, seconds = 0, int(parts[0]), float(parts[1])
+    elif len(parts) == 3:
+        hours, minutes, seconds = int(parts[0]), int(parts[1]), float(parts[2])
+    else:
+        raise ValueError(f"Unrecognized ps CPU time: {value}")
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+class HighCPUHangTrigger:
+    """Track same-PID interval CPU and fire once after both hang thresholds."""
+    def __init__(self, sampling_started):
+        self.sampling_started = sampling_started
+        self.previous = {}
+        self.high_cpu_seconds = {}
+        self.captured = False
+
+    def observe(self, pid, cpu_seconds, observed_at):
+        previous = self.previous.get(pid)
+        self.previous[pid] = (cpu_seconds, observed_at)
+        if previous is None:
+            self.high_cpu_seconds[pid] = 0.0
+            return None, None, False
+
+        previous_cpu, previous_at = previous
+        elapsed = observed_at - previous_at
+        cpu_delta = cpu_seconds - previous_cpu
+        if elapsed <= 0 or cpu_delta < 0:
+            self.high_cpu_seconds[pid] = 0.0
+            return None, elapsed, False
+
+        interval_cpu_percent = max(0.0, cpu_delta / elapsed * 100.0)
+        if interval_cpu_percent >= 95.0:
+            self.high_cpu_seconds[pid] = self.high_cpu_seconds.get(pid, 0.0) + elapsed
+        else:
+            self.high_cpu_seconds[pid] = 0.0
+        should_capture = (
+            not self.captured
+            and observed_at - self.sampling_started >= 20.0
+            and self.high_cpu_seconds[pid] >= 10.0
+        )
+        if should_capture:
+            self.captured = True
+        return interval_cpu_percent, elapsed, should_capture
+
+
 def sample_app_process(udid, output, stop):
-    """Host ps CPU is a time average; RSS is the simulator process, not device RAM."""
+    """Record host process CPU intervals; RSS is not device RAM."""
+    sampling_started = time.monotonic()
+    hang_trigger = HighCPUHangTrigger(sampling_started)
     with output.open("w") as stream:
         while not stop.is_set():
             try:
-                rows = subprocess.run(["ps", "-axo", "pid=,%cpu=,rss=,command="],
+                rows = subprocess.run(["ps", "-axo", "pid=,%cpu=,rss=,time=,command="],
                                       capture_output=True, text=True, timeout=5)
+                observed_at = time.monotonic()
                 for line in rows.stdout.splitlines():
                     if udid not in line or "/RemoteAI.app/RemoteAI" not in line:
                         continue
-                    pid, cpu, rss, _ = line.strip().split(None, 3)
-                    stream.write(json.dumps({"hostTime": time.time(), "pid": int(pid),
-                                             "psAverageCPUPercent": float(cpu),
-                                             "residentBytes": int(rss) * 1024}) + "\n")
+                    pid, cpu, rss, ps_cpu_time, _ = line.strip().split(None, 4)
+                    pid = int(pid)
+                    cumulative_cpu_seconds = parse_ps_cpu_time(ps_cpu_time)
+                    interval_cpu_percent, interval_seconds, capture = hang_trigger.observe(
+                        pid, cumulative_cpu_seconds, observed_at)
+                    stream.write(json.dumps({
+                        "hostTime": time.time(),
+                        "pid": pid,
+                        "psAverageCPUPercent": float(cpu),
+                        "psCPUTime": ps_cpu_time,
+                        "cumulativeCPUSeconds": cumulative_cpu_seconds,
+                        "intervalSeconds": interval_seconds,
+                        "intervalCPUPercent": interval_cpu_percent,
+                        "residentBytes": int(rss) * 1024,
+                        "hangSampleTriggered": capture,
+                    }) + "\n")
                     stream.flush()
+                    if capture:
+                        sample_file = output.parent / "hang-sample.txt"
+                        try:
+                            result = subprocess.run(
+                                ["sample", str(pid), "3", "-file", str(sample_file)],
+                                capture_output=True, text=True, timeout=10)
+                            if result.returncode:
+                                stream.write(json.dumps({
+                                    "hangSampleError": result.stderr.strip()[:1000],
+                                    "returnCode": result.returncode,
+                                    "pid": pid,
+                                }) + "\n")
+                        except subprocess.TimeoutExpired:
+                            stream.write(json.dumps({
+                                "hangSampleError": "sample timed out after 10 seconds",
+                                "pid": pid,
+                            }) + "\n")
+                        except OSError as error:
+                            stream.write(json.dumps({
+                                "hangSampleError": str(error),
+                                "pid": pid,
+                            }) + "\n")
+                        stream.flush()
             except (subprocess.TimeoutExpired, ValueError) as error:
                 stream.write(json.dumps({"samplingError": str(error)}) + "\n")
             stop.wait(1)
