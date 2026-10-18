@@ -204,6 +204,10 @@ jobs:
               --only testMachineRuntimeHierarchyOnIPhone \
               --only testOpenCachedWebConversation \
               --only testConversationOpensAtLatestAndOffersReturnToBottomAfterBrowsingHistory \
+              --only testDraftSurvivesLeavingAndReopeningConversation \
+              --only testFastBackDuringDraftLoadDoesNotOverwriteSavedDraft \
+              --only testRejectedSendDraftSurvivesConversationReopen \
+              --only testUnknownSendDraftIsNotFlushedEmptyWhenConversationReopens \
               | tee build/ui-tests.log
           else
             python3 scripts/run_candidate_ui_tests.py \

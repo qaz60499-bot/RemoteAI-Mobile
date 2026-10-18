@@ -257,8 +257,10 @@ final class WorkspaceStore: ObservableObject {
             : ((try? SQLiteStore.appStore()) ?? (try! SQLiteStore.inMemory()))
         let stressChars = Int(process.environment["REMOTEAI_UI_STRESS_CHARS"] ?? "") ?? 0
         let stressChunkDelayMilliseconds = Int(process.environment["REMOTEAI_UI_STRESS_CHUNK_MS"] ?? "") ?? 50
+        let mockScenario = MockScenario(rawValue: process.environment["REMOTEAI_UI_TEST_SCENARIO"] ?? "") ?? .normal
+        let mockLoadRecentDelayMilliseconds = useMock ? (Int(process.environment["REMOTEAI_UI_TEST_LOAD_DELAY_MS"] ?? "") ?? 0) : 0
         let transport: Transport = useMock
-            ? MockTransport(stressChars: stressChars, stressChunkDelayMilliseconds: stressChunkDelayMilliseconds)
+            ? MockTransport(scenario: mockScenario, stressChars: stressChars, stressChunkDelayMilliseconds: stressChunkDelayMilliseconds, loadRecentDelayMilliseconds: mockLoadRecentDelayMilliseconds)
             : CloudflareTransport(config: config)
         let store = WorkspaceStore(transport: transport, cache: cache)
         store.machine = MachineMetadata(id: useMock ? "my-pc" : config.machineId, name: "My PC", state: .connecting)
@@ -2308,7 +2310,38 @@ final class WorkspaceStore: ObservableObject {
         pairingStage = .completed
     }
 
-    func draft(sessionId: String) async -> String { (try? await cache.draft(sessionId: sessionId)) ?? "" }
+    func draft(sessionId: String) async -> String {
+        let savedDraft = (try? await cache.draft(sessionId: sessionId)) ?? ""
+        guard !savedDraft.isEmpty else { return savedDraft }
+        let pendingPrefix = Self.pendingCommandPrefix(machineId: machine.id)
+        let pendingCommands = (try? await cache.values(RemoteCommand.self, keyPrefix: pendingPrefix)) ?? []
+        let normalizedDraft = savedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isPendingSend = pendingCommands.contains { command in
+            command.action == "sendMessage"
+                && command.sessionId == sessionId
+                && command.payload["text"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) == normalizedDraft
+        }
+        // The durable pending command is the retry source for unknown delivery. Keep
+        // its matching draft in SQLite until confirmation, but don't restore it into
+        // the composer where another tap could create a second command.
+        return isPendingSend ? "" : savedDraft
+    }
+
+    func saveDraft(_ text: String, sessionId: String) async throws {
+        do {
+            try await cache.saveDraft(text, sessionId: sessionId)
+            if errors[sessionId]?.hasPrefix("草稿保存失败：") == true {
+                errors[sessionId] = nil
+            }
+        } catch {
+            if let storeError = error as? StoreError, storeError == .valueTooLarge {
+                errors[sessionId] = "草稿保存失败：内容超过本地保存上限（256 KiB），请缩短后再发送。"
+            } else {
+                errors[sessionId] = "草稿保存失败：\(error.localizedDescription)"
+            }
+            throw error
+        }
+    }
     func clearError(sessionId: String) { errors[sessionId] = nil }
 
     private func pendingOperationCommandId(key: String, machineId: String) async -> UUID {

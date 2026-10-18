@@ -2771,6 +2771,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let mock = MockTransport(scenario: .webSendDeliveryUnknown, historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
+        try await cache.saveDraft("delivery-unknown", sessionId: "photo-upload")
         let commandId = UUID()
 
         let sent = await store.send(text: "delivery-unknown", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
@@ -2780,9 +2781,60 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame })
         let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
         XCTAssertEqual(pending?.commandId, commandId)
+        let persistedDraft = try await cache.draft(sessionId: "photo-upload")
+        XCTAssertEqual(persistedDraft, "delivery-unknown", "Unknown delivery retains the saved text beside the durable exact-command retry state")
+        let composerDraft = await store.draft(sessionId: "photo-upload")
+        XCTAssertEqual(composerDraft, "", "A matching pending send must not reappear in the composer and invite a duplicate command")
         let unknownSendAttempts = await mock.actionAttemptCount("sendMessage")
         XCTAssertEqual(unknownSendAttempts, 1, "Unknown delivery must not trigger an automatic second send")
         await store.suspend()
+    }
+
+    @MainActor
+    func testPersistedDraftSurvivesSendInterruptedByBackgroundSuspension() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        try await cache.saveDraft("keep while send is unresolved", sessionId: "photo-upload")
+        await mock.setRequestDelay(action: "sendMessage", nanoseconds: 800_000_000)
+
+        let commandId = UUID()
+        let sendTask = Task { @MainActor in
+            await store.send(text: "keep while send is unresolved", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
+        }
+        var started = false
+        let deadline = Date().addingTimeInterval(3)
+        while !started && Date() < deadline {
+            started = await mock.actionAttemptCount("sendMessage") == 1
+            if !started { try await Task.sleep(nanoseconds: 20_000_000) }
+        }
+        XCTAssertTrue(started, "The test must suspend after the send command reaches the mock transport")
+        await store.suspend()
+
+        let sent = await sendTask.value
+        XCTAssertFalse(sent, "Suspending the store invalidates the in-flight send result")
+        let persistedDraft = try await cache.draft(sessionId: "photo-upload")
+        XCTAssertEqual(persistedDraft, "keep while send is unresolved", "The original draft remains durable until delivery confirmation")
+    }
+
+    @MainActor
+    func testWorkspaceStoreReportsOversizedDraftSaveFailure() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: MockTransport(historyCount: 0), cache: cache)
+
+        do {
+            try await store.saveDraft(String(repeating: "x", count: SQLiteStore.maxKVBytes + 1), sessionId: "oversized")
+            XCTFail("Expected WorkspaceStore to propagate the SQLite draft limit")
+        } catch {
+            XCTAssertEqual(error as? StoreError, .valueTooLarge)
+        }
+
+        XCTAssertTrue(store.errors["oversized"]?.contains("256 KiB") == true, "The existing session error banner must explain why autosave failed")
+        try await store.saveDraft("small draft", sessionId: "oversized")
+        XCTAssertNil(store.errors["oversized"], "A later successful write clears only the draft-save error")
+        let savedDraft = try await cache.draft(sessionId: "oversized")
+        XCTAssertEqual(savedDraft, "small draft")
     }
 
     @MainActor

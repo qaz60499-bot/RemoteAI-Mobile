@@ -42,7 +42,7 @@ actor MockTransport: Transport {
     private let runtimes: [ServerRuntime]
     private let instances: [ServerInstance]
 
-    init(scenario: MockScenario = .normal, historyCount: Int = 1200, stressChars: Int = 0, stressChunkDelayMilliseconds: Int = 50) {
+    init(scenario: MockScenario = .normal, historyCount: Int = 1200, stressChars: Int = 0, stressChunkDelayMilliseconds: Int = 50, loadRecentDelayMilliseconds: Int = 0) {
         self.scenario = scenario
         let eventPipe = AsyncStream<RemoteEvent>.makeStream()
         self.continuation = eventPipe.continuation
@@ -53,6 +53,10 @@ actor MockTransport: Transport {
         self.stressChars = [10_000, 30_000, 50_000, 100_000, 150_000].contains(stressChars) ? stressChars : 0
         let boundedStressDelay = min(500, max(20, stressChunkDelayMilliseconds))
         self.stressChunkDelayNanoseconds = UInt64(boundedStressDelay) * 1_000_000
+        let boundedLoadDelay = min(5_000, max(0, loadRecentDelayMilliseconds))
+        if boundedLoadDelay > 0 {
+            requestDelayNanoseconds["loadRecentMessages"] = UInt64(boundedLoadDelay) * 1_000_000
+        }
         // Protocol timestamps are serialized at millisecond precision. Build deterministic
         // mock history on the same precision so `(createdAt, messageId)` cursor comparisons
         // do not change after an encode/decode round-trip.

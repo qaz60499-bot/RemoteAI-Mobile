@@ -1036,6 +1036,12 @@ struct WebProjectView: View {
 }
 
 struct ChatView: View {
+    private enum DraftLoadStatus {
+        case loading
+        case loaded
+        case editedBeforeLoad
+    }
+
     @EnvironmentObject var store: WorkspaceStore
     @Environment(\.scenePhase) private var scenePhase
     let runtime: RuntimeDescriptor
@@ -1055,6 +1061,10 @@ struct ChatView: View {
     @State private var attachmentError: String?
     @State private var sending = false
     @State private var sendTask: Task<Void, Never>?
+    @State private var draftSaveTask: Task<Bool, Never>?
+    @State private var draftLoadStatus = DraftLoadStatus.loading
+    @State private var draftRevision: UInt64 = 0
+    @State private var savedDraftRevision: UInt64 = 0
     @State private var composerCommandId: UUID?
     @State private var selectedModel = ""
     @State private var voiceBaseText = ""
@@ -1336,6 +1346,7 @@ struct ChatView: View {
                     addFile: { showFilePicker = true },
                     toggleVoice: { toggleVoiceInput() },
                     stop: { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } },
+                    draftDidChange: { handleDraftChange($0) },
                     send: {
                         if runtime.kind == .antigravity && isGenerating {
                             attachmentError = "Antigravity 电脑侧边栏仍在执行。为避免打乱任务顺序，本次未发送、草稿已保留。请等待完成，或先手动点击 Stop。"
@@ -1347,10 +1358,30 @@ struct ChatView: View {
                         let commandId = composerCommandId ?? UUID()
                         let correctingActiveRun = isGenerating
                         focused = false
-                        input = ""
-                        pendingAttachments.removeAll()
+                        if case .loading = draftLoadStatus { draftLoadStatus = .editedBeforeLoad }
                         sending = true
+                        let sendDraftRevision = draftRevision
+                        let persistBeforeSendTask = replaceDraftSaveTask(with: text, revision: sendDraftRevision, afterNanoseconds: 0)
                         sendTask = Task {
+                            let persistedBeforeSend = await persistBeforeSendTask.value
+                            guard persistedBeforeSend else {
+                                await MainActor.run {
+                                    sending = false
+                                    sendTask = nil
+                                }
+                                return
+                            }
+                            let composerStillMatchesSend = await MainActor.run { () -> Bool in
+                                guard draftRevision == sendDraftRevision, input == text else {
+                                    sending = false
+                                    sendTask = nil
+                                    return false
+                                }
+                                input = ""
+                                pendingAttachments.removeAll()
+                                return true
+                            }
+                            guard composerStillMatchesSend else { return }
                             if correctingActiveRun {
                                 let stopped = await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id)
                                 if !stopped {
@@ -1369,14 +1400,20 @@ struct ChatView: View {
                                 sendTask = nil
                                 if sent {
                                     composerCommandId = nil
+                                    if draftRevision != sendDraftRevision {
+                                        flushDraftIfDirty(force: true)
+                                    }
                                     return
                                 }
                                 let state = store.commandStates[commandId]
                                 let hasOptimisticMessage = store.messagesBySession[session.id, default: []].contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame }
                                 if state == .unknown && hasOptimisticMessage {
-                                    // The final send may already have happened remotely. Keep the
-                                    // composer empty; the message-row Retry replays exactly once.
+                                    // The final send may already have happened remotely. Do not
+                                    // restore that sent text; the row Retry replays the exact command.
                                     composerCommandId = nil
+                                    if draftRevision != sendDraftRevision {
+                                        flushDraftIfDirty(force: true)
+                                    }
                                     return
                                 }
                                 if input.isEmpty { input = text }
@@ -1384,6 +1421,11 @@ struct ChatView: View {
                                 // If only attachment transfer was interrupted, there is no remote
                                 // message yet. Reusing this ID also reuses deterministic upload IDs.
                                 composerCommandId = state == .unknown ? commandId : nil
+                                if draftRevision == sendDraftRevision {
+                                    markDraftDirtyAndSave(input)
+                                } else {
+                                    flushDraftIfDirty()
+                                }
                             }
                         }
                     }
@@ -1405,10 +1447,14 @@ struct ChatView: View {
         .sheet(item: $textSelectionRequest) { request in
             TextSelectionSheet(text: request.text, monospaced: request.monospaced)
         }
-        .onDisappear { speechInput.stop() }
+        .onDisappear {
+            speechInput.stop()
+            flushDraftIfDirty()
+        }
         .onChange(of: scenePhase) { phase in
             if phase != .active {
                 speechInput.stop()
+                flushDraftIfDirty()
             } else {
                 Task { await store.synchronizeVisibleSession(session.id, force: true) }
             }
@@ -1424,7 +1470,17 @@ struct ChatView: View {
             if let mock = store.transport as? MockTransport {
                 await mock.runStressIfRequested(sessionId: session.id)
             }
-            if input.isEmpty { input = await store.draft(sessionId: session.id) }
+            if case .loading = draftLoadStatus {
+                let savedDraft = await store.draft(sessionId: session.id)
+                if case .loading = draftLoadStatus {
+                    draftLoadStatus = .loaded
+                    if input.isEmpty { input = savedDraft }
+                } else if case .editedBeforeLoad = draftLoadStatus {
+                    draftLoadStatus = .loaded
+                }
+            } else if case .editedBeforeLoad = draftLoadStatus {
+                draftLoadStatus = .loaded
+            }
 
             // Push remains the primary path, but a logically-connected websocket can
             // still miss one event around SPA/document replacement. Reconcile only the
@@ -1440,6 +1496,56 @@ struct ChatView: View {
         }
     }
 
+    private func scheduleDraftSave(_ text: String, revision: UInt64) {
+        _ = replaceDraftSaveTask(with: text, revision: revision, afterNanoseconds: 350_000_000)
+    }
+
+    private func handleDraftChange(_ text: String) {
+        if case .loading = draftLoadStatus { draftLoadStatus = .editedBeforeLoad }
+        draftRevision &+= 1
+        scheduleDraftSave(text, revision: draftRevision)
+    }
+
+    private func markDraftDirtyAndSave(_ text: String) {
+        draftRevision &+= 1
+        scheduleDraftSave(text, revision: draftRevision)
+    }
+
+    private func flushDraftIfDirty(force: Bool = false) {
+        guard force || draftRevision != savedDraftRevision else { return }
+        _ = replaceDraftSaveTask(with: input, revision: draftRevision, afterNanoseconds: 0)
+    }
+
+    @discardableResult
+    private func replaceDraftSaveTask(with text: String, revision: UInt64, afterNanoseconds delay: UInt64) -> Task<Bool, Never> {
+        let previousSave = draftSaveTask
+        previousSave?.cancel()
+        let sessionId = session.id
+        let store = store
+        let saveTask = Task { @MainActor in
+            if let previousSave { _ = await previousSave.value }
+            guard !Task.isCancelled else { return false }
+            if delay > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: delay)
+                } catch {
+                    return false
+                }
+            }
+            guard !Task.isCancelled else { return false }
+            do {
+                try await store.saveDraft(text, sessionId: sessionId)
+                if draftRevision == revision, input == text { savedDraftRevision = revision }
+                return true
+            } catch {
+                // WorkspaceStore publishes the existing session error banner.
+                return false
+            }
+        }
+        draftSaveTask = saveTask
+        return saveTask
+    }
+
     private func toggleVoiceInput() {
         if speechInput.isRecording {
             speechInput.stop()
@@ -1451,6 +1557,7 @@ struct ChatView: View {
             let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !spoken.isEmpty else { return }
             input = voiceBaseText.isEmpty ? spoken : "\(voiceBaseText) \(spoken)"
+            handleDraftChange(input)
         }
     }
 
@@ -1507,6 +1614,7 @@ struct Composer: View {
     let addFile: () -> Void
     let toggleVoice: () -> Void
     let stop: () -> Void
+    let draftDidChange: (String) -> Void
     let send: () -> Void
 
     private var hasDraft: Bool {
@@ -1566,7 +1674,13 @@ struct Composer: View {
                 .disabled(!enabled)
                 .accessibilityLabel(isRecording ? "Stop voice input" : "Voice input")
 
-                TextEditor(text: $draft.text)
+                TextEditor(text: Binding(
+                    get: { draft.text },
+                    set: { text in
+                        draft.text = text
+                        draftDidChange(text)
+                    }
+                ))
                     .focused(focused)
                     .frame(minHeight: 36, maxHeight: 92)
                     .padding(.horizontal, 7).padding(.vertical, 2)

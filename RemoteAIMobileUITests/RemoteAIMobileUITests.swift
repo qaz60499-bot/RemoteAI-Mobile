@@ -3,10 +3,16 @@ import XCTest
 final class RemoteAIMobileUITests: XCTestCase {
     override func setUpWithError() throws { continueAfterFailure = false }
 
-    private func makeMockApp() -> XCUIApplication {
+    private func makeMockApp(scenario: String? = nil, loadRecentDelayMilliseconds: Int? = nil) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments += ["-UITestMockMode", "1"]
         app.launchEnvironment["REMOTEAI_UI_TEST_MOCK"] = "1"
+        if let scenario {
+            app.launchEnvironment["REMOTEAI_UI_TEST_SCENARIO"] = scenario
+        }
+        if let loadRecentDelayMilliseconds {
+            app.launchEnvironment["REMOTEAI_UI_TEST_LOAD_DELAY_MS"] = String(loadRecentDelayMilliseconds)
+        }
         return app
     }
 
@@ -99,6 +105,119 @@ final class RemoteAIMobileUITests: XCTestCase {
         expectation(for: dismissed, evaluatedWith: app.keyboards.firstMatch)
         waitForExpectations(timeout: 5)
         XCTAssertEqual(composer.value as? String, "unsent keyboard draft")
+    }
+
+    func testDraftSurvivesLeavingAndReopeningConversation() throws {
+        let app = makeMockApp()
+        app.launch()
+        app.staticTexts["Web"].tap()
+        XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 3))
+        app.staticTexts["Photo SaaS"].tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 3))
+        app.staticTexts["上传性能优化"].tap()
+
+        let composer = app.textViews["MessageComposer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        composer.tap()
+        composer.typeText("navigation draft")
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 5))
+        app.staticTexts["上传性能优化"].tap()
+
+        let reopenedComposer = app.textViews["MessageComposer"]
+        XCTAssertTrue(reopenedComposer.waitForExistence(timeout: 5))
+        XCTAssertEqual(reopenedComposer.value as? String, "navigation draft")
+    }
+
+    func testFastBackDuringDraftLoadDoesNotOverwriteSavedDraft() throws {
+        let app = makeMockApp(loadRecentDelayMilliseconds: 2_000)
+        app.launch()
+        app.staticTexts["Web"].tap()
+        XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 3))
+        app.staticTexts["Photo SaaS"].tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 3))
+        app.staticTexts["上传性能优化"].tap()
+
+        let composer = app.textViews["MessageComposer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        composer.tap()
+        composer.typeText("preserve during slow history load")
+        XCTAssertEqual(composer.value as? String, "preserve during slow history load")
+        Thread.sleep(forTimeInterval: 2.5) // Let autosave and the first delayed load finish before starting a fresh delayed re-entry.
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 5))
+
+        // The new ChatView has an empty local composer while its fresh history load is delayed.
+        // Leaving now must not flush that empty value over the persisted draft.
+        app.staticTexts["上传性能优化"].tap()
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 5))
+
+        app.staticTexts["上传性能优化"].tap()
+        let restoredComposer = app.textViews["MessageComposer"]
+        XCTAssertTrue(restoredComposer.waitForExistence(timeout: 5))
+        let restoredDraft = NSPredicate(format: "value == %@", "preserve during slow history load")
+        expectation(for: restoredDraft, evaluatedWith: restoredComposer)
+        waitForExpectations(timeout: 8)
+    }
+
+    func testRejectedSendDraftSurvivesConversationReopen() throws {
+        let app = makeMockApp(scenario: "webSendNotAccepted")
+        app.launch()
+        app.staticTexts["Web"].tap()
+        XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 3))
+        app.staticTexts["Photo SaaS"].tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 3))
+        app.staticTexts["上传性能优化"].tap()
+
+        let composer = app.textViews["MessageComposer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        composer.tap()
+        composer.typeText("restore after rejection")
+        app.buttons["Send"].tap()
+        XCTAssertTrue(app.staticTexts["WEB_SEND_NOT_ACCEPTED: Mock page kept the original composer text"].waitForExistence(timeout: 5))
+        let restoredText = NSPredicate(format: "value == %@", "restore after rejection")
+        expectation(for: restoredText, evaluatedWith: composer)
+        waitForExpectations(timeout: 5)
+
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 5))
+        app.staticTexts["上传性能优化"].tap()
+
+        let reopenedComposer = app.textViews["MessageComposer"]
+        XCTAssertTrue(reopenedComposer.waitForExistence(timeout: 5))
+        XCTAssertEqual(reopenedComposer.value as? String, "restore after rejection")
+    }
+
+    func testUnknownSendDraftIsNotFlushedEmptyWhenConversationReopens() throws {
+        let app = makeMockApp(scenario: "webSendDeliveryUnknown")
+        app.launch()
+        app.staticTexts["Web"].tap()
+        XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 3))
+        app.staticTexts["Photo SaaS"].tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 3))
+        app.staticTexts["上传性能优化"].tap()
+
+        let composer = app.textViews["MessageComposer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        composer.tap()
+        composer.typeText("retain pending delivery draft")
+        app.buttons["Send"].tap()
+        XCTAssertTrue(app.staticTexts["Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."].waitForExistence(timeout: 8))
+        let composerCleared = NSPredicate(format: "value == %@", "")
+        expectation(for: composerCleared, evaluatedWith: composer)
+        waitForExpectations(timeout: 5)
+
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 5))
+        app.staticTexts["上传性能优化"].tap()
+
+        let reopenedComposer = app.textViews["MessageComposer"]
+        XCTAssertTrue(reopenedComposer.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."].waitForExistence(timeout: 5))
+        XCTAssertEqual(reopenedComposer.value as? String, "")
+        XCTAssertFalse(app.buttons["Send"].isEnabled)
     }
 
     func testPairingScreenHasManualAndQRPaths() throws {
