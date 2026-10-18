@@ -3534,12 +3534,12 @@ final class WorkspaceStore: ObservableObject {
                         if suppressEventPresentation {
                             switch event.type {
                             case "GENERATION_STARTED":
-                                coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                                coalescedSessionPresentation[sessionId] = (true, generationStartedLabel(runtimeId: event.runtimeId), event.createdAt)
                             case "MESSAGE_UPDATED" where event.payload["partial"]?.boolValue != false:
                                 coalescedSessionPresentation[sessionId] = (true, "正在生成回答…", event.createdAt)
                             case "TOOL_STARTED", "TOOL_FINISHED":
                                 if coalescedSessionPresentation[sessionId]?.active != false {
-                                    coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                                    coalescedSessionPresentation[sessionId] = (true, generationStartedLabel(runtimeId: event.runtimeId), event.createdAt)
                                 }
                             case "MESSAGE_ADDED" where event.payload["role"]?.stringValue == "assistant":
                                 coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
@@ -3892,7 +3892,7 @@ final class WorkspaceStore: ObservableObject {
             if suppressTransientPresentation { return }
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             setSessionState(sessionId, .busy)
-            liveRunStatusBySession[sessionId] = "ChatGPT 正在处理…"
+            liveRunStatusBySession[sessionId] = generationStartedLabel(runtimeId: event.runtimeId)
             DiagnosticsLog.shared.record("generation_state_applied", fields: [
                 "state": SessionState.busy.rawValue,
                 "sequence": String(event.sequence),
@@ -4206,6 +4206,14 @@ final class WorkspaceStore: ObservableObject {
         if lower.contains("reading") && trimmed.count < 120 { return trimmed }
         if !trimmed.contains("\n"), trimmed.count <= 80 { return trimmed }
         return "正在生成回答…"
+    }
+
+    private func generationStartedLabel(runtimeId: String) -> String {
+        switch runtimeId {
+        case "runtime.codex": return "Codex 正在处理…"
+        case "runtime.antigravity": return "Antigravity 正在处理…"
+        default: return "ChatGPT 正在处理…"
+        }
     }
 
     func webProcessStatusLabel(_ raw: String) -> String {
@@ -4619,6 +4627,13 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func reconcileOptimisticUserEcho(_ serverMessage: ChatMessage, sessionId: String) async {
+        if routeForSession(sessionId)?.runtimeId == "runtime.codex",
+           let providerId = serverMessage.providerMessageId, providerId != serverMessage.id {
+            // An authoritative native turn maps the old API ID to the original
+            // client ID. Remove only that exact alias, never another equal prompt.
+            messagesBySession[sessionId]?.removeAll { $0.id == providerId && $0.role == .user }
+            try? await cache.deleteMessage(id: providerId)
+        }
         guard let optimistic = messagesBySession[sessionId, default: []].last(where: {
             $0.role == .user && $0.sequence == nil && UUID(uuidString: $0.id) != nil && $0.text == serverMessage.text && abs($0.createdAt.timeIntervalSince(serverMessage.createdAt)) < 180
         }) else { return }

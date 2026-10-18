@@ -31,4 +31,18 @@ final class CodexDirectoryTests: XCTestCase {
         XCTAssertNil(decoded.workingDirectory)
         XCTAssertEqual(decoded.id, legacy.id)
     }
+    func testNativeMessageAliasesAndUnknownStatePreserveTheirIdentity() throws {
+        let row = ServerMessage(messageId: "original-client-id", sessionId: "original-thread", role: "user",
+                                content: "same prompt", externalId: "native-api-id", createdAt: Date(timeIntervalSince1970: 1))
+        let message = row.chatMessage
+        XCTAssertEqual(message.id, "original-client-id")
+        XCTAssertEqual(message.providerMessageId, "native-api-id")
+        XCTAssertEqual(SessionState.server("unknown"), .unknown)
+        let encoded = try JSONEncoder.remoteAI.encode(message)
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        legacy.removeValue(forKey: "providerMessageId")
+        let decoded = try JSONDecoder.remoteAI.decode(ChatMessage.self, from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertNil(decoded.providerMessageId)
+        XCTAssertEqual(decoded.id, message.id)
+    }
 }

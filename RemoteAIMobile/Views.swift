@@ -1283,13 +1283,15 @@ struct ChatView: View {
                             } else if let progressAt = generationProgressAt {
                                 Text(runtime.kind == .antigravity
                                     ? "对话进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 等待完成，或手动点击 Stop；发送不会自动打断"
-                                    : "电脑端进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 可直接发送新指令纠正方向")
+                                    : runtime.kind == .codex
+                                        ? "Codex 进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 等待完成，或手动点击 Stop"
+                                        : "电脑端进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 可直接发送新指令纠正方向")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                             } else {
                                 Text(runtime.kind == .antigravity
                                     ? "电脑端对话正在处理；请等待完成，或手动点击 Stop。"
-                                    : "可直接发送新指令纠正方向；也可以先停止。")
+                                    : runtime.kind == .codex ? "等待当前 Codex 任务完成，或手动点击 Stop。" : "可直接发送新指令纠正方向；也可以先停止。")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                             }

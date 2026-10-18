@@ -42,7 +42,7 @@ enum ConnectionDiagnosticPhase: String, Codable, Equatable {
         }
     }
 }
-enum SessionState: String, Codable { case idle = "Idle", busy = "Busy", waiting = "Waiting", sleeping = "Sleeping", error = "Error" }
+enum SessionState: String, Codable { case idle = "Idle", busy = "Busy", waiting = "Waiting", sleeping = "Sleeping", error = "Error", unknown = "Unknown" }
 enum CommandState: String, Codable { case pending = "Pending", acknowledged = "Acknowledged", executing = "Executing", completed = "Completed", failed = "Failed", unknown = "Unknown" }
 enum WebState: String, Codable { case registered = "Registered", browserClosed = "BrowserClosed", attached = "Attached", unsupported = "Unsupported" }
 enum MessageRole: String, Codable { case user, assistant, system, tool }
@@ -394,6 +394,7 @@ struct ChatMessage: Codable, Identifiable, Hashable {
     var detail: String?
     var attachments: [MessageAttachment]? = nil
     let createdAt: Date
+    var providerMessageId: String? = nil
 
     var cursor: MessageCursor { MessageCursor(createdAt: createdAt, messageId: id) }
 
@@ -667,6 +668,7 @@ extension SessionState {
         case "running", "busy", "generating": return .busy
         case "waiting": return .waiting
         case "sleeping": return .sleeping
+        case "unknown": return .unknown
         // "interrupted" is an Agent-lifecycle recovery marker, not a current
         // provider failure. Rendering every historical restart marker as a red Error
         // makes healthy old chats look broken until each one is opened and reconciled.
@@ -721,6 +723,8 @@ extension ServerSession {
 extension ServerMessage {
     var chatMessage: ChatMessage {
         let mappedRole = MessageRole(rawValue: role.lowercased()) ?? .system
-        return ChatMessage(id: messageId, sessionId: sessionId, sequence: nil, role: mappedRole, kind: .text, text: content, toolName: nil, toolStatus: nil, detail: nil, attachments: attachments, createdAt: createdAt)
+        var message = ChatMessage(id: messageId, sessionId: sessionId, sequence: nil, role: mappedRole, kind: .text, text: content, toolName: nil, toolStatus: nil, detail: nil, attachments: attachments, createdAt: createdAt)
+        message.providerMessageId = externalId
+        return message
     }
 }
