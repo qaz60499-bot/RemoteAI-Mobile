@@ -3583,7 +3583,36 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(server.descriptor.updatedAt, updated)
         XCTAssertEqual(server.descriptor.lastActivityAt, activity)
         XCTAssertEqual(server.descriptor.orderingDate, activity)
+        XCTAssertNil(server.descriptor.backgroundTaskStatus, "Older session metadata must remain decodable and missing task state must stay unknown")
     }
+
+    func testBackgroundTaskStatusDecodesContractAndRejectsMissingTaskList() throws {
+        let observedAt = Date(timeIntervalSince1970: 1_788_596_045)
+        let metadata = JSONValue.object([
+            "state": .string("available"),
+            "observedAt": .string(RemoteAIDate.string(observedAt)),
+            "tasks": .array([
+                .object([
+                    "id": .string("task-1"),
+                    "title": .string("Inspect build"),
+                    "status": .string("running"),
+                    "progress": .string("Reading files")
+                ])
+            ])
+        ])
+        let snapshot = try metadata.decode(BackgroundTaskStatusSnapshot.self)
+        XCTAssertEqual(snapshot.state, .available)
+        XCTAssertEqual(snapshot.observedAt, observedAt)
+        XCTAssertEqual(snapshot.tasks.first?.status, .running)
+        XCTAssertEqual(snapshot.tasks.first?.progress, "Reading files")
+
+        let missingTasks = JSONValue.object([
+            "state": .string("available"),
+            "observedAt": .string(RemoteAIDate.string(observedAt))
+        ])
+        XCTAssertThrowsError(try missingTasks.decode(BackgroundTaskStatusSnapshot.self), "A missing task list must not decode as an available empty list")
+    }
+
 
     @MainActor
     func testWebProviderSurfaceIssueShowsOnPhoneWithoutFabricatingBusyStateAndClearsOnRecovery() async throws {
@@ -3994,6 +4023,75 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
         XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
         XCTAssertEqual(historyAfter, historyBefore)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testBackgroundTaskStatusStaysSeparateFromIdleAndStaleConversationStatus() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+
+        let initialObservedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date())))
+        await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
+            state: .available,
+            observedAt: initialObservedAt,
+            tasks: [BackgroundTaskDescriptor(id: "task-1", title: "Background task", status: .running, progress: "Preparing")]
+        ))
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+
+        var session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.state, .idle, "A running background task must not make an idle conversation Busy")
+        XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.status, .running)
+
+        let liveAt = Date()
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: liveAt
+        ), deliverLive: true)
+        for _ in 0..<80 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .busy {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+
+        let newerObservedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(max(Date(), initialObservedAt.addingTimeInterval(1)))))
+        await mock.setSessionStatus("photo-upload", status: "idle", lastActivityAt: liveAt.addingTimeInterval(-5))
+        await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
+            state: .available,
+            observedAt: newerObservedAt,
+            tasks: [BackgroundTaskDescriptor(id: "task-1", title: "Background task", status: .waiting, progress: "Waiting for a slot")]
+        ))
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+
+        session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.state, .busy, "An evidence-poor Idle response must not end newer conversation activity")
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, newerObservedAt, "A newer background snapshot must still apply when session Idle is rejected")
+        XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.progress, "Waiting for a slot")
+
+        await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
+            state: .available,
+            observedAt: newerObservedAt.addingTimeInterval(-10),
+            tasks: [BackgroundTaskDescriptor(id: "task-1", title: "Background task", status: .queued, progress: "Older snapshot")]
+        ))
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+
+        session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.state, .busy)
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, newerObservedAt, "An older background snapshot must not roll state back")
+        XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.progress, "Waiting for a slot")
         await store.suspend()
     }
 

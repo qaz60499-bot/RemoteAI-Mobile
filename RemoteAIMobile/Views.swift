@@ -616,6 +616,8 @@ struct FixedTimestamp: View {
 }
 
 struct SessionRow: View {
+    @EnvironmentObject private var store: WorkspaceStore
+    @Environment(\.scenePhase) private var scenePhase
     let session: SessionDescriptor
     var body: some View {
         HStack {
@@ -623,17 +625,128 @@ struct SessionRow: View {
                 Text(session.title)
                 FixedTimestamp(date: session.updatedAt, prefix: "最后更新")
                 FixedTimestamp(date: session.lastActivityAt ?? session.updatedAt, prefix: "最后进行")
+                if session.instanceId == "antigravity.desktop" {
+                    BackgroundTaskStatusView(
+                        snapshot: session.backgroundTaskStatus,
+                        machineOnline: store.machine.state == .online,
+                        sceneActive: scenePhase == .active,
+                        compact: true
+                    )
+                }
                 if session.instanceId == "antigravity.desktop",
                    session.state == .busy || session.state == .waiting,
                    let progress = session.lastProgressStatus, !progress.isEmpty {
-                    Text(progress).font(.caption2).foregroundColor(.secondary).lineLimit(2)
+                    Text("对话进度：\(progress)").font(.caption2).foregroundColor(.secondary).lineLimit(2)
                 }
             }
             Spacer()
             Text(session.instanceId == "antigravity.desktop" && (session.state == .busy || session.state == .waiting)
-                ? "侧边栏执行中" : session.state.rawValue)
+                ? "对话处理中" : session.state.rawValue)
                 .font(.caption)
                 .foregroundColor(session.state == .error ? .red : .secondary)
+        }
+    }
+}
+
+private struct BackgroundTaskStatusView: View {
+    let snapshot: BackgroundTaskStatusSnapshot?
+    let machineOnline: Bool
+    let sceneActive: Bool
+    var compact = false
+
+    private var isCurrent: Bool {
+        guard let snapshot, snapshot.state == .available, machineOnline, sceneActive else { return false }
+        let age = Date().timeIntervalSince(snapshot.observedAt)
+        return age >= -60 && age <= 45
+    }
+
+    private var prioritizedTasks: [BackgroundTaskDescriptor] {
+        (snapshot?.tasks ?? []).enumerated().sorted { left, right in
+            let leftRank = Self.rank(left.element.status)
+            let rightRank = Self.rank(right.element.status)
+            return leftRank == rightRank ? left.offset < right.offset : leftRank < rightRank
+        }.map { $0.element }
+    }
+
+    private var summary: String {
+        guard let snapshot else { return "状态未知 · 待同步" }
+        guard snapshot.state == .available else { return "状态未知 · 待核对" }
+        let running = snapshot.tasks.filter { $0.status == .running }.count
+        if running > 0 { return "运行中 · \(running) 项" }
+        let waiting = snapshot.tasks.filter { $0.status == .waiting || $0.status == .queued }.count
+        if waiting > 0 { return "等待中 · \(waiting) 项" }
+        if snapshot.tasks.contains(where: { $0.status == .unknown }) { return "状态未知" }
+        return "当前无运行任务"
+    }
+
+    private var displayedSummary: String {
+        guard !isCurrent, snapshot != nil else { return summary }
+        return "最后记录：\(summary) · 待核对"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: compact ? 2 : 5) {
+            Text("后台任务：\(displayedSummary)")
+                .font(compact ? .caption2 : .caption.weight(.medium))
+                .foregroundColor(isCurrent && snapshot?.tasks.contains(where: { $0.status == .running }) == true ? .green : .secondary)
+                .lineLimit(2)
+
+            if let snapshot, !compact {
+                if isCurrent {
+                    Text("状态已核对 · \(snapshot.observedAt.formatted(date: .omitted, time: .standard))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("最后同步 \(snapshot.observedAt.formatted(date: .omitted, time: .standard))；连接恢复并刷新后核对")
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                }
+                ForEach(Array(prioritizedTasks.prefix(3))) { task in
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(task.title.isEmpty ? task.id : task.title)
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Text(Self.label(for: task.status))
+                            .foregroundColor(task.status == .running && isCurrent ? .green : .secondary)
+                    }
+                    .font(.caption2)
+                    if let progress = task.progress?.trimmingCharacters(in: .whitespacesAndNewlines), !progress.isEmpty {
+                        Text(progress)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+            } else if compact,
+                      let progress = prioritizedTasks.first(where: { $0.status == .running })?.progress,
+                      !progress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(progress)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    private static func rank(_ status: BackgroundTaskState) -> Int {
+        switch status {
+        case .running: return 0
+        case .waiting: return 1
+        case .queued: return 2
+        case .unknown: return 3
+        case .completed, .canceled, .failed: return 4
+        }
+    }
+
+    private static func label(for status: BackgroundTaskState) -> String {
+        switch status {
+        case .running: return "运行中"
+        case .waiting: return "等待中"
+        case .queued: return "排队中"
+        case .completed: return "已结束"
+        case .canceled: return "已取消"
+        case .failed: return "失败"
+        case .unknown: return "未知"
         }
     }
 }
@@ -1008,6 +1121,17 @@ struct ChatView: View {
         }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {
+                if runtime.kind == .antigravity {
+                    BackgroundTaskStatusView(
+                        snapshot: currentSession.backgroundTaskStatus,
+                        machineOnline: store.machine.state == .online,
+                        sceneActive: scenePhase == .active
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.ultraThinMaterial)
+                }
                 if supportsModelSelection, !modelOptions.isEmpty {
                     HStack(spacing: 8) {
                         Label("Model", systemImage: "cpu")
@@ -1027,7 +1151,7 @@ struct ChatView: View {
                         ProgressView()
                             .scaleEffect(0.8)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(generationStatusText)
+                            Text(runtime.kind == .antigravity ? "对话处理中 · \(generationStatusText)" : generationStatusText)
                                 .font(.caption.weight(.medium))
                                 .lineLimit(2)
                             if store.desktopAgentConnected == false {
@@ -1040,13 +1164,13 @@ struct ChatView: View {
                                     .foregroundColor(.orange)
                             } else if let progressAt = generationProgressAt {
                                 Text(runtime.kind == .antigravity
-                                    ? "侧边栏进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 等待完成，或手动点击 Stop；发送不会自动打断"
+                                    ? "对话进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 等待完成，或手动点击 Stop；发送不会自动打断"
                                     : "电脑端进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 可直接发送新指令纠正方向")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                             } else {
                                 Text(runtime.kind == .antigravity
-                                    ? "电脑端侧边栏正在执行；请等待完成，或手动点击 Stop。"
+                                    ? "电脑端对话正在处理；请等待完成，或手动点击 Stop。"
                                     : "可直接发送新指令纠正方向；也可以先停止。")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)

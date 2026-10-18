@@ -21,6 +21,7 @@ actor MockTransport: Transport {
     private var sessions: [ServerSession] = []
     private var sessionStatusOverrides: [String: String] = [:]
     private var sessionStatusActivityOverrides: [String: Date] = [:]
+    private var sessionBackgroundTaskStatusOverrides: [String: JSONValue] = [:]
     private var webProjects: [WebProjectDescriptor] = []
     private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
@@ -140,6 +141,13 @@ actor MockTransport: Transport {
         } else {
             sessionStatusActivityOverrides.removeValue(forKey: sessionId)
         }
+    }
+    func setBackgroundTaskStatus(_ sessionId: String, snapshot: BackgroundTaskStatusSnapshot?) {
+        guard let snapshot, let value = try? JSONValue.encode(snapshot) else {
+            sessionBackgroundTaskStatusOverrides.removeValue(forKey: sessionId)
+            return
+        }
+        sessionBackgroundTaskStatusOverrides[sessionId] = value
     }
     func setSequence(_ value: Int64) { sequence = max(0, value) }
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
@@ -535,6 +543,9 @@ actor MockTransport: Transport {
                 metadata["lastActivityAt"] = .string(RemoteAIDate.string(now))
                 metadata["lastProgressStatus"] = .string("Thinking")
                 metadata["lastProgressAt"] = .string(RemoteAIDate.string(now))
+            }
+            if let backgroundTaskStatus = sessionBackgroundTaskStatusOverrides[sessionId] {
+                metadata["backgroundTaskStatus"] = backgroundTaskStatus
             }
             response = success([
                 "sessionId": .string(sessionId),

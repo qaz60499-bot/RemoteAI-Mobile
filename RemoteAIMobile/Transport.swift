@@ -105,6 +105,7 @@ struct RemoteSessionStatusSnapshot: Equatable {
     let lastProgressStatus: String?
     let lastProgressAt: Date?
     let providerSurfaceIssue: RemoteProviderSurfaceIssue?
+    var backgroundTaskStatus: BackgroundTaskStatusSnapshot? = nil
 }
 
 enum TransportError: LocalizedError, Equatable {
@@ -277,6 +278,10 @@ extension Transport {
               object["sessionId"]?.stringValue == sessionId,
               let status = object["status"]?.stringValue else { throw TransportError.malformedData }
         let metadata = object["metadata"]?.objectValue ?? [:]
+        let backgroundTaskStatus: BackgroundTaskStatusSnapshot? = {
+            guard let value = metadata["backgroundTaskStatus"] else { return nil }
+            return try? value.decode(BackgroundTaskStatusSnapshot.self)
+        }()
         let providerIssueObject = metadata["providerSurfaceIssue"]?.objectValue
         let providerIssue: RemoteProviderSurfaceIssue? = {
             guard let providerIssueObject,
@@ -298,7 +303,8 @@ extension Transport {
             lastActivityAt: metadata["lastActivityAt"]?.stringValue.flatMap(RemoteAIDate.parse),
             lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
             lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse),
-            providerSurfaceIssue: providerIssue
+            providerSurfaceIssue: providerIssue,
+            backgroundTaskStatus: backgroundTaskStatus
         )
     }
 

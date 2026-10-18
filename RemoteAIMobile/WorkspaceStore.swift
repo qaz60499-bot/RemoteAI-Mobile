@@ -1444,6 +1444,14 @@ final class WorkspaceStore: ObservableObject {
             if let index = sessions.firstIndex(where: { $0.id == sessionId }) {
                 let current = sessions[index]
                 var updated = current
+                let receivedBackgroundTaskStatus = snapshot.backgroundTaskStatus ?? BackgroundTaskStatusSnapshot(
+                    state: .unavailable,
+                    observedAt: requestStartedAt,
+                    error: "后台任务状态未提供"
+                )
+                if receivedBackgroundTaskStatus.observedAt >= (current.backgroundTaskStatus?.observedAt ?? .distantPast) {
+                    updated.backgroundTaskStatus = receivedBackgroundTaskStatus
+                }
                 if !staleIdleSnapshot {
                     updated.state = snapshot.state
                     updated.lastProgressStatus = snapshot.lastProgressStatus
@@ -1518,12 +1526,25 @@ final class WorkspaceStore: ObservableObject {
             }
             return snapshot
         } catch let error as TransportError where error == .disconnected || error == .timeout || error == .offline {
+            markBackgroundTaskStatusUnavailable(sessionId, observedAt: requestStartedAt)
             DiagnosticsLog.shared.record("session_status_deferred", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
             return nil
         } catch {
+            markBackgroundTaskStatusUnavailable(sessionId, observedAt: requestStartedAt)
             DiagnosticsLog.shared.record("session_status_failed", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
             return nil
         }
+    }
+
+    private func markBackgroundTaskStatusUnavailable(_ sessionId: String, observedAt: Date) {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        let current = sessions[index].backgroundTaskStatus
+        guard observedAt >= (current?.observedAt ?? .distantPast) else { return }
+        sessions[index].backgroundTaskStatus = BackgroundTaskStatusSnapshot(
+            state: .unavailable,
+            observedAt: observedAt,
+            error: "后台任务状态暂不可用"
+        )
     }
 
     /// Catch up a conversation that is currently visible on the phone. Websocket push

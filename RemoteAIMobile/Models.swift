@@ -96,8 +96,50 @@ struct SessionDescriptor: Codable, Identifiable, Hashable {
     var lastActivityAt: Date? = nil
     var lastProgressStatus: String? = nil
     var lastProgressAt: Date? = nil
+    var backgroundTaskStatus: BackgroundTaskStatusSnapshot? = nil
 
     var orderingDate: Date { max(updatedAt, lastActivityAt ?? updatedAt) }
+}
+
+enum BackgroundTaskAvailability: String, Codable, Hashable {
+    case available
+    case unavailable
+}
+
+enum BackgroundTaskState: String, Codable, Hashable {
+    case running
+    case waiting
+    case queued
+    case completed
+    case canceled
+    case failed
+    case unknown
+}
+
+struct BackgroundTaskDescriptor: Codable, Hashable, Identifiable {
+    let id: String
+    let title: String
+    let status: BackgroundTaskState
+    let progress: String?
+}
+
+struct BackgroundTaskStatusSnapshot: Codable, Hashable {
+    let state: BackgroundTaskAvailability
+    let observedAt: Date
+    let tasks: [BackgroundTaskDescriptor]
+    let error: String?
+
+    init(
+        state: BackgroundTaskAvailability,
+        observedAt: Date,
+        tasks: [BackgroundTaskDescriptor] = [],
+        error: String? = nil
+    ) {
+        self.state = state
+        self.observedAt = observedAt
+        self.tasks = tasks
+        self.error = error
+    }
 }
 
 struct AttachmentTransferProgress: Equatable {
@@ -634,7 +676,10 @@ extension ServerSession {
             // ordering. lastVisited can be refreshed by DOM discovery alone.
             lastActivityAt: persistedActivity,
             lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
-            lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+            lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse),
+            backgroundTaskStatus: metadata["backgroundTaskStatus"].flatMap {
+                try? $0.decode(BackgroundTaskStatusSnapshot.self)
+            }
         )
     }
 }
