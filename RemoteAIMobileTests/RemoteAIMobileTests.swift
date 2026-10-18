@@ -4092,6 +4092,10 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(session.state, .busy)
         XCTAssertEqual(session.backgroundTaskStatus?.observedAt, newerObservedAt, "An older background snapshot must not roll state back")
         XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.progress, "Waiting for a slot")
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, newerObservedAt, "A catalog response must not erase a newer status snapshot")
+        XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.progress, "Waiting for a slot")
         await store.suspend()
     }
 

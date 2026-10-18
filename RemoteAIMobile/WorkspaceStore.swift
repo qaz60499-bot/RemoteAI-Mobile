@@ -1270,7 +1270,15 @@ final class WorkspaceStore: ObservableObject {
             // Keep the existing event revision guard above: a stale list response
             // must never overwrite a newer session created by a live event.
             let currentRows = sessions.filter { $0.instanceId == instance.id }
-            let remoteRows = remote.sorted(by: Self.sessionOrdersBefore)
+            let currentById = Dictionary(uniqueKeysWithValues: currentRows.map { ($0.id, $0) })
+            let remoteRows = remote.map { row in
+                var updated = row
+                if let known = currentById[row.id]?.backgroundTaskStatus,
+                   known.observedAt > (row.backgroundTaskStatus?.observedAt ?? .distantPast) {
+                    updated.backgroundTaskStatus = known
+                }
+                return updated
+            }.sorted(by: Self.sessionOrdersBefore)
             let catalogChanged = currentRows != remoteRows
             if catalogChanged {
                 var merged = sessions.filter { $0.instanceId != instance.id }
