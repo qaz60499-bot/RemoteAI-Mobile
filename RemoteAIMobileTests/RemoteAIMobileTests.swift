@@ -2138,6 +2138,31 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testAntigravityHistoryReplacementPublishesOneMergedTranscript() async throws {
+        let base = Date(timeIntervalSince1970: 1_790_167_500)
+        let store = WorkspaceStore(transport: MockTransport(historyCount: 0), cache: try SQLiteStore.inMemory())
+        let local = [
+            ChatMessage(id: "older-assistant", sessionId: "ag", sequence: 1, role: .assistant, kind: .text, text: "older page", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(-60)),
+            ChatMessage(id: "ag-user", sessionId: "ag", sequence: 2, role: .user, kind: .text, text: "question", toolName: nil, toolStatus: nil, detail: nil, createdAt: base),
+            ChatMessage(id: "legacy-final", sessionId: "ag", sequence: 3, role: .assistant, kind: .text, text: "intermediate answer", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(6)),
+            ChatMessage(id: "unrelated-tool", sessionId: "ag", sequence: 4, role: .tool, kind: .toolEvent, text: "", toolName: "DevSpace", toolStatus: "Completed", detail: nil, createdAt: base.addingTimeInterval(8)),
+        ]
+        let canonical = ChatMessage(id: "canonical-final", sessionId: "ag", sequence: 5, role: .assistant, kind: .text, text: "canonical answer", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(7))
+        store.messagesBySession["ag"] = local
+
+        var publishedIDs: [[String]] = []
+        let subscription = store.$messagesBySession.dropFirst().sink { snapshot in
+            publishedIDs.append(snapshot["ag", default: []].map(\.id))
+        }
+
+        await store.reconcileAntigravityAuthoritativeAssistantWindow([canonical], sessionId: "ag")
+
+        XCTAssertEqual(publishedIDs, [["older-assistant", "ag-user", "canonical-final", "unrelated-tool"]],
+                       "Replacing stale assistant history must publish the merged transcript once, never a delete-only intermediate list")
+        withExtendedLifetime(subscription) {}
+    }
+
+    @MainActor
     func testWebTranscriptReconciliationCollapsesOnlyAdjacentExactAssistantDuplicates() {
         let base = Date(timeIntervalSince1970: 1_790_167_600)
         let rows = [

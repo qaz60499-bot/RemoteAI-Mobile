@@ -4664,11 +4664,14 @@ final class WorkspaceStore: ObservableObject {
         })
     }
 
-    private func reconcileAntigravityAuthoritativeAssistantWindow(_ authoritative: [ChatMessage], sessionId: String) async {
+    func reconcileAntigravityAuthoritativeAssistantWindow(_ authoritative: [ChatMessage], sessionId: String) async {
         let local = messagesBySession[sessionId, default: []]
         let staleIDs = Self.staleAntigravityAssistantIDs(local: local, authoritative: authoritative)
         guard !staleIDs.isEmpty else { return }
-        messagesBySession[sessionId]?.removeAll { staleIDs.contains($0.id) }
+        // Publish the replacement transcript as one list update. Removing legacy
+        // planner rows before awaiting cache deletion lets the visible LazyVStack
+        // lay out a temporary, shorter history before canonical rows are merged.
+        merge(authoritative, into: sessionId, removing: staleIDs)
         for id in staleIDs { try? await cache.deleteMessage(id: id) }
         DiagnosticsLog.shared.record("antigravity_history_reconciled", fields: [
             "session": sessionId,
@@ -4676,10 +4679,11 @@ final class WorkspaceStore: ObservableObject {
         ])
     }
 
-    private func merge(_ incoming: [ChatMessage], into sessionId: String) {
+    private func merge(_ incoming: [ChatMessage], into sessionId: String, removing removedIDs: Set<String> = []) {
         let current = messagesBySession[sessionId, default: []]
         let visibleExisting = current.filter {
-            !($0.kind == .toolEvent
+            !removedIDs.contains($0.id)
+                && !($0.kind == .toolEvent
                 && $0.toolName == "ChatGPT Web"
                 && isTransientWebProcessDetail($0.detail))
         }
@@ -4690,6 +4694,7 @@ final class WorkspaceStore: ObservableObject {
         }
         var map = Dictionary(uniqueKeysWithValues: visibleExisting.map { ($0.id, $0) })
         if visibleExisting.count == current.count,
+           removedIDs.isEmpty,
            visibleIncoming.allSatisfy({ map[$0.id] == $0 }) {
             return
         }
