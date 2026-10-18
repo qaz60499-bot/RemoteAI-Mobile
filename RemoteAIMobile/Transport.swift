@@ -192,6 +192,10 @@ struct OpenWebTab: Decodable, Identifiable, Equatable {
     let kind: String
     let sessionId: String?
     let busy: Bool
+    var executionState: String? = nil
+    var lastActivityAt: String? = nil
+    var lastProgressAt: String? = nil
+    var lastProgressSummary: String? = nil
     var conversationId: String? = nil
     var projectAlias: String? = nil
     var projectId: String? = nil
@@ -265,8 +269,9 @@ extension Transport {
         return try response.decode([ServerInstance].self).map(\.descriptor)
     }
 
-    func listSessions(machineId: String, runtimeId: String, instanceId: String) async throws -> [SessionDescriptor] {
-        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, action: "listSessions")
+    func listSessions(machineId: String, runtimeId: String, instanceId: String, limit: Int? = nil) async throws -> [SessionDescriptor] {
+        let payload: [String: JSONValue] = limit.map { ["limit": .number(Double($0))] } ?? [:]
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, action: "listSessions", payload: payload)
         let response = try await requireSuccess(execute(command))
         return try response.decode([ServerSession].self).map(\.descriptor)
     }

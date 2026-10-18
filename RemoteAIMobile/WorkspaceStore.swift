@@ -7,6 +7,8 @@ final class WorkspaceStore: ObservableObject {
     @Published var runtimes: [RuntimeDescriptor] = []
     @Published var instances: [InstanceDescriptor] = []
     @Published var sessions: [SessionDescriptor] = []
+    @Published private(set) var codexSessionLimits: [String: Int] = [:]
+    @Published private(set) var codexSessionsMayHaveMore: [String: Bool] = [:]
     @Published var messagesBySession: [String: [ChatMessage]] = [:]
     @Published var webProjects: [WebProjectDescriptor] = []
     @Published var openWebTabs: [OpenWebTab] = []
@@ -1256,6 +1258,12 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    func loadMoreCodexSessions(runtime: RuntimeDescriptor, instance: InstanceDescriptor) async {
+        guard runtime.kind == .codex, !sessionRefreshes.contains(instance.id) else { return }
+        codexSessionLimits[instance.id] = min(5000, codexSessionLimits[instance.id, default: 100] + 100)
+        await refreshSessions(runtime: runtime, instance: instance)
+    }
+
     func refreshSessions(runtime: RuntimeDescriptor, instance: InstanceDescriptor) async {
         guard sessionRefreshes.insert(instance.id).inserted else { return }
         defer { sessionRefreshes.remove(instance.id) }
@@ -1263,8 +1271,10 @@ final class WorkspaceStore: ObservableObject {
         let revision = sessionRevisions[instance.id, default: 0]
         guard machine.state == .online else { return }
         do {
-            let remote = try await transport.listSessions(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id)
+            let limit = runtime.kind == .codex ? codexSessionLimits[instance.id, default: 100] : nil
+            let remote = try await transport.listSessions(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id, limit: limit)
             guard generation == lifecycleGeneration, revision == sessionRevisions[instance.id, default: 0], machine.state == .online, !isSuspended else { return }
+            if let limit { codexSessionsMayHaveMore[instance.id] = remote.count >= limit && limit < 5000 }
             // An unchanged authoritative catalog must not invalidate every Chat row,
             // disturb scroll position, or write the same SQLite metadata again.
             // Keep the existing event revision guard above: a stale list response

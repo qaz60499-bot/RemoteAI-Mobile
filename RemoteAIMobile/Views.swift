@@ -315,6 +315,22 @@ struct InstanceView: View {
                                     .font(.caption2).foregroundColor(.secondary)
                                 Text(webTabStatus(tab))
                                     .font(.caption2).foregroundColor(.secondary)
+                                Text("执行：\(tab.executionState ?? "Unknown") · Agent 最近记录")
+                                    .font(.caption2).foregroundColor(.secondary)
+                                if let value = tab.lastActivityAt, let date = RemoteAIDate.parse(value) {
+                                    FixedTimestamp(date: date, prefix: "最后活动")
+                                }
+                                if let value = tab.lastProgressAt, let date = RemoteAIDate.parse(value) {
+                                    FixedTimestamp(date: date, prefix: "最近实际进展")
+                                }
+                                if let action = tab.lastProgressSummary {
+                                    Text("最近事件：\(action)").font(.caption2).foregroundColor(.secondary)
+                                }
+                                if let diagnosis = store.webTabDiagnosesById[tab.id],
+                                   diagnosis.draftPresent == true || diagnosis.pendingUploads == true {
+                                    Text("Blocked · 草稿或上传尚未完成，禁止关闭与刷新")
+                                        .font(.caption2).foregroundColor(.orange)
+                                }
                                 if let diagnosis = store.webTabDiagnosesById[tab.id] {
                                     if let issue = diagnosis.issueMessage, !issue.isEmpty {
                                         Text("原因：\(issue)").font(.caption2).foregroundColor(.secondary)
@@ -515,7 +531,7 @@ struct InstanceView: View {
                         }
                     }
                 } header: { Text("Projects · 本地工作目录") } footer: {
-                    Text("根据 Codex 记录的真实工作目录分组；这是 RemoteAI 本地分组。进入后继续原 Thread，不创建替代会话。")
+                    Text("根据 Codex 记录的真实工作目录分组；这是 RemoteAI 本地分组。仅加载当前实例最近一页，更多历史按需读取。")
                 }
                 Section("Chats") {
                     ForEach(store.sessions.filter {
@@ -526,6 +542,13 @@ struct InstanceView: View {
                             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                 Button("归档", role: .destructive) { deleteCandidate = session; showingDeleteConfirmation = true }
                             }
+                    }
+                }
+                if store.codexSessionsMayHaveMore[instance.id] == true {
+                    Section {
+                        Button("加载更多历史 Chats / 工作目录") {
+                            Task { await store.loadMoreCodexSessions(runtime: runtime, instance: instance) }
+                        }
                     }
                 }
             } else {
@@ -680,6 +703,11 @@ struct CodexDirectoryChatsView: View {
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         Button("归档", role: .destructive) { archiveCandidate = session; showArchive = true }
                     }
+                }
+            }
+            if store.codexSessionsMayHaveMore[instance.id] == true {
+                Button("加载更多历史 Chats") {
+                    Task { await store.loadMoreCodexSessions(runtime: runtime, instance: instance) }
                 }
             }
         }
