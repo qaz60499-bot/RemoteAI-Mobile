@@ -1948,10 +1948,37 @@ enum MessageRenderingPolicy {
 
 struct MessageContentSegment: Identifiable, Equatable {
     private static let editBlockMarker = "__REMOTEAI_EDIT_BLOCK__"
+    private static let writingBlockFenceLanguage = "remoteai-writing-block-v1"
     private static let editRegex = try! NSRegularExpression(
         pattern: #"(^|\r?\n[ \t]*\r?\n)[ \t]*Edit[ \t]*\r?\n(?:[ \t]*\r?\n)?"#,
         options: [.caseInsensitive, .anchorsMatchLines]
     )
+
+    private struct WritingBlockFence {
+        let wrapperRange: NSRange
+        let bodyRange: NSRange
+    }
+
+    private struct WritingFenceScan {
+        var blocks: [WritingBlockFence] = []
+        var incompleteOpeningRange: NSRange?
+    }
+
+    private struct MarkdownFence {
+        let character: unichar
+        let length: Int
+    }
+
+    private struct WritingFenceFlags {
+        let leadingNewline: Bool
+        let trailingNewline: Bool
+    }
+
+    private struct MarkdownLine {
+        let start: Int
+        let contentEnd: Int
+        let end: Int
+    }
 
     let id: Int
     let text: String
@@ -1961,7 +1988,97 @@ struct MessageContentSegment: Identifiable, Equatable {
     var isEditBlock: Bool { !isCode && language == Self.editBlockMarker }
 
     static func parse(_ value: String) -> [MessageContentSegment] {
-        if value.range(of: "Edit", options: .caseInsensitive) == nil,
+        let writingScan = writingFenceScan(in: value)
+        guard !writingScan.blocks.isEmpty || writingScan.incompleteOpeningRange != nil else {
+            return legacyParse(value, inferContinuation: true)
+        }
+
+        var result: [MessageContentSegment] = []
+        let nsValue = value as NSString
+        var cursor = 0
+        for block in writingScan.blocks {
+            if block.wrapperRange.location > cursor {
+                let ordinary = nsValue.substring(with: NSRange(location: cursor, length: block.wrapperRange.location - cursor))
+                appendLegacySegments(ordinary, inferContinuation: false, to: &result)
+            }
+            let body = nsValue.substring(with: block.bodyRange)
+            if !body.isEmpty {
+                result.append(MessageContentSegment(id: result.count, text: body, isCode: false, language: editBlockMarker))
+            }
+            cursor = NSMaxRange(block.wrapperRange)
+        }
+
+        let ordinaryEnd = writingScan.incompleteOpeningRange?.location ?? nsValue.length
+        if ordinaryEnd > cursor {
+            let ordinary = nsValue.substring(with: NSRange(location: cursor, length: ordinaryEnd - cursor))
+            appendLegacySegments(ordinary, inferContinuation: false, to: &result)
+        }
+        return result
+    }
+
+    static func editBlocks(in value: String) -> [MessageContentSegment] {
+        let writingScan = writingFenceScan(in: value)
+        guard !writingScan.blocks.isEmpty || writingScan.incompleteOpeningRange != nil else {
+            return legacyEditBlocks(in: value, inferContinuation: true)
+        }
+
+        let nsValue = value as NSString
+        var blocks: [MessageContentSegment] = []
+        var cursor = 0
+        for block in writingScan.blocks {
+            if block.wrapperRange.location > cursor {
+                let ordinary = nsValue.substring(with: NSRange(location: cursor, length: block.wrapperRange.location - cursor))
+                blocks.append(contentsOf: legacyEditBlocks(in: ordinary, inferContinuation: false))
+            }
+            let body = nsValue.substring(with: block.bodyRange)
+            if !body.isEmpty {
+                blocks.append(MessageContentSegment(id: blocks.count, text: body, isCode: false, language: editBlockMarker))
+            }
+            cursor = NSMaxRange(block.wrapperRange)
+        }
+
+        let ordinaryEnd = writingScan.incompleteOpeningRange?.location ?? nsValue.length
+        if ordinaryEnd > cursor {
+            let ordinary = nsValue.substring(with: NSRange(location: cursor, length: ordinaryEnd - cursor))
+            blocks.append(contentsOf: legacyEditBlocks(in: ordinary, inferContinuation: false))
+        }
+        return blocks
+    }
+
+    static func copyableText(_ value: String) -> String {
+        let writingScan = writingFenceScan(in: value)
+        guard !writingScan.blocks.isEmpty || writingScan.incompleteOpeningRange != nil else { return value }
+
+        let nsValue = value as NSString
+        var pieces: [String] = []
+        var cursor = 0
+        for block in writingScan.blocks {
+            if block.wrapperRange.location > cursor {
+                pieces.append(nsValue.substring(with: NSRange(location: cursor, length: block.wrapperRange.location - cursor)))
+            }
+            pieces.append(nsValue.substring(with: block.bodyRange))
+            cursor = NSMaxRange(block.wrapperRange)
+        }
+        if let incompleteOpeningRange = writingScan.incompleteOpeningRange {
+            if incompleteOpeningRange.location > cursor {
+                pieces.append(nsValue.substring(with: NSRange(location: cursor, length: incompleteOpeningRange.location - cursor)))
+            }
+            cursor = NSMaxRange(incompleteOpeningRange)
+        }
+        if cursor < nsValue.length {
+            pieces.append(nsValue.substring(from: cursor))
+        }
+        return pieces.joined()
+    }
+
+    static func containsWritingBlockFence(in value: String) -> Bool {
+        let writingScan = writingFenceScan(in: value)
+        return !writingScan.blocks.isEmpty || writingScan.incompleteOpeningRange != nil
+    }
+
+    private static func legacyParse(_ value: String, inferContinuation: Bool) -> [MessageContentSegment] {
+        if inferContinuation,
+           value.range(of: "Edit", options: .caseInsensitive) == nil,
            let inferred = inferredContinuationPrompt(in: value) {
             return [MessageContentSegment(id: 0, text: inferred, isCode: false, language: editBlockMarker)]
         }
@@ -1999,9 +2116,17 @@ struct MessageContentSegment: Identifiable, Equatable {
         return result.isEmpty ? [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)] : result
     }
 
-    static func editBlocks(in value: String) -> [MessageContentSegment] {
-        let inferredPrompt = inferredContinuationPrompt(in: value)
-        guard value.range(of: "Edit", options: .caseInsensitive) != nil else { return continuationPromptBlocks(inferredPrompt) }
+    private static func appendLegacySegments(_ value: String, inferContinuation: Bool, to result: inout [MessageContentSegment]) {
+        for segment in legacyParse(value, inferContinuation: inferContinuation) {
+            result.append(MessageContentSegment(id: result.count, text: segment.text, isCode: segment.isCode, language: segment.language))
+        }
+    }
+
+    private static func legacyEditBlocks(in value: String, inferContinuation: Bool) -> [MessageContentSegment] {
+        let inferredPrompt = inferContinuation ? inferredContinuationPrompt(in: value) : nil
+        guard value.range(of: "Edit", options: .caseInsensitive) != nil else {
+            return continuationPromptBlocks(inferredPrompt)
+        }
         let nsValue = value as NSString
         let matches = editMatches(in: value, nsValue: nsValue)
         guard !matches.isEmpty else { return [] }
@@ -2044,6 +2169,144 @@ struct MessageContentSegment: Identifiable, Equatable {
     private static func continuationPromptBlocks(_ prompt: String?) -> [MessageContentSegment] {
         guard let prompt, !prompt.isEmpty else { return [] }
         return [MessageContentSegment(id: 0, text: prompt, isCode: false, language: editBlockMarker)]
+    }
+
+    private static func writingFenceScan(in value: String) -> WritingFenceScan {
+        guard value.contains(writingBlockFenceLanguage) else { return WritingFenceScan() }
+
+        let nsValue = value as NSString
+        let lines = markdownLines(in: nsValue)
+        var scan = WritingFenceScan()
+        var ordinaryFence: MarkdownFence?
+        var writingFence: MarkdownFence?
+        var writingFlags: WritingFenceFlags?
+        var writingStart: Int?
+        var writingBodyStart = 0
+
+        for line in lines {
+            if let activeWritingFence = writingFence {
+                guard isFenceCloser(line, fence: activeWritingFence, in: nsValue) else { continue }
+
+                var bodyEnd = line.start
+                if bodyEnd > writingBodyStart, nsValue.character(at: bodyEnd - 1) == 10 {
+                    // The adapter always adds one LF as fence framing. Remove only
+                    // that byte; a trailing CR or CRLF belongs to the raw body.
+                    bodyEnd -= 1
+                }
+                let start = writingStart ?? line.start
+                let flags = writingFlags ?? WritingFenceFlags(leadingNewline: false, trailingNewline: false)
+                let wrapperEnd = flags.trailingNewline && line.end > line.contentEnd ? line.end : line.contentEnd
+                scan.blocks.append(WritingBlockFence(
+                    wrapperRange: NSRange(location: start, length: wrapperEnd - start),
+                    bodyRange: NSRange(location: writingBodyStart, length: max(0, bodyEnd - writingBodyStart))
+                ))
+                writingFence = nil
+                writingFlags = nil
+                writingStart = nil
+                continue
+            }
+
+            if let activeOrdinaryFence = ordinaryFence {
+                if isFenceCloser(line, fence: activeOrdinaryFence, in: nsValue) {
+                    ordinaryFence = nil
+                }
+                continue
+            }
+
+            guard let opener = fenceOpener(in: line, from: nsValue) else { continue }
+            if opener.fence.character == 96, let flags = writingFenceFlags(from: opener.info) {
+                if flags.leadingNewline,
+                   line.start == 0 || nsValue.character(at: line.start - 1) != 10 {
+                    ordinaryFence = opener.fence
+                    continue
+                }
+                writingFence = opener.fence
+                writingFlags = flags
+                writingStart = line.start - (flags.leadingNewline ? 1 : 0)
+                writingBodyStart = line.end
+            } else if opener.fence.character == 126 || !opener.info.contains("`") {
+                ordinaryFence = opener.fence
+            }
+        }
+
+        if let writingStart {
+            let openingEnd = writingBodyStart
+            scan.incompleteOpeningRange = NSRange(location: writingStart, length: max(0, openingEnd - writingStart))
+        }
+        return scan
+    }
+
+    private static func writingFenceFlags(from info: String) -> WritingFenceFlags? {
+        let parts = info.split(whereSeparator: { $0 == " " || $0 == "\t" })
+        guard parts.count == 2, parts[0] == writingBlockFenceLanguage else { return nil }
+        let flags = Array(parts[1])
+        guard flags.count == 4, flags[0] == "p", flags[2] == "t",
+              (flags[1] == "0" || flags[1] == "1"),
+              (flags[3] == "0" || flags[3] == "1") else { return nil }
+        return WritingFenceFlags(leadingNewline: flags[1] == "1", trailingNewline: flags[3] == "1")
+    }
+
+    private static func markdownLines(in value: NSString) -> [MarkdownLine] {
+        var lines: [MarkdownLine] = []
+        var start = 0
+        while start < value.length {
+            let newline = value.range(of: "\n", options: [], range: NSRange(location: start, length: value.length - start))
+            let rawEnd = newline.location == NSNotFound ? value.length : newline.location
+            var contentEnd = rawEnd
+            if contentEnd > start, value.character(at: contentEnd - 1) == 13 {
+                contentEnd -= 1
+            }
+            let end = newline.location == NSNotFound ? value.length : newline.location + 1
+            lines.append(MarkdownLine(start: start, contentEnd: contentEnd, end: end))
+            start = end
+        }
+        return lines
+    }
+
+    private static func fenceOpener(in line: MarkdownLine, from value: NSString) -> (fence: MarkdownFence, info: String)? {
+        var cursor = line.start
+        var indentation = 0
+        while cursor < line.contentEnd, value.character(at: cursor) == 32 {
+            cursor += 1
+            indentation += 1
+            if indentation > 3 { return nil }
+        }
+        guard cursor < line.contentEnd else { return nil }
+        let character = value.character(at: cursor)
+        guard character == 96 || character == 126 else { return nil }
+        var count = 0
+        while cursor + count < line.contentEnd, value.character(at: cursor + count) == character {
+            count += 1
+        }
+        guard count >= 3 else { return nil }
+        let suffixStart = cursor + count
+        let suffix = suffixStart < line.contentEnd
+            ? value.substring(with: NSRange(location: suffixStart, length: line.contentEnd - suffixStart))
+            : ""
+        let info = suffix.trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
+        return (MarkdownFence(character: character, length: count), info)
+    }
+
+    private static func isFenceCloser(_ line: MarkdownLine, fence: MarkdownFence, in value: NSString) -> Bool {
+        var cursor = line.start
+        var indentation = 0
+        while cursor < line.contentEnd, value.character(at: cursor) == 32 {
+            cursor += 1
+            indentation += 1
+            if indentation > 3 { return false }
+        }
+        var count = 0
+        while cursor + count < line.contentEnd, value.character(at: cursor + count) == fence.character {
+            count += 1
+        }
+        guard count >= fence.length else { return false }
+        cursor += count
+        while cursor < line.contentEnd {
+            let character = value.character(at: cursor)
+            guard character == 32 || character == 9 else { return false }
+            cursor += 1
+        }
+        return true
     }
 
     private static func editMatches(in value: String, nsValue: NSString) -> [NSTextCheckingResult] {
@@ -2197,7 +2460,9 @@ final class MessageRenderContent: NSObject {
         // Parsing thousands of repeated inline fences/styles into many Text nodes
         // inflates SwiftUI layout and XCTest/VoiceOver accessibility snapshots.
         // Preserve existing Edit-block extraction and short-message formatting.
-        if isLarge && displayText.range(of: "Edit", options: .caseInsensitive) == nil {
+        if isLarge,
+           displayText.range(of: "Edit", options: .caseInsensitive) == nil,
+           !MessageContentSegment.containsWritingBlockFence(in: displayText) {
             segments = [MessageContentSegment(id: 0, text: inlinePreview, isCode: false, language: nil)]
         } else {
             segments = MessageContentSegment.parse(inlinePreview)
@@ -2249,7 +2514,7 @@ struct AssistantStreamRow: View, Equatable {
     }
 
     private func copyCurrentText() {
-        UIPasteboard.general.string = stream.text
+        UIPasteboard.general.string = MessageContentSegment.copyableText(stream.text)
         copiedCurrentText = true
         let token = UUID()
         copyFeedbackToken = token
@@ -2284,7 +2549,7 @@ struct AssistantStreamRow: View, Equatable {
                         }
                         .buttonStyle(.borderless)
                         Button("查看 / 选择当前全文") {
-                            onSelectText?(stream.text, false)
+                            onSelectText?(MessageContentSegment.copyableText(stream.text), false)
                         }
                         .font(.caption2)
                         .buttonStyle(.borderless)
@@ -2353,7 +2618,7 @@ struct MessageRow: View, Equatable {
     private var preservedEditBlocks: [MessageContentSegment] {
         fullStreamingText == nil ? renderContent.preservedEditBlocks : []
     }
-    private var selectionText: String { fullStreamingText?() ?? displayText }
+    private var selectionText: String { MessageContentSegment.copyableText(fullStreamingText?() ?? displayText) }
 
     private func copyText(_ text: String, actionID: String) {
         UIPasteboard.general.string = text

@@ -36,6 +36,59 @@ final class LongRenderingRegressionTests: XCTestCase {
         XCTAssertLessThan(MessageRenderingPolicy.inlineText(blocks[0].text).utf8.count, 16 * 1024)
     }
 
+    func testLargeFencedWritingBlockKeepsWholeBodyBeyondPreviewAndStripsWrapperForFullCopy() {
+        let prefix = String(repeating: "普通说明文字。\n", count: 2_500)
+        let editBody = String(repeating: "需要复制的中文正文\n    保留缩进\nCopy\nEdit\n", count: 1_000)
+        let content = "\(prefix)\n\n\(fencedWritingBlock(editBody))\n\n尾部说明。"
+        let message = ChatMessage(
+            id: "long-fenced-edit",
+            sessionId: "session",
+            sequence: 3,
+            role: .assistant,
+            kind: .text,
+            text: content,
+            toolName: nil,
+            toolStatus: nil,
+            detail: nil,
+            createdAt: Date()
+        )
+
+        let prepared = MessageRenderCache().content(for: message)
+
+        XCTAssertTrue(prepared.isLarge)
+        XCTAssertFalse(prepared.segments.contains(where: \.isEditBlock))
+        XCTAssertEqual(prepared.preservedEditBlocks.map(\.text), [editBody])
+        XCTAssertEqual(
+            MessageContentSegment.copyableText(content),
+            "\(prefix)\n\n\(editBody)\n\n尾部说明。"
+        )
+        XCTAssertLessThan(MessageRenderingPolicy.inlineText(editBody).utf8.count, 16 * 1024)
+    }
+
+    func testLargeFencedWritingBlockPreviewSkipsPartialTransportFence() {
+        let prefix = String(repeating: "普通说明文字。\n", count: 2_500)
+        let fullBody = String(repeating: "完整中文块\n    缩进\n", count: 1_000)
+        let content = "\(prefix)\n\n\(fencedWritingBlock(fullBody))\n\n尾部说明。"
+        let message = ChatMessage(
+            id: "long-fenced-edit-preview",
+            sessionId: "session",
+            sequence: 4,
+            role: .assistant,
+            kind: .text,
+            text: content,
+            toolName: nil,
+            toolStatus: nil,
+            detail: nil,
+            createdAt: Date()
+        )
+
+        let prepared = MessageRenderCache().content(for: message)
+
+        XCTAssertTrue(prepared.isLarge)
+        XCTAssertEqual(prepared.preservedEditBlocks.map(\.text), [fullBody])
+        XCTAssertFalse(prepared.segments.contains(where: { $0.text.contains("remoteai-writing-block-v1") }))
+    }
+
     func testLongToolEditCardCopiesCanonicalFullContentNotInlinePreview() {
         let detail = String(repeating: "RemoteAIMobile/Views.swift changed line\n", count: 3_000)
         let message = ChatMessage(

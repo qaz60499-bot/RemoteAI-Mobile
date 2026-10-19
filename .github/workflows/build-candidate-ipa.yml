@@ -6,7 +6,7 @@ on:
       gate:
         description: Validation scope
         type: choice
-        options: [candidate, streaming, sync, web-controls]
+        options: [candidate, streaming, sync, web-controls, copy-controls]
         default: candidate
 
 permissions:
@@ -100,6 +100,10 @@ jobs:
             if [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
               echo "unchanged_full_candidate_baseline=7fd609bde530269347b9089cbce0f2894ed9c232/run39204233990"
               echo "full_unit_and_stream_stress=not_rerun_views_only_controls_change"
+            elif [[ '${{ inputs.gate }}' == 'copy-controls' ]]; then
+              echo "unchanged_full_candidate_baseline=7fd609bde530269347b9089cbce0f2894ed9c232/run39204233990"
+              echo "copy_controls_validation=full_unit_security_navigation_device_build"
+              echo "long_stream_stress=not_rerun_copy_parser_and_feedback_change"
             fi
             echo "xcode_version=$XCODE_VERSION"
             echo "xcode_build=$XCODE_BUILD"
@@ -200,10 +204,10 @@ jobs:
               --only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable \
               --only testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable \
               | tee build/ui-tests.log
-          elif [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
-            # Views-only controls change: compile both targets and exercise the
-            # hierarchy/cached-Chat navigation. Keep prior full-suite evidence;
-            # do not rerun unchanged draft and long-stream stress scenarios here.
+          elif [[ '${{ inputs.gate }}' == 'web-controls' || '${{ inputs.gate }}' == 'copy-controls' ]]; then
+            # Exercise hierarchy/cached-Chat navigation for both control scopes.
+            # copy-controls also runs the full unit suite above for its parser.
+            # Keep prior evidence for unchanged long-stream stress scenarios.
             python3 scripts/run_candidate_ui_tests.py \
               --udid '${{ steps.simulator.outputs.udid }}' \
               --only testMachineRuntimeHierarchyOnIPhone \
@@ -231,7 +235,7 @@ jobs:
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
 
       - name: Streaming cadence and process samples without accessibility polling
-        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls'
+        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'copy-controls'
         run: |
           set -euo pipefail
           python3 scripts/sample_streaming_performance.py --udid '${{ steps.simulator.outputs.udid }}' | tee build/stream-performance.log
@@ -355,6 +359,9 @@ jobs:
             if [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
               echo '- Validation scope: Web controls; 2 targeted UI/navigation tests'
               echo '- Full unit and long-stream stress: NOT RERUN; unchanged baseline run39204233990'
+            elif [[ '${{ inputs.gate }}' == 'copy-controls' ]]; then
+              echo '- Validation scope: Copy controls; full unit and security suites, 2 UI/navigation tests'
+              echo '- Long-stream stress: NOT RERUN; baseline run39204233990; physical copy/paste acceptance is separate'
             else
               echo '- Unit/UI: PASS'
             fi

@@ -3,6 +3,24 @@ import Security
 import Combine
 @testable import RemoteAIMobile
 
+func fencedWritingBlock(_ body: String, leadingNewline: Bool = false, trailingNewline: Bool = false) -> String {
+    var currentBackticks = 0
+    var longestBacktickRun = 0
+    for character in body {
+        if character == "`" {
+            currentBackticks += 1
+            longestBacktickRun = max(longestBacktickRun, currentBackticks)
+        } else {
+            currentBackticks = 0
+        }
+    }
+    let fence = String(repeating: "`", count: max(3, longestBacktickRun + 1))
+    let flags = "p\(leadingNewline ? 1 : 0)t\(trailingNewline ? 1 : 0)"
+    let prefix = leadingNewline ? "\n" : ""
+    let suffix = trailingNewline ? "\n" : ""
+    return "\(prefix)\(fence)remoteai-writing-block-v1 \(flags)\n\(body)\n\(fence)\(suffix)"
+}
+
 final class RemoteAIMobileTests: XCTestCase {
     func testSpeechInputLifecyclePermissionAndInterruptionStateMachine() {
         var state: SpeechInputLifecycleState = .idle
@@ -2300,6 +2318,76 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(segments[0].isEditBlock)
         XCTAssertTrue(segments[1].isEditBlock)
         XCTAssertEqual(segments[1].text, "@DevSpace\n\n请继续当前项目，不要重新开始。")
+    }
+
+    func testFencedWritingBlockKeepsExactBodyAndDoesNotConsumeFollowingProse() {
+        let body = "第一段\n\n    保留缩进\nCopy\nEdit\nExit\n```swift\nlet value = 42\n```\n末段\n"
+        let text = "前置说明。\n\n\(fencedWritingBlock(body))\n\n尾部说明。"
+
+        let segments = MessageContentSegment.parse(text)
+
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertEqual(segments[0].text, "前置说明。\n\n")
+        XCTAssertTrue(segments[1].isEditBlock)
+        XCTAssertFalse(segments[1].isCode)
+        XCTAssertEqual(segments[1].text, body)
+        XCTAssertEqual(segments[2].text, "\n\n尾部说明。")
+        XCTAssertEqual(MessageContentSegment.editBlocks(in: text).map(\.text), [body])
+    }
+
+    func testFencedWritingBlocksKeepRepeatedBodiesAndCopyableTextRemovesOnlyWrappers() {
+        let body = "中文块\n    缩进\nCopy\nEdit\n```text\ninner fence\n```\n"
+        let text = "Before\n\n\(fencedWritingBlock(body))\n\nBetween\n\n\(fencedWritingBlock(body))\n\nAfter"
+
+        let segments = MessageContentSegment.parse(text)
+        let blocks = MessageContentSegment.editBlocks(in: text)
+
+        XCTAssertEqual(segments.filter(\.isEditBlock).map(\.text), [body, body])
+        XCTAssertEqual(blocks.map(\.text), [body, body])
+        XCTAssertEqual(
+            MessageContentSegment.copyableText(text),
+            "Before\n\n\(body)\n\nBetween\n\n\(body)\n\nAfter"
+        )
+    }
+
+    func testFencedWritingBlockCanSitInlineBetweenProseAndCopiesBackWithoutAddedNewlines() {
+        let body = "完整正文\n    保留缩进"
+        let text = "前置\(fencedWritingBlock(body, leadingNewline: true, trailingNewline: true))后置"
+
+        let segments = MessageContentSegment.parse(text)
+
+        XCTAssertEqual(segments.filter(\.isEditBlock).map(\.text), [body])
+        XCTAssertEqual(MessageContentSegment.copyableText(text), "前置\(body)后置")
+    }
+
+    func testFencedWritingBlockPreservesTrailingWhitespaceAndCRLFAsBodyContent() {
+        let bodies = ["结尾空格  ", "结尾回车\r", "结尾换行\n", "结尾CRLF\r\n"]
+
+        for body in bodies {
+            let text = fencedWritingBlock(body)
+            XCTAssertEqual(MessageContentSegment.editBlocks(in: text).map(\.text), [body])
+            XCTAssertEqual(MessageContentSegment.copyableText(text), body)
+        }
+    }
+
+    func testReservedWritingFenceInsideOrdinaryMarkdownCodeRemainsOrdinaryMarkdown() {
+        let text = "````markdown\n```remoteai-writing-block-v1\nnot a Writing Block\n```\n````\nAfter"
+
+        let segments = MessageContentSegment.parse(text)
+
+        XCTAssertFalse(segments.contains(where: \.isEditBlock))
+        XCTAssertEqual(MessageContentSegment.copyableText(text), text)
+    }
+
+    func testIncompleteWritingFencePreviewHidesTransportMarkerAndCopyDropsOnlyOpeningLine() {
+        let body = "正在生成的正文\n    保留缩进\nCopy\nEdit"
+        let opening = "````remoteai-writing-block-v1 p0t0\n"
+        let text = "说明。\n\n\(opening)\(body)"
+
+        let segments = MessageContentSegment.parse(text)
+
+        XCTAssertEqual(segments.map(\.text), ["说明。\n\n"])
+        XCTAssertEqual(MessageContentSegment.copyableText(text), "说明。\n\n\(body)")
     }
 
     func testFlattenedContinuationPromptWithoutEditLabelBecomesCopyableBlock() {
