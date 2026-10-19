@@ -6,7 +6,7 @@ on:
       gate:
         description: Validation scope
         type: choice
-        options: [candidate, streaming, sync]
+        options: [candidate, streaming, sync, web-controls]
         default: candidate
 
 permissions:
@@ -96,6 +96,11 @@ jobs:
             echo "commit=$GITHUB_SHA"
             echo "ref=$GITHUB_REF"
             echo "event=$GITHUB_EVENT_NAME"
+            echo "validation_scope=${{ inputs.gate }}"
+            if [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
+              echo "unchanged_full_candidate_baseline=7fd609bde530269347b9089cbce0f2894ed9c232/run39204233990"
+              echo "full_unit_and_stream_stress=not_rerun_views_only_controls_change"
+            fi
             echo "xcode_version=$XCODE_VERSION"
             echo "xcode_build=$XCODE_BUILD"
             echo "iphoneos_sdk=$IPHONEOS_SDK_VERSION"
@@ -161,7 +166,7 @@ jobs:
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/protocol-security.log | tail -1
 
       - name: Unit tests
-        if: inputs.gate != 'streaming'
+        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls'
         shell: bash
         run: |
           set -euo pipefail
@@ -195,6 +200,15 @@ jobs:
               --only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable \
               --only testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable \
               | tee build/ui-tests.log
+          elif [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
+            # Views-only controls change: compile both targets and exercise the
+            # hierarchy/cached-Chat navigation. Keep prior full-suite evidence;
+            # do not rerun unchanged draft and long-stream stress scenarios here.
+            python3 scripts/run_candidate_ui_tests.py \
+              --udid '${{ steps.simulator.outputs.udid }}' \
+              --only testMachineRuntimeHierarchyOnIPhone \
+              --only testOpenCachedWebConversation \
+              | tee build/ui-tests.log
           elif [[ '${{ inputs.gate }}' == 'sync' ]]; then
             # Targeted regression gate for metadata/Project/Chat sync candidates.
             # The full candidate gate (including both long-stream stress cases)
@@ -217,7 +231,7 @@ jobs:
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
 
       - name: Streaming cadence and process samples without accessibility polling
-        if: inputs.gate != 'streaming'
+        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls'
         run: |
           set -euo pipefail
           python3 scripts/sample_streaming_performance.py --udid '${{ steps.simulator.outputs.udid }}' | tee build/stream-performance.log
@@ -338,7 +352,12 @@ jobs:
             echo '- Candidate only; not final release acceptance'
             echo '- External Live iOS Relay pairing smoke: intentionally excluded from this workflow'
             echo '- Protocol Security / Fuzz: PASS'
-            echo '- Unit/UI: PASS'
+            if [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
+              echo '- Validation scope: Web controls; 2 targeted UI/navigation tests'
+              echo '- Full unit and long-stream stress: NOT RERUN; unchanged baseline run39204233990'
+            else
+              echo '- Unit/UI: PASS'
+            fi
             echo '- Device architecture: `arm64`'
             echo '- Bundle ID: `com.remoteai.mobile`'
             echo '- IPA: `${{ steps.ipa.outputs.name }}`'
