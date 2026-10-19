@@ -2137,6 +2137,20 @@ struct TextSelectionSheet: View {
     @Environment(\.dismiss) private var dismiss
     let text: String
     let monospaced: Bool
+    @State private var copied = false
+    @State private var copyFeedbackToken: UUID?
+
+    private func copyAllText() {
+        UIPasteboard.general.string = text
+        copied = true
+        let token = UUID()
+        copyFeedbackToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard copyFeedbackToken == token else { return }
+            copied = false
+            copyFeedbackToken = nil
+        }
+    }
 
     var body: some View {
         NavigationView {
@@ -2147,7 +2161,7 @@ struct TextSelectionSheet: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .navigationBarLeading) {
-                        Button("全部复制") { UIPasteboard.general.string = text }
+                        Button(copied ? "已复制" : "全部复制", action: copyAllText)
                     }
                     ToolbarItem(placement: .navigationBarTrailing) {
                         Button("完成") { dismiss() }
@@ -2227,9 +2241,23 @@ struct AssistantStreamRow: View, Equatable {
     var followTail: () -> Void = {}
     var onSelectText: ((String, Bool) -> Void)? = nil
     @State private var followTask: Task<Void, Never>?
+    @State private var copiedCurrentText = false
+    @State private var copyFeedbackToken: UUID?
 
     static func == (lhs: AssistantStreamRow, rhs: AssistantStreamRow) -> Bool {
         lhs.stream === rhs.stream && lhs.message == rhs.message
+    }
+
+    private func copyCurrentText() {
+        UIPasteboard.general.string = stream.text
+        copiedCurrentText = true
+        let token = UUID()
+        copyFeedbackToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard copyFeedbackToken == token else { return }
+            copiedCurrentText = false
+            copyFeedbackToken = nil
+        }
     }
 
     var body: some View {
@@ -2249,9 +2277,9 @@ struct AssistantStreamRow: View, Equatable {
                         .accessibilityHidden(true)
                     HStack(spacing: 12) {
                         Button {
-                            UIPasteboard.general.string = stream.text
+                            copyCurrentText()
                         } label: {
-                            Label("复制当前全文", systemImage: "doc.on.doc")
+                            Label(copiedCurrentText ? "已复制" : "复制当前全文", systemImage: copiedCurrentText ? "checkmark" : "doc.on.doc")
                                 .font(.caption2)
                         }
                         .buttonStyle(.borderless)
@@ -2310,6 +2338,8 @@ struct MessageRow: View, Equatable {
             && (lhs.retry == nil) == (rhs.retry == nil) && lhs.retryContextKey == rhs.retryContextKey
     }
     @State private var toolExpanded = true
+    @State private var copiedActionID: String?
+    @State private var copyFeedbackToken: UUID?
     private var renderContent: MessageRenderContent { preparedRenderContent ?? MessageRenderCache.shared.content(for: message) }
     private var displayText: String { renderContent.displayText }
     private var displayAttachments: [MessageAttachment] { renderContent.attachments }
@@ -2324,6 +2354,24 @@ struct MessageRow: View, Equatable {
         fullStreamingText == nil ? renderContent.preservedEditBlocks : []
     }
     private var selectionText: String { fullStreamingText?() ?? displayText }
+
+    private func copyText(_ text: String, actionID: String) {
+        UIPasteboard.general.string = text
+        copiedActionID = actionID
+        let token = UUID()
+        copyFeedbackToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard copyFeedbackToken == token else { return }
+            copiedActionID = nil
+            copyFeedbackToken = nil
+        }
+    }
+
+    private func copyLabel(_ title: String, actionID: String) -> some View {
+        let isCopied = copiedActionID == actionID
+        return Label(isCopied ? "已复制" : title, systemImage: isCopied ? "checkmark" : "doc.on.doc")
+            .font(.caption2)
+    }
 
     var body: some View {
         Group {
@@ -2352,16 +2400,21 @@ struct MessageRow: View, Equatable {
                         }
                         .buttonStyle(.plain)
                         Spacer(minLength: 8)
+                        if copiedActionID == "tool-card" {
+                            Label("已复制", systemImage: "checkmark")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
                         Button {
-                            UIPasteboard.general.string = message.toolCardCopyText
+                            copyText(message.toolCardCopyText, actionID: "tool-card")
                         } label: {
-                            Image(systemName: "doc.on.doc")
+                            Image(systemName: copiedActionID == "tool-card" ? "checkmark" : "doc.on.doc")
                                 .font(.subheadline.weight(.medium))
                                 .frame(width: 34, height: 34)
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.borderless)
-                        .accessibilityLabel("复制整块")
+                        .accessibilityLabel(copiedActionID == "tool-card" ? "已复制" : "复制整块")
                         .accessibilityIdentifier("tool-card-copy-whole")
                     }
                     if let detail = message.detail, !detail.isEmpty {
@@ -2385,8 +2438,8 @@ struct MessageRow: View, Equatable {
                                 Spacer(minLength: 0)
                             }
                             HStack(spacing: 12) {
-                                Button("复制整块") {
-                                    UIPasteboard.general.string = message.toolCardCopyText
+                                Button(copiedActionID == "tool-card" ? "已复制" : "复制整块") {
+                                    copyText(message.toolCardCopyText, actionID: "tool-card")
                                 }
                                 Button("选择整块") {
                                     onSelectText?(message.toolCardCopyText, true)
@@ -2403,7 +2456,7 @@ struct MessageRow: View, Equatable {
                 .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
                 .contextMenu {
                     Button {
-                        UIPasteboard.general.string = message.toolCardCopyText
+                        copyText(message.toolCardCopyText, actionID: "tool-card")
                     } label: {
                         Label("复制整块", systemImage: "doc.on.doc")
                     }
@@ -2433,10 +2486,9 @@ struct MessageRow: View, Equatable {
                                         .font(.caption2)
                                         .buttonStyle(.borderless)
                                         Button {
-                                            UIPasteboard.general.string = segment.text
+                                            copyText(segment.text, actionID: "code-\(segment.id)")
                                         } label: {
-                                            Label("复制", systemImage: "doc.on.doc")
-                                                .font(.caption2)
+                                            copyLabel("复制", actionID: "code-\(segment.id)")
                                         }
                                         .buttonStyle(.borderless)
                                     }
@@ -2483,10 +2535,9 @@ struct MessageRow: View, Equatable {
                         if !displayText.isEmpty {
                             HStack(spacing: 12) {
                                 Button {
-                                    UIPasteboard.general.string = selectionText
+                                    copyText(selectionText, actionID: "message-full")
                                 } label: {
-                                    Label("复制全文", systemImage: "doc.on.doc")
-                                        .font(.caption2)
+                                    copyLabel("复制全文", actionID: "message-full")
                                 }
                                 .buttonStyle(.borderless)
                                 Button {
@@ -2524,10 +2575,9 @@ struct MessageRow: View, Equatable {
             }
             HStack(spacing: 12) {
                 Button {
-                    UIPasteboard.general.string = segment.text
+                    copyText(segment.text, actionID: "edit-\(segment.id)")
                 } label: {
-                    Label("复制整块", systemImage: "doc.on.doc")
-                        .font(.caption2)
+                    copyLabel("复制整块", actionID: "edit-\(segment.id)")
                 }
                 .buttonStyle(.borderless)
                 Button(isLargeEdit ? "查看 / 选择全文" : "选择部分") {
@@ -2547,7 +2597,7 @@ struct MessageRow: View, Equatable {
         .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
         .contextMenu {
             Button {
-                UIPasteboard.general.string = segment.text
+                copyText(segment.text, actionID: "edit-\(segment.id)")
             } label: {
                 Label("复制整块", systemImage: "doc.on.doc")
             }
