@@ -19,5 +19,5 @@
   },
   "relayFrames": ["PAIR_REQUEST","PAIR_CHALLENGE","PAIR_PROOF","PAIR_ACCEPT","ENCRYPTED","ACK","PING","PONG"],
   "eventTypes": ["MESSAGE_ADDED","MESSAGE_UPDATED","TOOL_STARTED","TOOL_FINISHED","GENERATION_STARTED","GENERATION_STOPPED","COMMAND_RESULT","COMMAND_REJECTED"],
-  "scenarios": ["normal","streaming","tool-event","disconnect","reconnect","duplicate-event","sequence-gap","command-failure","offline","1200-message-history","windows-crypto-vector"]
+  "scenarios": ["normal","streaming","tool-event","disconnect","reconnect","duplicate-event","sequence-gap","command-failure","offline","1200-message-history","windows-crypto-vector","tall-tail-viewport"]
 }

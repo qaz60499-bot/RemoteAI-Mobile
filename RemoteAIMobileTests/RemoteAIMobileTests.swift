@@ -2791,6 +2791,45 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testOldHistoricalFinalDoesNotClearUnknownWebSendNotice() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .webSendDeliveryUnknown, historyCount: 1200)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let web = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(web)
+        let photo = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: web, instance: photo)
+        try await cache.saveDraft("delivery-unknown-with-history", sessionId: "photo-upload")
+        let commandId = UUID()
+        let notice = "Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."
+
+        let sent = await store.send(text: "delivery-unknown-with-history", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
+
+        XCTAssertFalse(sent)
+        XCTAssertEqual(store.commandStates[commandId], .unknown)
+        XCTAssertEqual(store.errors["photo-upload"], notice, "An older assistant final cannot resolve a newer unknown send")
+        let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertEqual(pending?.commandId, commandId)
+        let persistedDraft = try await cache.draft(sessionId: "photo-upload")
+        XCTAssertEqual(persistedDraft, "delivery-unknown-with-history")
+        let composerDraft = await store.draft(sessionId: "photo-upload")
+        XCTAssertEqual(composerDraft, "", "The pending command keeps its draft out of the composer")
+        let sendAttempts = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sendAttempts, 1)
+
+        await store.loadSession("photo-upload")
+
+        XCTAssertEqual(store.commandStates[commandId], .unknown)
+        XCTAssertEqual(store.errors["photo-upload"], notice, "A successful history refresh still cannot clear an unresolved delivery notice")
+        let pendingAfterRefresh: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertEqual(pendingAfterRefresh?.commandId, commandId)
+        let sendAttemptsAfterRefresh = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sendAttemptsAfterRefresh, 1, "History reconciliation must not resend the command")
+        await store.suspend()
+    }
+
+    @MainActor
     func testPersistedDraftSurvivesSendInterruptedByBackgroundSuspension() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
@@ -2840,7 +2879,7 @@ final class RemoteAIMobileTests: XCTestCase {
     @MainActor
     func testWebSendDeliveryUnknownAutoReconcilesCommittedProviderTurnWithoutSecondSend() async throws {
         let cache = try SQLiteStore.inMemory()
-        let mock = MockTransport(scenario: .webSendDeliveryUnknownAfterCommit, historyCount: 0)
+        let mock = MockTransport(scenario: .webSendDeliveryUnknownAfterCommit, historyCount: 1200)
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
         let commandId = UUID()
@@ -2849,6 +2888,7 @@ final class RemoteAIMobileTests: XCTestCase {
 
         XCTAssertTrue(sent, "A provider user turn found by read-only reconciliation should resolve unknown delivery")
         XCTAssertEqual(store.commandStates[commandId], .completed)
+        XCTAssertNil(store.errors["photo-upload"], "A matching provider user turn resolves the unknown delivery warning")
         let sendAttempts = await mock.actionAttemptCount("sendMessage")
         XCTAssertEqual(sendAttempts, 1, "Reconciliation must never issue a second send side effect")
         let serverUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "delivery-committed")

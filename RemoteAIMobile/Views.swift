@@ -201,6 +201,7 @@ struct InstanceView: View {
     @State private var showingCloseWebTabConfirmation = false
     @State private var enteredWebProject: WebProjectDescriptor?
     @State private var openEnteredWebProject = false
+    @State private var isWebTabManagementExpanded = false
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
     private var isAntigravity: Bool { runtime.id == "runtime.antigravity" }
     private var supportsProjects: Bool { isChatGPTWeb || isAntigravity }
@@ -273,7 +274,7 @@ struct InstanceView: View {
     var body: some View {
         List {
             if isChatGPTWeb {
-                Section {
+                DisclosureGroup(isExpanded: $isWebTabManagementExpanded) {
                     if store.openWebTabsQueryFailed {
                         Text("Chrome 查询失败，当前打开数量未知；保留上次已确认的列表。")
                             .font(.caption).foregroundColor(.secondary)
@@ -418,13 +419,14 @@ struct InstanceView: View {
                     if let error = store.errors["web.tabs"] {
                         ErrorBanner(text: error) { store.clearError(sessionId: "web.tabs") }
                     }
-                } header: {
-                    Text(store.openWebTabsQueryFailed || !store.hasLoadedOpenWebTabs
-                         ? "实际打开数量未知"
-                         : "网页标签 \(store.openWebTabs.count) · 实际 Chat \(store.openWebTabs.filter { $0.isChat }.count) · 异常 \(abnormalWebTabCount)")
-                } footer: {
                     Text("状态区分 Chrome 标签存在、页面可操作、ChatGPT 错误和连接不可验证；检测不会发送消息。关闭只关闭标签页，不删除历史。")
+                        .font(.caption).foregroundColor(.secondary)
+                } label: {
+                    Text(store.openWebTabsQueryFailed || !store.hasLoadedOpenWebTabs
+                         ? "标签管理 · 实际打开数量未知"
+                         : "标签管理 · 已打开 \(store.openWebTabs.count) 个 · 实际 Chat \(store.openWebTabs.filter { $0.isChat }.count) · 异常 \(abnormalWebTabCount)")
                 }
+                .accessibilityHint("展开查看和管理电脑 Chrome 当前打开的 ChatGPT 标签页。")
             }
             if supportsProjects {
                 Section {
@@ -1035,6 +1037,48 @@ struct WebProjectView: View {
     }
 }
 
+private struct ChatTranscriptTailLayout: Equatable {
+    var bottomFrame: CGRect?
+    var contentSize: CGSize?
+    var viewportSize: CGSize?
+}
+
+private struct ChatTranscriptLayoutSize: Equatable {
+    let contentWidth: Int
+    let contentHeight: Int
+    let viewportWidth: Int
+    let viewportHeight: Int
+
+    init(contentSize: CGSize, viewportSize: CGSize) {
+        contentWidth = Int(contentSize.width.rounded())
+        contentHeight = Int(contentSize.height.rounded())
+        viewportWidth = Int(viewportSize.width.rounded())
+        viewportHeight = Int(viewportSize.height.rounded())
+    }
+}
+
+private enum ChatTranscriptPositionRequest: Equatable {
+    case unmeasured
+    case measured(ChatTranscriptLayoutSize)
+}
+
+private struct ChatTranscriptTailLayoutPreferenceKey: PreferenceKey {
+    static let defaultValue = ChatTranscriptTailLayout(bottomFrame: nil, contentSize: nil, viewportSize: nil)
+
+    static func reduce(value: inout ChatTranscriptTailLayout, nextValue: () -> ChatTranscriptTailLayout) {
+        let next = nextValue()
+        if let bottomFrame = next.bottomFrame {
+            value.bottomFrame = bottomFrame
+        }
+        if let contentSize = next.contentSize {
+            value.contentSize = contentSize
+        }
+        if let viewportSize = next.viewportSize {
+            value.viewportSize = viewportSize
+        }
+    }
+}
+
 struct ChatView: View {
     private enum DraftLoadStatus {
         case loading
@@ -1070,7 +1114,9 @@ struct ChatView: View {
     @State private var voiceBaseText = ""
     @State private var isAtBottom = true
     @State private var didInitialScrollToBottom = false
-    @State private var userBrowsingHistory = false
+    @State private var shouldFollowTranscriptTail = true
+    @State private var measuredTranscriptLayoutSize: ChatTranscriptLayoutSize?
+    @State private var lastTranscriptPositionRequest: ChatTranscriptPositionRequest?
     @StateObject private var speechInput = SpeechInputController()
     @State private var textSelectionRequest: TextSelectionRequest?
     @FocusState private var focused: Bool
@@ -1100,6 +1146,18 @@ struct ChatView: View {
             return nil
         }
         return notice
+    }
+    private func requestTranscriptTailPosition(
+        using proxy: ScrollViewProxy,
+        layoutSize: ChatTranscriptLayoutSize? = nil,
+        force: Bool = false
+    ) {
+        guard shouldFollowTranscriptTail else { return }
+        let measuredSize = layoutSize ?? measuredTranscriptLayoutSize
+        let request = measuredSize.map(ChatTranscriptPositionRequest.measured) ?? .unmeasured
+        guard force || request != lastTranscriptPositionRequest else { return }
+        lastTranscriptPositionRequest = request
+        proxy.scrollTo("bottom", anchor: .bottom)
     }
     private var isGenerating: Bool {
         if currentSessionState == .error { return false }
@@ -1131,99 +1189,153 @@ struct ChatView: View {
             ScrollViewReader { proxy in
                 ZStack(alignment: .bottomTrailing) {
                     ScrollView {
-                        LazyVStack(spacing: 12) {
-                            Color.clear.frame(height: 1).id("top").onAppear { guard didInitialScrollToBottom, userBrowsingHistory, !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
-                            if loadingOlder { ProgressView().padding(.vertical, 6) }
-                            ForEach(messages) { message in
-                                let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
-                                // Definite failures restore the composer and use a new operation.
-                                // Only unknown delivery is replayed with the original command ID.
-                                let retryable = message.kind == .error || commandState == .unknown
-                                if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
-                                    AssistantStreamRow(stream: stream, message: message, followTail: {
-                                        guard !userBrowsingHistory else { return }
-                                        proxy.scrollTo("bottom", anchor: .bottom)
-                                    }, onSelectText: { text, monospaced in
-                                        textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
-                                    }).id(message.id)
-                                } else {
-                                    MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: supportsModelSelection ? selectedModel : "") } } : nil, retryContextKey: selectedModel, onSelectText: { text, monospaced in
-                                        textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
-                                    }).equatable().id(message.id)
+                        VStack(spacing: 12) {
+                            LazyVStack(spacing: 12) {
+                                Color.clear.frame(height: 1).id("top").onAppear { guard !shouldFollowTranscriptTail, !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
+                                if loadingOlder { ProgressView().padding(.vertical, 6) }
+                                ForEach(messages) { message in
+                                    let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
+                                    // Definite failures restore the composer and use a new operation.
+                                    // Only unknown delivery is replayed with the original command ID.
+                                    let retryable = message.kind == .error || commandState == .unknown
+                                    if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
+                                        AssistantStreamRow(stream: stream, message: message, followTail: {
+                                            requestTranscriptTailPosition(using: proxy)
+                                        }, onSelectText: { text, monospaced in
+                                            textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
+                                        }).id(message.id)
+                                    } else {
+                                        MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: supportsModelSelection ? selectedModel : "") } } : nil, retryContextKey: selectedModel, onSelectText: { text, monospaced in
+                                            textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
+                                        }).equatable().id(message.id)
+                                    }
                                 }
                             }
                             Color.clear
                                 .frame(height: 1)
                                 .id("bottom")
-                                .onAppear {
-                                    // LazyVStack may recycle/retain the bottom sentinel while a
-                                    // streaming row is changing height. Never let that lifecycle
-                                    // event cancel an explicit user intent to browse older history;
-                                    // otherwise tail-following can re-enable between two drag events
-                                    // and the "回到最新消息" affordance disappears intermittently.
-                                    guard !userBrowsingHistory else {
-                                        isAtBottom = false
-                                        return
+                                .background(
+                                    GeometryReader { marker in
+                                        Color.clear.preference(
+                                            key: ChatTranscriptTailLayoutPreferenceKey.self,
+                                            value: ChatTranscriptTailLayout(
+                                                bottomFrame: marker.frame(in: .named("ChatTranscriptViewport")),
+                                                contentSize: nil,
+                                                viewportSize: nil
+                                            )
+                                        )
                                     }
-                                    isAtBottom = true
-                                }
-                                .onDisappear { isAtBottom = false }
+                                )
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
+                        .background(
+                            GeometryReader { content in
+                                Color.clear.preference(
+                                    key: ChatTranscriptTailLayoutPreferenceKey.self,
+                                    value: ChatTranscriptTailLayout(
+                                        bottomFrame: nil,
+                                        contentSize: content.size,
+                                        viewportSize: nil
+                                    )
+                                )
+                            }
+                        )
                     }
                     .background(Color(.systemGroupedBackground))
+                    .coordinateSpace(name: "ChatTranscriptViewport")
+                    .background(
+                        GeometryReader { viewport in
+                            Color.clear.preference(
+                                key: ChatTranscriptTailLayoutPreferenceKey.self,
+                                value: ChatTranscriptTailLayout(
+                                    bottomFrame: nil,
+                                    contentSize: nil,
+                                    viewportSize: viewport.size
+                                )
+                            )
+                        }
+                    )
                     .simultaneousGesture(
                         TapGesture().onEnded { focused = false }
                     )
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 8)
                             .onChanged { value in
-                                // A downward finger drag moves the transcript toward older
-                                // messages. Mark that intent immediately instead of relying
-                                // only on LazyVStack bottom-sentinel disappearance, which may
-                                // be delayed while the sentinel remains retained offscreen.
-                                // A deliberate vertical swipe owns history browsing in either direction.
-                                // Do not let live tool events or streaming updates steal scroll position.
+                                // A deliberate vertical swipe disables tail-follow immediately,
+                                // so incoming messages and streaming layout changes cannot take
+                                // control of the user's history position.
                                 if abs(value.translation.height) > 8 {
                                     focused = false
-                                    userBrowsingHistory = true
+                                    shouldFollowTranscriptTail = false
                                     isAtBottom = false
                                 }
                             }
                     )
                     .onAppear {
-                        guard !didInitialScrollToBottom, !messages.isEmpty else { return }
+                        guard !didInitialScrollToBottom,
+                              shouldFollowTranscriptTail,
+                              !messages.isEmpty else { return }
                         DispatchQueue.main.async {
-                            proxy.scrollTo("bottom", anchor: .bottom)
-                            didInitialScrollToBottom = true
+                            guard shouldFollowTranscriptTail else { return }
+                            requestTranscriptTailPosition(using: proxy)
                         }
                     }
                     .onChange(of: messages.last?.id) { _ in
-                        guard !loadingOlder, !messages.isEmpty else { return }
+                        guard !loadingOlder,
+                              shouldFollowTranscriptTail,
+                              !messages.isEmpty else { return }
                         if !didInitialScrollToBottom {
                             DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
-                                didInitialScrollToBottom = true
+                                guard shouldFollowTranscriptTail else { return }
+                                requestTranscriptTailPosition(using: proxy)
                             }
-                        } else if !userBrowsingHistory {
-                            userBrowsingHistory = false
+                        } else {
                             withAnimation(.easeOut(duration: 0.18)) {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                                requestTranscriptTailPosition(using: proxy)
                             }
                         }
                     }
                     .onChange(of: session.id) { _ in
                         didInitialScrollToBottom = false
-                        userBrowsingHistory = false
+                        shouldFollowTranscriptTail = true
                         isAtBottom = true
+                        measuredTranscriptLayoutSize = nil
+                        lastTranscriptPositionRequest = nil
+                        requestTranscriptTailPosition(using: proxy)
+                    }
+                    .onPreferenceChange(ChatTranscriptTailLayoutPreferenceKey.self) { layout in
+                        guard let bottomFrame = layout.bottomFrame,
+                              let contentSize = layout.contentSize,
+                              let viewportSize = layout.viewportSize else { return }
+                        let measuredSize = ChatTranscriptLayoutSize(contentSize: contentSize, viewportSize: viewportSize)
+                        let layoutSizeChanged = measuredTranscriptLayoutSize != measuredSize
+                        if layoutSizeChanged {
+                            measuredTranscriptLayoutSize = measuredSize
+                        }
+                        let visibilityTolerance: CGFloat = 1
+                        let tailIsVisible = bottomFrame.minY >= -visibilityTolerance
+                            && bottomFrame.maxY <= viewportSize.height + visibilityTolerance
+                        if isAtBottom != tailIsVisible {
+                            isAtBottom = tailIsVisible
+                        }
+                        if tailIsVisible {
+                            // Initial positioning is complete only after layout confirms the
+                            // tail marker is actually inside the visible scroll viewport.
+                            didInitialScrollToBottom = true
+                        } else if layoutSizeChanged && shouldFollowTranscriptTail {
+                            // Position once for each distinct rounded content/viewport size.
+                            // The marker stays outside LazyVStack, and scroll-offset-only frame
+                            // changes do not request a correction.
+                            requestTranscriptTailPosition(using: proxy, layoutSize: measuredSize)
+                        }
                     }
 
-                    if didInitialScrollToBottom, !isAtBottom, !messages.isEmpty {
+                    if !isAtBottom, !messages.isEmpty {
                         Button {
-                            userBrowsingHistory = false
+                            shouldFollowTranscriptTail = true
                             withAnimation(.easeOut(duration: 0.18)) {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                                requestTranscriptTailPosition(using: proxy, force: true)
                             }
                         } label: {
                             Image(systemName: "arrow.down")

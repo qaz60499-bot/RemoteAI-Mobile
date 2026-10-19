@@ -1417,8 +1417,11 @@ final class WorkspaceStore: ObservableObject {
             // was delivered as GENERATION_STOPPED. Keeping the error while the session
             // is explicitly .error lets ChatView continue showing rate-limit / unusual-
             // activity evidence even while periodic reconciliation polls are running.
+            let pendingUnknownSend = await hasPendingUnknownSend(sessionId: sessionId)
+            guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
             if sessions.first(where: { $0.id == sessionId })?.state != .error,
-               errors[sessionId] != nil {
+               errors[sessionId] != nil,
+               !pendingUnknownSend {
                 errors.removeValue(forKey: sessionId)
             }
             // A successful authoritative history read is the recovery watermark for
@@ -4598,6 +4601,12 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func settleRunStateIfAuthoritativeFinalExists(_ remote: [ChatMessage], sessionId: String) async {
+        let generation = lifecycleGeneration
+        // A final after an older user turn cannot resolve a newer send whose delivery is
+        // still unknown. Keep its warning and pending command until authoritative history
+        // contains the corresponding provider user turn and reconciliation completes it.
+        let pendingUnknownSend = await hasPendingUnknownSend(sessionId: sessionId)
+        guard generation == lifecycleGeneration, !isSuspended, !pendingUnknownSend else { return }
         guard let latestUserIndex = remote.lastIndex(where: { $0.role == .user }) else { return }
         let suffixStart = remote.index(after: latestUserIndex)
         guard suffixStart < remote.endIndex else { return }
@@ -4657,6 +4666,18 @@ final class WorkspaceStore: ObservableObject {
                 try? await cache.remove(key: Self.pendingCommandKey(id, machineId: machine.id))
             }
         }
+    }
+
+    private func hasPendingUnknownSend(sessionId: String) async -> Bool {
+        let unknownIds = commandStates.compactMap { $0.value == .unknown ? $0.key : nil }
+        for id in unknownIds {
+            guard let command = try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(id, machineId: machine.id)),
+                  commandStates[id] == .unknown,
+                  command.action == "sendMessage",
+                  command.sessionId == sessionId else { continue }
+            return true
+        }
+        return false
     }
 
     private func reconcileOptimisticUserEcho(_ serverMessage: ChatMessage, sessionId: String) async {

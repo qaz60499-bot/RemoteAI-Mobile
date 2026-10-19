@@ -5,6 +5,7 @@ enum MockScenario: String, CaseIterable {
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
     case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, alreadyExecutedThenSuccess, deltaOnlySend
     case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, staleThenFreshProjectConversations, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
+    case tallTailViewport
 }
 
 actor MockTransport: Transport {
@@ -87,15 +88,35 @@ actor MockTransport: Transport {
             ServerSession(sessionId: "codex6-a", runtimeId: "runtime.codex", instanceId: "codex.6", externalId: nil, title: "Session A", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now)
         ]
 
+        let tallTailLabels = ["B", "C", "D", "E", "F", "G"]
+        let tallTailContents: [String]
+        if scenario == .tallTailViewport {
+            tallTailContents = [
+                "Tail viewport fixture B — long lead-in.\n" + String(repeating: "B · A previous paragraph stays readable while the next row measures its height.\n", count: 22),
+                "Tail viewport fixture C — fenced code.\n```swift\n" + String(repeating: "let measuredRow = await transcript.layoutPass() // C\n", count: 27) + "```\n",
+                "Tail viewport fixture D — mixed language paragraphs.\n\n" + String(repeating: "D 段落说明：消息布局应随内容自然增长，并保持历史浏览位置。\n\n", count: 22),
+                "Tail viewport fixture E — nested details.\n" + String(repeating: "E · detail line\n  Supporting context remains part of this message row.\n", count: 18),
+                "Tail viewport fixture F — final tall row before the short tail.\n" + String(repeating: "F / scroll marker follows this varied-height content.\n", count: 25),
+                "Tail viewport fixture G — visible latest message."
+            ]
+        } else {
+            tallTailContents = []
+        }
         var messages: [ServerMessage] = []
         if historyCount > 0 {
             for i in 1...historyCount {
                 let assistant = i % 2 == 0
+                let tailFixtureIndex = i - (historyCount - tallTailContents.count + 1)
+                let tailFixtureContent = scenario == .tallTailViewport
+                    && historyCount >= tallTailContents.count
+                    && tallTailContents.indices.contains(tailFixtureIndex)
+                    ? tallTailContents[tailFixtureIndex]
+                    : nil
                 messages.append(ServerMessage(
-                    messageId: "mock-\(i)",
+                    messageId: tailFixtureContent == nil ? "mock-\(i)" : "tall-tail-\(tallTailLabels[tailFixtureIndex])",
                     sessionId: "photo-upload",
                     role: assistant ? "assistant" : "user",
-                    content: assistant ? "Mock assistant response \(i). This verifies long-history pagination without rendering everything at once." + (stressChars > 0 ? String(repeating: "\n历史 Markdown **文字** `code` 中文🙂", count: 500) : "") : "Mock user message \(i)",
+                    content: tailFixtureContent ?? (assistant ? "Mock assistant response \(i). This verifies long-history pagination without rendering everything at once." + (stressChars > 0 ? String(repeating: "\n历史 Markdown **文字** `code` 中文🙂", count: 500) : "") : "Mock user message \(i)"),
                     externalId: nil,
                     createdAt: now.addingTimeInterval(Double(i - historyCount) * 30)
                 ))
