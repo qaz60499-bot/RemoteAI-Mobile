@@ -192,6 +192,8 @@ final class RemoteAIMobileUITests: XCTestCase {
 
     func testUnknownSendDraftIsNotFlushedEmptyWhenConversationReopens() throws {
         let app = makeMockApp(scenario: "webSendDeliveryUnknown")
+        let unknownDeliveryMessage = "Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."
+        let unknownDeliveryBanner = app.staticTexts.matching(NSPredicate(format: "label == %@", unknownDeliveryMessage)).firstMatch
         app.launch()
         app.staticTexts["Web"].tap()
         XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 3))
@@ -204,7 +206,7 @@ final class RemoteAIMobileUITests: XCTestCase {
         composer.tap()
         composer.typeText("retain pending delivery draft")
         app.buttons["Send"].tap()
-        XCTAssertTrue(app.staticTexts["Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."].waitForExistence(timeout: 8))
+        XCTAssertTrue(unknownDeliveryBanner.waitForExistence(timeout: 8))
         let composerCleared = NSPredicate(format: "value == %@", "")
         expectation(for: composerCleared, evaluatedWith: composer)
         waitForExpectations(timeout: 5)
@@ -215,7 +217,7 @@ final class RemoteAIMobileUITests: XCTestCase {
 
         let reopenedComposer = app.textViews["MessageComposer"]
         XCTAssertTrue(reopenedComposer.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."].waitForExistence(timeout: 5))
+        XCTAssertTrue(unknownDeliveryBanner.waitForExistence(timeout: 5))
         XCTAssertEqual(reopenedComposer.value as? String, "")
         XCTAssertFalse(app.buttons["Send"].isEnabled)
     }
