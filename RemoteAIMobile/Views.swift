@@ -1227,8 +1227,19 @@ struct ChatView: View {
     private var generationProgressAt: Date? {
         currentSession.lastProgressAt ?? currentSession.lastActivityAt
     }
+    private var matchingSessionErrorNotice: SystemNoticePresentation? {
+        guard let error = store.errors[session.id],
+              let notice = store.systemNotice(forSessionId: session.id),
+              case .session(let noticeSessionId) = notice.scope,
+              noticeSessionId == session.id,
+              notice.text == error else { return nil }
+        return notice
+    }
     private var relevantSystemNotice: SystemNoticePresentation? {
-        guard let notice = store.systemNotice(forSessionId: session.id) else { return nil }
+        guard let notice = store.systemNotice(
+            forSessionId: session.id,
+            suppressingMatchingSessionText: store.errors[session.id]
+        ) else { return nil }
         if case .global = notice.scope,
            runtime.kind != .web,
            (notice.text.contains("ChatGPT") || notice.text.contains("Browser Bridge")) {
@@ -1305,6 +1316,7 @@ struct ChatView: View {
             || store.liveRunStatusBySession[session.id] != nil
     }
     var body: some View {
+        let errorNoticeToDismiss = matchingSessionErrorNotice
         VStack(spacing: 0) {
             if store.shouldDisplayConnectionBanner {
                 StatusBanner(
@@ -1323,13 +1335,20 @@ struct ChatView: View {
                 )
             }
             if let error = store.errors[session.id] {
+                let dismissError: () -> Void = {
+                    store.clearError(
+                        sessionId: session.id,
+                        matching: error,
+                        notice: errorNoticeToDismiss
+                    )
+                }
                 if let tab = matchingKnownOpenWebTab {
                     let isManaging = store.managingWebTabIds.contains(tab.id)
                     let reloadDisabled = tab.busy || isManaging || store.machine.state != .online
                     let reloadTitle = tab.busy ? "正在生成，暂不可刷新" : (isManaging ? "正在处理网页" : (store.machine.state == .online ? "刷新对应网页" : "电脑未连接"))
                     ErrorBanner(
                         text: error,
-                        dismiss: { store.clearError(sessionId: session.id) },
+                        dismiss: dismissError,
                         actionTitle: reloadTitle,
                         actionDisabled: reloadDisabled,
                         action: { Task { await store.manageOpenWebTab(tab, operation: "reload") } }
@@ -1338,7 +1357,7 @@ struct ChatView: View {
                         Text(note).font(.caption).foregroundColor(.secondary)
                     }
                 } else {
-                    ErrorBanner(text: error) { store.clearError(sessionId: session.id) }
+                    ErrorBanner(text: error, dismiss: dismissError)
                     if runtime.id == "runtime.web", instance.id == "web.chatgpt" {
                         Text("未确认这条 Chat 对应的电脑网页，暂不提供刷新操作。")
                             .font(.caption)

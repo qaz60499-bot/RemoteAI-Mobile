@@ -4051,6 +4051,21 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "An idle provider outage must not look like an active generation")
         let aIssue = try XCTUnwrap(store.systemNotice(forSessionId: "photo-upload"))
         XCTAssertEqual(aIssue.scope, .session("photo-upload"))
+        let aError = try XCTUnwrap(store.errors["photo-upload"])
+        XCTAssertNil(
+            store.systemNotice(forSessionId: "photo-upload", suppressingMatchingSessionText: aError),
+            "A matching same-session provider notice is hidden while its error banner is visible"
+        )
+        XCTAssertEqual(
+            store.systemNotice(forSessionId: "photo-upload", suppressingMatchingSessionText: "different error")?.id,
+            aIssue.id,
+            "A same-session notice with different text remains visible"
+        )
+        store.recentSystemNotice = "Unrelated global notice"
+        let globalFallback = try XCTUnwrap(store.systemNotice(forSessionId: "photo-upload", suppressingMatchingSessionText: aError))
+        XCTAssertEqual(globalFallback.scope, .global, "Suppressing the duplicate session notice leaves the global notice available")
+        store.clearSystemNotice(globalFallback)
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-upload")?.id, aIssue.id)
         XCTAssertNil(store.systemNotice(forSessionId: "photo-ios"), "A's provider outage must not appear in B")
         XCTAssertNil(store.recentSystemNotice, "A providerSurface event must not write the global notice")
 
@@ -4080,6 +4095,13 @@ final class RemoteAIMobileTests: XCTestCase {
         let bIssue = try XCTUnwrap(store.systemNotice(forSessionId: "photo-ios"))
         XCTAssertEqual(bIssue.scope, .session("photo-ios"))
         XCTAssertTrue(bIssue.text.contains("B 的 ChatGPT 网页"))
+        let bError = try XCTUnwrap(store.errors["photo-ios"])
+        XCTAssertNil(store.systemNotice(forSessionId: "photo-ios", suppressingMatchingSessionText: bError))
+        XCTAssertEqual(
+            store.systemNotice(forSessionId: "photo-upload", suppressingMatchingSessionText: bError)?.id,
+            aIssue.id,
+            "A's notice remains visible when B has a matching error"
+        )
 
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
@@ -4104,9 +4126,12 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertNil(store.errors["photo-upload"])
-        XCTAssertTrue(store.systemNotice(forSessionId: "photo-upload")?.text.contains("ChatGPT 网页已恢复") == true)
+        let aRecovery = try XCTUnwrap(store.systemNotice(forSessionId: "photo-upload"))
+        XCTAssertTrue(aRecovery.text.contains("ChatGPT 网页已恢复"))
+        store.clearError(sessionId: "photo-upload", matching: aError, notice: aIssue)
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-upload")?.id, aRecovery.id, "A stale outage dismissal must preserve the recovery notice")
         XCTAssertEqual(store.systemNotice(forSessionId: "photo-ios")?.id, bIssue.id, "A's provider recovery must not clear B's outage")
-        XCTAssertEqual(store.errors["photo-ios"], "B 的 ChatGPT 网页暂不可用。")
+        XCTAssertEqual(store.errors["photo-ios"], bError)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
 
         await mock.injectEvent(RemoteEvent(
@@ -4131,7 +4156,49 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertNil(store.errors["photo-ios"])
-        XCTAssertTrue(store.systemNotice(forSessionId: "photo-ios")?.text.contains("ChatGPT 网页已恢复") == true)
+        let bRecovery = try XCTUnwrap(store.systemNotice(forSessionId: "photo-ios"))
+        XCTAssertTrue(bRecovery.text.contains("ChatGPT 网页已恢复"))
+        store.clearError(sessionId: "photo-ios", matching: bError, notice: bIssue)
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-ios")?.id, bRecovery.id, "A stale outage dismissal must preserve B's recovery notice")
+
+        let dismissalError = aError
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1205,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "SESSION_STATUS",
+            payload: [
+                "providerSurface": .bool(true),
+                "state": .string("degraded"),
+                "providerState": .string("connection-lost"),
+                "code": .string("PROVIDER_UNAVAILABLE"),
+                "message": .string(dismissalError),
+                "retryable": .bool(true),
+                "at": .string(RemoteAIDate.string(now.addingTimeInterval(3)))
+            ],
+            createdAt: now.addingTimeInterval(3)
+        ), deliverLive: true)
+        for _ in 0..<80 where store.errors["photo-upload"] != dismissalError {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let dismissalNotice = try XCTUnwrap(store.systemNotice(forSessionId: "photo-upload"))
+        XCTAssertEqual(dismissalNotice.text, dismissalError)
+        XCTAssertNotEqual(dismissalNotice.id, aIssue.id, "The same message after recovery receives a new notice identity")
+        XCTAssertNil(store.systemNotice(forSessionId: "photo-upload", suppressingMatchingSessionText: dismissalError))
+        store.clearError(sessionId: "photo-upload", matching: aError, notice: aIssue)
+        XCTAssertEqual(store.errors["photo-upload"], dismissalError, "A stale outage dismissal must not clear the same-text outage after recovery")
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-upload")?.id, dismissalNotice.id, "The newer same-text outage notice must survive a stale dismissal")
+        store.recentSystemNotice = "Newer global notice"
+        let newerGlobal = try XCTUnwrap(store.systemNotice(forSessionId: "photo-upload", suppressingMatchingSessionText: dismissalError))
+        XCTAssertEqual(newerGlobal.scope, .global)
+        store.clearError(sessionId: "photo-upload", matching: dismissalError, notice: dismissalNotice)
+        XCTAssertNil(store.errors["photo-upload"])
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-upload")?.id, newerGlobal.id, "Dismissing the matching session error preserves the global notice")
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-ios")?.id, bRecovery.id, "Dismissing A's error must preserve B's recovery notice")
         await store.suspend()
     }
 

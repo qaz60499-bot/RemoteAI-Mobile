@@ -2629,6 +2629,22 @@ final class WorkspaceStore: ObservableObject {
     }
     func clearError(sessionId: String) { errors[sessionId] = nil }
 
+    func clearError(
+        sessionId: String,
+        matching displayedError: String,
+        notice: SystemNoticePresentation?
+    ) {
+        guard errors[sessionId] == displayedError else { return }
+        if let notice {
+            guard case .session(let noticeSessionId) = notice.scope,
+                  noticeSessionId == sessionId,
+                  notice.text == displayedError,
+                  sessionSystemNoticesBySession[sessionId]?.presentation.id == notice.id else { return }
+        }
+        errors[sessionId] = nil
+        if let notice { clearSystemNotice(notice) }
+    }
+
     private func pendingOperationCommandId(key: String, machineId: String) async -> UUID {
         let cacheKey = "pending.operation.\(machineId).\(key)"
         if let raw = try? await cache.get(String.self, key: cacheKey), let id = UUID(uuidString: raw) { return id }
@@ -4382,9 +4398,12 @@ final class WorkspaceStore: ObservableObject {
         ])
     }
 
-    func systemNotice(forSessionId sessionId: String) -> SystemNoticePresentation? {
+    func systemNotice(
+        forSessionId sessionId: String,
+        suppressingMatchingSessionText text: String? = nil
+    ) -> SystemNoticePresentation? {
         if let notice = sessionSystemNoticesBySession[sessionId]?.presentation {
-            return notice
+            guard let text, notice.text == text else { return notice }
         }
         guard let recentSystemNotice else { return nil }
         return SystemNoticePresentation(id: recentSystemNoticeId, text: recentSystemNotice, scope: .global)
