@@ -1199,6 +1199,12 @@ struct ChatView: View {
     @State private var shouldFollowTranscriptTail = true
     @State private var measuredTranscriptLayoutSize: ChatTranscriptLayoutSize?
     @State private var lastTranscriptPositionRequest: ChatTranscriptPositionRequest?
+    #if DEBUG
+    @State private var transcriptDiagnosticLayout = ChatTranscriptTailLayout(bottomFrame: nil, contentSize: nil, viewportSize: nil)
+    @State private var transcriptDiagnosticSamples = 0
+    @State private var transcriptDiagnosticRequests = 0
+    @State private var transcriptDiagnosticDecision = "none"
+    #endif
     @StateObject private var speechInput = SpeechInputController()
     @State private var textSelectionRequest: TextSelectionRequest?
     @FocusState private var focused: Bool
@@ -1235,17 +1241,59 @@ struct ChatView: View {
         layoutSize: ChatTranscriptLayoutSize? = nil,
         force: Bool = false
     ) {
-        guard shouldFollowTranscriptTail else { return }
+        guard shouldFollowTranscriptTail else {
+            recordTranscriptPositionDiagnostic("follow-disabled")
+            return
+        }
         let measuredSize = layoutSize ?? measuredTranscriptLayoutSize
         let request = measuredSize.map(ChatTranscriptPositionRequest.measured) ?? .unmeasured
-        guard force || request != lastTranscriptPositionRequest else { return }
+        guard force || request != lastTranscriptPositionRequest else {
+            recordTranscriptPositionDiagnostic("duplicate")
+            return
+        }
         lastTranscriptPositionRequest = request
+        recordTranscriptPositionDiagnostic(force ? "issued-force" : "issued")
         proxy.scrollTo("bottom", anchor: .bottom)
+    }
+    private func recordTranscriptPositionDiagnostic(_ decision: String) {
+        #if DEBUG
+        guard ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" else { return }
+        transcriptDiagnosticDecision = decision
+        guard transcriptDiagnosticRequests < 80 else { return }
+        transcriptDiagnosticRequests += 1
+        DiagnosticsLog.shared.record("chat_tail_position_probe", fields: [
+            "session": session.id,
+            "decision": decision,
+            "requestCount": String(transcriptDiagnosticRequests),
+            "request": String(describing: lastTranscriptPositionRequest),
+            "followTail": String(shouldFollowTranscriptTail),
+            "atBottom": String(isAtBottom),
+            "didInitial": String(didInitialScrollToBottom),
+            "rawLayout": String(describing: transcriptDiagnosticLayout),
+        ])
+        #endif
+    }
+    private func recordTranscriptLayoutDiagnostic(_ layout: ChatTranscriptTailLayout) {
+        #if DEBUG
+        guard ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1",
+              transcriptDiagnosticLayout != layout else { return }
+        transcriptDiagnosticLayout = layout
+        guard transcriptDiagnosticSamples < 80 else { return }
+        transcriptDiagnosticSamples += 1
+        DiagnosticsLog.shared.record("chat_tail_layout_probe", fields: [
+            "session": session.id,
+            "sampleCount": String(transcriptDiagnosticSamples),
+            "rawLayout": String(describing: layout),
+            "followTail": String(shouldFollowTranscriptTail),
+            "atBottom": String(isAtBottom),
+            "didInitial": String(didInitialScrollToBottom),
+        ])
+        #endif
     }
     private var transcriptAccessibilityValue: String {
         #if DEBUG
         if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
-            return "followTail=\(shouldFollowTranscriptTail);atBottom=\(isAtBottom)"
+            return "followTail=\(shouldFollowTranscriptTail);atBottom=\(isAtBottom);didInitial=\(didInitialScrollToBottom);samples=\(transcriptDiagnosticSamples);requests=\(transcriptDiagnosticRequests);decision=\(transcriptDiagnosticDecision);raw=\(String(describing: transcriptDiagnosticLayout));lastRequest=\(String(describing: lastTranscriptPositionRequest))"
         }
         #endif
         return isAtBottom ? "最新消息" : "浏览历史消息"
@@ -1421,6 +1469,7 @@ struct ChatView: View {
                         requestTranscriptTailPosition(using: proxy)
                     }
                     .onPreferenceChange(ChatTranscriptTailLayoutPreferenceKey.self) { layout in
+                        recordTranscriptLayoutDiagnostic(layout)
                         guard let bottomFrame = layout.bottomFrame,
                               let contentSize = layout.contentSize,
                               let viewportSize = layout.viewportSize else { return }
