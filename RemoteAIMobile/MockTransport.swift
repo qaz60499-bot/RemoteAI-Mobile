@@ -22,11 +22,14 @@ actor MockTransport: Transport {
     private var sessions: [ServerSession] = []
     private var sessionStatusOverrides: [String: String] = [:]
     private var sessionStatusActivityOverrides: [String: Date] = [:]
+    private var sessionStatusRevisionOverrides: [String: Date] = [:]
+    private var sessionsWithoutStatusRevision = Set<String>()
     private var sessionBackgroundTaskStatusOverrides: [String: JSONValue] = [:]
     private var webProjects: [WebProjectDescriptor] = []
     private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
     private var commandAttempts: [String: Int] = [:]
+    private var actionFailureCounts: [String: Int] = [:]
     private var lastPreferCacheByAction: [String: Bool] = [:]
     private var connectAttempts = 0
     private var executionDelayNanoseconds: UInt64 = 0
@@ -159,14 +162,21 @@ actor MockTransport: Transport {
         sessionStatusOverrides[sessionId] = "idle"
     }
     func setScenario(_ value: MockScenario) { scenario = value }
-    func setSessionStatus(_ sessionId: String, status: String, lastActivityAt: Date? = nil) {
+    func setSessionStatus(_ sessionId: String, status: String, lastActivityAt: Date? = nil, updatedAt: Date? = nil) {
         sessionStatusOverrides[sessionId] = status
         if let lastActivityAt {
             sessionStatusActivityOverrides[sessionId] = lastActivityAt
         } else {
             sessionStatusActivityOverrides.removeValue(forKey: sessionId)
         }
+        if let updatedAt {
+            sessionStatusRevisionOverrides[sessionId] = updatedAt
+            sessionsWithoutStatusRevision.remove(sessionId)
+        } else {
+            sessionStatusRevisionOverrides.removeValue(forKey: sessionId)
+        }
     }
+    func omitSessionStatusRevision(_ sessionId: String) { sessionsWithoutStatusRevision.insert(sessionId) }
     func setBackgroundTaskStatus(_ sessionId: String, snapshot: BackgroundTaskStatusSnapshot?) {
         guard let snapshot, let value = try? JSONValue.encode(snapshot) else {
             sessionBackgroundTaskStatusOverrides.removeValue(forKey: sessionId)
@@ -178,6 +188,7 @@ actor MockTransport: Transport {
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
     func setRequestDelay(action: String, nanoseconds: UInt64) { requestDelayNanoseconds[action] = nanoseconds }
     func setResponseDelay(action: String, nanoseconds: UInt64) { responseDelayNanoseconds[action] = nanoseconds }
+    func failNextAction(_ action: String, count: Int = 1) { actionFailureCounts[action] = max(0, count) }
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
     func lastPreferCacheValue(_ action: String) -> Bool? { lastPreferCacheByAction[action] }
     func connectionAttemptCount() -> Int { connectAttempts }
@@ -323,6 +334,12 @@ actor MockTransport: Transport {
         guard connected, scenario != .offline else { throw TransportError.offline }
         if scenario == .commandFailure {
             let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "PROVIDER_UNAVAILABLE", message: "Mock provider unavailable", retryable: true, details: nil), idempotentReplay: nil)
+            processedCommands[command.commandId] = response
+            return response
+        }
+        if actionFailureCounts[command.action, default: 0] > 0 {
+            actionFailureCounts[command.action, default: 0] -= 1
+            let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "MOCK_ACTION_FAILURE", message: "Mock action failed once", retryable: true, details: nil), idempotentReplay: nil)
             processedCommands[command.commandId] = response
             return response
         }
@@ -572,12 +589,17 @@ actor MockTransport: Transport {
             if let backgroundTaskStatus = sessionBackgroundTaskStatusOverrides[sessionId] {
                 metadata["backgroundTaskStatus"] = backgroundTaskStatus
             }
-            response = success([
+            var statusResponse: [String: JSONValue] = [
                 "sessionId": .string(sessionId),
                 "status": .string(sessionStatusOverrides[sessionId] ?? (active ? "generating" : (stored?.status ?? "idle"))),
                 "browserConnected": .bool(true),
                 "metadata": .object(metadata)
-            ])
+            ]
+            if !sessionsWithoutStatusRevision.contains(sessionId),
+               let updatedAt = sessionStatusRevisionOverrides[sessionId] ?? stored?.updatedAt {
+                statusResponse["updatedAt"] = .string(RemoteAIDate.string(updatedAt))
+            }
+            response = success(statusResponse)
         case "resumeSession", "openConversation", "focusConversation", "registerCurrentPage", "unregisterConversation":
             response = success(["ok": .bool(true)])
         default:

@@ -1165,6 +1165,173 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.suspend()
     }
 
+    func testSessionStatusDecodesOptionalRemoteRevision() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let revision = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date(timeIntervalSince1970: 946_684_800.123))))
+
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: revision)
+        let status = try await mock.sessionStatus(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload"
+        )
+        XCTAssertEqual(status.updatedAt, revision)
+
+        await mock.setSessionStatus("photo-upload", status: "idle")
+        await mock.omitSessionStatusRevision("photo-upload")
+        let legacyStatus = try await mock.sessionStatus(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload"
+        )
+        XCTAssertNil(legacyStatus.updatedAt, "Older Agents without a session revision remain supported")
+        await mock.disconnect()
+    }
+
+    @MainActor
+    func testOrdinaryIdleSyncReloadsHistoryWhenRemoteRevisionChangesDespiteClockSkew() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+
+        let baselineRevision = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date(timeIntervalSince1970: 946_684_800))))
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: baselineRevision)
+        await store.loadSession("photo-upload", remoteRevision: baselineRevision)
+
+        let catalogUpdatedAt = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.updatedAt)
+        let remoteRevision = baselineRevision.addingTimeInterval(-1)
+        XCTAssertGreaterThan(catalogUpdatedAt, remoteRevision, "The test models a PC clock behind the phone's catalog timestamp")
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: remoteRevision)
+        await mock.appendHistoryMessage(ServerMessage(
+            messageId: "idle-revision-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "updated while the chat stayed idle",
+            externalId: nil,
+            createdAt: Date()
+        ))
+        let beforeSync = await mock.actionAttemptCount("loadRecentMessages")
+
+        await store.synchronizeVisibleSession("photo-upload")
+
+        let afterSync = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(afterSync, beforeSync + 1, "An ordinary idle status revision must trigger one authoritative history read")
+        XCTAssertEqual(store.messagesBySession["photo-upload"]?.last?.id, "idle-revision-final")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testLegacyStatusWithoutRevisionKeepsTerminalActivityFallback() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        await store.loadSession("photo-upload")
+
+        let catalogUpdatedAt = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.updatedAt)
+        let remoteActivity = catalogUpdatedAt.addingTimeInterval(30)
+        await mock.setSessionStatus("photo-upload", status: "idle", lastActivityAt: remoteActivity)
+        await mock.omitSessionStatusRevision("photo-upload")
+        await mock.appendHistoryMessage(ServerMessage(
+            messageId: "legacy-status-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "recovered from legacy terminal activity",
+            externalId: nil,
+            createdAt: remoteActivity
+        ))
+        let beforeSync = await mock.actionAttemptCount("loadRecentMessages")
+
+        await store.synchronizeVisibleSession("photo-upload")
+
+        let afterSync = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(afterSync, beforeSync + 1, "An older Agent with no updatedAt must retain its terminal timestamp fallback")
+        XCTAssertEqual(store.messagesBySession["photo-upload"]?.last?.id, "legacy-status-final")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testUnchangedRemoteRevisionDoesNotReloadHistoryAndBusyRevisionStaysProtected() {
+        let revision = Date(timeIntervalSince1970: 946_684_800)
+        XCTAssertFalse(WorkspaceStore.visibleHistoryReloadDue(
+            force: false,
+            hasSuccessfulHistory: true,
+            terminalTransition: false,
+            remoteStatusIsTerminal: true,
+            remoteRevision: revision,
+            lastSuccessfulRemoteRevision: revision
+        ), "An unchanged terminal status revision must not reload history")
+        XCTAssertFalse(WorkspaceStore.visibleHistoryReloadDue(
+            force: false,
+            hasSuccessfulHistory: true,
+            terminalTransition: false,
+            remoteStatusIsTerminal: false,
+            remoteRevision: revision.addingTimeInterval(1),
+            lastSuccessfulRemoteRevision: revision
+        ), "A changed revision must not trigger a history reload while the remote run is busy")
+    }
+
+    @MainActor
+    func testFailedHistoryReadKeepsRemoteRevisionRetryableDespiteNewerCatalogDate() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+
+        let baselineRevision = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date(timeIntervalSince1970: 946_684_800))))
+        let remoteRevision = baselineRevision.addingTimeInterval(-1)
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: baselineRevision)
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        let catalogUpdatedAt = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.updatedAt)
+        XCTAssertGreaterThan(catalogUpdatedAt, baselineRevision)
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: remoteRevision)
+        await mock.appendHistoryMessage(ServerMessage(
+            messageId: "retry-after-history-failure",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "retry recovered this final",
+            externalId: nil,
+            createdAt: Date()
+        ))
+        await mock.failNextAction("loadRecentMessages")
+        let beforeRetry = await mock.actionAttemptCount("loadRecentMessages")
+
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        let afterFailure = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(afterFailure, beforeRetry + 1)
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.id == "retry-after-history-failure" })
+
+        XCTAssertTrue(WorkspaceStore.visibleHistoryReloadDue(
+            force: false,
+            hasSuccessfulHistory: true,
+            terminalTransition: false,
+            remoteStatusIsTerminal: true,
+            remoteRevision: remoteRevision,
+            lastSuccessfulRemoteRevision: baselineRevision
+        ), "A failed read leaves the remote revision unmatched, so the next ordinary idle poll remains due")
+
+        // Force only bypasses the normal idle status-poll interval in this test; the
+        // policy assertion above verifies the failed revision itself stayed due.
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        let afterSuccess = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(afterSuccess, afterFailure + 1, "A failed history read must not advance the successful remote revision watermark")
+        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.id == "retry-after-history-failure" })
+        await store.suspend()
+    }
+
     @MainActor
     func testCreateSessionCannotBeErasedByConcurrentOlderRefresh() async throws {
         let cache = try SQLiteStore.inMemory()

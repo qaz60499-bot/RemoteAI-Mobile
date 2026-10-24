@@ -127,6 +127,7 @@ final class WorkspaceStore: ObservableObject {
     private var sessionLoads = Set<String>()
     private var visibleSessionSyncAt: [String: Date] = [:]
     private var visibleSessionHistorySyncAt: [String: Date] = [:]
+    private var visibleSessionHistoryRemoteRevision: [String: Date] = [:]
     private var systemTransportOfflineChannels = Set<String>()
     private var webProviderIssueMessageBySession: [String: String] = [:]
     private var webProviderIssueStateBySession: [String: String] = [:]
@@ -172,6 +173,20 @@ final class WorkspaceStore: ObservableObject {
     // catalog is still intentionally lazy. Keep that route so opening a conversation
     // can recover its history before the instance/session list has been expanded.
     private var sessionRouteHints: [String: (machineId: String, runtimeId: String, instanceId: String)] = [:]
+
+    static func visibleHistoryReloadDue(
+        force: Bool,
+        hasSuccessfulHistory: Bool,
+        terminalTransition: Bool,
+        remoteStatusIsTerminal: Bool,
+        remoteRevision: Date?,
+        lastSuccessfulRemoteRevision: Date?
+    ) -> Bool {
+        force
+            || !hasSuccessfulHistory
+            || terminalTransition
+            || (remoteStatusIsTerminal && remoteRevision != nil && remoteRevision != lastSuccessfulRemoteRevision)
+    }
 
     private static func pendingCommandPrefix(machineId: String) -> String {
         "pending.command.\(machineId)."
@@ -1319,7 +1334,7 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func loadSession(_ sessionId: String) async {
+    func loadSession(_ sessionId: String, remoteRevision: Date? = nil) async {
         guard sessionLoads.insert(sessionId).inserted else { return }
         defer { sessionLoads.remove(sessionId) }
         let generation = lifecycleGeneration
@@ -1428,6 +1443,11 @@ final class WorkspaceStore: ObservableObject {
             // this visible conversation. Periodic status probes must not immediately
             // reload the same long transcript again unless later evidence invalidates it.
             visibleSessionHistorySyncAt[sessionId] = Date()
+            if let remoteRevision {
+                // This is a remote revision token, not a wall-clock freshness comparison.
+                // Advance it only after loadRecent succeeded so failures remain retryable.
+                visibleSessionHistoryRemoteRevision[sessionId] = remoteRevision
+            }
         } catch {
             guard generation == lifecycleGeneration, !isSuspended else { return }
             let hasUsableLocalHistory = !messagesBySession[sessionId, default: []].isEmpty
@@ -1628,17 +1648,21 @@ final class WorkspaceStore: ObservableObject {
         let remoteStatus = await refreshVisibleSessionStatus(sessionId, rejectEvidencePoorIdle: recoveredLiveActivityDuringSync)
         guard machine.state == .online, !isSuspended else { return }
 
+        let terminalTransition = active
+            && remoteStatus.map { $0.state == .idle || $0.state == .error } == true
         let stillActive = remoteStatus.map { $0.state == .busy || $0.state == .waiting } ?? active
         let remoteEvidenceAt = remoteStatus.flatMap { snapshot in
             [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
         }
-        let terminalTransition = active
-            && remoteStatus.map { $0.state == .idle || $0.state == .error } == true
-        let missedTerminalActivity = !stillActive
+        // Older Agents omit updatedAt. Keep their existing terminal evidence as a
+        // fallback so a newer final/activity timestamp can still recover history.
+        // Current Agents use the exact remote revision path below and never compare
+        // that server timestamp with the phone's catalog Date.
+        let missedTerminalActivity = remoteStatus?.updatedAt == nil
+            && !stillActive
             && remoteEvidenceAt.map { remoteAt in
                 knownActivityBeforeStatus.map { remoteAt > $0 } ?? true
             } == true
-
         // Full history/DOM reconciliation is intentionally evidence-driven. Re-reading
         // and re-merging the latest 50 messages on a fixed 10/30-second timer makes long
         // contexts stutter even though push/cursor state is healthy. Reload only when:
@@ -1646,13 +1670,21 @@ final class WorkspaceStore: ObservableObject {
         // - the prior authoritative history watermark was invalidated (for example a
         //   large cursor fast-forward clears it),
         // - an active run became terminal, so a missed final must be recovered, or
-        // - terminal status proves newer remote activity than the phone has observed.
-        let historyDue = force
-            || visibleSessionHistorySyncAt[sessionId] == nil
-            || terminalTransition
-            || missedTerminalActivity
+        // - status reports a different remote session revision than the last successful
+        //   history read, including an ordinary idle catalog/message update.
+        // updatedAt is a server revision token. The decision compares exact equality
+        // with the revision last covered by a successful loadRecent; the phone and PC
+        // clocks may be skewed, so their Date values are never ordered here.
+        let historyDue = Self.visibleHistoryReloadDue(
+            force: force,
+            hasSuccessfulHistory: visibleSessionHistorySyncAt[sessionId] != nil,
+            terminalTransition: terminalTransition,
+            remoteStatusIsTerminal: remoteStatus.map { $0.state == .idle || $0.state == .error } ?? false,
+            remoteRevision: remoteStatus?.updatedAt,
+            lastSuccessfulRemoteRevision: visibleSessionHistoryRemoteRevision[sessionId]
+        ) || missedTerminalActivity
         if historyDue {
-            await loadSession(sessionId)
+            await loadSession(sessionId, remoteRevision: remoteStatus?.updatedAt)
         }
     }
 
@@ -3481,6 +3513,7 @@ final class WorkspaceStore: ObservableObject {
                     authoritativeResyncProjectAliases.formUnion(projectConversationsByAlias.keys)
                     visibleSessionSyncAt.removeAll()
                     visibleSessionHistorySyncAt.removeAll()
+                    visibleSessionHistoryRemoteRevision.removeAll()
                     metadataRefreshDeferredForDelta = true
                     DiagnosticsLog.shared.record("delta_recovery_fast_forward", fields: [
                         "cursor": String(previousCursor),

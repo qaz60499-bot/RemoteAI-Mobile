@@ -101,6 +101,7 @@ struct RemoteSessionStatusSnapshot: Equatable {
     let sessionId: String
     let state: SessionState
     let browserConnected: Bool?
+    var updatedAt: Date? = nil
     let lastActivityAt: Date?
     let lastProgressStatus: String?
     let lastProgressAt: Date?
@@ -305,6 +306,7 @@ extension Transport {
             sessionId: sessionId,
             state: .server(status),
             browserConnected: object["browserConnected"]?.boolValue,
+            updatedAt: object["updatedAt"]?.stringValue.flatMap(RemoteAIDate.parse),
             lastActivityAt: metadata["lastActivityAt"]?.stringValue.flatMap(RemoteAIDate.parse),
             lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
             lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse),
