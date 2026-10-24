@@ -1201,6 +1201,14 @@ struct ChatView: View {
         lastTranscriptPositionRequest = request
         proxy.scrollTo("bottom", anchor: .bottom)
     }
+    private var transcriptAccessibilityValue: String {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
+            return "followTail=\(shouldFollowTranscriptTail);atBottom=\(isAtBottom)"
+        }
+        #endif
+        return isAtBottom ? "最新消息" : "浏览历史消息"
+    }
     private var isGenerating: Bool {
         if currentSessionState == .error { return false }
         return currentSessionState == .busy
@@ -1307,6 +1315,8 @@ struct ChatView: View {
                             }
                         )
                     }
+                    .accessibilityIdentifier("ChatTranscript")
+                    .accessibilityValue(transcriptAccessibilityValue)
                     .background(Color(.systemGroupedBackground))
                     .coordinateSpace(name: "ChatTranscriptViewport")
                     .background(

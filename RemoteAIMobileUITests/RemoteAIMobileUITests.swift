@@ -268,8 +268,15 @@ final class RemoteAIMobileUITests: XCTestCase {
         XCTAssertTrue(progress.exists, "Typing must finish while the stream is still live")
         print("STREAM_UI chars=\(chars) composerInteractionMs=\((ProcessInfo.processInfo.systemUptime - typingBegan) * 1000)")
         let scrollingBegan = ProcessInfo.processInfo.systemUptime
-        app.swipeDown()
-        app.swipeDown()
+        let transcript = app.scrollViews["ChatTranscript"]
+        XCTAssertTrue(transcript.waitForExistence(timeout: 3))
+        // Target the transcript and record its follow state to distinguish an
+        // ignored gesture from an automatic return to the tail during streaming.
+        print("TRANSCRIPT_UI before=\(transcript.value ?? "nil")")
+        transcript.swipeDown()
+        print("TRANSCRIPT_UI first=\(transcript.value ?? "nil")")
+        transcript.swipeDown()
+        print("TRANSCRIPT_UI second=\(transcript.value ?? "nil")")
         let latest = app.buttons["回到最新消息"]
         XCTAssertTrue(latest.waitForExistence(timeout: 3))
         latest.tap()
