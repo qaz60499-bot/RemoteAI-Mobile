@@ -3,6 +3,36 @@ import XCTest
 
 @MainActor
 final class WebTabTests: XCTestCase {
+    private func inventoryRow(
+        id: Int,
+        title: String,
+        url: String,
+        conversationId: String? = nil,
+        sessionId: String? = nil,
+        projectId: String? = nil,
+        projectAlias: String? = nil
+    ) -> [String: Any] {
+        var row: [String: Any] = [
+            "tabId": id,
+            "title": title,
+            "canonicalUrl": url,
+            "active": true,
+            "loading": false,
+            "kind": "root-conversation",
+            "busy": false
+        ]
+        row["conversationId"] = conversationId
+        row["sessionId"] = sessionId
+        row["projectId"] = projectId
+        row["projectAlias"] = projectAlias
+        return row
+    }
+
+    private func inventoryJSON(_ rows: [[String: Any]]) -> String {
+        let data = try! JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
     private final class TabTransport: Transport {
         var inventoryFails = false
         var inspectionFails = false
@@ -50,6 +80,201 @@ final class WebTabTests: XCTestCase {
         XCTAssertFalse(store.openWebTabsQueryFailed)
         XCTAssertTrue(store.openWebTabs.isEmpty)
         XCTAssertEqual(store.closedWebTabs.first?.sessionId, "webconv-stable-chat")
+    }
+
+    func testAuthoritativeInventoryWithNewTabIDKeepsSameChatOpenWithoutSessionId() async throws {
+        let transport = TabTransport()
+        let chatURL = "https://chatgpt.com/c/stable-chat"
+        transport.rows = inventoryJSON([
+            inventoryRow(id: 502_907_201, title: "Exactline reply", url: chatURL, conversationId: "stable-chat")
+        ])
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+
+        await store.refreshOpenWebTabs()
+        XCTAssertEqual(store.openWebTabs.map(\.id), [502_907_201])
+        XCTAssertNil(store.openWebTabs.first?.sessionId)
+
+        transport.rows = inventoryJSON([
+            inventoryRow(id: 502_907_460, title: "Exactline reply", url: chatURL, conversationId: "stable-chat")
+        ])
+        await store.refreshOpenWebTabs()
+
+        XCTAssertEqual(store.openWebTabs.map(\.id), [502_907_460])
+        XCTAssertTrue(store.closedWebTabs.isEmpty)
+        XCTAssertTrue(store.recentWebTabNotices.isEmpty)
+    }
+
+    func testConfirmedClosureIsRetainedUntilSameConversationReopensWithNewTabID() async throws {
+        let transport = TabTransport()
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+
+        await store.refreshOpenWebTabs()
+        transport.rows = "[]"
+        await store.refreshOpenWebTabs()
+        XCTAssertEqual(store.closedWebTabs.map(\.id), [7])
+
+        transport.rows = inventoryJSON([
+            inventoryRow(
+                id: 460,
+                title: "Existing Chat",
+                url: "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef/c/stable-chat",
+                conversationId: "stable-chat",
+                projectAlias: "g-p-0123456789abcdef0123456789abcdef"
+            )
+        ])
+        await store.refreshOpenWebTabs()
+
+        XCTAssertEqual(store.openWebTabs.map(\.id), [460])
+        XCTAssertTrue(store.closedWebTabs.isEmpty)
+        XCTAssertFalse(store.recentWebTabNotices.contains(where: { $0.isClosure }))
+    }
+
+    func testSameConversationInDifferentKnownProjectsRemainsASeparateClosedTab() async throws {
+        let transport = TabTransport()
+        let chatURL = "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef/c/stable-chat"
+        transport.rows = inventoryJSON([
+            inventoryRow(
+                id: 7,
+                title: "Project A chat",
+                url: chatURL,
+                conversationId: "stable-chat",
+                projectId: "project-a",
+                projectAlias: "g-p-0123456789abcdef0123456789abcdef"
+            )
+        ])
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+
+        transport.rows = inventoryJSON([
+            inventoryRow(
+                id: 460,
+                title: "Project B chat",
+                url: chatURL,
+                conversationId: "stable-chat",
+                projectId: "project-b",
+                projectAlias: "g-p-0123456789abcdef0123456789abcdef"
+            )
+        ])
+        await store.refreshOpenWebTabs()
+
+        XCTAssertEqual(store.openWebTabs.map(\.id), [460])
+        XCTAssertEqual(store.closedWebTabs.map(\.id), [7])
+        XCTAssertEqual(store.closedWebTabs.first?.title, "Project A chat")
+    }
+
+    func testDifferentConversationIdentityInSameProjectIsNotMerged() async throws {
+        let transport = TabTransport()
+        let projectAlias = "g-p-0123456789abcdef0123456789abcdef"
+        transport.rows = inventoryJSON([
+            inventoryRow(
+                id: 7,
+                title: "First chat",
+                url: "https://chatgpt.com/g/\(projectAlias)/c/first-chat",
+                conversationId: "first-chat",
+                projectAlias: projectAlias
+            )
+        ])
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+
+        transport.rows = inventoryJSON([
+            inventoryRow(
+                id: 460,
+                title: "Second chat",
+                url: "https://chatgpt.com/g/\(projectAlias)/c/second-chat",
+                conversationId: "second-chat",
+                projectAlias: projectAlias
+            )
+        ])
+        await store.refreshOpenWebTabs()
+
+        XCTAssertEqual(store.openWebTabs.map(\.id), [460])
+        XCTAssertEqual(store.closedWebTabs.map(\.id), [7])
+    }
+
+    func testAliasOnlyAndProjectIdOnlyMetadataMatchTheSameProject() async throws {
+        let transport = TabTransport()
+        let chatURL = "https://chatgpt.com/c/stable-chat"
+        transport.rows = inventoryJSON([
+            inventoryRow(
+                id: 7,
+                title: "Project chat",
+                url: chatURL,
+                conversationId: "stable-chat",
+                projectAlias: "g-p-0123456789abcdef0123456789abcdef"
+            )
+        ])
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+
+        transport.rows = inventoryJSON([
+            inventoryRow(
+                id: 460,
+                title: "Project chat",
+                url: chatURL,
+                conversationId: "stable-chat",
+                projectId: "01234567-89ab-cdef-0123-456789abcdef"
+            )
+        ])
+        await store.refreshOpenWebTabs()
+
+        XCTAssertEqual(store.openWebTabs.map(\.id), [460])
+        XCTAssertTrue(store.closedWebTabs.isEmpty)
+    }
+
+    func testCanonicalProjectURLPreventsMergingDifferentProjectsWithoutMetadata() async throws {
+        let transport = TabTransport()
+        transport.rows = inventoryJSON([
+            inventoryRow(
+                id: 7,
+                title: "Project A chat",
+                url: "https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef/c/stable-chat",
+                conversationId: "stable-chat"
+            )
+        ])
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+
+        transport.rows = inventoryJSON([
+            inventoryRow(
+                id: 460,
+                title: "Project B chat",
+                url: "https://chatgpt.com/g/g-p-fedcba9876543210fedcba9876543210/c/stable-chat",
+                conversationId: "stable-chat"
+            )
+        ])
+        await store.refreshOpenWebTabs()
+
+        XCTAssertEqual(store.openWebTabs.map(\.id), [460])
+        XCTAssertEqual(store.closedWebTabs.map(\.id), [7])
+    }
+
+    func testInventoryFailurePreservesPreviouslyConfirmedClosedCards() async throws {
+        let transport = TabTransport()
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+
+        transport.rows = "[]"
+        await store.refreshOpenWebTabs()
+        XCTAssertEqual(store.closedWebTabs.map(\.id), [7])
+
+        transport.rows = inventoryJSON([
+            inventoryRow(id: 8, title: "Another chat", url: "https://chatgpt.com/c/other-chat", conversationId: "other-chat")
+        ])
+        await store.refreshOpenWebTabs()
+        transport.inventoryFails = true
+        await store.refreshOpenWebTabs()
+
+        XCTAssertTrue(store.openWebTabsQueryFailed)
+        XCTAssertEqual(store.openWebTabs.map(\.id), [8])
+        XCTAssertEqual(store.closedWebTabs.map(\.id), [7])
     }
 
     func testConcurrentRefreshesIssueOneInventoryRequest() async throws {

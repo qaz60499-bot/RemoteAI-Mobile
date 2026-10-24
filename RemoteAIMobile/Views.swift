@@ -202,6 +202,7 @@ struct InstanceView: View {
     @State private var enteredWebProject: WebProjectDescriptor?
     @State private var openEnteredWebProject = false
     @State private var isWebTabManagementExpanded = false
+    @State private var isClosedWebTabsExpanded = false
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
     private var isAntigravity: Bool { runtime.id == "runtime.antigravity" }
     private var supportsProjects: Bool { isChatGPTWeb || isAntigravity }
@@ -406,7 +407,23 @@ struct InstanceView: View {
                         if let checkedAt = store.lastOpenWebTabsCheckAt {
                             FixedTimestamp(date: checkedAt, prefix: "最后成功读取标签列表")
                         }
-                        ForEach(store.closedWebTabs) { tab in
+                        if !store.closedWebTabs.isEmpty {
+                            HStack {
+                                Text("最近已关闭（\(store.closedWebTabs.count)）")
+                                    .font(.caption.weight(.semibold))
+                                Spacer()
+                                if store.closedWebTabs.count > 3 {
+                                    Button(isClosedWebTabsExpanded ? "收起" : "显示全部") {
+                                        withAnimation(.easeInOut(duration: 0.18)) {
+                                            isClosedWebTabsExpanded.toggle()
+                                        }
+                                    }
+                                    .font(.caption)
+                                }
+                            }
+                        }
+                        ForEach(Array(store.closedWebTabs.prefix(isClosedWebTabsExpanded ? store.closedWebTabs.count : 3).enumerated()), id: \.offset) { item in
+                            let tab = item.element
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("标签已关闭：\(tab.title)").font(.caption)
                                 if let sessionId = tab.sessionId {
@@ -428,8 +445,8 @@ struct InstanceView: View {
                                 }
                             }
                         }
-                        ForEach(store.recentWebTabNotices, id: \.self) { notice in
-                            Text(notice).font(.caption2).foregroundColor(.secondary)
+                        ForEach(Array(store.recentWebTabNotices.prefix(2))) { notice in
+                            Text(notice.text).font(.caption2).foregroundColor(.secondary)
                         }
                         if let error = store.errors["web.tabs"] {
                             ErrorBanner(text: error) { store.clearError(sessionId: "web.tabs") }

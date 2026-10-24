@@ -1,6 +1,32 @@
 import Foundation
 import SwiftUI
 
+private enum OpenWebTabDurableIdentity {
+    case chat(conversation: String, project: OpenWebTabProjectIdentity?)
+    case project(OpenWebTabProjectIdentity)
+}
+
+private struct OpenWebTabProjectIdentity {
+    let projectIdTokens: Set<String>
+    let projectAliasTokens: Set<String>
+
+    var allTokens: Set<String> { projectIdTokens.union(projectAliasTokens) }
+}
+
+struct WebTabNotice: Identifiable, Equatable {
+    let id: UUID
+    let closedTab: OpenWebTab?
+    let text: String
+    let isClosure: Bool
+
+    init(closedTab: OpenWebTab? = nil, text: String, isClosure: Bool = false) {
+        self.id = UUID()
+        self.closedTab = closedTab
+        self.text = text
+        self.isClosure = isClosure
+    }
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     @Published var machine = MachineMetadata(id: "my-pc", name: "My PC", state: .connecting)
@@ -21,7 +47,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var webTabDiagnosesById: [Int: WebTabDiagnosis] = [:]
     @Published private(set) var webTabLastSuccessfulCheckAt: [Int: Date] = [:]
     @Published var webTabActionNotesById: [Int: String] = [:]
-    @Published var recentWebTabNotices: [String] = []
+    @Published var recentWebTabNotices: [WebTabNotice] = []
     private var explicitlyClosedWebTabIDs = Set<Int>()
     private var inspectingWebTabIds = Set<Int>()
     private var webTabInspectionTask: Task<Void, Never>?
@@ -467,20 +493,38 @@ final class WorkspaceStore: ObservableObject {
             // Only an authoritative Chrome inventory may establish disappearance.
             // A network/bridge error never means a tab was closed.
             if hasLoadedOpenWebTabs {
-                let currentIDs = Set(tabs.map(\.id))
-                for old in openWebTabs where !currentIDs.contains(old.id) {
-                    closedWebTabs.removeAll { $0.id == old.id }
+                for old in openWebTabs {
+                    if let current = tabs.first(where: { openWebTabsRepresentSameTab(old, $0) }) {
+                        if current.id != old.id { explicitlyClosedWebTabIDs.remove(old.id) }
+                        continue
+                    }
+                    if let identity = durableOpenWebTabIdentity(old) {
+                        closedWebTabs.removeAll { sameDurableOpenWebTabIdentity(identity, durableOpenWebTabIdentity($0)) }
+                    }
                     closedWebTabs.insert(old, at: 0)
                     let intentional = explicitlyClosedWebTabIDs.remove(old.id) != nil
                     let text = intentional
                         ? "已关闭：\(old.title)（只关闭网页，未删除历史）"
                         : "标签页已消失：\(old.title)；未收到本手机关闭确认，可能在电脑端关闭或被自动回收"
-                    recentWebTabNotices.insert(text, at: 0)
+                    recentWebTabNotices.removeAll { notice in
+                        guard notice.isClosure, let noticeTab = notice.closedTab else { return false }
+                        return sameDurableOpenWebTabIdentity(durableOpenWebTabIdentity(noticeTab), durableOpenWebTabIdentity(old))
+                    }
+                    recentWebTabNotices.insert(WebTabNotice(closedTab: old, text: text, isClosure: true), at: 0)
                 }
                 recentWebTabNotices = Array(recentWebTabNotices.prefix(5))
             }
-            closedWebTabs.removeAll { old in tabs.contains { $0.id == old.id || (old.sessionId != nil && $0.sessionId == old.sessionId) } }
-            closedWebTabs = Array(closedWebTabs.prefix(20))
+            // A Chrome restart may assign a new tab ID to the same conversation. Remove
+            // its stale closed card by durable conversation/project identity as soon as
+            // that identity reappears in an authoritative inventory.
+            for old in closedWebTabs where tabs.contains(where: { openWebTabsRepresentSameTab(old, $0) }) {
+                recentWebTabNotices.removeAll { notice in
+                    guard notice.isClosure, let noticeTab = notice.closedTab else { return false }
+                    return sameDurableOpenWebTabIdentity(durableOpenWebTabIdentity(noticeTab), durableOpenWebTabIdentity(old))
+                }
+            }
+            closedWebTabs.removeAll { old in tabs.contains { openWebTabsRepresentSameTab(old, $0) } }
+            deduplicateClosedWebTabs()
             for old in openWebTabs where !tabs.contains(where: { $0.id == old.id && $0.canonicalUrl == old.canonicalUrl }) {
                 webTabDiagnosesById.removeValue(forKey: old.id)
                 webTabLastSuccessfulCheckAt.removeValue(forKey: old.id)
@@ -512,6 +556,101 @@ final class WorkspaceStore: ObservableObject {
                 errors["web.tabs"] = error.localizedDescription
             }
         }
+    }
+
+    private func openWebTabsRepresentSameTab(_ left: OpenWebTab, _ right: OpenWebTab) -> Bool {
+        let leftIdentity = durableOpenWebTabIdentity(left)
+        let rightIdentity = durableOpenWebTabIdentity(right)
+        if let leftIdentity, let rightIdentity {
+            return sameDurableOpenWebTabIdentity(leftIdentity, rightIdentity)
+        }
+        // A tab ID is reliable only while at least one side has no durable identity.
+        // If both IDs were reused for different known chats/projects, the identities
+        // above take precedence and the old page is correctly retained as closed.
+        return left.id == right.id
+    }
+
+    private func deduplicateClosedWebTabs() {
+        var unique: [OpenWebTab] = []
+        for tab in closedWebTabs {
+            if let identity = durableOpenWebTabIdentity(tab),
+               unique.contains(where: { sameDurableOpenWebTabIdentity(identity, durableOpenWebTabIdentity($0)) }) {
+                continue
+            }
+            // Anonymous root pages have no stable key; retain them independently.
+            unique.append(tab)
+        }
+        closedWebTabs = Array(unique.prefix(20))
+    }
+
+    private func sameDurableOpenWebTabIdentity(
+        _ left: OpenWebTabDurableIdentity?,
+        _ right: OpenWebTabDurableIdentity?
+    ) -> Bool {
+        guard let left, let right else { return false }
+        switch (left, right) {
+        case let (.chat(leftConversation, leftProject), .chat(rightConversation, rightProject)):
+            return leftConversation == rightConversation && projectsAreCompatible(leftProject, rightProject)
+        case let (.project(leftProject), .project(rightProject)):
+            return projectsAreCompatible(leftProject, rightProject)
+        default:
+            return false
+        }
+    }
+
+    private func projectsAreCompatible(_ left: OpenWebTabProjectIdentity?, _ right: OpenWebTabProjectIdentity?) -> Bool {
+        guard let left, let right else { return true }
+        // Check each identifier that both sides expose. A matching alias must not hide
+        // a contradictory project ID (or vice versa).
+        if !left.projectIdTokens.isEmpty, !right.projectIdTokens.isEmpty,
+           left.projectIdTokens.isDisjoint(with: right.projectIdTokens) { return false }
+        if !left.projectAliasTokens.isEmpty, !right.projectAliasTokens.isEmpty,
+           left.projectAliasTokens.isDisjoint(with: right.projectAliasTokens) { return false }
+        // When one side exposes only an ID and the other only an alias, match only if
+        // their normalized forms (including a g-p UUID base) prove the same project.
+        let hasCommonField = (!left.projectIdTokens.isEmpty && !right.projectIdTokens.isEmpty)
+            || (!left.projectAliasTokens.isEmpty && !right.projectAliasTokens.isEmpty)
+        return hasCommonField || !left.allTokens.isDisjoint(with: right.allTokens)
+    }
+
+    private func durableOpenWebTabIdentity(_ tab: OpenWebTab) -> OpenWebTabDurableIdentity? {
+        let projectIdTokens = openWebTabProjectTokens(tab.projectId)
+        let projectAlias = normalizedWebConversationAlias(tab.projectAlias)
+            ?? webProjectAlias(from: tab.canonicalUrl)
+        let projectAliasTokens = openWebTabProjectTokens(projectAlias)
+        let project = (projectIdTokens.isEmpty && projectAliasTokens.isEmpty)
+            ? nil
+            : OpenWebTabProjectIdentity(projectIdTokens: projectIdTokens, projectAliasTokens: projectAliasTokens)
+
+        if tab.isChat || tab.conversationId != nil || webConversationAlias(from: tab.canonicalUrl) != nil {
+            guard let conversation = normalizedWebConversationAlias(tab.conversationId)
+                    ?? webConversationAlias(from: tab.canonicalUrl) else { return nil }
+            return .chat(conversation: conversation, project: project)
+        }
+        if let project { return .project(project) }
+        // A raw/root page without a durable project identity must never be merged with
+        // another anonymous page merely because their titles or URLs happen to match.
+        return nil
+    }
+
+    private func webProjectAlias(from canonicalURL: String?) -> String? {
+        guard let canonicalURL, let url = URL(string: canonicalURL) else { return nil }
+        let parts = url.path.split(separator: "/").map(String.init)
+        guard let marker = parts.lastIndex(of: "g"), parts.indices.contains(marker + 1),
+              let alias = normalizedWebConversationAlias(parts[marker + 1]),
+              alias.hasPrefix("g-p-") else { return nil }
+        return alias
+    }
+
+    private func openWebTabProjectTokens(_ raw: String?) -> Set<String> {
+        guard let normalized = normalizedWebConversationAlias(raw) else { return [] }
+        var tokens: Set<String> = [normalized]
+        if let projectId = webProjectBaseId(from: normalized) { tokens.insert(projectId) }
+        let compactUUID = normalized.replacingOccurrences(of: "-", with: "")
+        if compactUUID.count == 32, compactUUID.allSatisfy({ $0.isHexDigit }) {
+            tokens.insert(compactUUID)
+        }
+        return tokens
     }
 
     func inspectOpenWebTab(_ tab: OpenWebTab) async {
@@ -567,7 +706,10 @@ final class WorkspaceStore: ObservableObject {
         guard machine.state == .online, !isSuspended else { return }
         do {
             try await transport.reopenVerifiedWebConversation(machineId: machine.id, sessionId: sessionId)
-            recentWebTabNotices.insert("已请求重新打开原 Chat（不是新建 Chat）；请检查 Chrome 页面是否恢复。", at: 0)
+            let text = "已请求重新打开原 Chat（不是新建 Chat）；请检查 Chrome 页面是否恢复。"
+            let closedTab = closedWebTabs.first(where: { $0.sessionId == sessionId })
+            recentWebTabNotices.removeAll { !$0.isClosure && $0.text == text }
+            recentWebTabNotices.insert(WebTabNotice(closedTab: closedTab, text: text), at: 0)
             recentWebTabNotices = Array(recentWebTabNotices.prefix(5))
             await refreshOpenWebTabs()
         } catch {
