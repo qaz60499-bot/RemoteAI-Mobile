@@ -94,6 +94,7 @@ struct DiagnosticsView: View {
     @ObservedObject private var log = DiagnosticsLog.shared
     @State private var copied = false
     @State private var exporting = false
+    @State private var checkingIntegrity = false
     @State private var exportItem: DiagnosticExportItem?
     @State private var exportError: String?
 
@@ -107,6 +108,16 @@ struct DiagnosticsView: View {
                 }
                 .font(.caption)
                 .padding()
+                Button(checkingIntegrity ? "校验中…" : "校验最近 Chat") {
+                    guard !checkingIntegrity else { return }
+                    checkingIntegrity = true
+                    Task { @MainActor in
+                        await store.diagnoseRecentChatIntegrity()
+                        checkingIntegrity = false
+                    }
+                }
+                .disabled(checkingIntegrity || store.recentVisibleSessionIdForDiagnostics == nil)
+                .padding(.bottom, 8)
                 Divider()
                 ScrollView {
                     Text(log.text)

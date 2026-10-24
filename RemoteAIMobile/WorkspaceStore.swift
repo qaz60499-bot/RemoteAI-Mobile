@@ -33,6 +33,9 @@ final class WorkspaceStore: ObservableObject {
     @Published var runtimes: [RuntimeDescriptor] = []
     @Published var instances: [InstanceDescriptor] = []
     @Published var sessions: [SessionDescriptor] = []
+    /// The most recently opened/synchronized visible Chat, kept only in memory so a
+    /// user-requested integrity snapshot has a single explicit scope.
+    @Published private(set) var recentVisibleSessionIdForDiagnostics: String?
     @Published private(set) var codexSessionLimits: [String: Int] = [:]
     @Published private(set) var codexSessionsMayHaveMore: [String: Bool] = [:]
     @Published var messagesBySession: [String: [ChatMessage]] = [:]
@@ -1477,6 +1480,9 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func loadSession(_ sessionId: String, remoteRevision: Date? = nil) async {
+        if recentVisibleSessionIdForDiagnostics != sessionId {
+            recentVisibleSessionIdForDiagnostics = sessionId
+        }
         guard sessionLoads.insert(sessionId).inserted else { return }
         defer { sessionLoads.remove(sessionId) }
         let generation = lifecycleGeneration
@@ -1603,6 +1609,71 @@ final class WorkspaceStore: ObservableObject {
                 return
             }
             errors[sessionId] = error.localizedDescription
+        }
+    }
+
+    /// Emit a bounded, explicit comparison of the last 100 loaded transcript rows and
+    /// the same session's SQLite cache. This method reads no transport or source body
+    /// into diagnostics; raw text is used only transiently for local hashing.
+    func diagnoseRecentChatIntegrity() async {
+        guard let sessionId = recentVisibleSessionIdForDiagnostics else {
+            DiagnosticsLog.shared.record("chat_integrity_snapshot", fields: [
+                "layer": "presentation-model",
+                "count": "0",
+                "observedAt": ISO8601DateFormatter().string(from: Date()),
+                "status": "no_visible_session",
+            ], level: "WARN")
+            return
+        }
+
+        let observedAt = ISO8601DateFormatter().string(from: Date())
+        let modelInputs = Array(messagesBySession[sessionId, default: []].suffix(100))
+            .map(ChatMessageIntegrityInput.init)
+        let modelTask = Task.detached(priority: .utility) {
+            ChatMessageIntegrityDigest.snapshot(modelInputs, layer: "presentation-model")
+        }
+
+        do {
+            let cachedMessages = try await cache.recentMessages(sessionId: sessionId, limit: 100)
+            let cacheInputs = cachedMessages
+                .filter { $0.sessionId == sessionId }
+                .suffix(100)
+                .map(ChatMessageIntegrityInput.init)
+            let cacheTask = Task.detached(priority: .utility) {
+                ChatMessageIntegrityDigest.snapshot(Array(cacheInputs), layer: "cache")
+            }
+            let modelRows = await modelTask.value
+            let cacheRows = await cacheTask.value
+            recordChatIntegrityRows(modelRows, sessionId: sessionId, layer: "presentation-model", observedAt: observedAt)
+            recordChatIntegrityRows(cacheRows, sessionId: sessionId, layer: "cache", observedAt: observedAt)
+        } catch {
+            let modelRows = await modelTask.value
+            recordChatIntegrityRows(modelRows, sessionId: sessionId, layer: "presentation-model", observedAt: observedAt)
+            DiagnosticsLog.shared.record("chat_integrity_snapshot", fields: [
+                "sessionId": sessionId,
+                "layer": "cache",
+                "count": "0",
+                "observedAt": observedAt,
+                "status": "read_failed",
+            ], level: "WARN")
+        }
+    }
+
+    private func recordChatIntegrityRows(
+        _ rows: [ChatMessageIntegrityRow],
+        sessionId: String,
+        layer: String,
+        observedAt: String
+    ) {
+        DiagnosticsLog.shared.record("chat_integrity_snapshot", fields: [
+            "sessionId": sessionId,
+            "layer": layer,
+            "count": String(rows.count),
+            "observedAt": observedAt,
+            "status": "ok",
+        ])
+        for row in rows {
+            DiagnosticsLog.shared.record("chat_integrity_row", fields: row.diagnosticFields)
         }
     }
 
@@ -1749,6 +1820,9 @@ final class WorkspaceStore: ObservableObject {
     /// poll more frequently so a provider final/progress state appears without requiring
     /// the user to leave and reopen the chat.
     func synchronizeVisibleSession(_ sessionId: String, force: Bool = false) async {
+        if recentVisibleSessionIdForDiagnostics != sessionId {
+            recentVisibleSessionIdForDiagnostics = sessionId
+        }
         guard machine.state == .online, !isSuspended else { return }
         guard !sessionLoads.contains(sessionId) else { return }
 

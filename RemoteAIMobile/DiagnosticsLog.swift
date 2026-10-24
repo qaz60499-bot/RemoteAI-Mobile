@@ -42,6 +42,78 @@ private struct RemoteAIDiagnosticPerformanceSummary: Codable, Hashable {
     let slowOperationCount: Int
 }
 
+/// A privacy-bounded row used only when a user explicitly requests a transcript
+/// integrity snapshot. The source text is carried only in the short-lived input and
+/// never in the result or diagnostic fields.
+struct ChatMessageIntegrityInput: Sendable {
+    let rowId: String
+    let sessionId: String
+    let role: String
+    let sequence: Int64?
+    let text: String
+
+    init(_ message: ChatMessage) {
+        rowId = message.id
+        sessionId = message.sessionId
+        role = message.role.rawValue
+        sequence = message.sequence
+        text = message.text
+    }
+}
+
+struct ChatMessageIntegrityRow: Equatable, Sendable {
+    let rowId: String
+    let sessionId: String
+    let role: String
+    let sequence: Int64?
+    let utf16Length: Int
+    let utf8Bytes: Int
+    let sha256: String
+    let layer: String
+    let status: String
+
+    var diagnosticFields: [String: String] {
+        [
+            "rowId": rowId,
+            "sessionId": sessionId,
+            "role": role,
+            "sequence": sequence.map { String($0) } ?? "none",
+            "utf16Length": String(utf16Length),
+            "utf8Bytes": String(utf8Bytes),
+            "sha256": sha256,
+            "layer": layer,
+            "status": status,
+        ]
+    }
+}
+
+enum ChatMessageIntegrityDigest {
+    /// Hash the exact UTF-8 encoding of ChatMessage.text. Callers bound the rows before
+    /// invoking this function so work cannot unexpectedly grow with other sessions.
+    static func snapshot(
+        _ inputs: [ChatMessageIntegrityInput],
+        layer: String
+    ) -> [ChatMessageIntegrityRow] {
+        inputs.map { input in
+            let data = Data(input.text.utf8)
+            let digest = SHA256.hash(data: data)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            return ChatMessageIntegrityRow(
+                rowId: input.rowId,
+                sessionId: input.sessionId,
+                role: input.role,
+                sequence: input.sequence,
+                utf16Length: input.text.utf16.count,
+                utf8Bytes: data.count,
+                sha256: digest,
+                layer: layer,
+                status: "observed"
+            )
+        }
+    }
+}
+
 private enum RemoteAIDiagnosticRedactor {
     static let sensitiveKeyFragments = [
         "authorization", "api_key", "apikey", "api-key", "token", "cookie", "secret", "password",
@@ -156,7 +228,8 @@ final class DiagnosticsLog: ObservableObject {
         "canonicalequal", "firstvisiblems", "firstdeltaafterstreaminitms", "visibleupdateintervalp50ms",
         "visibleupdateintervalp95ms", "flushtoframep95ms", "mainthreadstallsover100ms", "reconnectattempt",
         "agentconnected", "browserconnected", "storagedegraded", "presentationcoalesced",
-        "identitydigest", "orderdigest"
+        "identitydigest", "orderdigest",
+        "rowid", "sessionid", "role", "utf16length", "utf8bytes", "sha256", "layer", "status", "observedat"
     ]
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
