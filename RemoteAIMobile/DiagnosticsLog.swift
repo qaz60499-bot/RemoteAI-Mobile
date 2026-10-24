@@ -294,6 +294,11 @@ final class DiagnosticsLog: ObservableObject {
             parts.append("\(safeKey)=\(safeValue)")
         }
         let summary = RemoteAIDiagnosticRedactor.text(parts.joined(separator: " "), limit: 1024)
+        if record.event == "chat_integrity_row" || record.event == "chat_integrity_snapshot" {
+            // The user explicitly requested this audit snapshot; keep its allowlisted metadata visible at the default log level.
+            logger.notice("\(summary, privacy: .public)")
+            return
+        }
         switch record.level {
         case "ERROR": logger.error("\(summary, privacy: .public)")
         case "WARN": logger.warning("\(summary, privacy: .public)")
