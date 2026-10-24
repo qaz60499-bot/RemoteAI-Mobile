@@ -4019,6 +4019,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let mock = MockTransport(historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
+        store.recentSystemNotice = nil
         let now = Date()
 
         await mock.injectEvent(RemoteEvent(
@@ -4048,11 +4049,42 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
         XCTAssertEqual(store.errors["photo-upload"], "电脑端 ChatGPT 网页连接已中断；Windows Agent 仍在线，RemoteAI 正在等待 ChatGPT 恢复。")
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "An idle provider outage must not look like an active generation")
+        let aIssue = try XCTUnwrap(store.systemNotice(forSessionId: "photo-upload"))
+        XCTAssertEqual(aIssue.scope, .session("photo-upload"))
+        XCTAssertNil(store.systemNotice(forSessionId: "photo-ios"), "A's provider outage must not appear in B")
+        XCTAssertNil(store.recentSystemNotice, "A providerSurface event must not write the global notice")
 
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
             eventId: UUID(),
             sequence: 1202,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-ios",
+            type: "SESSION_STATUS",
+            payload: [
+                "providerSurface": .bool(true),
+                "state": .string("degraded"),
+                "providerState": .string("connection-lost"),
+                "code": .string("PROVIDER_UNAVAILABLE"),
+                "message": .string("B 的 ChatGPT 网页暂不可用。"),
+                "retryable": .bool(true),
+                "at": .string(RemoteAIDate.string(now))
+            ],
+            createdAt: now.addingTimeInterval(0.5)
+        ), deliverLive: true)
+        for _ in 0..<80 where store.errors["photo-ios"] == nil {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let bIssue = try XCTUnwrap(store.systemNotice(forSessionId: "photo-ios"))
+        XCTAssertEqual(bIssue.scope, .session("photo-ios"))
+        XCTAssertTrue(bIssue.text.contains("B 的 ChatGPT 网页"))
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1203,
             machineId: "my-pc",
             runtimeId: "runtime.web",
             instanceId: "photo",
@@ -4072,8 +4104,34 @@ final class RemoteAIMobileTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertNil(store.errors["photo-upload"])
-        XCTAssertTrue(store.recentSystemNotice?.contains("ChatGPT 网页已恢复") == true)
+        XCTAssertTrue(store.systemNotice(forSessionId: "photo-upload")?.text.contains("ChatGPT 网页已恢复") == true)
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-ios")?.id, bIssue.id, "A's provider recovery must not clear B's outage")
+        XCTAssertEqual(store.errors["photo-ios"], "B 的 ChatGPT 网页暂不可用。")
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1204,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-ios",
+            type: "SESSION_STATUS",
+            payload: [
+                "providerSurface": .bool(true),
+                "state": .string("online"),
+                "providerState": .string("online"),
+                "recovered": .bool(true),
+                "at": .string(RemoteAIDate.string(now.addingTimeInterval(2)))
+            ],
+            createdAt: now.addingTimeInterval(2)
+        ), deliverLive: true)
+        for _ in 0..<80 where store.errors["photo-ios"] != nil {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNil(store.errors["photo-ios"])
+        XCTAssertTrue(store.systemNotice(forSessionId: "photo-ios")?.text.contains("ChatGPT 网页已恢复") == true)
         await store.suspend()
     }
 
@@ -4101,10 +4159,10 @@ final class RemoteAIMobileTests: XCTestCase {
             ],
             createdAt: now
         ), deliverLive: true)
-        for _ in 0..<80 where store.recentSystemNotice?.contains("不会跟着串线") != true {
+        for _ in 0..<80 where store.systemNotice(forSessionId: "photo-upload")?.text.contains("不会跟着串线") != true {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertTrue(store.recentSystemNotice?.contains("不会跟着串线") == true)
+        XCTAssertTrue(store.systemNotice(forSessionId: "photo-upload")?.text.contains("不会跟着串线") == true)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
 
         await mock.injectEvent(RemoteEvent(
@@ -4122,10 +4180,117 @@ final class RemoteAIMobileTests: XCTestCase {
             ],
             createdAt: now.addingTimeInterval(1)
         ), deliverLive: true)
-        for _ in 0..<80 where store.recentSystemNotice?.contains("已重新绑定") != true {
+        for _ in 0..<80 where store.systemNotice(forSessionId: "photo-upload")?.text.contains("已重新绑定") != true {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertTrue(store.recentSystemNotice?.contains("已重新绑定") == true)
+        XCTAssertTrue(store.systemNotice(forSessionId: "photo-upload")?.text.contains("已重新绑定") == true)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testWebSystemNoticesStayScopedAndDismissOnlyDisplayedScope() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        store.recentSystemNotice = nil
+        let now = Date()
+
+        func bindingEvent(sequence: Int64, sessionId: String, reason: String, activeTabId: Int? = nil) -> RemoteEvent {
+            var payload: [String: JSONValue] = ["reason": .string(reason)]
+            if let activeTabId { payload["activeTabId"] = .number(Double(activeTabId)) }
+            return RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: sequence,
+                machineId: "my-pc",
+                runtimeId: "runtime.web",
+                instanceId: "photo",
+                sessionId: sessionId,
+                type: "WEB_BINDING_CHANGED",
+                payload: payload,
+                createdAt: now.addingTimeInterval(Double(sequence - 1200))
+            )
+        }
+
+        await mock.injectEvent(bindingEvent(sequence: 1201, sessionId: "photo-upload", reason: "tabClosed"), deliverLive: true)
+        for _ in 0..<80 where store.systemNotice(forSessionId: "photo-upload")?.text.contains("标签页已关闭") != true {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let aClosed = try XCTUnwrap(store.systemNotice(forSessionId: "photo-upload"))
+        XCTAssertEqual(aClosed.scope, .session("photo-upload"))
+        XCTAssertTrue(aClosed.text.contains("标签页已关闭"))
+        XCTAssertNil(store.systemNotice(forSessionId: "photo-ios"), "A's closed-tab warning must not appear in B")
+        XCTAssertNil(store.recentSystemNotice, "A session binding event must not write the global notice")
+
+        await mock.injectEvent(bindingEvent(sequence: 1202, sessionId: "photo-ios", reason: "tabClosed"), deliverLive: true)
+        for _ in 0..<80 where store.systemNotice(forSessionId: "photo-ios")?.text.contains("标签页已关闭") != true {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let bClosed = try XCTUnwrap(store.systemNotice(forSessionId: "photo-ios"))
+        XCTAssertEqual(bClosed.scope, .session("photo-ios"))
+        XCTAssertTrue(bClosed.text.contains("标签页已关闭"))
+
+        await store.loadSession("photo-upload")
+        let aRecoveredFromHistory = try XCTUnwrap(store.systemNotice(forSessionId: "photo-upload"))
+        XCTAssertTrue(aRecoveredFromHistory.text.contains("已重新绑定"), "A's successful history read should clear its stale close warning")
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-ios")?.id, bClosed.id, "A's history recovery must not clear B's notice")
+
+        await mock.injectEvent(bindingEvent(sequence: 1203, sessionId: "photo-upload", reason: "tabClosed"), deliverLive: true)
+        for _ in 0..<80 where store.systemNotice(forSessionId: "photo-upload")?.text.contains("标签页已关闭") != true {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        await mock.injectEvent(bindingEvent(sequence: 1204, sessionId: "photo-upload", reason: "registeredPageNavigated", activeTabId: 574), deliverLive: true)
+        for _ in 0..<80 where store.systemNotice(forSessionId: "photo-upload")?.text.contains("已重新绑定") != true {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let aRebound = try XCTUnwrap(store.systemNotice(forSessionId: "photo-upload"))
+        XCTAssertTrue(aRebound.text.contains("已重新绑定"))
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-ios")?.id, bClosed.id, "A's rebind must not clear B's notice")
+        store.clearSystemNotice(aRebound)
+        XCTAssertNil(store.systemNotice(forSessionId: "photo-upload"))
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-ios")?.id, bClosed.id, "Dismissing A must leave B's notice intact")
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1205,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "TRANSPORT_STATUS",
+            payload: ["channel": .string("browser-bridge"), "state": .string("offline")],
+            createdAt: now.addingTimeInterval(5)
+        ), deliverLive: true)
+        for _ in 0..<80 where store.recentSystemNotice?.contains("Browser Bridge") != true {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let browserBridgeNotice = try XCTUnwrap(store.systemNotice(forSessionId: "codex6-a"))
+        XCTAssertEqual(browserBridgeNotice.scope, .global)
+        XCTAssertTrue(browserBridgeNotice.text.contains("Browser Bridge"), "A global Browser Bridge notice remains available to any chat")
+        store.recentSystemNotice = browserBridgeNotice.text
+        store.clearSystemNotice(browserBridgeNotice)
+        XCTAssertEqual(store.recentSystemNotice, browserBridgeNotice.text, "A stale dismiss must not clear a newer global notice with identical text")
+        let refreshedBrowserBridgeNotice = try XCTUnwrap(store.systemNotice(forSessionId: "codex6-a"))
+        XCTAssertNotEqual(refreshedBrowserBridgeNotice.id, browserBridgeNotice.id)
+        store.clearSystemNotice(refreshedBrowserBridgeNotice)
+        XCTAssertNil(store.recentSystemNotice)
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-ios")?.id, bClosed.id, "Dismissing Browser Bridge must not clear B's scoped notice")
+
+        await mock.injectHealth(TransportHealthEvent(channel: .agent, state: .offline, at: now, detail: "confirmed offline"))
+        for _ in 0..<80 where store.recentSystemNotice?.contains("Windows Agent 已确认离线") != true {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let globalNotice = try XCTUnwrap(store.systemNotice(forSessionId: "codex6-a"))
+        XCTAssertEqual(globalNotice.scope, .global)
+        XCTAssertTrue(globalNotice.text.contains("Windows Agent 已确认离线"), "A global transport notice remains available to any chat")
+        store.clearSystemNotice(globalNotice)
+        XCTAssertNil(store.recentSystemNotice)
+        XCTAssertEqual(store.systemNotice(forSessionId: "photo-ios")?.id, bClosed.id, "Dismissing the global transport notice must not clear B's scoped notice")
+
+        store.clearSystemNotice(bClosed)
+        XCTAssertNil(store.systemNotice(forSessionId: "photo-ios"))
         await store.suspend()
     }
 

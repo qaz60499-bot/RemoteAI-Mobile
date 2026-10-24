@@ -1221,10 +1221,11 @@ struct ChatView: View {
     private var generationProgressAt: Date? {
         currentSession.lastProgressAt ?? currentSession.lastActivityAt
     }
-    private var relevantSystemNotice: String? {
-        guard let notice = store.recentSystemNotice else { return nil }
-        // A browser-specific diagnostic must not appear inside Codex or Antigravity Chats.
-        if runtime.kind != .web && (notice.contains("ChatGPT") || notice.contains("Browser Bridge")) {
+    private var relevantSystemNotice: SystemNoticePresentation? {
+        guard let notice = store.systemNotice(forSessionId: session.id) else { return nil }
+        if case .global = notice.scope,
+           runtime.kind != .web,
+           (notice.text.contains("ChatGPT") || notice.text.contains("Browser Bridge")) {
             return nil
         }
         return notice
@@ -1268,9 +1269,9 @@ struct ChatView: View {
             }
             if let notice = relevantSystemNotice {
                 StatusBanner(
-                    text: notice,
+                    text: notice.text,
                     systemImage: "desktopcomputer.and.arrow.down",
-                    dismiss: { store.clearRecentSystemNotice() }
+                    dismiss: { store.clearSystemNotice(notice) }
                 )
             }
             if let error = store.errors[session.id] {
