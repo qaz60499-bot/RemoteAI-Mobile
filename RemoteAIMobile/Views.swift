@@ -119,12 +119,24 @@ struct DiagnosticsView: View {
                 .disabled(checkingIntegrity || store.recentVisibleSessionIdForDiagnostics == nil)
                 .padding(.bottom, 8)
                 Divider()
-                ScrollView {
-                    Text(log.text)
-                        .font(.system(.caption2, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .padding()
+                ScrollViewReader { reader in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(log.text)
+                                .font(.system(.caption2, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                                .padding()
+                            Color.clear.frame(height: 1).id("chat-integrity-log-tail")
+                        }
+                    }
+                    .onChange(of: checkingIntegrity) { isChecking in
+                        guard !isChecking else { return }
+                        // Show the explicitly requested result after its text has laid out.
+                        DispatchQueue.main.async {
+                            reader.scrollTo("chat-integrity-log-tail", anchor: .bottom)
+                        }
+                    }
                 }
             }
             .navigationTitle("诊断日志")
