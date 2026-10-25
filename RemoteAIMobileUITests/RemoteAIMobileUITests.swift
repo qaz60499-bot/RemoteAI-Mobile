@@ -281,6 +281,19 @@ final class RemoteAIMobileUITests: XCTestCase {
                       "A single transcript swipe must move away from the live tail")
         let latest = app.buttons["回到最新消息"]
         XCTAssertTrue(latest.waitForExistence(timeout: 3))
+        // CI 40198580210 visibly browsed history and then jumped back to the
+        // streaming tail without a new scroll request. A single immediate sample
+        // can miss that delayed jump. Observe a fixed history interval before the
+        // explicit return; do not retry the swipe or wait for a failed check to pass.
+        for sample in 1...3 {
+            Thread.sleep(forTimeInterval: 1)
+            let heldHistoryState = transcript.value as? String
+            print("TRANSCRIPT_UI historySample=\(sample) state=\(heldHistoryState ?? "nil")")
+            XCTAssertTrue(heldHistoryState?.contains("followTail=false;atBottom=false") == true,
+                          "Streaming must preserve the user's history position: \(heldHistoryState ?? "nil")")
+            XCTAssertTrue(latest.exists && latest.isHittable,
+                          "Return to latest must stay available while browsing history")
+        }
         latest.tap()
         print("STREAM_UI chars=\(chars) historyAndReturnInteractionMs=\((ProcessInfo.processInfo.systemUptime - scrollingBegan) * 1000)")
         let marker = "STRESS_BEGIN_\(chars)"

@@ -1141,6 +1141,8 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
         private var offsetObservation: NSKeyValueObservation?
         private var sizeObservation: NSKeyValueObservation?
         private var observations = 0
+        private var jumpObservations = 0
+        private var lastObservationAt = 0.0
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
@@ -1160,10 +1162,12 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
                 if let scroll = candidate as? UIScrollView {
                     observedScroll = scroll
                     offsetObservation = scroll.observe(\.contentOffset, options: [.old, .new]) { [weak self] scroll, change in
+                        guard change.newValue != change.oldValue else { return }
                         let delta = (change.newValue?.y ?? 0) - (change.oldValue?.y ?? 0)
                         self?.record(scroll, reason: "offset", jump: delta)
                     }
-                    sizeObservation = scroll.observe(\.contentSize, options: [.old, .new]) { [weak self] scroll, _ in
+                    sizeObservation = scroll.observe(\.contentSize, options: [.old, .new]) { [weak self] scroll, change in
+                        guard change.newValue != change.oldValue else { return }
                         self?.record(scroll, reason: "size", jump: 0)
                     }
                     record(scroll, reason: "attached", jump: 0)
@@ -1174,14 +1178,23 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
         }
 
         private func record(_ scroll: UIScrollView, reason: String, jump: CGFloat) {
-            guard observations < 200 else { return }
+            let uptime = ProcessInfo.processInfo.systemUptime
+            let largeJump = abs(jump) > 1_000
+            if largeJump {
+                guard jumpObservations < 20 else { return }
+                jumpObservations += 1
+            } else {
+                guard observations < 200, uptime - lastObservationAt >= 0.08 else { return }
+                lastObservationAt = uptime
+            }
             observations += 1
-            DiagnosticsLog.shared.record("chat_native_scroll_probe", fields: [
+            var fields = [
                 "sample": String(observations),
-                "uptime": String(ProcessInfo.processInfo.systemUptime),
+                "uptime": String(uptime),
                 "reason": reason,
                 "offset": String(describing: scroll.contentOffset),
-                "contentSize": String(describing: scroll.contentSize),
+                "scrollHeight": String(Double(scroll.contentSize.height)),
+                "scrollWidth": String(Double(scroll.contentSize.width)),
                 "bounds": String(describing: scroll.bounds),
                 "insets": String(describing: scroll.adjustedContentInset),
                 "dragging": String(scroll.isDragging),
@@ -1191,8 +1204,15 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
                 "followTail": String(following),
                 "focused": String(composerFocused),
                 "jump": String(Double(jump)),
-                "jumpStack": abs(jump) > 1_000 ? Thread.callStackSymbols.prefix(28).joined(separator: " | ") : "",
-            ])
+            ]
+            if largeJump {
+                // Each diagnostic field is bounded to 512 chars by the existing
+                // redactor. Separate frames preserve the caller beyond KVO glue.
+                for (index, frame) in Thread.callStackSymbols.prefix(28).enumerated() {
+                    fields[String(format: "jumpFrame%02d", index)] = frame
+                }
+            }
+            DiagnosticsLog.shared.record("chat_native_scroll_probe", fields: fields)
         }
     }
 }
