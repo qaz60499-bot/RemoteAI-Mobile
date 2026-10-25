@@ -1120,6 +1120,19 @@ private struct ChatTranscriptTailLayout: Equatable {
 }
 
 #if DEBUG
+// Reference storage avoids invalidating the transcript merely to count requests.
+private final class ChatTranscriptScrollRequestTrace {
+    private var sequence = 0
+
+    func record(_ fields: [String: String]) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        sequence += 1
+        var fields = fields
+        fields["requestSequence"] = String(sequence)
+        DiagnosticsLog.shared.record("chat_transcript_scroll_request", fields: fields)
+    }
+}
+
 // Observation only: never sets an offset, delegate, inset, or gesture handler.
 // CI 40198580210 returned to the tail with follow=false and no new scrollTo.
 // KVO stacks distinguish a deferred SwiftUI scroll from lazy-height correction.
@@ -1303,6 +1316,7 @@ struct ChatView: View {
     @State private var transcriptDiagnosticSamples = 0
     @State private var transcriptDiagnosticRequests = 0
     @State private var transcriptDiagnosticDecision = "none"
+    @State private var transcriptScrollRequestTrace = ChatTranscriptScrollRequestTrace()
     #endif
     @StateObject private var speechInput = SpeechInputController()
     @State private var textSelectionRequest: TextSelectionRequest?
@@ -1363,7 +1377,41 @@ struct ChatView: View {
         }
         lastTranscriptPositionRequest = request
         recordTranscriptPositionDiagnostic(force ? "issued-force" : "issued")
+        recordTranscriptScrollRequest(reason: "tail", target: "bottom", anchor: "bottom")
         proxy.scrollTo("bottom", anchor: .bottom)
+    }
+    private func recordTranscriptScrollRequest(reason: String, target: String, anchor: String) {
+        #if DEBUG
+        guard ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" else { return }
+        // Every actual request is recorded, including those beyond the bounded
+        // duplicate-decision log and the independent pagination restoration.
+        transcriptScrollRequestTrace.record([
+            "uptime": String(ProcessInfo.processInfo.systemUptime),
+            "reason": reason,
+            "target": target,
+            "anchor": anchor,
+            "followTail": String(shouldFollowTranscriptTail),
+            "rowCount": String(messages.count),
+            "firstRowId": messages.first?.id ?? "none",
+            "lastRowId": messages.last?.id ?? "none",
+        ])
+        #endif
+    }
+    private func recordTranscriptPaginationDiagnostic(_ phase: String, anchor: String) {
+        #if DEBUG
+        guard ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" else { return }
+        DiagnosticsLog.shared.record("chat_transcript_pagination_probe", fields: [
+            "uptime": String(ProcessInfo.processInfo.systemUptime),
+            "phase": phase,
+            "capturedAnchor": anchor,
+            "rowCount": String(messages.count),
+            "firstRowId": messages.first?.id ?? "none",
+            "lastRowId": messages.last?.id ?? "none",
+            "hasMore": store.hasMoreBySession[session.id].map { String($0) } ?? "unknown",
+            "loadingOlder": String(loadingOlder),
+            "followTail": String(shouldFollowTranscriptTail),
+        ])
+        #endif
     }
     private func recordTranscriptPositionDiagnostic(_ decision: String) {
         #if DEBUG
@@ -1471,7 +1519,22 @@ struct ChatView: View {
                     ScrollView {
                         VStack(spacing: 12) {
                             LazyVStack(spacing: 12) {
-                                Color.clear.frame(height: 1).id("top").onAppear { guard !shouldFollowTranscriptTail, !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
+                                Color.clear.frame(height: 1).id("top").onAppear {
+                                    guard !shouldFollowTranscriptTail, !loadingOlder,
+                                          store.hasMoreBySession[session.id] != false,
+                                          let anchor = messages.first?.id else { return }
+                                    loadingOlder = true
+                                    recordTranscriptPaginationDiagnostic("begin", anchor: anchor)
+                                    Task {
+                                        await store.loadOlder(session.id)
+                                        await MainActor.run {
+                                            recordTranscriptPaginationDiagnostic("load-returned", anchor: anchor)
+                                            recordTranscriptScrollRequest(reason: "pagination", target: anchor, anchor: "top")
+                                            proxy.scrollTo(anchor, anchor: .top)
+                                            loadingOlder = false
+                                        }
+                                    }
+                                }
                                 if loadingOlder { ProgressView().padding(.vertical, 6) }
                                 ForEach(messages) { message in
                                     let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
