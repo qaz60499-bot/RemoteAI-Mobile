@@ -1,4 +1,8 @@
 import SwiftUI
+
+#if !DEBUG
+#error("Pagination isolation experiment only: remove the diagnostic control before packaging a device candidate")
+#endif
 import AVFoundation
 import PhotosUI
 import UniformTypeIdentifiers
@@ -1524,14 +1528,25 @@ struct ChatView: View {
                                     guard !shouldFollowTranscriptTail, !loadingOlder,
                                           store.hasMoreBySession[session.id] != false,
                                           let anchor = messages.first?.id else { return }
+                                    let soleStreamingAnchor = messages.count == 1
+                                        && messages.first?.toolStatus == "Streaming"
                                     loadingOlder = true
                                     recordTranscriptPaginationDiagnostic("begin", anchor: anchor)
                                     Task {
                                         await store.loadOlder(session.id)
                                         await MainActor.run {
                                             recordTranscriptPaginationDiagnostic("load-returned", anchor: anchor)
-                                            recordTranscriptScrollRequest(reason: "pagination", target: anchor, anchor: "top")
-                                            proxy.scrollTo(anchor, anchor: .top)
+                                            // Diagnostic A/B: keep the same older-page load,
+                                            // but isolate the request implicated by c402138.
+                                            // Release compilation is deliberately blocked above.
+                                            let skipSoleStreamRestore = ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1"
+                                                && soleStreamingAnchor
+                                            if skipSoleStreamRestore {
+                                                recordTranscriptPaginationDiagnostic("restore-skipped-control", anchor: anchor)
+                                            } else {
+                                                recordTranscriptScrollRequest(reason: "pagination", target: anchor, anchor: "top")
+                                                proxy.scrollTo(anchor, anchor: .top)
+                                            }
                                             loadingOlder = false
                                         }
                                     }
