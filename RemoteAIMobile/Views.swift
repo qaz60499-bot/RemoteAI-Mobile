@@ -1119,6 +1119,85 @@ private struct ChatTranscriptTailLayout: Equatable {
     var viewportSize: CGSize?
 }
 
+#if DEBUG
+// Observation only: never sets an offset, delegate, inset, or gesture handler.
+// CI 40198580210 returned to the tail with follow=false and no new scrollTo.
+// KVO stacks distinguish a deferred SwiftUI scroll from lazy-height correction.
+private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
+    var following: Bool
+    var focused: Bool
+
+    func makeUIView(context: Context) -> ProbeView { ProbeView() }
+    func updateUIView(_ view: ProbeView, context: Context) {
+        view.following = following
+        view.focused = focused
+        view.attachIfNeeded()
+    }
+
+    final class ProbeView: UIView {
+        var following = true
+        var focused = false
+        private weak var observedScroll: UIScrollView?
+        private var offsetObservation: NSKeyValueObservation?
+        private var sizeObservation: NSKeyValueObservation?
+        private var observations = 0
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window == nil {
+                offsetObservation = nil
+                sizeObservation = nil
+                observedScroll = nil
+            } else {
+                DispatchQueue.main.async { [weak self] in self?.attachIfNeeded() }
+            }
+        }
+
+        func attachIfNeeded() {
+            guard window != nil, observedScroll == nil else { return }
+            var parent = superview
+            while let candidate = parent {
+                if let scroll = candidate as? UIScrollView {
+                    observedScroll = scroll
+                    offsetObservation = scroll.observe(\.contentOffset, options: [.old, .new]) { [weak self] scroll, change in
+                        let delta = (change.newValue?.y ?? 0) - (change.oldValue?.y ?? 0)
+                        self?.record(scroll, reason: "offset", jump: delta)
+                    }
+                    sizeObservation = scroll.observe(\.contentSize, options: [.old, .new]) { [weak self] scroll, _ in
+                        self?.record(scroll, reason: "size", jump: 0)
+                    }
+                    record(scroll, reason: "attached", jump: 0)
+                    break
+                }
+                parent = candidate.superview
+            }
+        }
+
+        private func record(_ scroll: UIScrollView, reason: String, jump: CGFloat) {
+            guard observations < 200 else { return }
+            observations += 1
+            DiagnosticsLog.shared.record("chat_native_scroll_probe", fields: [
+                "sample": String(observations),
+                "uptime": String(ProcessInfo.processInfo.systemUptime),
+                "reason": reason,
+                "offset": String(describing: scroll.contentOffset),
+                "contentSize": String(describing: scroll.contentSize),
+                "bounds": String(describing: scroll.bounds),
+                "insets": String(describing: scroll.adjustedContentInset),
+                "dragging": String(scroll.isDragging),
+                "decelerating": String(scroll.isDecelerating),
+                "tracking": String(scroll.isTracking),
+                "panState": String(scroll.panGestureRecognizer.state.rawValue),
+                "followTail": String(following),
+                "focused": String(focused),
+                "jump": String(Double(jump)),
+                "jumpStack": abs(jump) > 1_000 ? Thread.callStackSymbols.prefix(28).joined(separator: " | ") : "",
+            ])
+        }
+    }
+}
+#endif
+
 private struct ChatTranscriptLayoutSize: Equatable {
     let contentWidth: Int
     let contentHeight: Int
@@ -1410,6 +1489,15 @@ struct ChatView: View {
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
+                        #if DEBUG
+                        .background {
+                            if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
+                                ChatTranscriptNativeScrollProbe(following: shouldFollowTranscriptTail, focused: focused)
+                                    .allowsHitTesting(false)
+                                    .accessibilityHidden(true)
+                            }
+                        }
+                        #endif
                         .background(
                             GeometryReader { content in
                                 Color.clear.preference(
