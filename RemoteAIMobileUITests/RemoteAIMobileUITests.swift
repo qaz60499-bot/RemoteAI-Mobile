@@ -270,6 +270,19 @@ final class RemoteAIMobileUITests: XCTestCase {
         let scrollingBegan = ProcessInfo.processInfo.systemUptime
         let transcript = app.scrollViews["ChatTranscript"]
         XCTAssertTrue(transcript.waitForExistence(timeout: 3))
+        // The native trace in 40202895055 proves that closing the keyboard can
+        // expand the viewport more than this swipe moves it. Test the two user
+        // actions separately, keeping the actual off-tail requirement strict.
+        let dismissKeyboard = app.buttons["DismissComposerKeyboard"]
+        XCTAssertTrue(dismissKeyboard.waitForExistence(timeout: 3))
+        dismissKeyboard.tap()
+        let settledTail = NSPredicate { _, _ in
+            !app.keyboards.firstMatch.exists
+                && (transcript.value as? String)?.contains("followTail=true;atBottom=true") == true
+        }
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: settledTail, object: nil)], timeout: 10), .completed,
+                       "History browsing must start with a closed keyboard and a confirmed visible tail")
+        XCTAssertEqual(composer.value as? String, "still responsive", "Closing the keyboard must preserve the unsent draft")
         // Target the transcript and record its follow state to distinguish an
         // ignored gesture from an automatic return to the tail during streaming.
         print("TRANSCRIPT_UI before=\(transcript.value ?? "nil")")

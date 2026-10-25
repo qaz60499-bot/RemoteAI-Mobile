@@ -1649,6 +1649,11 @@ struct ChatView: View {
         .toolbar {
             ToolbarItem(placement: .principal) { VStack(spacing: 1) { Text(instance.name).font(.subheadline.weight(.semibold)); Text(session.title).font(.caption2).foregroundColor(.secondary); Text(store.machine.state.rawValue).font(.caption2).foregroundColor(store.machine.state == .online ? .green : .secondary) } }
             ToolbarItem(placement: .navigationBarTrailing) { if store.machine.state == .online && isGenerating { Button("Stop") { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } }.font(.caption) } }
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("收起键盘") { focused = false }
+                    .accessibilityIdentifier("DismissComposerKeyboard")
+            }
         }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {
