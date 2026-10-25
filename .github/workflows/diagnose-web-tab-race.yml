@@ -1,0 +1,59 @@
+name: Diagnose WebTab actor race
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: remoteai-web-tab-race-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Generate project with pinned tools
+        run: |
+          set -euo pipefail
+          test "$(xcodebuild -version | head -1)" = 'Xcode 16.4'
+          test "$(xcodebuild -version | tail -1)" = 'Build version 16F6'
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --output "$RUNNER_TEMP/xcodegen.zip" https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          echo "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP/web-tab-xcodegen"
+          "$RUNNER_TEMP/web-tab-xcodegen/xcodegen/bin/xcodegen" generate --spec project.yml
+          mkdir -p build/web-tab-race
+      - name: Reproduce old executor boundary and verify fixed tests
+        run: python3 scripts/diagnose_web_tab_race.py
+      - name: Export prior failed xcresult summaries and crash reports
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for RUN in 40174905979 40175376414; do
+            mkdir -p "build/web-tab-race/prior-$RUN"
+            gh run download "$RUN" --repo "$GITHUB_REPOSITORY" --name UI-evidence --dir "build/web-tab-race/prior-$RUN"
+            xcrun xcresulttool get test-results summary --path "build/web-tab-race/prior-$RUN/unit-tests.xcresult" --format json > "build/web-tab-race/prior-$RUN-summary.json"
+            xcrun xcresulttool get object --legacy --format json --path "build/web-tab-race/prior-$RUN/unit-tests.xcresult" > "build/web-tab-race/prior-$RUN-result.json"
+          done
+      - name: Preserve bounded diagnosis evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: WebTab-race-diagnosis
+          retention-days: 7
+          path: |
+            build/web-tab-race/*.log
+            build/web-tab-race/*.json
+            build/web-tab-race/prior-*/unit-crashes
+            build/web-tab-race/*-fixed.xcresult

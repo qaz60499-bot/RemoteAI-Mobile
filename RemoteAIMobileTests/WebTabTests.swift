@@ -33,6 +33,7 @@ final class WebTabTests: XCTestCase {
         return String(decoding: data, as: UTF8.self)
     }
 
+    @MainActor
     private final class TabTransport: Transport {
         var inventoryFails = false
         var inspectionFails = false
@@ -45,6 +46,12 @@ final class WebTabTests: XCTestCase {
         func eventStream() async -> AsyncStream<RemoteEvent> { AsyncStream { $0.finish() } }
         func healthStream() async -> AsyncStream<TransportHealthEvent> { AsyncStream { $0.finish() } }
         func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
+            // The outer XCTestCase does not isolate a nested type in Swift 5.
+            // Check before touching shared state so the regression fails safely.
+            guard Thread.isMainThread else {
+                XCTFail("TAB_TRANSPORT_EXECUTOR: execute must stay on MainActor")
+                throw TransportError.malformedData
+            }
             commands.append(command)
             if delay > 0 { try await Task.sleep(nanoseconds: delay) }
             let value: String
@@ -61,6 +68,34 @@ final class WebTabTests: XCTestCase {
             }
             return CommandResponseEnvelope(ok: true, result: try JSONDecoder.remoteAI.decode(JSONValue.self, from: Data(value.utf8)), error: nil, idempotentReplay: nil)
         }
+    }
+
+    func testTransportConcurrentCallsAndCancellationStayOnMainActor() async throws {
+        let transport = TabTransport()
+        transport.delay = 1_000_000
+        let commands = (0..<65).map { _ in
+            RemoteCommand(protocolVersion: 1, commandId: UUID(), machineId: "my-pc",
+                runtimeId: "runtime.web", instanceId: "web-main", sessionId: nil,
+                action: "listOpenWebTabs", payload: [:], createdAt: Date())
+        }
+        // Cancellation occurs before this MainActor task can start. The recorded
+        // command survives; its suspended execution must throw CancellationError.
+        let cancelled = Task { try await transport.execute(commands[0]) }
+        cancelled.cancel()
+        do {
+            _ = try await cancelled.value
+            XCTFail("Cancelled execution unexpectedly completed")
+        } catch is CancellationError {
+        }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for command in commands.dropFirst() {
+                group.addTask { _ = try await transport.execute(command) }
+            }
+            try await group.waitForAll()
+        }
+        XCTAssertEqual(transport.commands.count, commands.count)
+        XCTAssertEqual(Set(transport.commands.map(\.commandId)), Set(commands.map(\.commandId)))
+        XCTAssertEqual(transport.commands.first?.commandId, commands[0].commandId)
     }
 
     func testInventoryFailureRetainsConfirmedTabsAndDoesNotDeclareClosure() async throws {

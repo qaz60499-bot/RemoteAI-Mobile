@@ -6,7 +6,7 @@ on:
       gate:
         description: Validation scope
         type: choice
-        options: [candidate, streaming, sync, web-controls, copy-controls]
+        options: [candidate, streaming, sync, web-controls, copy-controls, web-tab-race]
         default: candidate
       unit_sanitizer:
         description: Optional unit-test memory diagnostic on the disposable simulator
@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: remoteai-ios-candidate-${{ github.ref }}
@@ -34,7 +35,7 @@ env:
 jobs:
   build:
     name: Candidate Test + Device IPA
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.gate != 'web-tab-race'
     runs-on: macos-15
     # Full candidate run 39132713116 exhausted 45 minutes after every UI
     # case passed (the two stress cases needed the existing one-time retry).
@@ -445,3 +446,7 @@ jobs:
             build/tests.log
             build/unit-actor-isolation-probe.json
           retention-days: 7
+
+  web-tab-race:
+    if: github.event_name == 'workflow_dispatch' && inputs.gate == 'web-tab-race'
+    uses: ./.github/workflows/diagnose-web-tab-race.yml
