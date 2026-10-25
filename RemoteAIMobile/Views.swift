@@ -1493,17 +1493,7 @@ struct ChatView: View {
                             }
                             Color.clear
                                 .frame(height: 1)
-                                // HostingScrollView can retain the previous bottom
-                                // target through a large lazy-height correction even
-                                // after our follow flag is false. Remove that target
-                                // while browsing; keep message identities unchanged.
-                                .id(shouldFollowTranscriptTail ? "bottom" : "browsing-bottom")
-                                .onAppear {
-                                    guard shouldFollowTranscriptTail, !messages.isEmpty else { return }
-                                    // Returning to latest reinstalls the target in a
-                                    // later view update; position only once it exists.
-                                    requestTranscriptTailPosition(using: proxy, force: true)
-                                }
+                                .id("bottom")
                                 .background(
                                     GeometryReader { marker in
                                         Color.clear.preference(
