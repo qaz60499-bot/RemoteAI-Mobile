@@ -684,6 +684,100 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testQueuedDeltaFailureDoesNotStrandEmptyCodexDisplaySnapshot() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        let runtime = try XCTUnwrap(store.runtimes.first { $0.id == "runtime.codex" })
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first { $0.id == "codex.6" })
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        await store.loadSession("codex6-a")
+        XCTAssertEqual(store.messagesBySession["codex6-a"] ?? [], [], "This Codex transcript starts as an already-loaded empty array")
+
+        try await cache.executeForTesting("""
+            CREATE TRIGGER fail_codex_final BEFORE INSERT ON messages
+            WHEN NEW.id = 'frozen-codex-final'
+            BEGIN SELECT RAISE(ABORT, 'injected final write failure'); END;
+            """)
+        let eventDate = Date().addingTimeInterval(-30)
+        let toolEvent = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1_201,
+            machineId: "my-pc",
+            runtimeId: "runtime.codex",
+            instanceId: "codex.6",
+            sessionId: "codex6-a",
+            type: "TOOL_STARTED",
+            payload: [
+                "tool": .object(["id": .string("frozen-codex-tool"), "name": .string("command_execution")]),
+                "summary": .string("Recovering Codex activity")
+            ],
+            createdAt: eventDate
+        )
+        let final = ServerMessage(
+            messageId: "frozen-codex-final",
+            sessionId: "codex6-a",
+            role: "assistant",
+            content: "This write fails after the display snapshot is captured.",
+            externalId: nil,
+            createdAt: eventDate.addingTimeInterval(1)
+        )
+        let finalEvent = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1_202,
+            machineId: "my-pc",
+            runtimeId: "runtime.codex",
+            instanceId: "codex.6",
+            sessionId: "codex6-a",
+            type: "MESSAGE_ADDED",
+            payload: try XCTUnwrap(try JSONValue.encode(final).objectValue),
+            createdAt: final.createdAt
+        )
+        await mock.injectEvents([toolEvent, finalEvent])
+        await mock.setResponseDelay(action: "getChangesAfterCursor", nanoseconds: 500_000_000)
+
+        var observedEmptySnapshot = false
+        let snapshotObserver = store.$deltaRecoveryDisplayMessagesBySession.sink { snapshots in
+            if snapshots?["codex6-a"]?.isEmpty == true { observedEmptySnapshot = true }
+        }
+        let attemptsBeforeRecovery = await mock.actionAttemptCount("getChangesAfterCursor")
+        let activeRecovery = Task { await store.verifyOnlineSyncHead() }
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("getChangesAfterCursor") > attemptsBeforeRecovery { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let attemptsAfterStart = await mock.actionAttemptCount("getChangesAfterCursor")
+        XCTAssertEqual(attemptsAfterStart, attemptsBeforeRecovery + 1)
+
+        // This second call coalesces into the delayed recovery while its empty snapshot
+        // still owns the transcript presentation.
+        await store.synchronizeVisibleSession("codex6-a", force: true)
+        let attemptsAfterQueuedRecovery = await mock.actionAttemptCount("getChangesAfterCursor")
+        XCTAssertEqual(attemptsAfterQueuedRecovery, attemptsBeforeRecovery + 1)
+        await activeRecovery.value
+        snapshotObserver.cancel()
+
+        let modelRows = store.messagesBySession["codex6-a", default: []]
+        XCTAssertTrue(observedEmptySnapshot, "The delayed page must freeze the already-loaded empty Codex transcript before applying its events")
+        XCTAssertTrue(modelRows.contains { $0.id == "tool-codex6-a-frozen-codex-tool" }, "The first event should be committed before the canonical final write fails")
+        XCTAssertNotNil(store.errors["sync"], "The canonical final failure must enter normal delta retry backoff")
+        let cursorAfterFailedPage = try await cache.lastSequence()
+        XCTAssertEqual(cursorAfterFailedPage, 1_200, "A failed final write must leave the durable cursor before the failed event")
+        XCTAssertNil(store.deltaRecoveryDisplayMessagesBySession, "A completed failed pass cannot leave its empty presentation snapshot owned by a queued retry that immediately hits backoff")
+        let effectiveDisplayRows = store.deltaRecoveryDisplayMessagesBySession?["codex6-a"]
+            ?? store.messagesBySession["codex6-a", default: []]
+        XCTAssertEqual(effectiveDisplayRows.map(\.id), modelRows.map(\.id), "After the pass ends, ChatView's effective transcript must fall back to the populated model rows")
+
+        try await cache.executeForTesting("DROP TRIGGER fail_codex_final;")
+        await store.suspend()
+    }
+
+    @MainActor
     func testLargeDeltaRecoveryCoalescesHistoricalProgressButPublishesLatestActiveTail() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
