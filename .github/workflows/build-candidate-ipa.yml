@@ -8,6 +8,10 @@ on:
         type: choice
         options: [candidate, streaming, sync, web-controls, copy-controls]
         default: candidate
+      unit_address_sanitizer:
+        description: Diagnose unit-test memory corruption on the disposable simulator
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -175,11 +179,17 @@ jobs:
         run: |
           set -euo pipefail
           set -o pipefail
+          set --
+          if [[ '${{ inputs.unit_address_sanitizer }}' == 'true' ]]; then
+            set -- -enableAddressSanitizer YES
+          fi
           xcodebuild test \
             -project RemoteAIMobile.xcodeproj \
             -scheme RemoteAIMobile \
             -configuration Debug \
             -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
+            -resultBundlePath build/unit-tests.xcresult \
+            "$@" \
             -skip-testing:RemoteAIMobileTests/ProtocolSecurityTests \
             -skip-testing:RemoteAIMobileUITests \
             | tee build/tests.log
@@ -371,10 +381,36 @@ jobs:
             echo '- Artifact ID: `${{ steps.upload.outputs.artifact-id }}`'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Preserve UI evidence
+      - name: Collect bounded RemoteAI crash reports
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib, shutil
+          destination = pathlib.Path('build/unit-crashes')
+          destination.mkdir(parents=True, exist_ok=True)
+          reports = pathlib.Path.home() / 'Library/Logs/DiagnosticReports'
+          selected = sorted((p for p in reports.glob('RemoteAI*') if p.is_file()),
+                            key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+          manifest = []
+          for source in selected:
+              if source.stat().st_size > 20 * 1024 * 1024:
+                  continue
+              target = destination / source.name
+              shutil.copyfile(source, target)
+              manifest.append({'name': source.name, 'bytes': target.stat().st_size,
+                               'sha256': hashlib.sha256(target.read_bytes()).hexdigest()})
+          (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Preserve test evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: UI-evidence
-          path: build/ui-evidence
+          path: |
+            build/ui-evidence
+            build/unit-tests.xcresult
+            build/unit-crashes
+            build/tests.log
           retention-days: 7
