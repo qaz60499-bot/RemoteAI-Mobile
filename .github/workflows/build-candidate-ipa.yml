@@ -8,10 +8,11 @@ on:
         type: choice
         options: [candidate, streaming, sync, web-controls, copy-controls]
         default: candidate
-      unit_address_sanitizer:
-        description: Diagnose unit-test memory corruption on the disposable simulator
-        type: boolean
-        default: false
+      unit_sanitizer:
+        description: Optional unit-test memory diagnostic on the disposable simulator
+        type: choice
+        options: [none, address, thread]
+        default: none
 
 permissions:
   contents: read
@@ -173,6 +174,33 @@ jobs:
           grep -E 'PROTOCOL_FUZZ_(NEGATIVE|CRYPTO|SIZE|RECOVERY|TOTAL)' build/protocol-security.log
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/protocol-security.log | tail -1
 
+      - name: Record pinned compiler nested actor isolation
+        if: inputs.unit_sanitizer != 'none' && inputs.unit_sanitizer != ''
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, subprocess, tempfile
+          source = '''
+          @MainActor final class Outer {
+              final class Inner { var rows: Int = 0 }
+          }
+          func readWithoutAwait(_ inner: Outer.Inner) async -> Int { inner.rows }
+          '''
+          with tempfile.TemporaryDirectory() as folder:
+              path = pathlib.Path(folder) / 'NestedActorIsolation.swift'
+              path.write_text(source)
+              result = subprocess.run(['xcrun', 'swiftc', '-swift-version', '5',
+                                       '-strict-concurrency=complete', '-warnings-as-errors',
+                                       '-typecheck', str(path)], capture_output=True, text=True, timeout=30)
+          version = subprocess.run(['xcrun', 'swiftc', '--version'], capture_output=True,
+                                   text=True, check=True, timeout=30).stdout
+          evidence = {'compiler': version, 'swiftLanguageVersion': '5', 'source': source,
+                      'exitCode': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr,
+                      'scope': 'compiler inference probe only; not a runtime race or heap-corruption proof'}
+          pathlib.Path('build/unit-actor-isolation-probe.json').write_text(json.dumps(evidence, indent=2))
+          print(json.dumps(evidence))
+          PY
+
       - name: Unit tests
         if: inputs.gate != 'streaming' && inputs.gate != 'web-controls'
         shell: bash
@@ -180,8 +208,10 @@ jobs:
           set -euo pipefail
           set -o pipefail
           set --
-          if [[ '${{ inputs.unit_address_sanitizer }}' == 'true' ]]; then
+          if [[ '${{ inputs.unit_sanitizer }}' == 'address' ]]; then
             set -- -enableAddressSanitizer YES
+          elif [[ '${{ inputs.unit_sanitizer }}' == 'thread' ]]; then
+            set -- -enableThreadSanitizer YES
           fi
           xcodebuild test \
             -project RemoteAIMobile.xcodeproj \
@@ -413,4 +443,5 @@ jobs:
             build/unit-tests.xcresult
             build/unit-crashes
             build/tests.log
+            build/unit-actor-isolation-probe.json
           retention-days: 7
