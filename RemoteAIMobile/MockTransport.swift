@@ -9,9 +9,10 @@ enum MockScenario: String, CaseIterable {
 }
 
 actor MockTransport: Transport {
+    private static let initialChangelogBaselineSequence: Int64 = 1200
     private var connected = false
     private var scenario: MockScenario
-    private var sequence: Int64 = 1200
+    private var sequence: Int64 = initialChangelogBaselineSequence
     private var continuation: AsyncStream<RemoteEvent>.Continuation?
     private var stream: AsyncStream<RemoteEvent>?
     private var healthContinuation: AsyncStream<TransportHealthEvent>.Continuation?
@@ -19,6 +20,7 @@ actor MockTransport: Transport {
     private var processedCommands: [UUID: CommandResponseEnvelope] = [:]
     private var history: [String: [ServerMessage]] = [:]
     private var eventLog: [RemoteEvent] = []
+    private var seededBaselineEventId: UUID?
     private var sessions: [ServerSession] = []
     private var sessionStatusOverrides: [String: String] = [:]
     private var sessionStatusActivityOverrides: [String: Date] = [:]
@@ -65,6 +67,23 @@ actor MockTransport: Transport {
         // mock history on the same precision so `(createdAt, messageId)` cursor comparisons
         // do not change after an encode/decode round-trip.
         let now = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970 * 1_000) / 1_000)
+        // The fixture begins from a completed snapshot at sequence 1200. Represent that
+        // baseline as an explicit benign changelog event so a zero-cursor client must
+        // obtain its checkpoint from delta, never from getStatus.latestSequence alone.
+        let baselineEvent = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: Self.initialChangelogBaselineSequence,
+            machineId: "my-pc",
+            runtimeId: "runtime.system",
+            instanceId: "agent",
+            sessionId: "photo-upload",
+            type: "SYSTEM_STATUS",
+            payload: [:],
+            createdAt: now
+        )
+        eventLog = [baselineEvent]
+        seededBaselineEventId = baselineEvent.eventId
         runtimes = [
             ServerRuntime(runtimeId: "runtime.web", kind: "Web", label: "Web", capabilities: ["list", "status", "sendMessage"], status: "ready", updatedAt: now),
             ServerRuntime(runtimeId: "runtime.codex", kind: "Codex", label: "Codex", capabilities: ["list", "status", "sendMessage"], status: "ready", updatedAt: now)
@@ -276,9 +295,23 @@ actor MockTransport: Transport {
         history[message.sessionId, default: []].append(message)
     }
     func injectEvent(_ event: RemoteEvent, deliverLive: Bool = false) {
+        removeSeededBaselineIfOverlapped(by: [event])
         eventLog.append(event)
         sequence = max(sequence, event.sequence)
         if deliverLive { continuation?.yield(event) }
+    }
+    func injectEvents(_ events: [RemoteEvent]) {
+        removeSeededBaselineIfOverlapped(by: events)
+        eventLog.append(contentsOf: events)
+        if let latestSequence = events.map(\.sequence).max() {
+            sequence = max(sequence, latestSequence)
+        }
+    }
+    private func removeSeededBaselineIfOverlapped(by events: [RemoteEvent]) {
+        guard events.contains(where: { $0.sequence <= Self.initialChangelogBaselineSequence }),
+              let seededBaselineEventId else { return }
+        eventLog.removeAll { $0.eventId == seededBaselineEventId }
+        self.seededBaselineEventId = nil
     }
     func injectHealth(_ event: TransportHealthEvent) {
         healthContinuation?.yield(event)

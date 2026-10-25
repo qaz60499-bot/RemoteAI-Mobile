@@ -547,22 +547,140 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testStartupFastForwardsVeryStaleDeltaCursorInsteadOfReplayingHistoricalStorm() async throws {
+    func testStartupReplaysBeyondOldFastForwardLimitAndPersistsCanonicalFinal() async throws {
         let cache = try SQLiteStore.inMemory()
         try await cache.setLastSequence(853)
         let mock = MockTransport(historyCount: 1)
-        await mock.setSequence(27_295)
+        let historicalBase = Date().addingTimeInterval(-30)
+        let historicalEvents = (1...2_000).map { offset in
+            RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: Int64(853 + offset),
+                machineId: "my-pc",
+                runtimeId: "runtime.system",
+                instanceId: "agent",
+                sessionId: "photo-upload",
+                type: "TRANSPORT_STATUS",
+                payload: ["channel": .string("browser-bridge"), "state": .string("offline")],
+                createdAt: historicalBase.addingTimeInterval(Double(offset) / 100.0)
+            )
+        }
+        let final = ServerMessage(
+            messageId: "stale-cursor-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "final recovered across the historical gap",
+            externalId: nil,
+            createdAt: Date()
+        )
+        let finalEvent = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 2_854,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: try XCTUnwrap(try JSONValue.encode(final).objectValue),
+            createdAt: final.createdAt
+        )
+        await mock.injectEvents(historicalEvents + [finalEvent])
         let store = WorkspaceStore(transport: mock, cache: cache)
 
         await store.start()
 
         let persistedSequence = try await cache.lastSequence()
         let deltaAttempts = await mock.actionAttemptCount("getChangesAfterCursor")
-        XCTAssertEqual(persistedSequence, 27_295)
-        XCTAssertEqual(deltaAttempts, 0, "A huge authenticated sequence gap should be reconciled by metadata/history, not by replaying tens of thousands of stale events")
-        XCTAssertFalse(store.runtimes.isEmpty, "Fast-forward must still continue into authoritative metadata refresh")
+        let cachedMessages = try await cache.recentMessages(sessionId: "photo-upload", limit: 10)
+        XCTAssertEqual(persistedSequence, 2_854)
+        XCTAssertGreaterThanOrEqual(deltaAttempts, 21, "A 2,001-event gap must be fetched in bounded pages rather than skipped by moving the cursor to the authenticated head")
+        XCTAssertTrue(cachedMessages.contains { $0.id == "stale-cursor-final" && $0.text == final.content }, "Historical recovery must durably retain the canonical message before advancing beyond it")
+        XCTAssertFalse(store.runtimes.isEmpty, "Recovery must still continue into authoritative metadata refresh")
         XCTAssertEqual(store.machine.state, .online)
         await store.suspend()
+    }
+
+    @MainActor
+    func testEmptyCacheDeltaReplayAppliesAcknowledgedCanonicalFinalBeforeCheckpoint() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let final = ServerMessage(
+            messageId: "empty-cache-ack-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "recovered from the zero-cursor event log",
+            externalId: nil,
+            createdAt: Date()
+        )
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1_201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: try XCTUnwrap(try JSONValue.encode(final).objectValue),
+            createdAt: final.createdAt
+        ))
+        let store = WorkspaceStore(transport: mock, cache: cache)
+
+        let cursorBeforeStartup = try await cache.lastSequence()
+        XCTAssertEqual(cursorBeforeStartup, 0)
+        await store.start()
+
+        let sequenceAfterRecovery = try await cache.lastSequence()
+        let cachedMessages = try await cache.recentMessages(sessionId: "photo-upload", limit: 10)
+        XCTAssertEqual(sequenceAfterRecovery, 1_201)
+        XCTAssertEqual(cachedMessages.filter { $0.id == "empty-cache-ack-final" }.count, 1, "An authenticated head must not skip an acknowledged event before its first local checkpoint")
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "empty-cache-ack-final" }.count, 1)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testDeltaRecoveryCancelsAtPageBoundaryWithTwentyThousandEventBacklog() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let initialSequence = try await cache.lastSequence()
+        let attemptsBeforeRecovery = await mock.actionAttemptCount("getChangesAfterCursor")
+        let historicalBase = Date().addingTimeInterval(-60)
+        let backlog = (1...20_000).map { offset in
+            RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: initialSequence + Int64(offset),
+                machineId: "my-pc",
+                runtimeId: "runtime.system",
+                instanceId: "agent",
+                sessionId: "photo-upload",
+                type: "TRANSPORT_STATUS",
+                payload: ["channel": .string("browser-bridge"), "state": .string("offline")],
+                createdAt: historicalBase.addingTimeInterval(Double(offset) / 1_000.0)
+            )
+        }
+        await mock.injectEvents(backlog)
+        await mock.setResponseDelay(action: "getChangesAfterCursor", nanoseconds: 200_000_000)
+
+        let recovery = Task { await store.verifyOnlineSyncHead() }
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("getChangesAfterCursor") > attemptsBeforeRecovery { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let attemptsBeforeSuspend = await mock.actionAttemptCount("getChangesAfterCursor")
+        XCTAssertEqual(attemptsBeforeSuspend, attemptsBeforeRecovery + 1)
+
+        await store.suspend()
+        await recovery.value
+
+        let cursorAfterSuspend = try await cache.lastSequence()
+        let attemptsAfterSuspend = await mock.actionAttemptCount("getChangesAfterCursor")
+        XCTAssertEqual(cursorAfterSuspend, initialSequence, "Cancellation during a 20,000-event catch-up must not checkpoint the latest head before processing pages")
+        XCTAssertEqual(attemptsAfterSuspend, attemptsBeforeRecovery + 1, "The suspended recovery must stop after the in-flight page returns")
     }
 
     @MainActor
@@ -620,7 +738,7 @@ final class RemoteAIMobileTests: XCTestCase {
         try await Task.sleep(nanoseconds: 120_000_000)
 
         let recoveredSequence = try await cache.lastSequence()
-        XCTAssertEqual(recoveredSequence, 1213)
+        XCTAssertEqual(recoveredSequence, 1200, "An unfinished stream must remain replayable from the last durable checkpoint")
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "recovered-active-stream" })?.text, "latest recovered tail")
         XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains(where: { $0.kind == .toolEvent }), "A large historical catch-up must not replay tool progress rows one by one into the visible transcript")
@@ -797,7 +915,7 @@ final class RemoteAIMobileTests: XCTestCase {
 
         XCTAssertNil(store.errors["sync"], "A legitimate live/delta overlap must not enter replay backoff")
         let recoveredSequence = try await cache.lastSequence()
-        XCTAssertEqual(recoveredSequence, 1201)
+        XCTAssertEqual(recoveredSequence, 1200, "An active run's transient event must not move the durable cursor past its replay point")
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
         await store.suspend()
     }
@@ -915,18 +1033,17 @@ final class RemoteAIMobileTests: XCTestCase {
             createdAt: now.addingTimeInterval(0.2)
         )
         await mock.injectEvent(postRecovery, deliverLive: true)
-        for _ in 0..<100 {
-            if try await cache.lastSequence() >= 1211 { break }
+        for _ in 0..<100 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .busy {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         let postRecoveryHead = try await cache.lastSequence()
-        XCTAssertEqual(postRecoveryHead, 1211)
+        XCTAssertEqual(postRecoveryHead, 1210, "A new active run must keep its transient event out of the durable cursor")
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
 
         await store.synchronizeVisibleSession("photo-upload", force: true)
         XCTAssertNil(store.errors["sync"], "A second delta after the overlap must not rediscover live events as a replay attack")
         let secondRecoveryHead = try await cache.lastSequence()
-        XCTAssertEqual(secondRecoveryHead, 1211)
+        XCTAssertEqual(secondRecoveryHead, 1210)
         await store.suspend()
     }
 
@@ -951,12 +1068,11 @@ final class RemoteAIMobileTests: XCTestCase {
             createdAt: now
         )
         await mock.injectEvent(first, deliverLive: true)
-        for _ in 0..<80 {
-            if try await cache.lastSequence() >= 1201 { break }
+        for _ in 0..<80 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .busy {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         let firstAppliedHead = try await cache.lastSequence()
-        XCTAssertEqual(firstAppliedHead, 1201)
+        XCTAssertEqual(firstAppliedHead, 1200, "Busy state must not checkpoint over an active run")
 
         let replay = RemoteEvent(
             protocolVersion: 1,
@@ -977,7 +1093,7 @@ final class RemoteAIMobileTests: XCTestCase {
         }
         XCTAssertEqual(store.errors["sync"], TransportError.replayDetected.localizedDescription)
         let replayHead = try await cache.lastSequence()
-        XCTAssertEqual(replayHead, 1201, "A reused event id at a future sequence must not advance the durable cursor")
+        XCTAssertEqual(replayHead, 1200, "A reused event id at a future sequence must not advance the durable cursor")
         await store.suspend()
     }
 
@@ -4826,6 +4942,142 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(restored, machine)
         let restoredSequence = try await db.lastSequence()
         XCTAssertEqual(restoredSequence, 99)
+    }
+
+    func testSQLiteCanonicalMessageAndCursorRollbackTogetherWhenCursorWriteFails() async throws {
+        let db = try SQLiteStore.inMemory()
+        let message = ChatMessage(id: "atomic-final", sessionId: "s", sequence: 42, role: .assistant, kind: .text, text: "canonical answer", toolName: nil, toolStatus: nil, detail: nil, attachments: nil, createdAt: Date())
+        try await db.executeForTesting("""
+            CREATE TRIGGER fail_sync_cursor BEFORE INSERT ON kv
+            WHEN NEW.key = 'sync.lastSequence'
+            BEGIN SELECT RAISE(ABORT, 'injected cursor write failure'); END;
+            """)
+
+        do {
+            try await db.upsertMessageAndSetLastSequence(message, sequence: 42)
+            XCTFail("Expected the injected cursor write to fail")
+        } catch {
+            XCTAssertEqual(error as? StoreError, .stepFailed)
+        }
+
+        let sequence = try await db.lastSequence()
+        let messages = try await db.recentMessages(sessionId: "s", limit: 10)
+        XCTAssertEqual(sequence, 0)
+        XCTAssertTrue(messages.isEmpty, "The message write must roll back with its cursor")
+    }
+
+    func testSQLiteFullAtBoundedMaxPageCountRollsBackMessageAndCursor() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let db = try SQLiteStore(url: url)
+        try await db.setLastSequence(10)
+        try await db.executeForTesting("PRAGMA max_page_count=16;")
+        let boundedPageCount = try await db.integerForTesting("PRAGMA max_page_count;")
+        XCTAssertEqual(boundedPageCount, 16, "The failure injection must be bounded to a tiny SQLite file")
+
+        // This is within SQLiteStore's accepted message size but cannot fit in the bounded database.
+        let message = ChatMessage(id: "full-final", sessionId: "s", sequence: 11, role: .assistant, kind: .text, text: String(repeating: "x", count: 300_000), toolName: nil, toolStatus: nil, detail: nil, attachments: nil, createdAt: Date())
+        do {
+            try await db.upsertMessageAndSetLastSequence(message, sequence: 11)
+            XCTFail("Expected SQLITE_FULL at the configured page limit")
+        } catch {
+            XCTAssertEqual(error as? StoreError, .stepFailed)
+        }
+
+        let pageCount = try await db.integerForTesting("PRAGMA page_count;")
+        let maxPageCount = try await db.integerForTesting("PRAGMA max_page_count;")
+        let sequence = try await db.lastSequence()
+        let messages = try await db.recentMessages(sessionId: "s", limit: 10)
+        XCTAssertLessThanOrEqual(pageCount, maxPageCount)
+        XCTAssertEqual(sequence, 10)
+        XCTAssertTrue(messages.isEmpty, "The message and cursor must roll back together on SQLITE_FULL")
+    }
+
+    func testSQLiteBusyWriterOnSecondConnectionLeavesMessageAndCursorUnchanged() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let writer = try SQLiteStore(url: url)
+        let competingWriter = try SQLiteStore(url: url)
+        try await writer.setLastSequence(20)
+        try await writer.executeForTesting("PRAGMA busy_timeout=0;")
+        try await competingWriter.executeForTesting("BEGIN IMMEDIATE;")
+
+        let message = ChatMessage(id: "busy-final", sessionId: "s", sequence: 21, role: .assistant, kind: .text, text: "competing writer", toolName: nil, toolStatus: nil, detail: nil, attachments: nil, createdAt: Date())
+        do {
+            try await writer.upsertMessageAndSetLastSequence(message, sequence: 21)
+            XCTFail("Expected SQLITE_BUSY while the second connection holds the write lock")
+        } catch {
+            XCTAssertEqual(error as? StoreError, .stepFailed)
+        }
+        try await competingWriter.executeForTesting("ROLLBACK;")
+
+        let sequence = try await writer.lastSequence()
+        let messages = try await writer.recentMessages(sessionId: "s", limit: 10)
+        XCTAssertEqual(sequence, 20)
+        XCTAssertTrue(messages.isEmpty, "A failed BEGIN IMMEDIATE must not persist message or cursor")
+    }
+
+    @MainActor
+    func testFailedLiveFinalWriteRollsBackAndDeltaRecoversAfterRestart() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let cache = try SQLiteStore(url: url)
+        let mock = MockTransport(historyCount: 0)
+        let firstStore = WorkspaceStore(transport: mock, cache: cache)
+        await firstStore.start()
+        let initialSequence = try await cache.lastSequence()
+        XCTAssertEqual(initialSequence, 1200)
+
+        let final = ServerMessage(
+            messageId: "retry-after-restart",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "durable after retry",
+            externalId: nil,
+            createdAt: Date()
+        )
+        let event = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: try XCTUnwrap(try JSONValue.encode(final).objectValue),
+            createdAt: final.createdAt
+        )
+        try await cache.executeForTesting("""
+            CREATE TRIGGER fail_sync_cursor BEFORE INSERT ON kv
+            WHEN NEW.key = 'sync.lastSequence'
+            BEGIN SELECT RAISE(ABORT, 'injected cursor write failure'); END;
+            """)
+        await mock.injectEvent(event, deliverLive: true)
+        for _ in 0..<100 {
+            if firstStore.errors["sync"] != nil { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertNotNil(firstStore.errors["sync"], "A failed atomic final write must be reported and left retryable")
+
+        let reopenedCache = try SQLiteStore(url: url)
+        let cursorAfterFailure = try await reopenedCache.lastSequence()
+        let messagesAfterFailure = try await reopenedCache.recentMessages(sessionId: "photo-upload", limit: 10)
+        XCTAssertEqual(cursorAfterFailure, initialSequence)
+        XCTAssertFalse(messagesAfterFailure.contains { $0.id == "retry-after-restart" }, "A cursor failure must roll back the canonical message")
+        XCTAssertFalse(firstStore.messagesBySession["photo-upload", default: []].contains { $0.id == "retry-after-restart" }, "A failed durable write must not publish terminal message state")
+
+        try await cache.executeForTesting("DROP TRIGGER fail_sync_cursor;")
+        await firstStore.suspend()
+        let restoredStore = WorkspaceStore(transport: mock, cache: reopenedCache)
+        await restoredStore.start()
+
+        let recoveredCursor = try await reopenedCache.lastSequence()
+        let recoveredMessages = try await reopenedCache.recentMessages(sessionId: "photo-upload", limit: 10)
+        XCTAssertEqual(recoveredCursor, 1201)
+        XCTAssertEqual(recoveredMessages.filter { $0.id == "retry-after-restart" }.count, 1)
+        XCTAssertEqual(restoredStore.messagesBySession["photo-upload", default: []].filter { $0.id == "retry-after-restart" }.count, 1)
+        await restoredStore.suspend()
     }
 
     func testSQLiteRejectsOversizedDraftAndKeepsIntegrity() async throws {

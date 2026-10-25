@@ -141,7 +141,7 @@ final class AssistantStreamTests: XCTestCase {
     }
 
     @MainActor
-    func testProcessRestartRebuildsTransientStreamFromExistingCursorAPI() async throws {
+    func testProcessRestartRebuildsTransientStreamWithoutAdvancingDurableCursor() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 1)
         // Cursor survives but the in-memory prefix does not.
@@ -158,7 +158,7 @@ final class AssistantStreamTests: XCTestCase {
         XCTAssertEqual(store.streamingFullText(sessionId: "photo-upload", fallback: ""), "prefix🙂 tail")
         XCTAssertNil(store.errors["sync"])
         let applied = try await cache.lastSequence()
-        XCTAssertEqual(applied, 1202)
+        XCTAssertEqual(applied, 1201, "Transient stream content must remain replayable after process reset")
         await store.suspend()
     }
 }

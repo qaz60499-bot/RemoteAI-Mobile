@@ -103,33 +103,79 @@ actor SQLiteStore {
 
     func upsertMessages(_ messages: [ChatMessage]) throws {
         guard !messages.isEmpty else { return }
-        let sql = "INSERT OR REPLACE INTO messages(id,session_id,sequence,created_at,json) VALUES(?,?,?,?,?)"
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }
-        defer { sqlite3_finalize(stmt) }
-
         try exec("BEGIN IMMEDIATE;")
         do {
-            for message in messages {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                let data = try encoder.encode(message)
-                guard data.count <= Self.maxMessageBytes else { throw StoreError.valueTooLarge }
-                bindText(stmt, 1, message.id)
-                bindText(stmt, 2, message.sessionId)
-                sqlite3_bind_int64(stmt, 3, message.sequence ?? 0)
-                sqlite3_bind_double(stmt, 4, message.createdAt.timeIntervalSince1970)
-                data.withUnsafeBytes { ptr in
-                    _ = sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(data.count), transient)
-                }
-                guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.stepFailed }
-            }
+            try writeMessages(messages)
             try exec("COMMIT;")
             protectDatabaseFiles()
         } catch {
             try? exec("ROLLBACK;")
             throw error
         }
+    }
+
+    func upsertMessageAndSetLastSequence(_ message: ChatMessage, sequence: Int64) throws {
+        try upsertMessageAndApplyDeletions(message, removingMessageIds: [], sequence: sequence)
+    }
+
+    func upsertMessageAndApplyDeletions(_ message: ChatMessage, removingMessageIds: [String], sequence: Int64?) throws {
+        try exec("BEGIN IMMEDIATE;")
+        do {
+            for messageId in removingMessageIds {
+                try deleteMessageRow(id: messageId)
+            }
+            try writeMessages([message])
+            if let sequence { try setLastSequence(sequence) }
+            try exec("COMMIT;")
+            protectDatabaseFiles()
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+    }
+
+    #if DEBUG
+    func executeForTesting(_ sql: String) throws {
+        try exec(sql)
+    }
+
+    func integerForTesting(_ sql: String) throws -> Int64 {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.stepFailed }
+        return sqlite3_column_int64(stmt, 0)
+    }
+    #endif
+
+    private func writeMessages(_ messages: [ChatMessage]) throws {
+        let sql = "INSERT OR REPLACE INTO messages(id,session_id,sequence,created_at,json) VALUES(?,?,?,?,?)"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }
+        defer { sqlite3_finalize(stmt) }
+
+        for message in messages {
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
+            let data = try encoder.encode(message)
+            guard data.count <= Self.maxMessageBytes else { throw StoreError.valueTooLarge }
+            bindText(stmt, 1, message.id)
+            bindText(stmt, 2, message.sessionId)
+            sqlite3_bind_int64(stmt, 3, message.sequence ?? 0)
+            sqlite3_bind_double(stmt, 4, message.createdAt.timeIntervalSince1970)
+            data.withUnsafeBytes { ptr in
+                _ = sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(data.count), transient)
+            }
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.stepFailed }
+        }
+    }
+
+    private func deleteMessageRow(id: String) throws {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "DELETE FROM messages WHERE id=?", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, id)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.stepFailed }
     }
 
     func recentMessages(sessionId: String, limit: Int) throws -> [ChatMessage] {
@@ -154,6 +200,15 @@ actor SQLiteStore {
         guard sqlite3_prepare_v2(db, "DELETE FROM messages WHERE id=?", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, id)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.stepFailed }
+        protectDatabaseFiles()
+    }
+
+    func deleteMessages(sessionId: String) throws {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "DELETE FROM messages WHERE session_id=?", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, sessionId)
         guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.stepFailed }
         protectDatabaseFiles()
     }

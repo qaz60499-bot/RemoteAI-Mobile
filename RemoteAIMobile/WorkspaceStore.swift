@@ -132,6 +132,7 @@ final class WorkspaceStore: ObservableObject {
     let cache: SQLiteStore
     private var tracker = SequenceTracker()
     private var eventReplayGuard = BoundedReplayGuard(capacity: 8192)
+    private var applyingEventIds = Set<String>()
     private var eventTask: Task<Void, Never>?
     private var healthTask: Task<Void, Never>?
     private var connectionMonitorTask: Task<Void, Never>?
@@ -216,14 +217,11 @@ final class WorkspaceStore: ObservableObject {
     private var metadataRefreshDeferredForDelta = false
     private var deltaRecoveryInFlight = false
     private var deltaRecoveryQueued = false
-    private var authoritativeResyncAfterDelta = false
-    private var authoritativeResyncProjectAliases = Set<String>()
     private var deltaRecoveryFailureCount = 0
     private var deltaRecoveryRetryNotBefore: Date?
     private static let deltaRecoveryFailureBackoffSeconds: [TimeInterval] = [1, 2, 4, 8]
     private static let deltaRecoveryPresentationCoalescingThreshold = 12
     private static let deltaRecoveryHistoricalPresentationAge: TimeInterval = 2
-    private static let maxHistoricalDeltaReplayEvents: Int64 = 2_000
     private var webProjectsRevision: UInt64 = 0
     private var webProjectsSnapshotId: String?
     private var projectConversationRevisions: [String: UInt64] = [:]
@@ -438,7 +436,7 @@ final class WorkspaceStore: ObservableObject {
             // failed catalog refresh must never leave the UI stuck in Connecting.
             pairingProgress?(.loadingRuntimes)
             connectionPhase = .loadingRuntimes
-            await recoverDelta(freshLatestSequence: authenticatedSequence)
+            await recoverDelta()
             guard generation == lifecycleGeneration, !isSuspended else { return authenticatedRoundTrip }
             await refreshMetadata()
             guard generation == lifecycleGeneration, !isSuspended else { return authenticatedRoundTrip }
@@ -937,12 +935,12 @@ final class WorkspaceStore: ObservableObject {
             } catch let transportError as TransportError where Self.isRecoverableCommandTransportError(transportError) {
                 DiagnosticsLog.shared.record("project_create_retry", fields: Self.diagnosticFields(for: transportError, adding: ["commandId": commandId.uuidString]), level: "WARN")
                 if !(await activeTransport.isConnected) { try await activeTransport.connect() }
-                let latest = try await activeTransport.latestSequence(machineId: activeMachineId)
+                _ = try await activeTransport.latestSequence(machineId: activeMachineId)
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
                 machine.state = .online
                 connectionPhase = .online
                 errors["connection"] = nil
-                await recoverDelta(freshLatestSequence: latest)
+                await recoverDelta(bypassRetryBackoff: true)
                 created = try await activeTransport.createWebProject(machineId: activeMachineId, projectName: trimmed, commandId: commandId)
             }
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return nil }
@@ -1814,7 +1812,7 @@ final class WorkspaceStore: ObservableObject {
                 discardStreamingPlaceholder(sessionId: sessionId)
                 if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
                 clearLiveRunActivity(sessionId: sessionId)
-                await settleRunningToolRows(sessionId: sessionId)
+                try? await settleRunningToolRows(sessionId: sessionId)
             }
             if route.runtimeId == "runtime.web" {
                 // SESSION_STATUS push is the fast path. The authoritative session-status
@@ -2056,7 +2054,7 @@ final class WorkspaceStore: ObservableObject {
             var recoveredConnectedTransport = false
             if await activeTransport.isConnected {
                 do {
-                    let authenticatedSequence = try await activeTransport.latestSequence(machineId: activeMachineId)
+                    _ = try await activeTransport.latestSequence(machineId: activeMachineId)
                     guard generation == lifecycleGeneration,
                           transport === activeTransport,
                           machine.id == activeMachineId,
@@ -2064,7 +2062,7 @@ final class WorkspaceStore: ObservableObject {
                     machine.state = .online
                     connectionPhase = .online
                     errors["connection"] = nil
-                    await recoverDelta(freshLatestSequence: authenticatedSequence)
+                    await recoverDelta(bypassRetryBackoff: true)
                     recoveredConnectedTransport = true
                     DiagnosticsLog.shared.record("send_stale_offline_recovered", fields: [
                         "runtime": runtimeId,
@@ -2193,12 +2191,12 @@ final class WorkspaceStore: ObservableObject {
                     guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
                     do {
                         if !(await activeTransport.isConnected) { try await activeTransport.connect() }
-                        let authenticatedSequence = try await activeTransport.latestSequence(machineId: activeMachineId)
+                        _ = try await activeTransport.latestSequence(machineId: activeMachineId)
                         guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
                         machine.state = .online
                         connectionPhase = .online
                         errors["connection"] = nil
-                        await recoverDelta(freshLatestSequence: authenticatedSequence)
+                        await recoverDelta(bypassRetryBackoff: true)
                         commandStates[commandId] = .executing
                         let replayedState = try await activeTransport.send(persisted)
                         commandStates[commandId] = replayedState
@@ -2545,6 +2543,7 @@ final class WorkspaceStore: ObservableObject {
         errors.removeAll()
         tracker = SequenceTracker()
         eventReplayGuard = BoundedReplayGuard(capacity: 8192)
+        applyingEventIds.removeAll()
         refreshWebProjectsInFlight = false
         refreshWebProjectsQueued = false
         projectConversationRefreshes.removeAll()
@@ -2751,7 +2750,7 @@ final class WorkspaceStore: ObservableObject {
                         // Reconcile the durable event gap before any catalog refresh. A
                         // reconnect must restore the active chat first; project/runtime
                         // metadata is lower priority and may be comparatively slow.
-                        await self.recoverDelta(freshLatestSequence: authenticatedSequence)
+                        await self.recoverDelta(bypassRetryBackoff: true)
                         await self.refreshMetadata()
                     } catch {
                         guard generation == self.lifecycleGeneration,
@@ -2778,7 +2777,7 @@ final class WorkspaceStore: ObservableObject {
                         self.endTransientConnectionPresentation()
                         DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence), "source": "agent-recovered"])
                         self.scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "agent-recovered")
-                        await self.recoverDelta(freshLatestSequence: authenticatedSequence)
+                        await self.recoverDelta(bypassRetryBackoff: true)
                         await self.refreshMetadata()
                     } catch {
                         guard generation == self.lifecycleGeneration,
@@ -3540,7 +3539,7 @@ final class WorkspaceStore: ObservableObject {
         _ event: RemoteEvent,
         sessionId: String,
         suppressPresentation: Bool
-    ) async {
+    ) async throws {
         guard event.runtimeId == "runtime.web",
               let projectAlias = event.payload["projectAlias"]?.stringValue,
               !projectAlias.isEmpty,
@@ -3612,19 +3611,55 @@ final class WorkspaceStore: ObservableObject {
             }
         }
 
-        if !suppressPresentation {
-            if existingIndex != nil {
-                try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
-            }
-            await persistMetadata()
+        // Historical presentation is coalesced, but replay still has to persist the
+        // event's authoritative identity before its durable cursor can move past it.
+        if existingIndex != nil {
+            try await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+        }
+        try await persistMetadataChecked()
+    }
+
+    @discardableResult
+    private func persistMetadata() async -> Bool {
+        do {
+            try await persistMetadataChecked()
+            return true
+        } catch {
+            return false
         }
     }
 
-    private func persistMetadata() async {
-        try? await cache.put(machine, key: "machine")
-        try? await cache.put(runtimes, key: "runtimes")
-        try? await cache.put(instances, key: "instances")
-        try? await cache.put(sessions, key: "sessions")
+    private func persistMetadataChecked(sessions snapshot: [SessionDescriptor]? = nil) async throws {
+        try await cache.put(machine, key: "machine")
+        try await cache.put(runtimes, key: "runtimes")
+        try await cache.put(instances, key: "instances")
+        try await cache.put(snapshot ?? sessions, key: "sessions")
+    }
+
+    private func hasUnsettledEventStreamState(excludingSessionId: String? = nil) -> Bool {
+        // A process-local stream buffer cannot justify a durable global checkpoint.
+        // Keep the cursor before any active run so restart replays it from SQLite's cursor.
+        let isOtherSession: (String) -> Bool = { id in
+            guard let excludingSessionId else { return true }
+            return id != excludingSessionId
+        }
+        let hasStream = assistantStreams.keys.contains(where: isOtherSession)
+            || streamingBuffers.keys.contains(where: isOtherSession)
+            || incompleteAssistantStreams.keys.contains(where: isOtherSession)
+        if hasStream { return true }
+        return sessions.contains { session in
+            isOtherSession(session.id) && (session.state == .busy || session.state == .waiting)
+        }
+    }
+
+    private func scheduleQueuedDeltaRecoveryIfPossible() {
+        guard deltaRecoveryQueued,
+              !deltaRecoveryInFlight,
+              applyingEventIds.isEmpty,
+              machine.state == .online,
+              !isSuspended else { return }
+        deltaRecoveryQueued = false
+        Task { [weak self] in await self?.recoverDelta() }
     }
 
     private func ingest(_ event: RemoteEvent) async {
@@ -3640,13 +3675,32 @@ final class WorkspaceStore: ObservableObject {
             await recoverDelta()
             return
         }
-        guard eventReplayGuard.accept(event.eventId.uuidString.lowercased()) else {
+        let replayKey = event.eventId.uuidString.lowercased()
+        guard !applyingEventIds.contains(replayKey) else { return }
+        var proposedReplayGuard = eventReplayGuard
+        guard proposedReplayGuard.accept(replayKey) else {
             errors["sync"] = TransportError.replayDetected.localizedDescription
             return
         }
-        tracker.advanceMonotonically(to: event.sequence)
-        await applyEvent(event)
-        try? await cache.setLastSequence(event.sequence)
+        applyingEventIds.insert(replayKey)
+        defer {
+            applyingEventIds.remove(replayKey)
+            scheduleQueuedDeltaRecoveryIfPossible()
+        }
+        do {
+            try await applyEvent(event)
+            if !hasUnsettledEventStreamState() {
+                try await cache.setLastSequence(event.sequence)
+            }
+            eventReplayGuard = proposedReplayGuard
+            tracker.advanceMonotonically(to: event.sequence)
+        } catch {
+            errors["sync"] = error.localizedDescription
+            DiagnosticsLog.shared.record("live_event_apply_failed", fields: [
+                "sequence": String(event.sequence),
+                "eventId": replayKey,
+            ], level: "ERROR")
+        }
     }
 
     // An open socket proves transport health, not that the final event arrived.
@@ -3656,17 +3710,22 @@ final class WorkspaceStore: ObservableObject {
         let activeTransport = transport
         guard !isSuspended, machine.state == .online, !deltaRecoveryInFlight else { return }
         lastOnlineHeadProbe = Date()
-        let appliedBeforeProbe = (try? await cache.lastSequence()) ?? 0
+        let durableBeforeProbe = (try? await cache.lastSequence()) ?? 0
         do {
             let head = try await activeTransport.latestSequence(machineId: machine.id)
             guard generation == lifecycleGeneration, transport === activeTransport, !isSuspended else { return }
-            let applied = (try? await cache.lastSequence()) ?? 0
-            if head > applied || head < appliedBeforeProbe {
+            let durableApplied = (try? await cache.lastSequence()) ?? 0
+            let applied = max(durableApplied, tracker.lastSequence)
+            if head > applied || head < durableBeforeProbe {
                 if syncState != "stale" { syncState = "stale" }
-                DiagnosticsLog.shared.record("online_sync_gap", fields: ["head": String(head), "applied": String(applied)])
-                await recoverDelta(freshLatestSequence: head)
+                DiagnosticsLog.shared.record("online_sync_gap", fields: [
+                    "head": String(head),
+                    "applied": String(applied),
+                    "durableCursor": String(durableApplied),
+                ])
+                await recoverDelta(bypassRetryBackoff: true)
             }
-            let current = (try? await cache.lastSequence()) ?? 0
+            let current = max((try? await cache.lastSequence()) ?? 0, tracker.lastSequence)
             for event in Array(incompleteAssistantStreams.values) { _ = await restoreAssistantStream(through: event) }
             let nextSyncState = current >= head && errors["sync"] == nil && incompleteAssistantStreams.isEmpty ? "synced" : "stale"
             if syncState != nextSyncState { syncState = nextSyncState }
@@ -3691,9 +3750,9 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func recoverDelta(freshLatestSequence: Int64? = nil) async {
+    private func recoverDelta(bypassRetryBackoff: Bool = false) async {
         guard machine.state == .online else { return }
-        if freshLatestSequence == nil,
+        if !bypassRetryBackoff,
            let retryNotBefore = deltaRecoveryRetryNotBefore,
            Date() < retryNotBefore {
             return
@@ -3706,6 +3765,10 @@ final class WorkspaceStore: ObservableObject {
             deltaRecoveryQueued = true
             return
         }
+        if !applyingEventIds.isEmpty {
+            deltaRecoveryQueued = true
+            return
+        }
         deltaRecoveryInFlight = true
         let generation = lifecycleGeneration
         defer {
@@ -3714,95 +3777,33 @@ final class WorkspaceStore: ObservableObject {
                 && generation == lifecycleGeneration
                 && machine.state == .online
                 && !isSuspended
+                && applyingEventIds.isEmpty
             if shouldRunQueuedRecovery {
                 deltaRecoveryQueued = false
                 Task { [weak self] in await self?.recoverDelta() }
-            } else {
+            } else if applyingEventIds.isEmpty {
                 deltaRecoveryQueued = false
                 if deltaRecoveryDisplayMessagesBySession != nil {
                     deltaRecoveryDisplayMessagesBySession = nil
                 }
-                if authoritativeResyncAfterDelta,
+                if metadataRefreshDeferredForDelta,
                    generation == lifecycleGeneration,
                    machine.state == .online,
                    !isSuspended {
-                    let aliases = authoritativeResyncProjectAliases
-                    authoritativeResyncAfterDelta = false
-                    authoritativeResyncProjectAliases.removeAll()
-                    metadataRefreshDeferredForDelta = false
-                    Task { @MainActor [weak self] in
-                        guard let self,
-                              generation == self.lifecycleGeneration,
-                              self.machine.state == .online,
-                              !self.isSuspended else { return }
-                        DiagnosticsLog.shared.record("delta_fast_forward_resync_begin", fields: ["projects": String(aliases.count)])
-                        await self.refreshMetadata()
-                        await self.refreshWebProjects(force: true)
-                        for alias in aliases {
-                            guard generation == self.lifecycleGeneration,
-                                  self.machine.state == .online,
-                                  !self.isSuspended else { return }
-                            await self.loadProjectConversations(projectAlias: alias, refresh: true, force: true)
-                        }
-                        DiagnosticsLog.shared.record("delta_fast_forward_resync_ok", fields: ["projects": String(aliases.count)])
-                    }
-                } else if metadataRefreshDeferredForDelta,
-                          generation == lifecycleGeneration,
-                          machine.state == .online,
-                          !isSuspended {
                     metadataRefreshDeferredForDelta = false
                     Task { [weak self] in await self?.refreshMetadata() }
-                } else {
-                    authoritativeResyncAfterDelta = false
-                    authoritativeResyncProjectAliases.removeAll()
-                    metadataRefreshDeferredForDelta = false
                 }
             }
         }
 
-        var cursor = (try? await cache.lastSequence()) ?? 0
         do {
-            if let freshLatestSequence, cursor > 0 {
-                let lag = freshLatestSequence - cursor
-                if lag < 0 || lag > Self.maxHistoricalDeltaReplayEvents {
-                    let previousCursor = cursor
-                    cursor = max(0, freshLatestSequence)
-                    try? await cache.setLastSequence(cursor)
-                    tracker.advanceMonotonically(to: cursor)
-                    deltaRecoveryFailureCount = 0
-                    deltaRecoveryRetryNotBefore = nil
-                    // Skipping tens of thousands of historical progress events is correct,
-                    // but moving the cursor alone leaves cached Projects/sessions stale.
-                    // Force a bounded authoritative rebuild after this recovery pass and
-                    // let the currently visible ChatView immediately re-read its history.
-                    authoritativeResyncAfterDelta = true
-                    authoritativeResyncProjectAliases.formUnion(projectConversationsByAlias.keys)
-                    visibleSessionSyncAt.removeAll()
-                    visibleSessionHistorySyncAt.removeAll()
-                    visibleSessionHistoryRemoteRevision.removeAll()
-                    metadataRefreshDeferredForDelta = true
-                    DiagnosticsLog.shared.record("delta_recovery_fast_forward", fields: [
-                        "cursor": String(previousCursor),
-                        "latestSequence": String(freshLatestSequence),
-                        "skippedEvents": String(max(0, lag)),
-                        "resyncProjects": String(authoritativeResyncProjectAliases.count),
-                    ], level: "WARN")
-                    return
-                }
-            }
-            if cursor == 0 && instances.isEmpty && sessions.isEmpty && webProjects.isEmpty {
-                // A fresh install has no local state to reconcile. Reuse the authenticated
-                // getStatus sequence when startup/reconnect already fetched it, so one
-                // initialization never issues a duplicate status request.
-                if let freshLatestSequence {
-                    cursor = freshLatestSequence
-                } else {
-                    cursor = try await transport.latestSequence(machineId: machine.id)
-                }
-                try? await cache.setLastSequence(cursor)
-                tracker.advanceMonotonically(to: cursor)
-                return
-            }
+            let persistedCursor = try await cache.lastSequence()
+            var cursor = max(persistedCursor, tracker.lastSequence)
+            // The authenticated head reports availability, not that local state has
+            // reconciled. This includes an empty cache: replay bounded pages from zero
+            // rather than making a status probe an application checkpoint. A fresh
+            // install can therefore catch up from the retained event log before it has
+            // any session metadata locally.
             var deferredPresentationDuringRecovery = false
             while true {
                 guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
@@ -3835,9 +3836,11 @@ final class WorkspaceStore: ObservableObject {
                     ])
                 }
                 for event in result.events where event.sequence > cursor {
+                    guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
                     try ProtocolSecurity.validate(event, expectedMachineId: machine.id)
                     let replayKey = event.eventId.uuidString.lowercased()
-                    if !eventReplayGuard.accept(replayKey) {
+                    var proposedReplayGuard = eventReplayGuard
+                    if !proposedReplayGuard.accept(replayKey) {
                         // A live websocket event can legitimately arrive while an
                         // authenticated delta request containing that same event is in
                         // flight. Skip only when the sequence tracker proves this event
@@ -3849,10 +3852,15 @@ final class WorkspaceStore: ObservableObject {
                             "eventId": replayKey,
                         ])
                         cursor = event.sequence
-                        try? await cache.setLastSequence(cursor)
                         continue
                     }
-                    tracker.advanceMonotonically(to: event.sequence)
+                    if applyingEventIds.contains(replayKey) {
+                        // Live delivery is currently applying this exact delta event.
+                        // Let it finish first; its durable cursor commit or failure will
+                        // determine where the queued recovery pass resumes.
+                        deltaRecoveryQueued = true
+                        return
+                    }
                     // Only old replay progress is presentation-coalesced. A current stream
                     // can be caught inside the same large delta page after a short network
                     // gap; those fresh events must remain visibly live instead of waiting
@@ -3893,11 +3901,25 @@ final class WorkspaceStore: ObservableObject {
                     // not current connectivity. Re-applying it makes a healthy phone flash
                     // offline/recovered while catching up. Live websocket/health callbacks are
                     // the only authority allowed to mutate current transport presentation.
-                    if event.type != "TRANSPORT_STATUS" {
-                        await applyEvent(event, suppressTransientPresentation: suppressEventPresentation)
+                    applyingEventIds.insert(replayKey)
+                    do {
+                        if event.type != "TRANSPORT_STATUS" {
+                            try await applyEvent(event, suppressTransientPresentation: suppressEventPresentation)
+                        }
+                    } catch {
+                        applyingEventIds.remove(replayKey)
+                        scheduleQueuedDeltaRecoveryIfPossible()
+                        throw error
+                    }
+                    guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else {
+                        applyingEventIds.remove(replayKey)
+                        return
                     }
                     cursor = event.sequence
-                    try? await cache.setLastSequence(cursor)
+                    eventReplayGuard = proposedReplayGuard
+                    tracker.advanceMonotonically(to: event.sequence)
+                    applyingEventIds.remove(replayKey)
+                    scheduleQueuedDeltaRecoveryIfPossible()
                 }
                 if coalesceHistoricalPresentation {
                     for (sessionId, presentation) in coalescedSessionPresentation {
@@ -3923,7 +3945,12 @@ final class WorkspaceStore: ObservableObject {
                     }
                 }
                 cursor = max(cursor, result.nextCursor)
-                try? await cache.setLastSequence(cursor)
+                // Commit a page only after every event in it succeeded. A failed page
+                // checkpoint is safe to replay, and an active stream keeps the global
+                // cursor behind its non-durable in-memory tail.
+                if !hasUnsettledEventStreamState() {
+                    try await cache.setLastSequence(cursor)
+                }
                 if !result.hasMore { break }
             }
             if deferredPresentationDuringRecovery {
@@ -3955,7 +3982,7 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func applyEvent(_ event: RemoteEvent, suppressTransientPresentation: Bool = false) async {
+    private func applyEvent(_ event: RemoteEvent, suppressTransientPresentation: Bool = false) async throws {
         if event.type == "TRANSPORT_STATUS" {
             // Historical delta recovery can contain many old Relay/Browser status
             // transitions. Replaying them into live transport state makes the phone
@@ -4031,14 +4058,16 @@ final class WorkspaceStore: ObservableObject {
 
         switch event.type {
         case "SESSION_DELETED":
-            sessions.removeAll { $0.id == sessionId }
+            let remainingSessions = sessions.filter { $0.id != sessionId }
+            try await cache.deleteMessages(sessionId: sessionId)
+            try await persistMetadataChecked(sessions: remainingSessions)
+            sessions = remainingSessions
             messagesBySession.removeValue(forKey: sessionId)
             liveRunStatusBySession.removeValue(forKey: sessionId)
-            await persistMetadata()
         case "MESSAGE_REMOVED":
             if let messageID = event.payload["messageId"]?.stringValue {
+                try await cache.deleteMessage(id: messageID)
                 messagesBySession[sessionId]?.removeAll { $0.id == messageID }
-                try? await cache.deleteMessage(id: messageID)
             }
         case "MESSAGE_UPDATED" where event.payload["partial"]?.boolValue != false || event.payload["messageId"]?.stringValue == nil:
             if event.runtimeId == "runtime.web", terminalWebRuns.contains(sessionId) { return }
@@ -4096,54 +4125,70 @@ final class WorkspaceStore: ObservableObject {
                 }
             }
         case "MESSAGE_ADDED", "MESSAGE_UPDATED":
-            if let server = try? JSONValue.object(event.payload).decode(ServerMessage.self) {
-                var base = server.chatMessage
-                if event.runtimeId == "runtime.web" {
-                    base = Self.normalizedWebAssistantMessage(base)
-                    // Static ChatGPT chrome can occasionally arrive as an assistant
-                    // event after accessibility fallback parsing. If normalization
-                    // removes the entire body and there is no generated attachment,
-                    // ignore it completely: it is neither a final answer nor a valid
-                    // terminal boundary for the mobile run.
-                    if base.role == .assistant,
-                       base.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                       (base.attachments ?? []).isEmpty {
-                        return
-                    }
-                }
-                if base.role == .assistant {
-                    if event.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
-                    if let stream = assistantStreams[sessionId] {
-                        let reconciledAt = StreamPerformance.now
-                        let canonicalEqual = stream.text == base.text
-                        var metrics = stream.performance.summary()
-                        metrics["session"] = sessionId
-                        metrics["finalBytes"] = String(base.text.utf8.count)
-                        metrics["finalChars"] = String(base.text.count)
-                        metrics["canonicalEqual"] = String(canonicalEqual)
-                        metrics["canonicalCompareMs"] = String(format: "%.3f", (StreamPerformance.now - reconciledAt) * 1000)
-                        metrics["finalEventAgeMs"] = String(format: "%.3f", Date().timeIntervalSince(event.createdAt) * 1000)
-                        DiagnosticsLog.shared.record("stream_performance", fields: metrics)
-                        stream.performance.stopFrames()
-                        DiagnosticsLog.shared.record("stream_canonical_reconciled", fields: [
-                            "session": sessionId,
-                            "canonicalEqual": String(canonicalEqual),
-                            "finalBytes": String(base.text.utf8.count),
-                            "accumulatedBytes": String(stream.utf8Count),
-                        ])
-                    }
-                    discardStreamingPlaceholder(sessionId: sessionId)
-                    // MESSAGE_ADDED is the durable final boundary. Converge the visible
-                    // run state even if the following GENERATION_STOPPED event is lost.
-                    setSessionState(sessionId, .idle)
-                    liveRunStatusBySession.removeValue(forKey: sessionId)
-                    clearLiveRunActivity(sessionId: sessionId)
-                }
-                if base.role == .user { await reconcileOptimisticUserEcho(base, sessionId: sessionId) }
-                let message = ChatMessage(id: base.id, sessionId: base.sessionId, sequence: event.sequence, role: base.role, kind: base.kind, text: base.text, toolName: nil, toolStatus: nil, detail: nil, attachments: base.attachments, createdAt: base.createdAt)
-                merge([message], into: sessionId)
-                try? await cache.upsertMessages([message])
+            guard let server = try? JSONValue.object(event.payload).decode(ServerMessage.self) else {
+                let isCanonicalBoundary = event.type == "MESSAGE_ADDED"
+                    || event.payload["partial"]?.boolValue == false
+                if isCanonicalBoundary { throw TransportError.malformedData }
+                return
             }
+            var base = server.chatMessage
+            if event.runtimeId == "runtime.web" {
+                base = Self.normalizedWebAssistantMessage(base)
+                // Static ChatGPT chrome can occasionally arrive as an assistant
+                // event after accessibility fallback parsing. If normalization
+                // removes the entire body and there is no generated attachment,
+                // ignore it completely: it is neither a final answer nor a valid
+                // terminal boundary for the mobile run.
+                if base.role == .assistant,
+                   base.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   (base.attachments ?? []).isEmpty {
+                    return
+                }
+            }
+            let message = ChatMessage(id: base.id, sessionId: base.sessionId, sequence: event.sequence, role: base.role, kind: base.kind, text: base.text, toolName: nil, toolStatus: nil, detail: nil, attachments: base.attachments, createdAt: base.createdAt)
+            let removedOptimisticIDs = base.role == .user
+                ? optimisticUserEchoIDs(base, sessionId: sessionId)
+                : []
+            let canCheckpointMessage = base.role == .assistant
+                ? !hasUnsettledEventStreamState(excludingSessionId: sessionId)
+                : !hasUnsettledEventStreamState()
+            try await cache.upsertMessageAndApplyDeletions(
+                message,
+                removingMessageIds: removedOptimisticIDs,
+                sequence: canCheckpointMessage ? event.sequence : nil
+            )
+            if !removedOptimisticIDs.isEmpty {
+                messagesBySession[sessionId]?.removeAll { $0.role == .user && removedOptimisticIDs.contains($0.id) }
+            }
+            if base.role == .assistant {
+                if event.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
+                if let stream = assistantStreams[sessionId] {
+                    let reconciledAt = StreamPerformance.now
+                    let canonicalEqual = stream.text == base.text
+                    var metrics = stream.performance.summary()
+                    metrics["session"] = sessionId
+                    metrics["finalBytes"] = String(base.text.utf8.count)
+                    metrics["finalChars"] = String(base.text.count)
+                    metrics["canonicalEqual"] = String(canonicalEqual)
+                    metrics["canonicalCompareMs"] = String(format: "%.3f", (StreamPerformance.now - reconciledAt) * 1000)
+                    metrics["finalEventAgeMs"] = String(format: "%.3f", Date().timeIntervalSince(event.createdAt) * 1000)
+                    DiagnosticsLog.shared.record("stream_performance", fields: metrics)
+                    stream.performance.stopFrames()
+                    DiagnosticsLog.shared.record("stream_canonical_reconciled", fields: [
+                        "session": sessionId,
+                        "canonicalEqual": String(canonicalEqual),
+                        "finalBytes": String(base.text.utf8.count),
+                        "accumulatedBytes": String(stream.utf8Count),
+                    ])
+                }
+                discardStreamingPlaceholder(sessionId: sessionId)
+                // MESSAGE_ADDED is the durable final boundary. Converge the visible
+                // run state only after its canonical row (and, when safe, cursor) is durable.
+                setSessionState(sessionId, .idle)
+                liveRunStatusBySession.removeValue(forKey: sessionId)
+                clearLiveRunActivity(sessionId: sessionId)
+            }
+            merge([message], into: sessionId)
         case "TOOL_STARTED", "TOOL_FINISHED":
             // Historical catch-up does not need to replay tool animation/status rows one
             // event at a time. The durable assistant message (or the next live event)
@@ -4163,7 +4208,7 @@ final class WorkspaceStore: ObservableObject {
             }
             let terminalWebRun = event.runtimeId == "runtime.web" && terminalWebRuns.contains(sessionId)
             if terminalWebRun && (!completed || rawToolName == "ChatGPT Web") {
-                await settleRunningToolRows(sessionId: sessionId, toolName: toolName)
+                try await settleRunningToolRows(sessionId: sessionId, toolName: toolName)
                 return
             }
             if !terminalWebRun { markLiveRunActivity(sessionId: sessionId, at: event.createdAt) }
@@ -4185,7 +4230,7 @@ final class WorkspaceStore: ObservableObject {
                     : displayDetail
 
                 if completed || isTransientWebProcessDetail(detail) {
-                    await settleRunningToolRows(sessionId: sessionId, toolName: "ChatGPT Web")
+                    try await settleRunningToolRows(sessionId: sessionId, toolName: "ChatGPT Web")
                     return
                 }
                 if messagesBySession[sessionId, default: []].contains(where: {
@@ -4196,7 +4241,7 @@ final class WorkspaceStore: ObservableObject {
                 }) {
                     return
                 }
-                await settleRunningToolRows(sessionId: sessionId, toolName: "ChatGPT Web")
+                try await settleRunningToolRows(sessionId: sessionId, toolName: "ChatGPT Web")
                 let message = ChatMessage(
                     id: "tool-\(event.eventId.uuidString.lowercased())",
                     sessionId: sessionId,
@@ -4209,16 +4254,16 @@ final class WorkspaceStore: ObservableObject {
                     detail: displayDetail,
                     createdAt: event.createdAt
                 )
+                try await cache.upsertMessages([message])
                 merge([message], into: sessionId)
-                try? await cache.upsertMessages([message])
                 return
             }
             let displayDetail = detail
             let stableToolId = toolObject?["id"]?.stringValue
             let messageId = stableToolId.map { "tool-\(sessionId)-\($0)" } ?? event.eventId.uuidString
             let message = ChatMessage(id: messageId, sessionId: sessionId, sequence: event.sequence, role: .tool, kind: .toolEvent, text: "", toolName: toolName, toolStatus: completed ? "Completed" : "Running", detail: displayDetail, createdAt: event.createdAt)
+            try await cache.upsertMessages([message])
             merge([message], into: sessionId)
-            try? await cache.upsertMessages([message])
             if !terminalWebRun {
                 liveRunStatusBySession[sessionId] = completed ? "\(toolName) 已完成，继续处理中…" : "正在运行 \(toolName)…"
             }
@@ -4240,8 +4285,8 @@ final class WorkspaceStore: ObservableObject {
                 // That prefix is transient UI state, not a durable assistant reply.
                 // Remove any already-flushed Streaming bubble instead of promoting it
                 // to final content when the terminal event explicitly reports failure.
+                try await settleRunningToolRows(sessionId: sessionId)
                 discardStreamingPlaceholder(sessionId: sessionId)
-                await settleRunningToolRows(sessionId: sessionId)
                 setSessionState(sessionId, .error)
                 DiagnosticsLog.shared.record("generation_state_applied", fields: [
                     "state": SessionState.error.rawValue,
@@ -4328,7 +4373,7 @@ final class WorkspaceStore: ObservableObject {
             // registration locally so a new in-progress desktop conversation appears
             // on the phone immediately instead of waiting for generation completion or
             // a later Project DOM scan.
-            await applyWebPageRegistrationEvent(event, sessionId: sessionId, suppressPresentation: suppressTransientPresentation)
+            try await applyWebPageRegistrationEvent(event, sessionId: sessionId, suppressPresentation: suppressTransientPresentation)
             if event.payload["activeTabId"]?.intValue != nil,
                webBindingDetachedSessions.remove(sessionId) != nil {
                 setSessionSystemNotice(
@@ -4987,11 +5032,12 @@ final class WorkspaceStore: ObservableObject {
         setSessionState(sessionId, .idle)
         if errors[sessionId] != nil { errors.removeValue(forKey: sessionId) }
 
-        await settleRunningToolRows(sessionId: sessionId)
+        try? await settleRunningToolRows(sessionId: sessionId)
     }
 
-    private func settleRunningToolRows(sessionId: String, toolName: String? = nil) async {
+    private func settleRunningToolRows(sessionId: String, toolName: String? = nil) async throws {
         var changed: [ChatMessage] = []
+        var updatedMessages: [ChatMessage]?
         if var local = messagesBySession[sessionId] {
             for index in local.indices where local[index].kind == .toolEvent
                 && local[index].toolStatus == "Running"
@@ -4999,9 +5045,12 @@ final class WorkspaceStore: ObservableObject {
                 local[index].toolStatus = "Completed"
                 changed.append(local[index])
             }
-            if !changed.isEmpty { messagesBySession[sessionId] = local }
+            if !changed.isEmpty { updatedMessages = local }
         }
-        if !changed.isEmpty { try? await cache.upsertMessages(changed) }
+        if !changed.isEmpty {
+            try await cache.upsertMessages(changed)
+            if let updatedMessages { messagesBySession[sessionId] = updatedMessages }
+        }
     }
 
     private func reconcilePendingUnknownCommands(with remote: [ChatMessage], sessionId: String) async {
@@ -5036,19 +5085,28 @@ final class WorkspaceStore: ObservableObject {
         return false
     }
 
-    private func reconcileOptimisticUserEcho(_ serverMessage: ChatMessage, sessionId: String) async {
+    private func optimisticUserEchoIDs(_ serverMessage: ChatMessage, sessionId: String) -> [String] {
+        var ids: [String] = []
         if routeForSession(sessionId)?.runtimeId == "runtime.codex",
            let providerId = serverMessage.providerMessageId, providerId != serverMessage.id {
             // An authoritative native turn maps the old API ID to the original
             // client ID. Remove only that exact alias, never another equal prompt.
-            messagesBySession[sessionId]?.removeAll { $0.id == providerId && $0.role == .user }
-            try? await cache.deleteMessage(id: providerId)
+            ids.append(providerId)
         }
-        guard let optimistic = messagesBySession[sessionId, default: []].last(where: {
+        if let optimistic = messagesBySession[sessionId, default: []].last(where: {
             $0.role == .user && $0.sequence == nil && UUID(uuidString: $0.id) != nil && $0.text == serverMessage.text && abs($0.createdAt.timeIntervalSince(serverMessage.createdAt)) < 180
-        }) else { return }
-        messagesBySession[sessionId]?.removeAll { $0.id == optimistic.id }
-        try? await cache.deleteMessage(id: optimistic.id)
+        }), !ids.contains(optimistic.id) {
+            ids.append(optimistic.id)
+        }
+        return ids
+    }
+
+    private func reconcileOptimisticUserEcho(_ serverMessage: ChatMessage, sessionId: String) async {
+        let ids = optimisticUserEchoIDs(serverMessage, sessionId: sessionId)
+        for id in ids { try? await cache.deleteMessage(id: id) }
+        if !ids.isEmpty {
+            messagesBySession[sessionId]?.removeAll { $0.role == .user && ids.contains($0.id) }
+        }
     }
 
     static func adjacentExactWebAssistantDuplicateIDs(_ messages: [ChatMessage]) -> Set<String> {
