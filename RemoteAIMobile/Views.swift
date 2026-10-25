@@ -1130,13 +1130,13 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
     func makeUIView(context: Context) -> ProbeView { ProbeView() }
     func updateUIView(_ view: ProbeView, context: Context) {
         view.following = following
-        view.focused = focused
+        view.composerFocused = focused
         view.attachIfNeeded()
     }
 
     final class ProbeView: UIView {
         var following = true
-        var focused = false
+        var composerFocused = false
         private weak var observedScroll: UIScrollView?
         private var offsetObservation: NSKeyValueObservation?
         private var sizeObservation: NSKeyValueObservation?
@@ -1189,7 +1189,7 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
                 "tracking": String(scroll.isTracking),
                 "panState": String(scroll.panGestureRecognizer.state.rawValue),
                 "followTail": String(following),
-                "focused": String(focused),
+                "focused": String(composerFocused),
                 "jump": String(Double(jump)),
                 "jumpStack": abs(jump) > 1_000 ? Thread.callStackSymbols.prefix(28).joined(separator: " | ") : "",
             ])
