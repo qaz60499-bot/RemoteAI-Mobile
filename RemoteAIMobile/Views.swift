@@ -1124,6 +1124,7 @@ private struct ChatTranscriptTailLayout: Equatable {
 private final class ChatTranscriptScrollRequestTrace {
     private var sequence = 0
 
+    @MainActor
     func record(_ fields: [String: String]) {
         dispatchPrecondition(condition: .onQueue(.main))
         sequence += 1
