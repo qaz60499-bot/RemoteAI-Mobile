@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import CryptoKit
 
 private enum OpenWebTabDurableIdentity {
     case chat(conversation: String, project: OpenWebTabProjectIdentity?)
@@ -1661,8 +1662,15 @@ final class WorkspaceStore: ObservableObject {
         let observedAt = ISO8601DateFormatter().string(from: Date())
         let modelInputs = Array(messagesBySession[sessionId, default: []].suffix(100))
             .map(ChatMessageIntegrityInput.init)
+        let displaySnapshot = deltaRecoveryDisplayMessagesBySession?[sessionId]
+        let effectiveDisplayMessages = displaySnapshot ?? messagesBySession[sessionId, default: []]
+        let effectiveDisplayInputs = Array(effectiveDisplayMessages.suffix(100))
+            .map(ChatMessageIntegrityInput.init)
         let modelTask = Task.detached(priority: .utility) {
             ChatMessageIntegrityDigest.snapshot(modelInputs, layer: "presentation-model")
+        }
+        let effectiveDisplayTask = Task.detached(priority: .utility) {
+            ChatMessageIntegrityDigest.snapshot(effectiveDisplayInputs, layer: "effective-display")
         }
 
         do {
@@ -1676,10 +1684,19 @@ final class WorkspaceStore: ObservableObject {
             }
             let modelRows = await modelTask.value
             let cacheRows = await cacheTask.value
+            let effectiveDisplayRows = await effectiveDisplayTask.value
             recordChatIntegrityRows(modelRows, sessionId: sessionId, layer: "presentation-model", observedAt: observedAt)
             recordChatIntegrityRows(cacheRows, sessionId: sessionId, layer: "cache", observedAt: observedAt)
+            recordChatIntegrityDisplay(
+                effectiveDisplayRows,
+                snapshot: displaySnapshot,
+                effectiveCount: effectiveDisplayMessages.count,
+                sessionId: sessionId,
+                observedAt: observedAt
+            )
         } catch {
             let modelRows = await modelTask.value
+            let effectiveDisplayRows = await effectiveDisplayTask.value
             recordChatIntegrityRows(modelRows, sessionId: sessionId, layer: "presentation-model", observedAt: observedAt)
             DiagnosticsLog.shared.record("chat_integrity_snapshot", fields: [
                 "sessionId": sessionId,
@@ -1688,7 +1705,42 @@ final class WorkspaceStore: ObservableObject {
                 "observedAt": observedAt,
                 "status": "read_failed",
             ], level: "WARN")
+            recordChatIntegrityDisplay(
+                effectiveDisplayRows,
+                snapshot: displaySnapshot,
+                effectiveCount: effectiveDisplayMessages.count,
+                sessionId: sessionId,
+                observedAt: observedAt
+            )
         }
+    }
+
+    private func recordChatIntegrityDisplay(
+        _ rows: [ChatMessageIntegrityRow],
+        snapshot: [ChatMessage]?,
+        effectiveCount: Int,
+        sessionId: String,
+        observedAt: String
+    ) {
+        let fingerprint = rows.map { row in
+            [row.rowId, row.role, row.sequence.map { String($0) } ?? "none", String(row.utf8Bytes), row.sha256]
+                .joined(separator: "|")
+        }.joined(separator: "\n")
+        let digest = SHA256.hash(data: Data(fingerprint.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        DiagnosticsLog.shared.record("chat_integrity_effective_display", fields: [
+            "sessionId": sessionId,
+            "layer": "effective-display",
+            "snapshotPresent": String(snapshot != nil),
+            "snapshotCount": snapshot.map { String($0.count) } ?? "none",
+            "effectiveCount": String(effectiveCount),
+            "sampledCount": String(rows.count),
+            "effectiveSHA256": digest,
+            "observedAt": observedAt,
+            "status": "ok",
+        ])
+        recordChatIntegrityRows(rows, sessionId: sessionId, layer: "effective-display", observedAt: observedAt)
     }
 
     private func recordChatIntegrityRows(
@@ -3778,14 +3830,17 @@ final class WorkspaceStore: ObservableObject {
                 && machine.state == .online
                 && !isSuspended
                 && applyingEventIds.isEmpty
+            // The frozen transcript belongs to this active pass only. Release it before
+            // launching a queued pass: that pass may immediately stop at retry backoff
+            // before installing its own defer/owner.
+            if deltaRecoveryDisplayMessagesBySession != nil {
+                deltaRecoveryDisplayMessagesBySession = nil
+            }
             if shouldRunQueuedRecovery {
                 deltaRecoveryQueued = false
                 Task { [weak self] in await self?.recoverDelta() }
             } else if applyingEventIds.isEmpty {
                 deltaRecoveryQueued = false
-                if deltaRecoveryDisplayMessagesBySession != nil {
-                    deltaRecoveryDisplayMessagesBySession = nil
-                }
                 if metadataRefreshDeferredForDelta,
                    generation == lifecycleGeneration,
                    machine.state == .online,
