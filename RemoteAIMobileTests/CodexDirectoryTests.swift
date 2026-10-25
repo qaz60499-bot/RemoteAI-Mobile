@@ -2,6 +2,17 @@ import XCTest
 @testable import RemoteAIMobile
 
 final class CodexDirectoryTests: XCTestCase {
+    func testDesktopCreateAvailabilityUsesCurrentServerCapabilityAndKeepsLegacyMetadataCompatible() throws {
+        var instance = InstanceDescriptor(id: "codex.8", runtimeId: "runtime.codex", name: "Codex8", subtitle: nil)
+        XCTAssertNil(instance.createSessionUnavailableReason)
+        instance.config["createSessionUnavailableReason"] = .string("  请先在 Codex Desktop Project 创建 Chat。\n")
+        let decoded = try JSONDecoder.remoteAI.decode(InstanceDescriptor.self,
+            from: JSONEncoder.remoteAI.encode(instance))
+        XCTAssertEqual(decoded.createSessionUnavailableReason, "请先在 Codex Desktop Project 创建 Chat。")
+        instance.config["createSessionUnavailableReason"] = .string(" \n ")
+        XCTAssertNil(instance.createSessionUnavailableReason)
+    }
+
     private func session(_ id: String, cwd: String?, time: TimeInterval = 1) -> SessionDescriptor {
         SessionDescriptor(id: id, instanceId: "codex.8", title: "Same title", state: .idle,
                           updatedAt: Date(timeIntervalSince1970: time), workingDirectory: cwd, threadId: id)

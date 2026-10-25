@@ -3460,6 +3460,7 @@ struct NewSessionView: View {
     }
 
     private var canCreate: Bool {
+        guard instance.createSessionUnavailableReason == nil else { return false }
         if supportsModelSelection {
             return !model.isEmpty && modelCatalog.models.contains(where: { $0.id == model })
         }
@@ -3469,6 +3470,11 @@ struct NewSessionView: View {
     var body: some View {
         NavigationView {
             Form {
+                if let reason = instance.createSessionUnavailableReason {
+                    Section("创建状态") {
+                        Text(reason).foregroundColor(.secondary).textSelection(.enabled)
+                    }
+                }
                 Section("工作区") {
                     Text(instance.name).font(.headline)
                     if let subtitle = instance.subtitle, !subtitle.isEmpty {

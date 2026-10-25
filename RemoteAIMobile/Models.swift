@@ -84,6 +84,12 @@ extension InstanceDescriptor {
     var configuredModel: String? {
         config["model"]?.stringValue
     }
+
+    var createSessionUnavailableReason: String? {
+        guard let raw = config["createSessionUnavailableReason"]?.stringValue else { return nil }
+        let reason = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return reason.isEmpty ? nil : reason
+    }
 }
 struct SessionDescriptor: Codable, Identifiable, Hashable {
     let id: String
