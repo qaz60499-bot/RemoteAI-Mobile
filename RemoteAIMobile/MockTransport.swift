@@ -300,6 +300,10 @@ actor MockTransport: Transport {
         sequence = max(sequence, event.sequence)
         if deliverLive { continuation?.yield(event) }
     }
+    // Deliver a changelog event over the live stream without appending a second copy.
+    func deliverLiveEvent(_ event: RemoteEvent) {
+        continuation?.yield(event)
+    }
     func injectEvents(_ events: [RemoteEvent]) {
         removeSeededBaselineIfOverlapped(by: events)
         eventLog.append(contentsOf: events)

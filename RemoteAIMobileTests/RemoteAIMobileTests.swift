@@ -900,17 +900,18 @@ final class RemoteAIMobileTests: XCTestCase {
         await mock.injectEvent(overlap)
         await mock.setResponseDelay(action: "getChangesAfterCursor", nanoseconds: 250_000_000)
 
+        let attemptsBeforeRecovery = await mock.actionAttemptCount("getChangesAfterCursor")
         let recovery = Task { await store.synchronizeVisibleSession("photo-upload", force: true) }
         for _ in 0..<80 {
-            if await mock.actionAttemptCount("getChangesAfterCursor") > 0 { break }
+            if await mock.actionAttemptCount("getChangesAfterCursor") > attemptsBeforeRecovery { break }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         let deltaAttemptCount = await mock.actionAttemptCount("getChangesAfterCursor")
-        XCTAssertGreaterThan(deltaAttemptCount, 0)
+        XCTAssertEqual(deltaAttemptCount, attemptsBeforeRecovery + 1)
 
         // The exact event reaches the live stream after the authenticated delta page
         // has already captured it but before that page returns to WorkspaceStore.
-        await mock.injectEvent(overlap, deliverLive: true)
+        await mock.deliverLiveEvent(overlap)
         await recovery.value
 
         XCTAssertNil(store.errors["sync"], "A legitimate live/delta overlap must not enter replay backoff")
@@ -979,17 +980,18 @@ final class RemoteAIMobileTests: XCTestCase {
         for event in overlapEvents { await mock.injectEvent(event) }
         await mock.setResponseDelay(action: "getChangesAfterCursor", nanoseconds: 300_000_000)
 
+        let attemptsBeforeRecovery = await mock.actionAttemptCount("getChangesAfterCursor")
         let recovery = Task { await store.synchronizeVisibleSession("photo-upload", force: true) }
         for _ in 0..<100 {
-            if await mock.actionAttemptCount("getChangesAfterCursor") > 0 { break }
+            if await mock.actionAttemptCount("getChangesAfterCursor") > attemptsBeforeRecovery { break }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         let deltaAttempts = await mock.actionAttemptCount("getChangesAfterCursor")
-        XCTAssertGreaterThan(deltaAttempts, 0)
+        XCTAssertEqual(deltaAttempts, attemptsBeforeRecovery + 1)
 
         // The delayed delta page has already captured 1201...1203. While it is in
         // flight, the websocket delivers those same events and continues to 1210.
-        for event in overlapEvents { await mock.injectEvent(event, deliverLive: true) }
+        for event in overlapEvents { await mock.deliverLiveEvent(event) }
         for sequence in 1204...1210 {
             await mock.injectEvent(RemoteEvent(
                 protocolVersion: 1,
