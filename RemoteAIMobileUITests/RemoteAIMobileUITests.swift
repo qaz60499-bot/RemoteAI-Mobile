@@ -274,9 +274,11 @@ final class RemoteAIMobileUITests: XCTestCase {
         // ignored gesture from an automatic return to the tail during streaming.
         print("TRANSCRIPT_UI before=\(transcript.value ?? "nil")")
         transcript.swipeDown()
-        print("TRANSCRIPT_UI first=\(transcript.value ?? "nil")")
-        transcript.swipeDown()
-        print("TRANSCRIPT_UI second=\(transcript.value ?? "nil")")
+        let historyState = transcript.value as? String
+        print("TRANSCRIPT_UI after=\(historyState ?? "nil")")
+        // Use the first confirmed history state; another swipe can return to the tail while streaming.
+        XCTAssertTrue(historyState?.contains("followTail=false;atBottom=false") == true,
+                      "A single transcript swipe must move away from the live tail")
         let latest = app.buttons["回到最新消息"]
         XCTAssertTrue(latest.waitForExistence(timeout: 3))
         latest.tap()
