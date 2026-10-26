@@ -1122,6 +1122,7 @@ private struct ChatTranscriptTailLayout: Equatable {
     var contentSize: CGSize?
     var viewportSize: CGSize?
     var topFrame: CGRect? = nil
+    var generation: TranscriptLayoutGeneration? = nil
 }
 
 #if DEBUG
@@ -1299,6 +1300,7 @@ private struct ChatTranscriptTailLayoutPreferenceKey: PreferenceKey {
 
     static func reduce(value: inout ChatTranscriptTailLayout, nextValue: () -> ChatTranscriptTailLayout) {
         let next = nextValue()
+        if let generation = next.generation { value.generation = generation }
         if let topFrame = next.topFrame { value.topFrame = topFrame }
         if let bottomFrame = next.bottomFrame {
             value.bottomFrame = bottomFrame
@@ -1333,6 +1335,8 @@ struct ChatView: View {
     }
     @State private var loadingOlder = false
     @State private var olderLoadTask: Task<Void, Never>?
+    @State private var olderLoadToken: UUID?
+    @State private var transcriptReadiness = TranscriptLayoutReadiness()
     @State private var isAtTranscriptStart = false
     @State private var isDraggingTranscript = false
     @State private var transcriptBrowseRevision: UInt64 = 0
@@ -1421,17 +1425,44 @@ struct ChatView: View {
         let browseRevision = transcriptBrowseRevision
         loadingOlder = true
         recordTranscriptPaginationDiagnostic("begin", anchor: anchor)
+        let token = UUID()
+        olderLoadToken = token
         olderLoadTask = Task { @MainActor in
-            defer { loadingOlder = false; olderLoadTask = nil }
+            defer {
+                if olderLoadToken == token {
+                    loadingOlder = false
+                    olderLoadToken = nil
+                    olderLoadTask = nil
+                }
+            }
             let prepended = await store.loadOlder(requestedSessionId)
             recordTranscriptPaginationDiagnostic(prepended ? "load-prepended" : "load-no-prepend", anchor: anchor)
-            guard prepended, !Task.isCancelled, requestedSessionId == session.id,
+            guard olderLoadToken == token, !Task.isCancelled else { return }
+            loadingOlder = false
+            guard prepended, requestedSessionId == session.id,
                   !shouldFollowTranscriptTail, !isDraggingTranscript,
                   browseRevision == transcriptBrowseRevision,
                   messages.first?.id != anchor, messages.contains(where: { $0.id == anchor }) else { return }
+            let expected = TranscriptLayoutGeneration(sessionID: requestedSessionId, firstRowID: messages.first?.id,
+                rowCount: messages.count, browseRevision: browseRevision, loading: false)
+            let ready = await transcriptReadiness.wait(for: expected)
+            recordTranscriptPaginationDiagnostic(ready ? "layout-native-ready" : "layout-not-ready", anchor: anchor)
+            guard ready, !Task.isCancelled, olderLoadToken == token,
+                  requestedSessionId == session.id, browseRevision == transcriptBrowseRevision,
+                  !shouldFollowTranscriptTail, !isDraggingTranscript,
+                  messages.first?.id == expected.firstRowID, messages.count == expected.rowCount,
+                  messages.contains(where: { $0.id == anchor }),
+                  transcriptReadiness.isReady(for: expected) else { return }
             recordTranscriptScrollRequest(reason: "pagination", target: anchor, anchor: "top")
             proxy.scrollTo(anchor, anchor: .top)
         }
+    }
+
+    private func cancelTranscriptHistoryLoad() {
+        olderLoadTask?.cancel()
+        olderLoadTask = nil
+        olderLoadToken = nil
+        loadingOlder = false
     }
 
     private func requestTranscriptTailPosition(
@@ -1641,6 +1672,8 @@ struct ChatView: View {
             if let attachmentError { ErrorBanner(text: attachmentError) { self.attachmentError = nil } }
             if let voiceError = speechInput.errorMessage { ErrorBanner(text: voiceError) { speechInput.dismissError() } }
             ScrollViewReader { proxy in
+                let layoutGeneration = TranscriptLayoutGeneration(sessionID: session.id, firstRowID: messages.first?.id,
+                    rowCount: messages.count, browseRevision: transcriptBrowseRevision, loading: loadingOlder)
                 ZStack(alignment: .bottomTrailing) {
                     ScrollView {
                         VStack(spacing: 12) {
@@ -1730,6 +1763,10 @@ struct ChatView: View {
                             }
                         }
                         #endif
+                        .background {
+                            TranscriptLayoutReadinessProbe(readiness: transcriptReadiness)
+                                .allowsHitTesting(false).accessibilityHidden(true)
+                        }
                         .background(
                             GeometryReader { content in
                                 Color.clear.preference(
@@ -1737,7 +1774,8 @@ struct ChatView: View {
                                     value: ChatTranscriptTailLayout(
                                         bottomFrame: nil,
                                         contentSize: content.size,
-                                        viewportSize: nil
+                                        viewportSize: nil,
+                                        generation: layoutGeneration
                                     )
                                 )
                             }
@@ -1770,6 +1808,7 @@ struct ChatView: View {
                                 // control of the user's history position.
                                 if abs(value.translation.height) > 8 {
                                     if !isDraggingTranscript {
+                                        cancelTranscriptHistoryLoad()
                                         transcriptBrowseRevision &+= 1
                                     }
                                     isDraggingTranscript = true
@@ -1808,7 +1847,7 @@ struct ChatView: View {
                         }
                     }
                     .onChange(of: session.id) { _ in
-                        olderLoadTask?.cancel()
+                        cancelTranscriptHistoryLoad()
                         isAtTranscriptStart = false
                         lastHistoryLoadRevision = nil
                         isDraggingTranscript = false
@@ -1827,6 +1866,9 @@ struct ChatView: View {
                     #endif
                     .onPreferenceChange(ChatTranscriptTailLayoutPreferenceKey.self) { layout in
                         recordTranscriptLayoutDiagnostic(layout)
+                        if let generation = layout.generation, let size = layout.contentSize {
+                            transcriptReadiness.rendered(generation, size: size)
+                        }
                         guard let bottomFrame = layout.bottomFrame,
                               let contentSize = layout.contentSize,
                               let viewportSize = layout.viewportSize else { return }
@@ -1859,6 +1901,7 @@ struct ChatView: View {
 
                     if !isAtBottom || !shouldFollowTranscriptTail, !messages.isEmpty {
                         Button {
+                            cancelTranscriptHistoryLoad()
                             shouldFollowTranscriptTail = true
                             withAnimation(.easeOut(duration: 0.18)) {
                                 requestTranscriptTailPosition(using: proxy, force: true)
@@ -2091,12 +2134,13 @@ struct ChatView: View {
             TextSelectionSheet(text: request.text, monospaced: request.monospaced)
         }
         .onDisappear {
-            olderLoadTask?.cancel()
+            cancelTranscriptHistoryLoad()
             speechInput.stop()
             flushDraftIfDirty()
         }
         .onChange(of: scenePhase) { phase in
             if phase != .active {
+                cancelTranscriptHistoryLoad()
                 speechInput.stop()
                 flushDraftIfDirty()
             } else {

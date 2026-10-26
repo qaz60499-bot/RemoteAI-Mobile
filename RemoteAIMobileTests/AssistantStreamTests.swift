@@ -1,5 +1,6 @@
 import XCTest
 import Combine
+import UIKit
 @testable import RemoteAIMobile
 
 final class AssistantStreamTests: XCTestCase {
@@ -139,6 +140,109 @@ final class AssistantStreamTests: XCTestCase {
         XCTAssertFalse(inserted)
         XCTAssertEqual(store.messagesBySession["photo-upload"], before)
         await store.suspend()
+    }
+
+    @MainActor
+    private final class ReadinessScroll: UIScrollView {
+        var tracking = false
+        var dragging = false
+        var decelerating = true
+        override var isTracking: Bool { tracking }
+        override var isDragging: Bool { dragging }
+        override var isDecelerating: Bool { decelerating }
+    }
+
+    @MainActor
+    private func readinessFixture() -> (TranscriptLayoutReadiness, ReadinessScroll, UIWindow, UUID, TranscriptLayoutGeneration) {
+        let readiness = TranscriptLayoutReadiness()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 800))
+        let scroll = ReadinessScroll(frame: window.bounds)
+        window.addSubview(scroll)
+        scroll.contentSize = CGSize(width: 390, height: 30_000)
+        let binding = UUID()
+        readiness.bind(scroll, id: binding)
+        let generation = TranscriptLayoutGeneration(sessionID: "session", firstRowID: "older", rowCount: 41, browseRevision: 2, loading: false)
+        return (readiness, scroll, window, binding, generation)
+    }
+
+    @MainActor
+    func testPaginationReadinessRequiresCommittedGenerationAndNativeIdle() async {
+        let (readiness, scroll, window, _, expected) = readinessFixture()
+        let offset = scroll.contentOffset
+        let wait = Task { @MainActor in await readiness.wait(for: expected) }
+        for _ in 0..<100 where !readiness.isWaiting { await Task.yield() }
+        XCTAssertTrue(readiness.isWaiting)
+        scroll.decelerating = false
+        readiness.rendered(TranscriptLayoutGeneration(sessionID: "session", firstRowID: "older", rowCount: 41, browseRevision: 2, loading: true), size: scroll.contentSize)
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
+        XCTAssertTrue(readiness.isWaiting, "The loading-indicator layout is not the committed page")
+        readiness.rendered(expected, size: CGSize(width: 390, height: 1_491))
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
+        XCTAssertTrue(readiness.isWaiting, "A new data generation with the old native size is premature")
+        readiness.rendered(expected, size: scroll.contentSize)
+        scroll.tracking = true
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
+        XCTAssertTrue(readiness.isWaiting)
+        scroll.tracking = false
+        scroll.dragging = true
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
+        XCTAssertTrue(readiness.isWaiting)
+        scroll.dragging = false
+        scroll.decelerating = true
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
+        XCTAssertTrue(readiness.isWaiting)
+        scroll.decelerating = false
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
+        let ready = await wait.value
+        XCTAssertTrue(ready)
+        XCTAssertFalse(readiness.isWaiting)
+        scroll.tracking = true
+        XCTAssertFalse(readiness.isReady(for: expected), "A new native touch must invalidate readiness before the resumed task positions")
+        scroll.tracking = false
+        XCTAssertEqual(scroll.contentOffset, offset, "Readiness must never position the scroll view")
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testPaginationCancelledWaitCannotConsumeReplacementIntent() async {
+        let (readiness, scroll, window, _, expected) = readinessFixture()
+        let first = Task { @MainActor in await readiness.wait(for: expected) }
+        for _ in 0..<100 where !readiness.isWaiting { await Task.yield() }
+        first.cancel()
+        let replacement = Task { @MainActor in await readiness.wait(for: expected) }
+        let cancelled = await first.value
+        XCTAssertFalse(cancelled)
+        for _ in 0..<100 { await Task.yield() }
+        XCTAssertTrue(readiness.isWaiting, "Late cancellation of an old intent must not cancel its replacement")
+        readiness.rendered(expected, size: scroll.contentSize)
+        scroll.decelerating = false
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
+        let ready = await replacement.value
+        XCTAssertTrue(ready)
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testPaginationReadinessTimeoutAndBindingOwnership() async {
+        let (readiness, scroll, window, binding, expected) = readinessFixture()
+        let wait = Task { @MainActor in await readiness.wait(for: expected) }
+        for _ in 0..<100 where !readiness.isWaiting { await Task.yield() }
+        readiness.unbind(id: UUID())
+        XCTAssertTrue(readiness.isWaiting, "An obsolete marker must not detach its successor")
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime + 6)
+        let timedOut = await wait.value
+        XCTAssertFalse(timedOut)
+        let detached = Task { @MainActor in await readiness.wait(for: expected) }
+        for _ in 0..<100 where !readiness.isWaiting { await Task.yield() }
+        readiness.unbind(id: binding)
+        let detachedReady = await detached.value
+        XCTAssertFalse(detachedReady)
+        readiness.bind(scroll, id: UUID())
+        readiness.rendered(expected, size: scroll.contentSize)
+        scroll.decelerating = false
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
+        XCTAssertFalse(readiness.isWaiting, "Reattachment must not resurrect a consumed intent")
+        withExtendedLifetime(window) {}
     }
 
     private func event(_ sequence: Int64, type: String = "MESSAGE_UPDATED", payload: [String: JSONValue]) -> RemoteEvent {

@@ -2064,7 +2064,6 @@ final class WorkspaceStore: ObservableObject {
         defer { olderMessageLoads.remove(sessionId) }
         let generation = lifecycleGeneration
         guard let first = messagesBySession[sessionId]?.first, hasMoreBySession[sessionId] != false else { return false }
-        let originalIDs = Set(messagesBySession[sessionId, default: []].map { $0.id })
         do {
             let page: Page<ChatMessage>
             if machine.state == .online, let route = routeForSession(sessionId) {
@@ -2077,12 +2076,14 @@ final class WorkspaceStore: ObservableObject {
             guard !Task.isCancelled, generation == lifecycleGeneration, !isSuspended else { return false }
             try? await cache.upsertMessages(page.items)
             guard !Task.isCancelled, generation == lifecycleGeneration, !isSuspended else { return false }
+            let presentIDs = Set(messagesBySession[sessionId, default: []].map { $0.id })
+            let insertedIDs = Set(page.items.map { $0.id }).subtracting(presentIDs)
             merge(page.items, into: sessionId)
             hasMoreBySession[sessionId] = page.hasMore
             errors[sessionId] = nil
             let updated = messagesBySession[sessionId, default: []]
             guard let anchorIndex = updated.firstIndex(where: { $0.id == first.id }) else { return false }
-            return updated[..<anchorIndex].contains(where: { !originalIDs.contains($0.id) })
+            return updated[..<anchorIndex].contains(where: { insertedIDs.contains($0.id) })
         } catch {
             if !Task.isCancelled, generation == lifecycleGeneration, !isSuspended { errors[sessionId] = error.localizedDescription }
         }
