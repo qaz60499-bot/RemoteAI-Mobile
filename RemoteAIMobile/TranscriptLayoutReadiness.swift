@@ -16,6 +16,11 @@ final class TranscriptLayoutReadiness: NSObject {
     private weak var scroll: UIScrollView?
     private weak var rootMarker: UIView?
     private var bindingID: UUID?
+    private var designatedBindingID: UUID?
+    private var requestedNativeGeneration: TranscriptLayoutGeneration?
+    private var nativeGeneration: TranscriptLayoutGeneration?
+    private var nativeLayoutSize: CGSize = .zero
+    private weak var nativeWindow: UIWindow?
     private var generation: TranscriptLayoutGeneration?
     private var renderedSize: CGSize = .zero
     private var pending: (id: UUID, expected: TranscriptLayoutGeneration, deadline: TimeInterval, continuation: CheckedContinuation<Bool, Never>)?
@@ -29,17 +34,52 @@ final class TranscriptLayoutReadiness: NSObject {
         @objc func frame(_ link: CADisplayLink) { owner?.sample(now: ProcessInfo.processInfo.systemUptime) }
     }
 
+    func registerRootMarker(id: UUID) {
+        designatedBindingID = id
+        bindingID = nil
+        scroll = nil
+        rootMarker = nil
+        requestedNativeGeneration = nil
+        nativeGeneration = nil
+        nativeLayoutSize = .zero
+        nativeWindow = nil
+    }
     func bind(_ scroll: UIScrollView, root: UIView, id: UUID) {
+        guard designatedBindingID == id else { return }
+        let changed = self.scroll !== scroll || rootMarker !== root || bindingID != id
         self.scroll = scroll
         rootMarker = root
         bindingID = id
+        if changed { requestedNativeGeneration = nil; invalidateNativeLayout(id: id) }
     }
     func unbind(id: UUID) {
         guard bindingID == id else { return }
+        invalidateNativeLayout(id: id)
         scroll = nil
         rootMarker = nil
         bindingID = nil
+        requestedNativeGeneration = nil
         finish(false)
+    }
+    func prepareRootLayout(_ generation: TranscriptLayoutGeneration, id: UUID) {
+        guard bindingID == id, requestedNativeGeneration != generation else { return }
+        requestedNativeGeneration = generation
+        invalidateNativeLayout(id: id)
+    }
+    func invalidateNativeLayout(id: UUID) {
+        guard bindingID == id else { return }
+        nativeGeneration = nil
+        nativeWindow = nil
+        nativeLayoutSize = .zero
+    }
+    func rootDidLayout(_ generation: TranscriptLayoutGeneration, size: CGSize, id: UUID) {
+        guard bindingID == id, requestedNativeGeneration == generation,
+              let rootMarker, let scroll, let window = rootMarker.window,
+              window === scroll.window, rootMarker.isDescendant(of: scroll),
+              rootMarker.bounds.size == size else { return }
+        nativeGeneration = generation
+        nativeLayoutSize = size
+        nativeWindow = window
     }
     func rendered(_ generation: TranscriptLayoutGeneration, size: CGSize) {
         self.generation = generation
@@ -72,10 +112,11 @@ final class TranscriptLayoutReadiness: NSObject {
         guard isReady(for: pending.expected) else { return }
         finish(true)
     }
-    // GeometryReader and this mounted root marker describe the same region.
-    // UIScrollView.contentSize can include a different lazy-layout extent.
+    // A native layout acknowledgment can still have the old allocation. Require
+    // capacity for the measured generation, never equality across layout layers.
     func isReady(for expected: TranscriptLayoutGeneration) -> Bool {
         guard generation == expected, !expected.loading,
+              requestedNativeGeneration == expected, nativeGeneration == expected,
               let scroll, scroll.window != nil,
               let rootMarker, rootMarker.window === scroll.window, rootMarker.isDescendant(of: scroll),
               !scroll.isTracking, !scroll.isDragging, !scroll.isDecelerating,
@@ -84,10 +125,13 @@ final class TranscriptLayoutReadiness: NSObject {
               renderedSize.width > 0, renderedSize.height > 0,
               scroll.contentSize.width.isFinite, scroll.contentSize.height.isFinite,
               scroll.contentSize.width > 0, scroll.contentSize.height > 0,
-              let window = rootMarker.window else { return false }
+              let window = rootMarker.window, nativeWindow === window,
+              rootMarker.bounds.size == nativeLayoutSize,
+              nativeLayoutSize.width.isFinite, nativeLayoutSize.height.isFinite,
+              nativeLayoutSize.width > 0, nativeLayoutSize.height > 0 else { return false }
         let scale = window.screen.scale
-        return abs((rootMarker.bounds.width * scale).rounded() - (renderedSize.width * scale).rounded()) <= 1
-            && abs((rootMarker.bounds.height * scale).rounded() - (renderedSize.height * scale).rounded()) <= 1
+        return (nativeLayoutSize.width * scale).rounded() >= (renderedSize.width * scale).rounded()
+            && (nativeLayoutSize.height * scale).rounded() >= (renderedSize.height * scale).rounded()
     }
 
     private func finish(_ ready: Bool) {
@@ -99,6 +143,9 @@ final class TranscriptLayoutReadiness: NSObject {
             fields["renderedRows"] = generation.map { String($0.rowCount) } ?? "none"
             fields["renderedLoading"] = generation.map { String($0.loading) } ?? "none"
             fields["generationMatches"] = String(generation == pending.expected)
+            fields["nativeGenerationMatches"] = String(nativeGeneration == pending.expected)
+            fields["nativeLayoutWidth"] = String(Double(nativeLayoutSize.width))
+            fields["nativeLayoutHeight"] = String(Double(nativeLayoutSize.height))
             fields["renderedWidth"] = String(Double(renderedSize.width))
             fields["nativeWidth"] = scroll.map { String(Double($0.contentSize.width)) } ?? "none"
             if let rootMarker, let scroll {
@@ -125,26 +172,60 @@ final class TranscriptLayoutReadiness: NSObject {
 
 struct TranscriptLayoutReadinessProbe: UIViewRepresentable {
     let readiness: TranscriptLayoutReadiness
-    func makeUIView(context: Context) -> Marker { Marker(readiness: readiness) }
-    func updateUIView(_ view: Marker, context: Context) { view.attach() }
+    let generation: TranscriptLayoutGeneration
+    func makeUIView(context: Context) -> Marker { Marker(readiness: readiness, generation: generation) }
+    func updateUIView(_ view: Marker, context: Context) { view.updateGeneration(generation) }
     static func dismantleUIView(_ view: Marker, coordinator: ()) { view.readiness.unbind(id: view.bindingID) }
 
     final class Marker: UIView {
         let readiness: TranscriptLayoutReadiness
         let bindingID = UUID()
-        init(readiness: TranscriptLayoutReadiness) {
+        private var generation: TranscriptLayoutGeneration
+        init(readiness: TranscriptLayoutReadiness, generation: TranscriptLayoutGeneration) {
             self.readiness = readiness
+            self.generation = generation
             super.init(frame: .zero)
+            readiness.registerRootMarker(id: bindingID)
             isAccessibilityElement = false
             isUserInteractionEnabled = false
         }
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-        override func didMoveToWindow() { super.didMoveToWindow(); attach() }
-        override func didMoveToSuperview() { super.didMoveToSuperview(); attach() }
-        func attach() {
+        override var bounds: CGRect {
+            didSet { if bounds.size != oldValue.size { readiness.invalidateNativeLayout(id: bindingID) } }
+        }
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            readiness.invalidateNativeLayout(id: bindingID)
+            attach()
+            setNeedsLayout()
+        }
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            readiness.invalidateNativeLayout(id: bindingID)
+            attach()
+            setNeedsLayout()
+        }
+        func updateGeneration(_ generation: TranscriptLayoutGeneration) {
+            let changed = self.generation != generation
+            self.generation = generation
+            attach()
+            if changed { setNeedsLayout() }
+        }
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            // Only save a receipt here. The pending frame observer resumes the
+            // caller; this callback never changes SwiftUI state or positions.
+            readiness.rootDidLayout(generation, size: bounds.size, id: bindingID)
+        }
+        private func attach() {
+            guard window != nil else { readiness.unbind(id: bindingID); return }
             var parent = superview
             while let view = parent {
-                if let scroll = view as? UIScrollView { readiness.bind(scroll, root: self, id: bindingID); return }
+                if let scroll = view as? UIScrollView {
+                    readiness.bind(scroll, root: self, id: bindingID)
+                    readiness.prepareRootLayout(generation, id: bindingID)
+                    return
+                }
                 parent = view.superview
             }
         }

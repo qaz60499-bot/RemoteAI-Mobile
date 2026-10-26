@@ -162,14 +162,17 @@ final class AssistantStreamTests: XCTestCase {
         let root = UIView(frame: CGRect(origin: .zero, size: scroll.contentSize))
         scroll.addSubview(root)
         let binding = UUID()
+        readiness.registerRootMarker(id: binding)
         readiness.bind(scroll, root: root, id: binding)
         let generation = TranscriptLayoutGeneration(sessionID: "session", firstRowID: "older", rowCount: 41, browseRevision: 2, loading: false)
+        readiness.prepareRootLayout(generation, id: binding)
+        readiness.rootDidLayout(generation, size: root.bounds.size, id: binding)
         return (readiness, scroll, root, window, binding, generation)
     }
 
     @MainActor
     func testPaginationReadinessRequiresCommittedGenerationAndNativeIdle() async {
-        let (readiness, scroll, _, window, _, expected) = readinessFixture()
+        let (readiness, scroll, root, window, binding, expected) = readinessFixture()
         let offset = scroll.contentOffset
         let wait = Task { @MainActor in await readiness.wait(for: expected) }
         for _ in 0..<100 where !readiness.isWaiting { await Task.yield() }
@@ -178,10 +181,15 @@ final class AssistantStreamTests: XCTestCase {
         readiness.rendered(TranscriptLayoutGeneration(sessionID: "session", firstRowID: "older", rowCount: 41, browseRevision: 2, loading: true), size: scroll.contentSize)
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
         XCTAssertTrue(readiness.isWaiting, "The loading-indicator layout is not the committed page")
-        readiness.rendered(expected, size: CGSize(width: 390, height: 1_491))
-        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
-        XCTAssertTrue(readiness.isWaiting, "A root measurement without its matching mounted native root frame is premature")
         readiness.rendered(expected, size: scroll.contentSize)
+        root.frame.size.height = 1_491
+        readiness.rootDidLayout(expected, size: root.bounds.size, id: binding)
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
+        XCTAssertTrue(readiness.isWaiting, "A new measured generation cannot fit the old native allocation")
+        root.frame.size = scroll.contentSize
+        readiness.sample(now: ProcessInfo.processInfo.systemUptime)
+        XCTAssertTrue(readiness.isWaiting, "A resized root needs its own layout acknowledgment")
+        readiness.rootDidLayout(expected, size: root.bounds.size, id: binding)
         scroll.simulatedTracking = true
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
         XCTAssertTrue(readiness.isWaiting)
@@ -207,17 +215,78 @@ final class AssistantStreamTests: XCTestCase {
 
     @MainActor
     func testPaginationRootWitnessRejectsStaleFrameWithoutEquatingNativeContentExtent() {
-        let (readiness, scroll, root, window, _, expected) = readinessFixture()
+        let (readiness, scroll, root, window, binding, expected) = readinessFixture()
         scroll.simulatedDecelerating = false
         let committedSize = CGSize(width: 390, height: 35_019)
         readiness.rendered(expected, size: committedSize)
         root.frame.size.height = 1_491
+        readiness.rootDidLayout(expected, size: root.bounds.size, id: binding)
         scroll.contentSize.height = 35_059
         XCTAssertFalse(readiness.isReady(for: expected), "Generation alone cannot acknowledge the old root frame")
         root.frame.size = committedSize
+        readiness.rootDidLayout(expected, size: root.bounds.size, id: binding)
         XCTAssertTrue(readiness.isReady(for: expected), "A mounted matching root need not equal the scroll view's lazy content extent")
         root.removeFromSuperview()
         XCTAssertFalse(readiness.isReady(for: expected), "A detached root cannot witness this scroll view's layout")
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testPaginationNativeLayoutReceiptRejectsEarlyAndObsoleteLifecycleStates() {
+        let readiness = TranscriptLayoutReadiness()
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 800))
+        let scroll = ReadinessScroll(frame: window.bounds)
+        scroll.simulatedDecelerating = false
+        window.addSubview(scroll)
+        scroll.contentSize = CGSize(width: 390, height: 34_437)
+        let before = TranscriptLayoutGeneration(sessionID: "session", firstRowID: "stream", rowCount: 1, browseRevision: 2, loading: false)
+        let expected = TranscriptLayoutGeneration(sessionID: "session", firstRowID: "older", rowCount: 41, browseRevision: 2, loading: false)
+        let root = TranscriptLayoutReadinessProbe.Marker(readiness: readiness, generation: before)
+        root.frame = CGRect(x: 0, y: 0, width: 390, height: 1_491)
+        scroll.addSubview(root)
+        root.layoutIfNeeded()
+        readiness.rendered(expected, size: CGSize(width: 390, height: 34_395))
+        root.updateGeneration(expected)
+        XCTAssertFalse(readiness.isReady(for: expected), "A generation update is not a native layout receipt")
+        root.layoutIfNeeded()
+        XCTAssertFalse(readiness.isReady(for: expected), "Even a real callback with the old allocation is insufficient")
+        root.frame.size.height = 34_437
+        XCTAssertFalse(readiness.isReady(for: expected), "A changed native allocation invalidates its old receipt")
+        root.layoutIfNeeded()
+        XCTAssertTrue(readiness.isReady(for: expected), "Allocated native root may exceed the measured SwiftUI extent")
+        root.frame.size.height = 34_438
+        XCTAssertFalse(readiness.isReady(for: expected))
+        root.layoutIfNeeded()
+        XCTAssertTrue(readiness.isReady(for: expected))
+        let next = TranscriptLayoutGeneration(sessionID: "session", firstRowID: "older", rowCount: 41, browseRevision: 3, loading: false)
+        root.updateGeneration(next)
+        readiness.rendered(next, size: CGSize(width: 390, height: 34_395))
+        XCTAssertFalse(readiness.isReady(for: next), "An unchanged size still needs a receipt for the new generation")
+        root.layoutIfNeeded()
+        XCTAssertTrue(readiness.isReady(for: next))
+        readiness.rootDidLayout(expected, size: root.bounds.size, id: root.bindingID)
+        readiness.rootDidLayout(next, size: root.bounds.size, id: UUID())
+        XCTAssertTrue(readiness.isReady(for: next), "Obsolete generation or binding must not overwrite the current receipt")
+        root.removeFromSuperview()
+        XCTAssertFalse(readiness.isReady(for: next))
+        scroll.addSubview(root)
+        XCTAssertFalse(readiness.isReady(for: next), "Reattachment must not reuse an old receipt")
+        root.layoutIfNeeded()
+        XCTAssertTrue(readiness.isReady(for: next))
+        let replacement = TranscriptLayoutReadinessProbe.Marker(readiness: readiness, generation: next)
+        replacement.frame = root.frame
+        scroll.addSubview(replacement)
+        replacement.layoutIfNeeded()
+        XCTAssertTrue(readiness.isReady(for: next))
+        root.updateGeneration(before)
+        XCTAssertTrue(readiness.isReady(for: next), "An obsolete marker update must not reclaim the designated replacement")
+        root.setNeedsLayout()
+        root.layoutIfNeeded()
+        XCTAssertTrue(readiness.isReady(for: next), "An obsolete marker's real layout callback must not reacquire the binding")
+        root.removeFromSuperview()
+        XCTAssertTrue(readiness.isReady(for: next), "An obsolete marker leaving the window must not detach its replacement")
+        scroll.simulatedTracking = true
+        XCTAssertFalse(readiness.isReady(for: next), "The final synchronous check must yield to a new native touch")
         withExtendedLifetime(window) {}
     }
 
@@ -255,7 +324,9 @@ final class AssistantStreamTests: XCTestCase {
         readiness.unbind(id: binding)
         let detachedReady = await detached.value
         XCTAssertFalse(detachedReady)
-        readiness.bind(scroll, root: root, id: UUID())
+        let newBinding = UUID()
+        readiness.registerRootMarker(id: newBinding)
+        readiness.bind(scroll, root: root, id: newBinding)
         readiness.rendered(expected, size: scroll.contentSize)
         scroll.simulatedDecelerating = false
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)

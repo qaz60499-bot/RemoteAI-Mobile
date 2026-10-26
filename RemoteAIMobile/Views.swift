@@ -1764,7 +1764,7 @@ struct ChatView: View {
                         }
                         #endif
                         .background {
-                            TranscriptLayoutReadinessProbe(readiness: transcriptReadiness)
+                            TranscriptLayoutReadinessProbe(readiness: transcriptReadiness, generation: layoutGeneration)
                                 .allowsHitTesting(false).accessibilityHidden(true)
                         }
                         .background(
