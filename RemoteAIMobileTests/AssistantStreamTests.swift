@@ -153,21 +153,23 @@ final class AssistantStreamTests: XCTestCase {
     }
 
     @MainActor
-    private func readinessFixture() -> (TranscriptLayoutReadiness, ReadinessScroll, UIWindow, UUID, TranscriptLayoutGeneration) {
+    private func readinessFixture() -> (TranscriptLayoutReadiness, ReadinessScroll, UIView, UIWindow, UUID, TranscriptLayoutGeneration) {
         let readiness = TranscriptLayoutReadiness()
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 800))
         let scroll = ReadinessScroll(frame: window.bounds)
         window.addSubview(scroll)
         scroll.contentSize = CGSize(width: 390, height: 30_000)
+        let root = UIView(frame: CGRect(origin: .zero, size: scroll.contentSize))
+        scroll.addSubview(root)
         let binding = UUID()
-        readiness.bind(scroll, id: binding)
+        readiness.bind(scroll, root: root, id: binding)
         let generation = TranscriptLayoutGeneration(sessionID: "session", firstRowID: "older", rowCount: 41, browseRevision: 2, loading: false)
-        return (readiness, scroll, window, binding, generation)
+        return (readiness, scroll, root, window, binding, generation)
     }
 
     @MainActor
     func testPaginationReadinessRequiresCommittedGenerationAndNativeIdle() async {
-        let (readiness, scroll, window, _, expected) = readinessFixture()
+        let (readiness, scroll, _, window, _, expected) = readinessFixture()
         let offset = scroll.contentOffset
         let wait = Task { @MainActor in await readiness.wait(for: expected) }
         for _ in 0..<100 where !readiness.isWaiting { await Task.yield() }
@@ -178,7 +180,7 @@ final class AssistantStreamTests: XCTestCase {
         XCTAssertTrue(readiness.isWaiting, "The loading-indicator layout is not the committed page")
         readiness.rendered(expected, size: CGSize(width: 390, height: 1_491))
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
-        XCTAssertTrue(readiness.isWaiting, "A new data generation with the old native size is premature")
+        XCTAssertTrue(readiness.isWaiting, "A root measurement without its matching mounted native root frame is premature")
         readiness.rendered(expected, size: scroll.contentSize)
         scroll.simulatedTracking = true
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
@@ -204,6 +206,22 @@ final class AssistantStreamTests: XCTestCase {
     }
 
     @MainActor
+    func testPaginationRootWitnessRejectsStaleFrameWithoutEquatingNativeContentExtent() {
+        let (readiness, scroll, root, window, _, expected) = readinessFixture()
+        scroll.simulatedDecelerating = false
+        let committedSize = CGSize(width: 390, height: 35_019)
+        readiness.rendered(expected, size: committedSize)
+        root.frame.size.height = 1_491
+        scroll.contentSize.height = 35_059
+        XCTAssertFalse(readiness.isReady(for: expected), "Generation alone cannot acknowledge the old root frame")
+        root.frame.size = committedSize
+        XCTAssertTrue(readiness.isReady(for: expected), "A mounted matching root need not equal the scroll view's lazy content extent")
+        root.removeFromSuperview()
+        XCTAssertFalse(readiness.isReady(for: expected), "A detached root cannot witness this scroll view's layout")
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
     func testPaginationCancelledWaitCannotConsumeReplacementIntent() async {
         let (readiness, scroll, window, _, expected) = readinessFixture()
         let first = Task { @MainActor in await readiness.wait(for: expected) }
@@ -224,7 +242,7 @@ final class AssistantStreamTests: XCTestCase {
 
     @MainActor
     func testPaginationReadinessTimeoutAndBindingOwnership() async {
-        let (readiness, scroll, window, binding, expected) = readinessFixture()
+        let (readiness, scroll, root, window, binding, expected) = readinessFixture()
         let wait = Task { @MainActor in await readiness.wait(for: expected) }
         for _ in 0..<100 where !readiness.isWaiting { await Task.yield() }
         readiness.unbind(id: UUID())
@@ -237,7 +255,7 @@ final class AssistantStreamTests: XCTestCase {
         readiness.unbind(id: binding)
         let detachedReady = await detached.value
         XCTAssertFalse(detachedReady)
-        readiness.bind(scroll, id: UUID())
+        readiness.bind(scroll, root: root, id: UUID())
         readiness.rendered(expected, size: scroll.contentSize)
         scroll.simulatedDecelerating = false
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)

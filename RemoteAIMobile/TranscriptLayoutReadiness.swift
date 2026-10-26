@@ -14,6 +14,7 @@ struct TranscriptLayoutGeneration: Equatable {
 @MainActor
 final class TranscriptLayoutReadiness: NSObject {
     private weak var scroll: UIScrollView?
+    private weak var rootMarker: UIView?
     private var bindingID: UUID?
     private var generation: TranscriptLayoutGeneration?
     private var renderedSize: CGSize = .zero
@@ -28,13 +29,15 @@ final class TranscriptLayoutReadiness: NSObject {
         @objc func frame(_ link: CADisplayLink) { owner?.sample(now: ProcessInfo.processInfo.systemUptime) }
     }
 
-    func bind(_ scroll: UIScrollView, id: UUID) {
+    func bind(_ scroll: UIScrollView, root: UIView, id: UUID) {
         self.scroll = scroll
+        rootMarker = root
         bindingID = id
     }
     func unbind(id: UUID) {
         guard bindingID == id else { return }
         scroll = nil
+        rootMarker = nil
         bindingID = nil
         finish(false)
     }
@@ -69,16 +72,22 @@ final class TranscriptLayoutReadiness: NSObject {
         guard isReady(for: pending.expected) else { return }
         finish(true)
     }
+    // GeometryReader and this mounted root marker describe the same region.
+    // UIScrollView.contentSize can include a different lazy-layout extent.
     func isReady(for expected: TranscriptLayoutGeneration) -> Bool {
         guard generation == expected, !expected.loading,
               let scroll, scroll.window != nil,
+              let rootMarker, rootMarker.window === scroll.window, rootMarker.isDescendant(of: scroll),
               !scroll.isTracking, !scroll.isDragging, !scroll.isDecelerating,
               scroll.bounds.width > 0, scroll.bounds.height > 0,
               renderedSize.width.isFinite, renderedSize.height.isFinite,
               renderedSize.width > 0, renderedSize.height > 0,
-              abs(scroll.contentSize.width - renderedSize.width) <= 1,
-              abs(scroll.contentSize.height - renderedSize.height) <= 1 else { return false }
-        return true
+              scroll.contentSize.width.isFinite, scroll.contentSize.height.isFinite,
+              scroll.contentSize.width > 0, scroll.contentSize.height > 0,
+              let window = rootMarker.window else { return false }
+        let scale = window.screen.scale
+        return abs((rootMarker.bounds.width * scale).rounded() - (renderedSize.width * scale).rounded()) <= 1
+            && abs((rootMarker.bounds.height * scale).rounded() - (renderedSize.height * scale).rounded()) <= 1
     }
 
     private func finish(_ ready: Bool) {
@@ -90,7 +99,15 @@ final class TranscriptLayoutReadiness: NSObject {
             fields["renderedRows"] = generation.map { String($0.rowCount) } ?? "none"
             fields["renderedLoading"] = generation.map { String($0.loading) } ?? "none"
             fields["generationMatches"] = String(generation == pending.expected)
+            fields["renderedWidth"] = String(Double(renderedSize.width))
+            fields["nativeWidth"] = scroll.map { String(Double($0.contentSize.width)) } ?? "none"
+            if let rootMarker, let scroll {
+                fields["nativeRootAttached"] = String(rootMarker.window != nil && rootMarker.window === scroll.window && rootMarker.isDescendant(of: scroll))
+                fields["nativeRootScale"] = rootMarker.window.map { String(Double($0.screen.scale)) } ?? "none"
+            } else { fields["nativeRootAttached"] = "false" }
             fields["renderedHeight"] = String(Double(renderedSize.height))
+            fields["nativeRootHeight"] = rootMarker.map { String(Double($0.bounds.height)) } ?? "none"
+            fields["nativeRootWidth"] = rootMarker.map { String(Double($0.bounds.width)) } ?? "none"
             fields["nativeHeight"] = scroll.map { String(Double($0.contentSize.height)) } ?? "none"
             fields["nativeTracking"] = scroll.map { String($0.isTracking) } ?? "none"
             fields["nativeDragging"] = scroll.map { String($0.isDragging) } ?? "none"
@@ -127,7 +144,7 @@ struct TranscriptLayoutReadinessProbe: UIViewRepresentable {
         func attach() {
             var parent = superview
             while let view = parent {
-                if let scroll = view as? UIScrollView { readiness.bind(scroll, id: bindingID); return }
+                if let scroll = view as? UIScrollView { readiness.bind(scroll, root: self, id: bindingID); return }
                 parent = view.superview
             }
         }
