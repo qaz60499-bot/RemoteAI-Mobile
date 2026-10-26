@@ -344,17 +344,25 @@ final class RemoteAIMobileUITests: XCTestCase {
         }
         XCTAssertGreaterThan(lastReceivedBytes, baselineBytes, "The stream must continue receiving while history is held")
         XCTAssertGreaterThanOrEqual(lastReadingUptime - baselineUptime, 3, "History location must remain stable for at least three native seconds")
-        let rowsBeforePaging = try XCTUnwrap(Int((try readingPosition(nativePosition))["readingLoadedRows"] ?? ""))
+        let beforePaging = try readingPosition(nativePosition)
+        let rowsBeforePaging = try XCTUnwrap(Int(beforePaging["readingLoadedRows"] ?? ""))
+        let pagingAnchor = try XCTUnwrap(beforePaging["readingRow"])
         // The direct stress fixture starts with only the bounded streaming row.
         // Reach its actual measured boundary, load an older page, then browse it.
         transcript.swipeDown()
         let pageLoaded = NSPredicate { _, _ in
             guard let value = nativePosition.value as? String else { return false }
-            let field = value.split(separator: ";").first { $0.hasPrefix("readingLoadedRows=") }
-            let count = field.flatMap { Int($0.dropFirst("readingLoadedRows=".count)) } ?? 0
-            return count > rowsBeforePaging
+            let fields = Dictionary(uniqueKeysWithValues: value.split(separator: ";").compactMap { part -> (String, String)? in
+                let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
+                return pair.count == 2 ? (pair[0], pair[1]) : nil
+            })
+            return (Int(fields["readingLoadedRows"] ?? "") ?? 0) > rowsBeforePaging
+                && fields["readingRow"] == pagingAnchor
+                && abs(Double(fields["readingIntra"] ?? "") ?? .infinity) <= 64
+                && fields["readingDragging"] == "false"
+                && fields["readingDecelerating"] == "false"
         }
-        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: pageLoaded, object: nil)], timeout: 8), .completed, "Reaching the real history boundary must still load an older page")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: pageLoaded, object: nil)], timeout: 8), .completed, "Paging must restore the original row near its top after loading older history")
         transcript.swipeDown()
         let olderBaseline = try readingPosition(nativePosition)
         let olderRow = try XCTUnwrap(olderBaseline["readingRow"])

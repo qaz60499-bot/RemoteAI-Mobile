@@ -1319,7 +1319,7 @@ struct ChatView: View {
     @State private var isAtTranscriptStart = false
     @State private var isDraggingTranscript = false
     @State private var transcriptBrowseRevision: UInt64 = 0
-    @State private var lastHistoryLoadAnchor: String?
+    @State private var lastHistoryLoadRevision: UInt64?
     @State private var pendingAttachments: [PendingAttachment] = []
     @State private var showPhotoPicker = false
     @State private var showFilePicker = false
@@ -1398,8 +1398,8 @@ struct ChatView: View {
         // at the measured history boundary after the user's gesture ends.
         guard isAtTranscriptStart, !isDraggingTranscript, !shouldFollowTranscriptTail,
               !loadingOlder, store.hasMoreBySession[session.id] != false,
-              let anchor = messages.first?.id, lastHistoryLoadAnchor != anchor else { return }
-        lastHistoryLoadAnchor = anchor
+              let anchor = messages.first?.id, lastHistoryLoadRevision != transcriptBrowseRevision else { return }
+        lastHistoryLoadRevision = transcriptBrowseRevision
         let requestedSessionId = session.id
         let browseRevision = transcriptBrowseRevision
         loadingOlder = true
@@ -1458,17 +1458,20 @@ struct ChatView: View {
         #if DEBUG
         guard ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" else { return }
         transcriptScrollRequestTrace.reading.loadedRowCount = messages.count
-        var fields = [
-            "uptime": String(ProcessInfo.processInfo.systemUptime),
-            "phase": phase,
-            "capturedAnchor": anchor,
-            "rowCount": String(messages.count),
-            "firstRowId": messages.first?.id ?? "none",
-            "lastRowId": messages.last?.id ?? "none",
-            "hasMore": store.hasMoreBySession[session.id].map { String($0) } ?? "unknown",
-            "loadingOlder": String(loadingOlder),
-            "followTail": String(shouldFollowTranscriptTail),
-        ]
+        var fields: [String: String] = [:]
+        fields["uptime"] = String(ProcessInfo.processInfo.systemUptime)
+        fields["phase"] = phase
+        fields["browseRevision"] = String(transcriptBrowseRevision)
+        fields["consumedRevision"] = lastHistoryLoadRevision.map { String($0) } ?? "none"
+        fields["gestureActive"] = String(isDraggingTranscript)
+        fields["boundaryVisible"] = String(isAtTranscriptStart)
+        fields["capturedAnchor"] = anchor
+        fields["rowCount"] = String(messages.count)
+        fields["firstRowId"] = messages.first?.id ?? "none"
+        fields["lastRowId"] = messages.last?.id ?? "none"
+        fields["hasMore"] = store.hasMoreBySession[session.id].map { String($0) } ?? "unknown"
+        fields["loadingOlder"] = String(loadingOlder)
+        fields["followTail"] = String(shouldFollowTranscriptTail)
         fields.merge(transcriptScrollRequestTrace.reading.snapshot(), uniquingKeysWith: { _, new in new })
         DiagnosticsLog.shared.record("chat_transcript_pagination_probe", fields: fields)
         #endif
@@ -1699,7 +1702,6 @@ struct ChatView: View {
                                 if abs(value.translation.height) > 8 {
                                     if !isDraggingTranscript {
                                         transcriptBrowseRevision &+= 1
-                                        lastHistoryLoadAnchor = nil
                                     }
                                     isDraggingTranscript = true
                                     focused = false
@@ -1739,7 +1741,7 @@ struct ChatView: View {
                     .onChange(of: session.id) { _ in
                         olderLoadTask?.cancel()
                         isAtTranscriptStart = false
-                        lastHistoryLoadAnchor = nil
+                        lastHistoryLoadRevision = nil
                         isDraggingTranscript = false
                         transcriptBrowseRevision &+= 1
                         didInitialScrollToBottom = false
@@ -1781,7 +1783,7 @@ struct ChatView: View {
                         }
                     }
 
-                    if !isAtBottom, !messages.isEmpty {
+                    if !isAtBottom || !shouldFollowTranscriptTail, !messages.isEmpty {
                         Button {
                             shouldFollowTranscriptTail = true
                             withAnimation(.easeOut(duration: 0.18)) {
