@@ -291,6 +291,53 @@ final class AssistantStreamTests: XCTestCase {
     }
 
     @MainActor
+    func testNativeTailVisibilityRejectsEstimatedGeometryAndObsoleteMarkers() {
+        let (readiness, scroll, root, window, _, expected) = readinessFixture()
+        scroll.contentInsetAdjustmentBehavior = .never
+        scroll.frame.size = CGSize(width: 390, height: 844)
+        scroll.contentInset = UIEdgeInsets(top: 99, left: 0, bottom: 197.66666666666666, right: 0)
+        scroll.contentSize = CGSize(width: 390, height: 1_447)
+        scroll.contentOffset.y = 790.6666666666666
+        readiness.rendered(expected, size: CGSize(width: 390, height: 2_847))
+        let marker = TranscriptTailVisibilityProbe.Marker(readiness: readiness, generation: expected)
+        marker.frame = CGRect(x: 12, y: 1_436, width: 366, height: 1)
+        XCTAssertNil(readiness.tailIsVisible(for: expected), "An unattached marker cannot establish visibility")
+        root.addSubview(marker)
+        XCTAssertEqual(readiness.tailIsVisible(for: expected), true, "Actual visible marker wins over the reproduced stale 2847-point SwiftUI estimate")
+        scroll.simulatedTracking = true
+        XCTAssertEqual(readiness.tailIsVisible(for: expected), true, "Visibility must not depend on pagination's native-idle barrier")
+        scroll.simulatedTracking = false
+        scroll.contentOffset.y = 100
+        XCTAssertEqual(readiness.tailIsVisible(for: expected), false, "The tail must be inside the adjusted native viewport")
+        scroll.contentOffset.y = 790.6666666666666
+        let other = TranscriptLayoutGeneration(sessionID: "other", firstRowID: "older", rowCount: 41, browseRevision: 2, loading: false)
+        marker.generation = other
+        XCTAssertNil(readiness.tailIsVisible(for: expected))
+        marker.generation = expected
+        let replacement = TranscriptTailVisibilityProbe.Marker(readiness: readiness, generation: expected)
+        replacement.frame = marker.frame.offsetBy(dx: 0, dy: -1_000)
+        root.addSubview(replacement)
+        XCTAssertEqual(readiness.tailIsVisible(for: expected), false)
+        marker.generation = expected
+        marker.setNeedsLayout()
+        marker.layoutIfNeeded()
+        readiness.unregisterTailMarker(id: marker.bindingID)
+        XCTAssertEqual(readiness.tailIsVisible(for: expected), false, "Obsolete update/layout/dismantle cannot reclaim or clear the replacement")
+        replacement.removeFromSuperview()
+        XCTAssertNil(readiness.tailIsVisible(for: expected))
+        root.addSubview(replacement)
+        replacement.frame = marker.frame
+        XCTAssertEqual(readiness.tailIsVisible(for: expected), true)
+        let nestedScroll = UIScrollView(frame: root.bounds)
+        root.addSubview(nestedScroll)
+        let nested = TranscriptTailVisibilityProbe.Marker(readiness: readiness, generation: expected)
+        nested.frame = marker.frame
+        nestedScroll.addSubview(nested)
+        XCTAssertNil(readiness.tailIsVisible(for: expected), "A nested scroll view cannot report this transcript's tail")
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
     func testPaginationCancelledWaitCannotConsumeReplacementIntent() async {
         let (readiness, scroll, _, window, _, expected) = readinessFixture()
         let first = Task { @MainActor in await readiness.wait(for: expected) }

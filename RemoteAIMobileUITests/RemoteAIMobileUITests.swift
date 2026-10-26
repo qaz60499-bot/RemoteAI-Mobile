@@ -287,18 +287,21 @@ final class RemoteAIMobileUITests: XCTestCase {
         let dismissKeyboard = app.buttons["DismissComposerKeyboard"]
         XCTAssertTrue(dismissKeyboard.waitForExistence(timeout: 3))
         dismissKeyboard.tap()
+        let nativePosition = app.otherElements["TranscriptNativeReadingPosition"]
+        XCTAssertTrue(nativePosition.waitForExistence(timeout: 3))
         let settledTail = NSPredicate { _, _ in
             !app.keyboards.firstMatch.exists
                 && (transcript.value as? String)?.contains("followTail=true;atBottom=true") == true
         }
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: settledTail, object: nil)], timeout: 10), .completed,
                        "History browsing must start with a closed keyboard and a confirmed visible tail")
+        let tailPosition = try readingPosition(nativePosition)
+        XCTAssertEqual(tailPosition["readingTailVisible"], "true", "The actual native bottom marker must be visible after closing the keyboard")
+        print("READING_UI keyboardClosed=" + String(describing: tailPosition))
         XCTAssertEqual(composer.value as? String, "still responsive", "Closing the keyboard must preserve the unsent draft")
         // Target the transcript and record its follow state to distinguish an
         // ignored gesture from an automatic return to the tail during streaming.
         print("TRANSCRIPT_UI before=\(transcript.value ?? "nil")")
-        let nativePosition = app.otherElements["TranscriptNativeReadingPosition"]
-        XCTAssertTrue(nativePosition.waitForExistence(timeout: 3))
         let readingBefore = try readingPosition(nativePosition)
         print("READING_UI before=" + String(describing: readingBefore))
         transcript.swipeDown()

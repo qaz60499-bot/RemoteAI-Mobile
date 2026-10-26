@@ -9,12 +9,14 @@ struct TranscriptLayoutGeneration: Equatable {
     let loading: Bool
 }
 
-// Observes the existing scroll view only while one pagination intent is pending.
+// Samples pagination readiness only while one intent is pending; tail queries
+// read the current native marker without observing or positioning the scroll view.
 // ScrollViewProxy remains the sole owner of programmatic positioning.
 @MainActor
 final class TranscriptLayoutReadiness: NSObject {
     private weak var scroll: UIScrollView?
     private weak var rootMarker: UIView?
+    private weak var tailMarker: TranscriptTailVisibilityProbe.Marker?
     private var bindingID: UUID?
     private var designatedBindingID: UUID?
     private var requestedNativeGeneration: TranscriptLayoutGeneration?
@@ -84,6 +86,32 @@ final class TranscriptLayoutReadiness: NSObject {
     func rendered(_ generation: TranscriptLayoutGeneration, size: CGSize) {
         self.generation = generation
         renderedSize = size
+    }
+    func registerTailMarker(_ marker: TranscriptTailVisibilityProbe.Marker) {
+        // Registration happens only at creation, never from an obsolete update.
+        tailMarker = marker
+    }
+    func unregisterTailMarker(id: UUID) {
+        guard tailMarker?.bindingID == id else { return }
+        tailMarker = nil
+    }
+    func tailIsVisible(for expected: TranscriptLayoutGeneration) -> Bool? {
+        guard requestedNativeGeneration == expected,
+              let scroll, let rootMarker, rootMarker.window != nil,
+              rootMarker.window === scroll.window, rootMarker.isDescendant(of: scroll),
+              let marker = tailMarker, marker.generation == expected,
+              marker.window === scroll.window, marker.window != nil else { return nil }
+        var parent = marker.superview
+        while let view = parent, !(view is UIScrollView) { parent = view.superview }
+        guard parent === scroll else { return nil }
+        let frame = marker.convert(marker.bounds, to: scroll)
+        let top = scroll.bounds.minY + scroll.adjustedContentInset.top
+        let bottom = scroll.bounds.maxY - scroll.adjustedContentInset.bottom
+        guard frame.minY.isFinite, frame.maxY.isFinite, frame.width.isFinite,
+              frame.width > 0, frame.height > 0, top.isFinite, bottom.isFinite,
+              bottom > top else { return nil }
+        // Read actual marker coordinates, not the lazy stack's estimated extent.
+        return frame.minY >= top - 1 && frame.maxY <= bottom + 1
     }
     var isWaiting: Bool { pending != nil }
 
@@ -229,5 +257,29 @@ struct TranscriptLayoutReadinessProbe: UIViewRepresentable {
                 parent = view.superview
             }
         }
+    }
+}
+
+// A measurement only: no state callback, scroll writer, observer, or frame loop.
+struct TranscriptTailVisibilityProbe: UIViewRepresentable {
+    let readiness: TranscriptLayoutReadiness
+    let generation: TranscriptLayoutGeneration
+    func makeUIView(context: Context) -> Marker { Marker(readiness: readiness, generation: generation) }
+    func updateUIView(_ view: Marker, context: Context) { view.generation = generation }
+    static func dismantleUIView(_ view: Marker, coordinator: ()) { view.readiness.unregisterTailMarker(id: view.bindingID) }
+
+    final class Marker: UIView {
+        let readiness: TranscriptLayoutReadiness
+        let bindingID = UUID()
+        var generation: TranscriptLayoutGeneration
+        init(readiness: TranscriptLayoutReadiness, generation: TranscriptLayoutGeneration) {
+            self.readiness = readiness
+            self.generation = generation
+            super.init(frame: .zero)
+            isAccessibilityElement = false
+            isUserInteractionEnabled = false
+            readiness.registerTailMarker(self)
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     }
 }

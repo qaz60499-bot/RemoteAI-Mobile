@@ -1462,11 +1462,22 @@ struct ChatView: View {
         loadingOlder = false
     }
 
+    @discardableResult
+    private func refreshTranscriptTailVisibility() -> Bool? {
+        let expected = TranscriptLayoutGeneration(sessionID: session.id, firstRowID: messages.first?.id,
+            rowCount: messages.count, browseRevision: transcriptBrowseRevision, loading: loadingOlder)
+        guard let visible = transcriptReadiness.tailIsVisible(for: expected) else { return nil }
+        if isAtBottom != visible { isAtBottom = visible }
+        if visible && !didInitialScrollToBottom { didInitialScrollToBottom = true }
+        return visible
+    }
+
     private func requestTranscriptTailPosition(
         using proxy: ScrollViewProxy,
         layoutSize: ChatTranscriptLayoutSize? = nil,
         force: Bool = false
     ) {
+        refreshTranscriptTailVisibility()
         guard shouldFollowTranscriptTail else {
             recordTranscriptPositionDiagnostic("follow-disabled")
             return
@@ -1737,6 +1748,18 @@ struct ChatView: View {
                             Color.clear
                                 .frame(height: 1)
                                 .id("bottom")
+                                .background {
+                                    TranscriptTailVisibilityProbe(readiness: transcriptReadiness, generation: layoutGeneration)
+                                        .allowsHitTesting(false).accessibilityHidden(true)
+                                }
+                                #if DEBUG
+                                .background {
+                                    if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
+                                        ChatTranscriptReadingRowProbe(trace: transcriptScrollRequestTrace.reading, key: "__bottom__")
+                                            .allowsHitTesting(false).accessibilityHidden(true)
+                                    }
+                                }
+                                #endif
                                 .background(
                                     GeometryReader { marker in
                                         Color.clear.preference(
@@ -1866,7 +1889,7 @@ struct ChatView: View {
                         if let generation = layout.generation, let size = layout.contentSize {
                             transcriptReadiness.rendered(generation, size: size)
                         }
-                        guard let bottomFrame = layout.bottomFrame,
+                        guard layout.bottomFrame != nil,
                               let contentSize = layout.contentSize,
                               let viewportSize = layout.viewportSize else { return }
                         isAtTranscriptStart = layout.topFrame.map {
@@ -1878,17 +1901,8 @@ struct ChatView: View {
                         if layoutSizeChanged {
                             measuredTranscriptLayoutSize = measuredSize
                         }
-                        let visibilityTolerance: CGFloat = 1
-                        let tailIsVisible = bottomFrame.minY >= -visibilityTolerance
-                            && bottomFrame.maxY <= viewportSize.height + visibilityTolerance
-                        if isAtBottom != tailIsVisible {
-                            isAtBottom = tailIsVisible
-                        }
-                        if tailIsVisible {
-                            // Initial positioning is complete only after layout confirms the
-                            // tail marker is actually inside the visible scroll viewport.
-                            didInitialScrollToBottom = true
-                        } else if layoutSizeChanged && shouldFollowTranscriptTail {
+                        let tailIsVisible = refreshTranscriptTailVisibility()
+                        if tailIsVisible != true && layoutSizeChanged && shouldFollowTranscriptTail {
                             // Position once for each distinct rounded content/viewport size.
                             // The marker stays outside LazyVStack, and scroll-offset-only frame
                             // changes do not request a correction.

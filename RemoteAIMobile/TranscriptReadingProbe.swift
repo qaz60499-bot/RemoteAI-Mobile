@@ -24,7 +24,7 @@ final class ChatTranscriptReadingTrace {
             guard let view = row.view, view.window != nil else { return nil }
             return (key, view.convert(view.bounds, to: scroll))
         }
-        let visible = frames.filter { $0.0 != "__top__" && $0.1.maxY > top && $0.1.minY < bottom }
+        let visible = frames.filter { $0.0 != "__top__" && $0.0 != "__bottom__" && $0.1.maxY > top && $0.1.minY < bottom }
             .sorted { $0.1.minY < $1.1.minY }.first
         var result: [String: String] = [:]
         result["readingRow"] = visible?.0 ?? "none"
@@ -48,6 +48,11 @@ final class ChatTranscriptReadingTrace {
             }
         }
         result.merge(anchorLayoutFields, uniquingKeysWith: { _, new in new })
+        if let tail = frames.first(where: { $0.0 == "__bottom__" }) {
+            result["readingTailY"] = String(Double(tail.1.minY - top))
+            result["readingTailHeight"] = String(Double(tail.1.height))
+            result["readingTailVisible"] = String(tail.1.minY >= top - 1 && tail.1.maxY <= bottom + 1)
+        }
         if let sentinel = frames.first(where: { $0.0 == "__top__" }) {
             result["readingTopY"] = String(Double(sentinel.1.minY - top))
         }
