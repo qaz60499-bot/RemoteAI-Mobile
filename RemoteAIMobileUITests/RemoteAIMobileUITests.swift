@@ -240,6 +240,17 @@ final class RemoteAIMobileUITests: XCTestCase {
         try verifyStreamingInteraction(chars: 50_000)
     }
 
+    private func readingPosition(_ element: XCUIElement) throws -> [String: String] {
+        let raw = try XCTUnwrap(element.value as? String, "Native reading-position observation must be present")
+        let fields = Dictionary(uniqueKeysWithValues: raw.split(separator: ";").compactMap { part -> (String, String)? in
+            let pair = part.split(separator: "=", maxSplits: 1).map(String.init)
+            return pair.count == 2 ? (pair[0], pair[1]) : nil
+        })
+        let row = try XCTUnwrap(fields["readingRow"])
+        XCTAssertFalse(["none", "unattached"].contains(row), "Must observe an actual rendered row: " + raw)
+        return fields
+    }
+
     private func verifyStreamingInteraction(chars: Int) throws {
         let app = makeMockApp()
         app.launchEnvironment["REMOTEAI_UI_STRESS_CHARS"] = String(chars)
@@ -286,6 +297,10 @@ final class RemoteAIMobileUITests: XCTestCase {
         // Target the transcript and record its follow state to distinguish an
         // ignored gesture from an automatic return to the tail during streaming.
         print("TRANSCRIPT_UI before=\(transcript.value ?? "nil")")
+        let nativePosition = app.otherElements["TranscriptNativeReadingPosition"]
+        XCTAssertTrue(nativePosition.waitForExistence(timeout: 3))
+        let readingBefore = try readingPosition(nativePosition)
+        print("READING_UI before=" + String(describing: readingBefore))
         transcript.swipeDown()
         let historyState = transcript.value as? String
         print("TRANSCRIPT_UI after=\(historyState ?? "nil")")
@@ -298,15 +313,32 @@ final class RemoteAIMobileUITests: XCTestCase {
         // streaming tail without a new scroll request. A single immediate sample
         // can miss that delayed jump. Observe a fixed history interval before the
         // explicit return; do not retry the swipe or wait for a failed check to pass.
+        let historyProgress = progress.label
+        let readingBaseline = try readingPosition(nativePosition)
+        let baselineRow = try XCTUnwrap(readingBaseline["readingRow"])
+        let baselineIntra = try XCTUnwrap(Double(readingBaseline["readingIntra"] ?? ""))
+        let baselineUptime = try XCTUnwrap(Double(readingBaseline["readingUptime"] ?? ""))
+        XCTAssertEqual(readingBaseline["readingDragging"], "false")
+        XCTAssertEqual(readingBaseline["readingDecelerating"], "false", "Sample after the single swipe settles")
+        print("READING_UI baseline=" + String(describing: readingBaseline))
+        var lastReadingUptime = baselineUptime
         for sample in 1...3 {
             Thread.sleep(forTimeInterval: 1)
             let heldHistoryState = transcript.value as? String
             print("TRANSCRIPT_UI historySample=\(sample) state=\(heldHistoryState ?? "nil")")
             XCTAssertTrue(heldHistoryState?.contains("followTail=false;atBottom=false") == true,
                           "Streaming must preserve the user's history position: \(heldHistoryState ?? "nil")")
+            let reading = try readingPosition(nativePosition)
+            print("READING_UI held=" + String(describing: reading))
+            XCTAssertEqual(reading["readingRow"], baselineRow, "Streaming must preserve the actual visible row")
+            let intra = try XCTUnwrap(Double(reading["readingIntra"] ?? ""))
+            XCTAssertEqual(intra, baselineIntra, accuracy: 24, "Streaming must preserve the position inside a long row")
+            lastReadingUptime = try XCTUnwrap(Double(reading["readingUptime"] ?? ""))
             XCTAssertTrue(latest.exists && latest.isHittable,
                           "Return to latest must stay available while browsing history")
         }
+        XCTAssertTrue(progress.exists && progress.label != historyProgress, "The stream must continue growing during the history interval")
+        XCTAssertGreaterThanOrEqual(lastReadingUptime - baselineUptime, 3, "History location must remain stable for at least three native seconds")
         latest.tap()
         print("STREAM_UI chars=\(chars) historyAndReturnInteractionMs=\((ProcessInfo.processInfo.systemUptime - scrollingBegan) * 1000)")
         let marker = "STRESS_BEGIN_\(chars)"

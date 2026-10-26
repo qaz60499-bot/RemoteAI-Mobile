@@ -1127,6 +1127,7 @@ private struct ChatTranscriptTailLayout: Equatable {
 // Reference storage avoids invalidating the transcript merely to count requests.
 private final class ChatTranscriptScrollRequestTrace {
     private var sequence = 0
+    let reading = ChatTranscriptReadingTrace()
 
     @MainActor
     func record(_ fields: [String: String]) {
@@ -1144,17 +1145,30 @@ private final class ChatTranscriptScrollRequestTrace {
 private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
     var following: Bool
     var focused: Bool
+    let reading: ChatTranscriptReadingTrace
 
-    func makeUIView(context: Context) -> ProbeView { ProbeView() }
+    func makeUIView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.isAccessibilityElement = true
+        view.accessibilityIdentifier = "TranscriptNativeReadingPosition"
+        view.accessibilityLabel = "TranscriptNativeReadingPosition"
+        return view
+    }
     func updateUIView(_ view: ProbeView, context: Context) {
         view.following = following
         view.composerFocused = focused
+        view.reading = reading
         view.attachIfNeeded()
     }
 
     final class ProbeView: UIView {
         var following = true
         var composerFocused = false
+        var reading: ChatTranscriptReadingTrace?
+        override var accessibilityValue: String? {
+            get { reading?.snapshot().sorted { $0.key < $1.key }.map { $0.key + "=" + $0.value }.joined(separator: ";") }
+            set {}
+        }
         private weak var observedScroll: UIScrollView?
         private var offsetObservation: NSKeyValueObservation?
         private var sizeObservation: NSKeyValueObservation?
@@ -1174,11 +1188,13 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
         }
 
         func attachIfNeeded() {
+            if let observedScroll { reading?.scroll = observedScroll }
             guard window != nil, observedScroll == nil else { return }
             var parent = superview
             while let candidate = parent {
                 if let scroll = candidate as? UIScrollView {
                     observedScroll = scroll
+                    reading?.scroll = scroll
                     offsetObservation = scroll.observe(\.contentOffset, options: [.old, .new]) { [weak self] scroll, change in
                         guard change.newValue != change.oldValue else { return }
                         let delta = (change.newValue?.y ?? 0) - (change.oldValue?.y ?? 0)
@@ -1223,6 +1239,7 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
                 "focused": String(composerFocused),
                 "jump": String(Double(jump)),
             ]
+            fields.merge(reading?.snapshot() ?? [:], uniquingKeysWith: { _, new in new })
             if largeJump {
                 // Each diagnostic field is bounded to 512 chars by the existing
                 // redactor. Separate frames preserve the caller beyond KVO glue.
@@ -1405,7 +1422,7 @@ struct ChatView: View {
     private func recordTranscriptPaginationDiagnostic(_ phase: String, anchor: String) {
         #if DEBUG
         guard ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" else { return }
-        DiagnosticsLog.shared.record("chat_transcript_pagination_probe", fields: [
+        var fields = [
             "uptime": String(ProcessInfo.processInfo.systemUptime),
             "phase": phase,
             "capturedAnchor": anchor,
@@ -1415,7 +1432,9 @@ struct ChatView: View {
             "hasMore": store.hasMoreBySession[session.id].map { String($0) } ?? "unknown",
             "loadingOlder": String(loadingOlder),
             "followTail": String(shouldFollowTranscriptTail),
-        ])
+        ]
+        fields.merge(transcriptScrollRequestTrace.reading.snapshot(), uniquingKeysWith: { _, new in new })
+        DiagnosticsLog.shared.record("chat_transcript_pagination_probe", fields: fields)
         #endif
     }
     private func recordTranscriptPositionDiagnostic(_ decision: String) {
@@ -1524,29 +1543,26 @@ struct ChatView: View {
                     ScrollView {
                         VStack(spacing: 12) {
                             LazyVStack(spacing: 12) {
-                                Color.clear.frame(height: 1).id("top").onAppear {
+                                Color.clear.frame(height: 1).id("top")
+                                    .background {
+                                        #if DEBUG
+                                        if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
+                                            ChatTranscriptReadingRowProbe(trace: transcriptScrollRequestTrace.reading, key: "__top__")
+                                                .allowsHitTesting(false).accessibilityHidden(true)
+                                        }
+                                        #endif
+                                    }.onAppear {
                                     guard !shouldFollowTranscriptTail, !loadingOlder,
                                           store.hasMoreBySession[session.id] != false,
                                           let anchor = messages.first?.id else { return }
-                                    let soleStreamingAnchor = messages.count == 1
-                                        && messages.first?.toolStatus == "Streaming"
                                     loadingOlder = true
                                     recordTranscriptPaginationDiagnostic("begin", anchor: anchor)
                                     Task {
                                         await store.loadOlder(session.id)
                                         await MainActor.run {
                                             recordTranscriptPaginationDiagnostic("load-returned", anchor: anchor)
-                                            // Diagnostic A/B: keep the same older-page load,
-                                            // but isolate the request implicated by c402138.
-                                            // Release compilation is deliberately blocked above.
-                                            let skipSoleStreamRestore = ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1"
-                                                && soleStreamingAnchor
-                                            if skipSoleStreamRestore {
-                                                recordTranscriptPaginationDiagnostic("restore-skipped-control", anchor: anchor)
-                                            } else {
-                                                recordTranscriptScrollRequest(reason: "pagination", target: anchor, anchor: "top")
-                                                proxy.scrollTo(anchor, anchor: .top)
-                                            }
+                                            recordTranscriptScrollRequest(reason: "pagination", target: anchor, anchor: "top")
+                                            proxy.scrollTo(anchor, anchor: .top)
                                             loadingOlder = false
                                         }
                                     }
@@ -1563,10 +1579,26 @@ struct ChatView: View {
                                         }, onSelectText: { text, monospaced in
                                             textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
                                         }).id(message.id)
+                                        .background {
+                                            #if DEBUG
+                                            if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
+                                                ChatTranscriptReadingRowProbe(trace: transcriptScrollRequestTrace.reading, key: message.id)
+                                                    .allowsHitTesting(false).accessibilityHidden(true)
+                                            }
+                                            #endif
+                                        }
                                     } else {
                                         MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: supportsModelSelection ? selectedModel : "") } } : nil, retryContextKey: selectedModel, onSelectText: { text, monospaced in
                                             textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
                                         }).equatable().id(message.id)
+                                        .background {
+                                            #if DEBUG
+                                            if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
+                                                ChatTranscriptReadingRowProbe(trace: transcriptScrollRequestTrace.reading, key: message.id)
+                                                    .allowsHitTesting(false).accessibilityHidden(true)
+                                            }
+                                            #endif
+                                        }
                                     }
                                 }
                             }
@@ -1591,9 +1623,8 @@ struct ChatView: View {
                         #if DEBUG
                         .background {
                             if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
-                                ChatTranscriptNativeScrollProbe(following: shouldFollowTranscriptTail, focused: focused)
+                                ChatTranscriptNativeScrollProbe(following: shouldFollowTranscriptTail, focused: focused, reading: transcriptScrollRequestTrace.reading)
                                     .allowsHitTesting(false)
-                                    .accessibilityHidden(true)
                             }
                         }
                         #endif
