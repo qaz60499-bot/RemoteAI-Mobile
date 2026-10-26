@@ -223,7 +223,7 @@ final class AssistantStreamTests: XCTestCase {
 
     @MainActor
     func testPaginationCancelledWaitCannotConsumeReplacementIntent() async {
-        let (readiness, scroll, window, _, expected) = readinessFixture()
+        let (readiness, scroll, _, window, _, expected) = readinessFixture()
         let first = Task { @MainActor in await readiness.wait(for: expected) }
         for _ in 0..<100 where !readiness.isWaiting { await Task.yield() }
         first.cancel()
