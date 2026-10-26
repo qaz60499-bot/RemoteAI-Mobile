@@ -1121,6 +1121,7 @@ private struct ChatTranscriptTailLayout: Equatable {
     var bottomFrame: CGRect?
     var contentSize: CGSize?
     var viewportSize: CGSize?
+    var topFrame: CGRect? = nil
 }
 
 #if DEBUG
@@ -1146,6 +1147,8 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
     var following: Bool
     var focused: Bool
     let reading: ChatTranscriptReadingTrace
+    var stream: AssistantStream?
+    var rowCount: Int
 
     func makeUIView(context: Context) -> ProbeView {
         let view = ProbeView()
@@ -1158,6 +1161,8 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
         view.following = following
         view.composerFocused = focused
         view.reading = reading
+        reading.stream = stream
+        reading.loadedRowCount = rowCount
         view.attachIfNeeded()
     }
 
@@ -1277,6 +1282,7 @@ private struct ChatTranscriptTailLayoutPreferenceKey: PreferenceKey {
 
     static func reduce(value: inout ChatTranscriptTailLayout, nextValue: () -> ChatTranscriptTailLayout) {
         let next = nextValue()
+        if let topFrame = next.topFrame { value.topFrame = topFrame }
         if let bottomFrame = next.bottomFrame {
             value.bottomFrame = bottomFrame
         }
@@ -1309,6 +1315,11 @@ struct ChatView: View {
         nonmutating set { draft.text = newValue }
     }
     @State private var loadingOlder = false
+    @State private var olderLoadTask: Task<Void, Never>?
+    @State private var isAtTranscriptStart = false
+    @State private var isDraggingTranscript = false
+    @State private var transcriptBrowseRevision: UInt64 = 0
+    @State private var lastHistoryLoadAnchor: String?
     @State private var pendingAttachments: [PendingAttachment] = []
     @State private var showPhotoPicker = false
     @State private var showFilePicker = false
@@ -1382,6 +1393,30 @@ struct ChatView: View {
         }
         return notice
     }
+    private func loadTranscriptHistoryIfNeeded(using proxy: ScrollViewProxy) {
+        // Lazy onAppear means instantiated, not visible. Paging must start only
+        // at the measured history boundary after the user's gesture ends.
+        guard isAtTranscriptStart, !isDraggingTranscript, !shouldFollowTranscriptTail,
+              !loadingOlder, store.hasMoreBySession[session.id] != false,
+              let anchor = messages.first?.id, lastHistoryLoadAnchor != anchor else { return }
+        lastHistoryLoadAnchor = anchor
+        let requestedSessionId = session.id
+        let browseRevision = transcriptBrowseRevision
+        loadingOlder = true
+        recordTranscriptPaginationDiagnostic("begin", anchor: anchor)
+        olderLoadTask = Task { @MainActor in
+            defer { loadingOlder = false; olderLoadTask = nil }
+            let prepended = await store.loadOlder(requestedSessionId)
+            recordTranscriptPaginationDiagnostic(prepended ? "load-prepended" : "load-no-prepend", anchor: anchor)
+            guard prepended, !Task.isCancelled, requestedSessionId == session.id,
+                  !shouldFollowTranscriptTail, !isDraggingTranscript,
+                  browseRevision == transcriptBrowseRevision,
+                  messages.first?.id != anchor, messages.contains(where: { $0.id == anchor }) else { return }
+            recordTranscriptScrollRequest(reason: "pagination", target: anchor, anchor: "top")
+            proxy.scrollTo(anchor, anchor: .top)
+        }
+    }
+
     private func requestTranscriptTailPosition(
         using proxy: ScrollViewProxy,
         layoutSize: ChatTranscriptLayoutSize? = nil,
@@ -1422,6 +1457,7 @@ struct ChatView: View {
     private func recordTranscriptPaginationDiagnostic(_ phase: String, anchor: String) {
         #if DEBUG
         guard ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" else { return }
+        transcriptScrollRequestTrace.reading.loadedRowCount = messages.count
         var fields = [
             "uptime": String(ProcessInfo.processInfo.systemUptime),
             "phase": phase,
@@ -1551,22 +1587,16 @@ struct ChatView: View {
                                                 .allowsHitTesting(false).accessibilityHidden(true)
                                         }
                                         #endif
-                                    }.onAppear {
-                                    guard !shouldFollowTranscriptTail, !loadingOlder,
-                                          store.hasMoreBySession[session.id] != false,
-                                          let anchor = messages.first?.id else { return }
-                                    loadingOlder = true
-                                    recordTranscriptPaginationDiagnostic("begin", anchor: anchor)
-                                    Task {
-                                        await store.loadOlder(session.id)
-                                        await MainActor.run {
-                                            recordTranscriptPaginationDiagnostic("load-returned", anchor: anchor)
-                                            recordTranscriptScrollRequest(reason: "pagination", target: anchor, anchor: "top")
-                                            proxy.scrollTo(anchor, anchor: .top)
-                                            loadingOlder = false
-                                        }
                                     }
-                                }
+                                    .background(
+                                        GeometryReader { marker in
+                                            Color.clear.preference(
+                                                key: ChatTranscriptTailLayoutPreferenceKey.self,
+                                                value: ChatTranscriptTailLayout(bottomFrame: nil, contentSize: nil, viewportSize: nil,
+                                                                                topFrame: marker.frame(in: .named("ChatTranscriptViewport")))
+                                            )
+                                        }
+                                    )
                                 if loadingOlder { ProgressView().padding(.vertical, 6) }
                                 ForEach(messages) { message in
                                     let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
@@ -1574,7 +1604,7 @@ struct ChatView: View {
                                     // Only unknown delivery is replayed with the original command ID.
                                     let retryable = message.kind == .error || commandState == .unknown
                                     if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
-                                        AssistantStreamRow(stream: stream, message: message, followTail: {
+                                        AssistantStreamRow(stream: stream, message: message, following: shouldFollowTranscriptTail, followTail: {
                                             requestTranscriptTailPosition(using: proxy)
                                         }, onSelectText: { text, monospaced in
                                             textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
@@ -1623,7 +1653,7 @@ struct ChatView: View {
                         #if DEBUG
                         .background {
                             if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
-                                ChatTranscriptNativeScrollProbe(following: shouldFollowTranscriptTail, focused: focused, reading: transcriptScrollRequestTrace.reading)
+                                ChatTranscriptNativeScrollProbe(following: shouldFollowTranscriptTail, focused: focused, reading: transcriptScrollRequestTrace.reading, stream: store.assistantStreams[session.id], rowCount: messages.count)
                                     .allowsHitTesting(false)
                             }
                         }
@@ -1667,10 +1697,19 @@ struct ChatView: View {
                                 // so incoming messages and streaming layout changes cannot take
                                 // control of the user's history position.
                                 if abs(value.translation.height) > 8 {
+                                    if !isDraggingTranscript {
+                                        transcriptBrowseRevision &+= 1
+                                        lastHistoryLoadAnchor = nil
+                                    }
+                                    isDraggingTranscript = true
                                     focused = false
                                     shouldFollowTranscriptTail = false
                                     isAtBottom = false
                                 }
+                            }
+                            .onEnded { _ in
+                                isDraggingTranscript = false
+                                loadTranscriptHistoryIfNeeded(using: proxy)
                             }
                     )
                     .onAppear {
@@ -1698,6 +1737,11 @@ struct ChatView: View {
                         }
                     }
                     .onChange(of: session.id) { _ in
+                        olderLoadTask?.cancel()
+                        isAtTranscriptStart = false
+                        lastHistoryLoadAnchor = nil
+                        isDraggingTranscript = false
+                        transcriptBrowseRevision &+= 1
                         didInitialScrollToBottom = false
                         shouldFollowTranscriptTail = true
                         isAtBottom = true
@@ -1710,6 +1754,10 @@ struct ChatView: View {
                         guard let bottomFrame = layout.bottomFrame,
                               let contentSize = layout.contentSize,
                               let viewportSize = layout.viewportSize else { return }
+                        isAtTranscriptStart = layout.topFrame.map {
+                            $0.maxY >= -1 && $0.minY <= viewportSize.height
+                        } ?? false
+                        loadTranscriptHistoryIfNeeded(using: proxy)
                         let measuredSize = ChatTranscriptLayoutSize(contentSize: contentSize, viewportSize: viewportSize)
                         let layoutSizeChanged = measuredTranscriptLayoutSize != measuredSize
                         if layoutSizeChanged {
@@ -1967,6 +2015,7 @@ struct ChatView: View {
             TextSelectionSheet(text: request.text, monospaced: request.monospaced)
         }
         .onDisappear {
+            olderLoadTask?.cancel()
             speechInput.stop()
             flushDraftIfDirty()
         }
@@ -2845,14 +2894,25 @@ struct AssistantStreamRow: View, Equatable {
     @ObservedObject var stream: AssistantStream
     @Environment(\.scenePhase) private var scenePhase
     let message: ChatMessage
+    var following = true
     var followTail: () -> Void = {}
     var onSelectText: ((String, Bool) -> Void)? = nil
     @State private var followTask: Task<Void, Never>?
+    @State private var browsingText: String?
     @State private var copiedCurrentText = false
     @State private var copyFeedbackToken: UUID?
 
     static func == (lhs: AssistantStreamRow, rhs: AssistantStreamRow) -> Bool {
-        lhs.stream === rhs.stream && lhs.message == rhs.message
+        lhs.stream === rhs.stream && lhs.message == rhs.message && lhs.following == rhs.following
+    }
+
+    private func presentationFingerprint(_ text: String) -> String {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
+            return String(text.utf8.reduce(UInt64(14695981039346656037)) { ($0 ^ UInt64($1)) &* 1099511628211 }, radix: 16)
+        }
+        #endif
+        return ""
     }
 
     private func copyCurrentText() {
@@ -2869,7 +2929,7 @@ struct AssistantStreamRow: View, Equatable {
 
     var body: some View {
         let began = StreamPerformance.now
-        let visibleText = stream.visibleText
+        let visibleText = browsingText ?? stream.visibleText
         let visibleBytes = stream.visibleBytes
         let _ = stream.performance.rowUpdated(bytes: visibleBytes)
         // Keep the live path deliberately cheap. Re-running the full Markdown/Edit/
@@ -2890,6 +2950,8 @@ struct AssistantStreamRow: View, Equatable {
                                 .font(.caption2)
                         }
                         .buttonStyle(.borderless)
+                        .accessibilityIdentifier("assistant-stream-current-copy")
+                        .accessibilityValue(presentationFingerprint(visibleText))
                         Button("查看 / 选择当前全文") {
                             onSelectText?(MessageContentSegment.copyableText(stream.text), false)
                         }
@@ -2907,7 +2969,13 @@ struct AssistantStreamRow: View, Equatable {
                 .foregroundColor(.secondary)
                 .accessibilityIdentifier("assistant-stream-progress")
         }
-        .onAppear { stream.performance.startFrames() }
+        .onAppear {
+            if !following, browsingText == nil { browsingText = stream.visibleText }
+            stream.performance.startFrames()
+        }
+        .onChange(of: following) { following in
+            browsingText = following ? nil : stream.visibleText
+        }
         .onDisappear {
             stream.performance.stopFrames()
             followTask?.cancel()

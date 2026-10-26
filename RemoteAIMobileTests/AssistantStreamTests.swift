@@ -97,6 +97,50 @@ final class AssistantStreamTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testLoadOlderReportsOnlyActualPrepending() async throws {
+        let store = WorkspaceStore(transport: MockTransport(historyCount: 120), cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadSession("photo-upload")
+        let initial = store.messagesBySession["photo-upload", default: []]
+        XCTAssertFalse(initial.isEmpty)
+        var prepends = 0
+        for _ in 0..<5 {
+            let before = store.messagesBySession["photo-upload", default: []]
+            let inserted = await store.loadOlder("photo-upload")
+            let after = store.messagesBySession["photo-upload", default: []]
+            if inserted {
+                prepends += 1
+                XCTAssertGreaterThan(after.count, before.count)
+                XCTAssertNotEqual(after.first?.id, before.first?.id)
+                XCTAssertEqual(Array(after.suffix(before.count)).map { $0.id }, before.map { $0.id })
+            } else {
+                XCTAssertEqual(after, before, "A no-op page must not claim a positioning correction")
+                break
+            }
+        }
+        XCTAssertGreaterThan(prepends, 0)
+        let completed = store.messagesBySession["photo-upload"]
+        let noMore = await store.loadOlder("photo-upload")
+        XCTAssertFalse(noMore)
+        XCTAssertEqual(store.messagesBySession["photo-upload"], completed)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testCancelledOlderPageDoesNotPublishOrRequestRestoration() async throws {
+        let store = WorkspaceStore(transport: MockTransport(historyCount: 120), cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadSession("photo-upload")
+        let before = store.messagesBySession["photo-upload"]
+        let load = Task { @MainActor in await store.loadOlder("photo-upload") }
+        load.cancel()
+        let inserted = await load.value
+        XCTAssertFalse(inserted)
+        XCTAssertEqual(store.messagesBySession["photo-upload"], before)
+        await store.suspend()
+    }
+
     private func event(_ sequence: Int64, type: String = "MESSAGE_UPDATED", payload: [String: JSONValue]) -> RemoteEvent {
         RemoteEvent(protocolVersion: 1, eventId: UUID(), sequence: sequence, machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", type: type, payload: payload, createdAt: Date())
     }

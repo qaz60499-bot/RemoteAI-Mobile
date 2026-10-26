@@ -10,6 +10,8 @@ final class ChatTranscriptReadingTrace {
     }
     private var rows: [String: Row] = [:]
     weak var scroll: UIScrollView?
+    weak var stream: AssistantStream?
+    var loadedRowCount = 0
     @MainActor func register(_ view: UIView, key: String) { rows[key] = Row(view) }
     @MainActor func snapshot() -> [String: String] {
         guard let scroll else { return ["readingRow": "unattached"] }
@@ -23,6 +25,8 @@ final class ChatTranscriptReadingTrace {
             .sorted { $0.1.minY < $1.1.minY }.first
         var result = [
             "readingRow": visible?.0 ?? "none",
+            "readingStreamBytes": String(stream?.utf8Count ?? 0),
+            "readingLoadedRows": String(loadedRowCount),
             "readingIntra": visible.map { String(Double(top - $0.1.minY)) } ?? "nan",
             "readingRowHeight": visible.map { String(Double($0.1.height)) } ?? "nan",
             "readingOffset": String(Double(scroll.contentOffset.y)),

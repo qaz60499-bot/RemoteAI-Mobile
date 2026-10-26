@@ -313,15 +313,18 @@ final class RemoteAIMobileUITests: XCTestCase {
         // streaming tail without a new scroll request. A single immediate sample
         // can miss that delayed jump. Observe a fixed history interval before the
         // explicit return; do not retry the swipe or wait for a failed check to pass.
-        let historyProgress = progress.label
         let readingBaseline = try readingPosition(nativePosition)
+        let baselineBytes = try XCTUnwrap(Int(readingBaseline["readingStreamBytes"] ?? ""))
         let baselineRow = try XCTUnwrap(readingBaseline["readingRow"])
+        let preview = app.buttons["assistant-stream-current-copy"]
+        let baselineFingerprint = baselineRow == "stream-photo-upload" ? try XCTUnwrap(preview.value as? String) : nil
         let baselineIntra = try XCTUnwrap(Double(readingBaseline["readingIntra"] ?? ""))
         let baselineUptime = try XCTUnwrap(Double(readingBaseline["readingUptime"] ?? ""))
         XCTAssertEqual(readingBaseline["readingDragging"], "false")
         XCTAssertEqual(readingBaseline["readingDecelerating"], "false", "Sample after the single swipe settles")
         print("READING_UI baseline=" + String(describing: readingBaseline))
         var lastReadingUptime = baselineUptime
+        var lastReceivedBytes = baselineBytes
         for sample in 1...3 {
             Thread.sleep(forTimeInterval: 1)
             let heldHistoryState = transcript.value as? String
@@ -334,11 +337,41 @@ final class RemoteAIMobileUITests: XCTestCase {
             let intra = try XCTUnwrap(Double(reading["readingIntra"] ?? ""))
             XCTAssertEqual(intra, baselineIntra, accuracy: 24, "Streaming must preserve the position inside a long row")
             lastReadingUptime = try XCTUnwrap(Double(reading["readingUptime"] ?? ""))
+            lastReceivedBytes = try XCTUnwrap(Int(reading["readingStreamBytes"] ?? ""))
+            if let baselineFingerprint { XCTAssertEqual(preview.value as? String, baselineFingerprint, "The rendered preview text must stay fixed while browsing") }
             XCTAssertTrue(latest.exists && latest.isHittable,
                           "Return to latest must stay available while browsing history")
         }
-        XCTAssertTrue(progress.exists && progress.label != historyProgress, "The stream must continue growing during the history interval")
+        XCTAssertGreaterThan(lastReceivedBytes, baselineBytes, "The stream must continue receiving while history is held")
         XCTAssertGreaterThanOrEqual(lastReadingUptime - baselineUptime, 3, "History location must remain stable for at least three native seconds")
+        let rowsBeforePaging = try XCTUnwrap(Int((try readingPosition(nativePosition))["readingLoadedRows"] ?? ""))
+        // The direct stress fixture starts with only the bounded streaming row.
+        // Reach its actual measured boundary, load an older page, then browse it.
+        transcript.swipeDown()
+        let pageLoaded = NSPredicate { _, _ in
+            guard let value = nativePosition.value as? String else { return false }
+            let field = value.split(separator: ";").first { $0.hasPrefix("readingLoadedRows=") }
+            let count = field.flatMap { Int($0.dropFirst("readingLoadedRows=".count)) } ?? 0
+            return count > rowsBeforePaging
+        }
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: pageLoaded, object: nil)], timeout: 8), .completed, "Reaching the real history boundary must still load an older page")
+        transcript.swipeDown()
+        let olderBaseline = try readingPosition(nativePosition)
+        let olderRow = try XCTUnwrap(olderBaseline["readingRow"])
+        XCTAssertTrue(olderRow.hasPrefix("mock-"), "An actual older message must be visible after paging")
+        let olderIntra = try XCTUnwrap(Double(olderBaseline["readingIntra"] ?? ""))
+        let olderBytes = try XCTUnwrap(Int(olderBaseline["readingStreamBytes"] ?? ""))
+        let olderUptime = try XCTUnwrap(Double(olderBaseline["readingUptime"] ?? ""))
+        var olderLast = olderBaseline
+        for _ in 1...3 {
+            Thread.sleep(forTimeInterval: 1)
+            olderLast = try readingPosition(nativePosition)
+            print("READING_UI olderHeld=" + String(describing: olderLast))
+            XCTAssertEqual(olderLast["readingRow"], olderRow)
+            XCTAssertEqual(try XCTUnwrap(Double(olderLast["readingIntra"] ?? "")), olderIntra, accuracy: 24)
+        }
+        XCTAssertGreaterThan(try XCTUnwrap(Int(olderLast["readingStreamBytes"] ?? "")), olderBytes)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(Double(olderLast["readingUptime"] ?? "")) - olderUptime, 3)
         latest.tap()
         print("STREAM_UI chars=\(chars) historyAndReturnInteractionMs=\((ProcessInfo.processInfo.systemUptime - scrollingBegan) * 1000)")
         let marker = "STRESS_BEGIN_\(chars)"

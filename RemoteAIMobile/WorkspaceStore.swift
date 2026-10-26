@@ -2058,27 +2058,35 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func loadOlder(_ sessionId: String) async {
-        guard olderMessageLoads.insert(sessionId).inserted else { return }
+    @discardableResult
+    func loadOlder(_ sessionId: String) async -> Bool {
+        guard !Task.isCancelled, olderMessageLoads.insert(sessionId).inserted else { return false }
         defer { olderMessageLoads.remove(sessionId) }
         let generation = lifecycleGeneration
-        guard let first = messagesBySession[sessionId]?.first, hasMoreBySession[sessionId] != false else { return }
+        guard let first = messagesBySession[sessionId]?.first, hasMoreBySession[sessionId] != false else { return false }
+        let originalIDs = Set(messagesBySession[sessionId, default: []].map { $0.id })
         do {
             let page: Page<ChatMessage>
             if machine.state == .online, let route = routeForSession(sessionId) {
                 page = try await transport.loadBefore(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, before: first.cursor, limit: 40)
-                guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+                guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return false }
             } else {
                 let local = try await cache.messagesBefore(sessionId: sessionId, before: first.cursor, limit: 40)
                 page = Page(items: local, beforeCursor: local.first?.cursor, hasMore: local.count == 40)
             }
+            guard !Task.isCancelled, generation == lifecycleGeneration, !isSuspended else { return false }
             try? await cache.upsertMessages(page.items)
+            guard !Task.isCancelled, generation == lifecycleGeneration, !isSuspended else { return false }
             merge(page.items, into: sessionId)
             hasMoreBySession[sessionId] = page.hasMore
             errors[sessionId] = nil
+            let updated = messagesBySession[sessionId, default: []]
+            guard let anchorIndex = updated.firstIndex(where: { $0.id == first.id }) else { return false }
+            return updated[..<anchorIndex].contains(where: { !originalIDs.contains($0.id) })
         } catch {
-            if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = error.localizedDescription }
+            if !Task.isCancelled, generation == lifecycleGeneration, !isSuspended { errors[sessionId] = error.localizedDescription }
         }
+        return false
     }
 
     @discardableResult
