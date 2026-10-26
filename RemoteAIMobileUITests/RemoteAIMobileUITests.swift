@@ -351,12 +351,40 @@ final class RemoteAIMobileUITests: XCTestCase {
         let rowsBeforePaging = try XCTUnwrap(Int(beforePaging["readingLoadedRows"] ?? ""))
         let pagingAnchor = try XCTUnwrap(beforePaging["readingRow"])
         // The direct stress fixture starts with only the bounded streaming row.
-        // CI 40299797242's default swipe stopped 42 points below the real top
-        // and never started pagination. Use one fast boundary gesture; never
-        // add a second gesture that could cancel an already-started page.
+        // A swipe's inertial endpoint depends on its starting native offset.
+        // CI 40321806548 stopped with the top marker still 18 points offscreen
+        // and no pagination begin. Do not confuse that unmet setup with a restore failure.
         transcript.swipeDown(velocity: .fast)
         print("READING_UI boundaryGesture=" + String(describing: nativePosition.value))
         print("TRANSCRIPT_UI boundaryGesture=" + String(describing: transcript.value))
+        let boundaryLayout = transcript.value as? String ?? ""
+        let boundaryPosition = try readingPosition(nativePosition)
+        if Int(boundaryPosition["readingLoadedRows"] ?? "") == rowsBeforePaging,
+           boundaryPosition["readingAnchorAttached"] == nil,
+           let topY = Double(boundaryPosition["readingTopY"] ?? ""), topY.isFinite, topY < -1 {
+            let viewport = try XCTUnwrap(Double(boundaryPosition["readingViewport"] ?? ""))
+            // capturedAnchor is set synchronously at the first pagination begin and
+            // remains present even if detached. Never gesture after that proof appears.
+            guard boundaryPosition["readingDragging"] == "false",
+                  boundaryPosition["readingDecelerating"] == "false",
+                  boundaryPosition["readingRow"] == pagingAnchor,
+                  boundaryLayout.contains("sessionID: \"photo-upload\""),
+                  boundaryLayout.contains("firstRowID: Optional(\"\(pagingAnchor)\")"),
+                  boundaryLayout.contains("rowCount: \(rowsBeforePaging),"),
+                  boundaryLayout.contains("loading: false"),
+                  viewport.isFinite, viewport > 0, -topY <= viewport * 0.1 else {
+                XCTFail("Boundary preparation is not a settled, unstarted page; refusing another gesture")
+                return
+            }
+            // One small measured drag, held at its end to avoid another fling.
+            // The extra visible margin also clears the scroll recognizer's touch slop.
+            let travel = CGFloat(-topY + 24)
+            let start = transcript.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            let end = start.withOffset(CGVector(dx: 0, dy: travel))
+            print("READING_UI boundaryPreparation topY=\(topY) travel=\(travel)")
+            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.2)
+            print("READING_UI preparedBoundary=" + String(describing: nativePosition.value))
+        }
         let pageLoaded = NSPredicate { _, _ in
             guard let value = nativePosition.value as? String else { return false }
             let fields = Dictionary(uniqueKeysWithValues: value.split(separator: ";").compactMap { part -> (String, String)? in
