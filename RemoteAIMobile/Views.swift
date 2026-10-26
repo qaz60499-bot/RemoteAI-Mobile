@@ -1125,10 +1125,27 @@ private struct ChatTranscriptTailLayout: Equatable {
 }
 
 #if DEBUG
+private struct ChatTranscriptAnchorLayoutProbe: Equatable {
+    let rowId: String
+    let renderedFirstRowId: String
+    let renderedRowCount: Int
+    let renderedLoading: Bool
+    let renderedRevision: UInt64
+    let frame: CGRect
+}
+
+private struct ChatTranscriptAnchorLayoutPreferenceKey: PreferenceKey {
+    static let defaultValue: ChatTranscriptAnchorLayoutProbe? = nil
+    static func reduce(value: inout ChatTranscriptAnchorLayoutProbe?, nextValue: () -> ChatTranscriptAnchorLayoutProbe?) {
+        if let next = nextValue() { value = next }
+    }
+}
+
 // Reference storage avoids invalidating the transcript merely to count requests.
 private final class ChatTranscriptScrollRequestTrace {
     private var sequence = 0
     let reading = ChatTranscriptReadingTrace()
+    var anchorSamples = 0
 
     @MainActor
     func record(_ fields: [String: String]) {
@@ -1171,7 +1188,7 @@ private struct ChatTranscriptNativeScrollProbe: UIViewRepresentable {
         var composerFocused = false
         var reading: ChatTranscriptReadingTrace?
         override var accessibilityValue: String? {
-            get { reading?.snapshot().sorted { $0.key < $1.key }.map { $0.key + "=" + $0.value }.joined(separator: ";") }
+            get { reading?.accessibilitySnapshot() }
             set {}
         }
         private weak var observedScroll: UIScrollView?
@@ -1457,6 +1474,10 @@ struct ChatView: View {
     private func recordTranscriptPaginationDiagnostic(_ phase: String, anchor: String) {
         #if DEBUG
         guard ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" else { return }
+        if phase == "begin" {
+            transcriptScrollRequestTrace.reading.capturedAnchor = anchor
+            transcriptScrollRequestTrace.reading.anchorLayoutFields = [:]
+        }
         transcriptScrollRequestTrace.reading.loadedRowCount = messages.count
         var fields: [String: String] = [:]
         fields["uptime"] = String(ProcessInfo.processInfo.systemUptime)
@@ -1476,6 +1497,48 @@ struct ChatView: View {
         DiagnosticsLog.shared.record("chat_transcript_pagination_probe", fields: fields)
         #endif
     }
+    #if DEBUG
+    @ViewBuilder
+    private func transcriptAnchorGeometryDiagnostic(for rowId: String) -> some View {
+        if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1",
+           transcriptScrollRequestTrace.reading.capturedAnchor == rowId {
+            let first = messages.first?.id ?? "none"
+            let count = messages.count
+            let loading = loadingOlder
+            let revision = transcriptBrowseRevision
+            GeometryReader { marker in
+                Color.clear.preference(
+                    key: ChatTranscriptAnchorLayoutPreferenceKey.self,
+                    value: ChatTranscriptAnchorLayoutProbe(rowId: rowId, renderedFirstRowId: first,
+                        renderedRowCount: count, renderedLoading: loading, renderedRevision: revision,
+                        frame: marker.frame(in: .named("ChatTranscriptViewport")))
+                )
+            }
+            .allowsHitTesting(false).accessibilityHidden(true)
+        }
+    }
+
+    private func recordTranscriptAnchorLayoutDiagnostic(_ layout: ChatTranscriptAnchorLayoutProbe?) {
+        guard ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1",
+              transcriptScrollRequestTrace.reading.capturedAnchor != nil else { return }
+        var fields: [String: String] = [:]
+        fields["anchorGeometryPresent"] = String(layout != nil)
+        if let layout {
+            fields["anchorGeometryRow"] = layout.rowId
+            fields["anchorGeometryFirst"] = layout.renderedFirstRowId
+            fields["anchorGeometryCount"] = String(layout.renderedRowCount)
+            fields["anchorGeometryLoading"] = String(layout.renderedLoading)
+            fields["anchorGeometryRevision"] = String(layout.renderedRevision)
+            fields["anchorGeometryFrame"] = String(describing: layout.frame)
+        }
+        transcriptScrollRequestTrace.reading.anchorLayoutFields = fields
+        guard transcriptScrollRequestTrace.anchorSamples < 100 else { return }
+        transcriptScrollRequestTrace.anchorSamples += 1
+        fields.merge(transcriptScrollRequestTrace.reading.snapshot(), uniquingKeysWith: { _, new in new })
+        DiagnosticsLog.shared.record("chat_transcript_anchor_layout_probe", fields: fields)
+    }
+    #endif
+
     private func recordTranscriptPositionDiagnostic(_ decision: String) {
         #if DEBUG
         guard ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" else { return }
@@ -1612,6 +1675,9 @@ struct ChatView: View {
                                         }, onSelectText: { text, monospaced in
                                             textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
                                         }).id(message.id)
+                                        #if DEBUG
+                                        .background { transcriptAnchorGeometryDiagnostic(for: message.id) }
+                                        #endif
                                         .background {
                                             #if DEBUG
                                             if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
@@ -1624,6 +1690,9 @@ struct ChatView: View {
                                         MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: supportsModelSelection ? selectedModel : "") } } : nil, retryContextKey: selectedModel, onSelectText: { text, monospaced in
                                             textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
                                         }).equatable().id(message.id)
+                                        #if DEBUG
+                                        .background { transcriptAnchorGeometryDiagnostic(for: message.id) }
+                                        #endif
                                         .background {
                                             #if DEBUG
                                             if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
@@ -1751,6 +1820,11 @@ struct ChatView: View {
                         lastTranscriptPositionRequest = nil
                         requestTranscriptTailPosition(using: proxy)
                     }
+                    #if DEBUG
+                    .onPreferenceChange(ChatTranscriptAnchorLayoutPreferenceKey.self) { layout in
+                        recordTranscriptAnchorLayoutDiagnostic(layout)
+                    }
+                    #endif
                     .onPreferenceChange(ChatTranscriptTailLayoutPreferenceKey.self) { layout in
                         recordTranscriptLayoutDiagnostic(layout)
                         guard let bottomFrame = layout.bottomFrame,

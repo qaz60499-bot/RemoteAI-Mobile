@@ -362,7 +362,9 @@ final class RemoteAIMobileUITests: XCTestCase {
                 && fields["readingDragging"] == "false"
                 && fields["readingDecelerating"] == "false"
         }
-        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: pageLoaded, object: nil)], timeout: 8), .completed, "Paging must restore the original row near its top after loading older history")
+        let pageRestoreResult = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: pageLoaded, object: nil)], timeout: 8)
+        print("READING_UI afterPaging=" + String(describing: nativePosition.value))
+        XCTAssertEqual(pageRestoreResult, .completed, "Paging must restore the original row near its top after loading older history")
         transcript.swipeDown()
         let olderBaseline = try readingPosition(nativePosition)
         let olderRow = try XCTUnwrap(olderBaseline["readingRow"])
