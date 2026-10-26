@@ -2906,7 +2906,7 @@ struct AssistantStreamRow: View, Equatable {
         lhs.stream === rhs.stream && lhs.message == rhs.message && lhs.following == rhs.following
     }
 
-    private func presentationFingerprint(_ text: String) -> String {
+    private func renderedPreviewDigest(_ text: String) -> String {
         #if DEBUG
         if ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_MOCK"] == "1" {
             return String(text.utf8.reduce(UInt64(14695981039346656037)) { ($0 ^ UInt64($1)) &* 1099511628211 }, radix: 16)
@@ -2951,7 +2951,7 @@ struct AssistantStreamRow: View, Equatable {
                         }
                         .buttonStyle(.borderless)
                         .accessibilityIdentifier("assistant-stream-current-copy")
-                        .accessibilityValue(presentationFingerprint(visibleText))
+                        .accessibilityValue(renderedPreviewDigest(visibleText))
                         Button("查看 / 选择当前全文") {
                             onSelectText?(MessageContentSegment.copyableText(stream.text), false)
                         }
