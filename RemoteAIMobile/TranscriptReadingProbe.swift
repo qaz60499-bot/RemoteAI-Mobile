@@ -23,19 +23,18 @@ final class ChatTranscriptReadingTrace {
         }
         let visible = frames.filter { $0.0 != "__top__" && $0.1.maxY > top && $0.1.minY < bottom }
             .sorted { $0.1.minY < $1.1.minY }.first
-        var result = [
-            "readingRow": visible?.0 ?? "none",
-            "readingStreamBytes": String(stream?.utf8Count ?? 0),
-            "readingLoadedRows": String(loadedRowCount),
-            "readingIntra": visible.map { String(Double(top - $0.1.minY)) } ?? "nan",
-            "readingRowHeight": visible.map { String(Double($0.1.height)) } ?? "nan",
-            "readingOffset": String(Double(scroll.contentOffset.y)),
-            "readingHeight": String(Double(scroll.contentSize.height)),
-            "readingViewport": String(Double(bottom - top)),
-            "readingDragging": String(scroll.isDragging),
-            "readingDecelerating": String(scroll.isDecelerating),
-            "readingUptime": String(ProcessInfo.processInfo.systemUptime)
-        ]
+        var result: [String: String] = [:]
+        result["readingRow"] = visible?.0 ?? "none"
+        result["readingStreamBytes"] = String(stream?.utf8Count ?? 0)
+        result["readingLoadedRows"] = String(loadedRowCount)
+        result["readingIntra"] = visible.map { String(Double(top - $0.1.minY)) } ?? "nan"
+        result["readingRowHeight"] = visible.map { String(Double($0.1.height)) } ?? "nan"
+        result["readingOffset"] = String(Double(scroll.contentOffset.y))
+        result["readingHeight"] = String(Double(scroll.contentSize.height))
+        result["readingViewport"] = String(Double(bottom - top))
+        result["readingDragging"] = String(scroll.isDragging)
+        result["readingDecelerating"] = String(scroll.isDecelerating)
+        result["readingUptime"] = String(ProcessInfo.processInfo.systemUptime)
         if let sentinel = frames.first(where: { $0.0 == "__top__" }) {
             result["readingTopY"] = String(Double(sentinel.1.minY - top))
         }
