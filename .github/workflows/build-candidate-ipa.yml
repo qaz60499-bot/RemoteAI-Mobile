@@ -37,11 +37,11 @@ jobs:
     name: Candidate Test + Device IPA
     if: github.event_name == 'workflow_dispatch' && inputs.gate != 'web-tab-race'
     runs-on: macos-15
-    # Full candidate run 39132713116 exhausted 45 minutes after every UI
-    # case passed (the two stress cases needed the existing one-time retry).
-    # Include bounded simulator startup/evidence export and device packaging;
-    # individual test deadlines and all assertions remain unchanged.
-    timeout-minutes: 60
+    # Full candidate run 40326759373 passed all 14 isolated UI cases, then
+    # exhausted 60 minutes during cadence sampling before device packaging.
+    # Allow the measured 45-minute UI phase plus compiler/simulator startup,
+    # cadence, signing and evidence export. Per-test deadlines stay unchanged.
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
