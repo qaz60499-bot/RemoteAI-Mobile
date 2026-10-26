@@ -144,12 +144,12 @@ final class AssistantStreamTests: XCTestCase {
 
     @MainActor
     private final class ReadinessScroll: UIScrollView {
-        var tracking = false
-        var dragging = false
-        var decelerating = true
-        override var isTracking: Bool { tracking }
-        override var isDragging: Bool { dragging }
-        override var isDecelerating: Bool { decelerating }
+        var simulatedTracking = false
+        var simulatedDragging = false
+        var simulatedDecelerating = true
+        override var isTracking: Bool { simulatedTracking }
+        override var isDragging: Bool { simulatedDragging }
+        override var isDecelerating: Bool { simulatedDecelerating }
     }
 
     @MainActor
@@ -172,7 +172,7 @@ final class AssistantStreamTests: XCTestCase {
         let wait = Task { @MainActor in await readiness.wait(for: expected) }
         for _ in 0..<100 where !readiness.isWaiting { await Task.yield() }
         XCTAssertTrue(readiness.isWaiting)
-        scroll.decelerating = false
+        scroll.simulatedDecelerating = false
         readiness.rendered(TranscriptLayoutGeneration(sessionID: "session", firstRowID: "older", rowCount: 41, browseRevision: 2, loading: true), size: scroll.contentSize)
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
         XCTAssertTrue(readiness.isWaiting, "The loading-indicator layout is not the committed page")
@@ -180,25 +180,25 @@ final class AssistantStreamTests: XCTestCase {
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
         XCTAssertTrue(readiness.isWaiting, "A new data generation with the old native size is premature")
         readiness.rendered(expected, size: scroll.contentSize)
-        scroll.tracking = true
+        scroll.simulatedTracking = true
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
         XCTAssertTrue(readiness.isWaiting)
-        scroll.tracking = false
-        scroll.dragging = true
+        scroll.simulatedTracking = false
+        scroll.simulatedDragging = true
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
         XCTAssertTrue(readiness.isWaiting)
-        scroll.dragging = false
-        scroll.decelerating = true
+        scroll.simulatedDragging = false
+        scroll.simulatedDecelerating = true
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
         XCTAssertTrue(readiness.isWaiting)
-        scroll.decelerating = false
+        scroll.simulatedDecelerating = false
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
         let ready = await wait.value
         XCTAssertTrue(ready)
         XCTAssertFalse(readiness.isWaiting)
-        scroll.tracking = true
+        scroll.simulatedTracking = true
         XCTAssertFalse(readiness.isReady(for: expected), "A new native touch must invalidate readiness before the resumed task positions")
-        scroll.tracking = false
+        scroll.simulatedTracking = false
         XCTAssertEqual(scroll.contentOffset, offset, "Readiness must never position the scroll view")
         withExtendedLifetime(window) {}
     }
@@ -215,7 +215,7 @@ final class AssistantStreamTests: XCTestCase {
         for _ in 0..<100 { await Task.yield() }
         XCTAssertTrue(readiness.isWaiting, "Late cancellation of an old intent must not cancel its replacement")
         readiness.rendered(expected, size: scroll.contentSize)
-        scroll.decelerating = false
+        scroll.simulatedDecelerating = false
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
         let ready = await replacement.value
         XCTAssertTrue(ready)
@@ -239,7 +239,7 @@ final class AssistantStreamTests: XCTestCase {
         XCTAssertFalse(detachedReady)
         readiness.bind(scroll, id: UUID())
         readiness.rendered(expected, size: scroll.contentSize)
-        scroll.decelerating = false
+        scroll.simulatedDecelerating = false
         readiness.sample(now: ProcessInfo.processInfo.systemUptime)
         XCTAssertFalse(readiness.isWaiting, "Reattachment must not resurrect a consumed intent")
         withExtendedLifetime(window) {}
