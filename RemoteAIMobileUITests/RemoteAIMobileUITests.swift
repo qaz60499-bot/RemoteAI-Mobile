@@ -351,8 +351,12 @@ final class RemoteAIMobileUITests: XCTestCase {
         let rowsBeforePaging = try XCTUnwrap(Int(beforePaging["readingLoadedRows"] ?? ""))
         let pagingAnchor = try XCTUnwrap(beforePaging["readingRow"])
         // The direct stress fixture starts with only the bounded streaming row.
-        // Reach its actual measured boundary, load an older page, then browse it.
-        transcript.swipeDown()
+        // CI 40299797242's default swipe stopped 42 points below the real top
+        // and never started pagination. Use one fast boundary gesture; never
+        // add a second gesture that could cancel an already-started page.
+        transcript.swipeDown(velocity: .fast)
+        print("READING_UI boundaryGesture=" + String(describing: nativePosition.value))
+        print("TRANSCRIPT_UI boundaryGesture=" + String(describing: transcript.value))
         let pageLoaded = NSPredicate { _, _ in
             guard let value = nativePosition.value as? String else { return false }
             let fields = Dictionary(uniqueKeysWithValues: value.split(separator: ";").compactMap { part -> (String, String)? in
