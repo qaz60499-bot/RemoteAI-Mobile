@@ -1,8 +1,5 @@
 import SwiftUI
 
-#if !DEBUG
-#error("Pagination isolation experiment only: remove the diagnostic control before packaging a device candidate")
-#endif
 import AVFoundation
 import PhotosUI
 import UniformTypeIdentifiers
