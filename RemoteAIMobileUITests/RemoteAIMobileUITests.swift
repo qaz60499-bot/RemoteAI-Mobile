@@ -42,6 +42,7 @@ final class RemoteAIMobileUITests: XCTestCase {
 
     func testRuntimeIssueSummaryOpensAndRefreshesCapabilities() throws {
         let app = makeMockApp()
+        app.launchEnvironment["REMOTEAI_UI_TEST_PAIRED"] = "1"
         app.launch()
         let entry = app.buttons["runtimeIssuesLink"]
         if !entry.isHittable { app.swipeUp() }

@@ -27,6 +27,9 @@ struct RemoteAIMobileApp: App {
             .environmentObject(store)
             .task {
                 await store.start()
+                if isUITest && ProcessInfo.processInfo.environment["REMOTEAI_UI_TEST_PAIRED"] == "1" {
+                    store.isPaired = true
+                }
                 if directStress, let runtime = store.runtimes.first(where: { $0.id == "runtime.web" }) {
                     await store.refreshRuntime(runtime)
                     if let instance = store.instances.first(where: { $0.id == "photo" }) {
