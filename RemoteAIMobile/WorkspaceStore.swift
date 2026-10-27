@@ -399,8 +399,10 @@ final class WorkspaceStore: ObservableObject {
             return false
         }
         let activeTransport = transport
-        installEventConsumer()
-        installHealthConsumer()
+        await installEventConsumer()
+        guard generation == lifecycleGeneration, !isSuspended, transport === activeTransport else { return false }
+        await installHealthConsumer()
+        guard generation == lifecycleGeneration, !isSuspended, transport === activeTransport else { return false }
         machine.state = .connecting
         connectionPhase = .relayConnecting
         DiagnosticsLog.shared.record("connection_start")
@@ -2737,13 +2739,16 @@ final class WorkspaceStore: ObservableObject {
         try? await cache.deleteMessage(id: id)
     }
 
-    private func installEventConsumer() {
+    private func installEventConsumer() async {
         eventTask?.cancel()
         let sourceTransport = transport
         let generation = lifecycleGeneration
+        // Rotate the transport's single-consumer pipe before connect() can accept
+        // another frame. A cancelled AsyncStream cannot be subscribed to again.
+        let stream = await sourceTransport.eventStream()
+        guard generation == lifecycleGeneration, !isSuspended, transport === sourceTransport else { return }
         eventTask = Task { [weak self] in
             guard let self else { return }
-            let stream = await sourceTransport.eventStream()
             for await event in stream {
                 guard !Task.isCancelled,
                       generation == self.lifecycleGeneration,
@@ -2754,13 +2759,14 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func installHealthConsumer() {
+    private func installHealthConsumer() async {
         healthTask?.cancel()
         let sourceTransport = transport
         let generation = lifecycleGeneration
+        let stream = await sourceTransport.healthStream()
+        guard generation == lifecycleGeneration, !isSuspended, transport === sourceTransport else { return }
         healthTask = Task { [weak self] in
             guard let self else { return }
-            let stream = await sourceTransport.healthStream()
             for await event in stream {
                 guard !Task.isCancelled,
                       generation == self.lifecycleGeneration,

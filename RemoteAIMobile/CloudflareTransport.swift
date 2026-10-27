@@ -20,8 +20,13 @@ actor CloudflareTransport: Transport {
     private var connectionWaiters: [CheckedContinuation<Void, Error>] = []
     private var continuation: AsyncStream<RemoteEvent>.Continuation?
     private var stream: AsyncStream<RemoteEvent>?
+    // These are single-consumer pipes. The first subscription uses the init-created
+    // streams so pre-connect deliveries remain buffered; later subscriptions replace
+    // cancelled streams with fresh pipes.
+    private var hasIssuedEventStream = false
     private var healthContinuation: AsyncStream<TransportHealthEvent>.Continuation?
     private var healthEventStream: AsyncStream<TransportHealthEvent>?
+    private var hasIssuedHealthStream = false
     private var pending: [UUID: CheckedContinuation<CommandResponseEnvelope, Error>] = [:]
     private var timeoutTasks: [UUID: Task<Void, Never>] = [:]
     private var inboundReplayGuard = BoundedReplayGuard(capacity: 4096)
@@ -151,11 +156,29 @@ actor CloudflareTransport: Transport {
     }
 
     func eventStream() async -> AsyncStream<RemoteEvent> {
+        if hasIssuedEventStream {
+            let oldContinuation = continuation
+            let eventPipe = AsyncStream<RemoteEvent>.makeStream()
+            continuation = eventPipe.continuation
+            stream = eventPipe.stream
+            oldContinuation?.finish()
+        } else {
+            hasIssuedEventStream = true
+        }
         guard let stream else { return AsyncStream { $0.finish() } }
         return stream
     }
 
     func healthStream() async -> AsyncStream<TransportHealthEvent> {
+        if hasIssuedHealthStream {
+            let oldContinuation = healthContinuation
+            let healthPipe = AsyncStream<TransportHealthEvent>.makeStream()
+            healthContinuation = healthPipe.continuation
+            healthEventStream = healthPipe.stream
+            oldContinuation?.finish()
+        } else {
+            hasIssuedHealthStream = true
+        }
         guard let healthEventStream else { return AsyncStream { $0.finish() } }
         return healthEventStream
     }

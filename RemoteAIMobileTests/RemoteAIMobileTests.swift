@@ -504,6 +504,51 @@ final class RemoteAIMobileTests: XCTestCase {
         reader.cancel()
     }
 
+    @MainActor
+    func testCloudflareHealthSubscriptionSurvivesCancelledReaderAndPreservesInitialBuffer() async throws {
+        // An insecure URL fails locally before opening a socket or reading pairing
+        // keys, while exercising the production transport's health publisher.
+        let transport = CloudflareTransport(config: RemoteAIConfig(
+            relayBaseURL: URL(string: "http://relay.example.invalid")!, machineId: "my-pc"
+        ))
+        func publishLocalConnectionFailure() async {
+            do {
+                try await transport.connect()
+                XCTFail("The insecure URL must fail before any network connection")
+            } catch {
+                XCTAssertEqual(error as? TransportError, .insecureRelay)
+            }
+        }
+
+        await publishLocalConnectionFailure()
+        let firstStream = await transport.healthStream()
+        let firstDelivery = expectation(description: "health buffered before the first subscription")
+        let firstReader = Task {
+            for await health in firstStream {
+                XCTAssertEqual(health.channel, .relay)
+                XCTAssertEqual(health.state, .offline)
+                firstDelivery.fulfill()
+            }
+        }
+        await fulfillment(of: [firstDelivery], timeout: 2)
+        firstReader.cancel()
+        await firstReader.value
+
+        let secondStream = await transport.healthStream()
+        let secondDelivery = expectation(description: "fresh health after reader cancellation")
+        let secondReader = Task {
+            for await health in secondStream {
+                XCTAssertEqual(health.channel, .relay)
+                XCTAssertEqual(health.state, .offline)
+                secondDelivery.fulfill()
+            }
+        }
+        await publishLocalConnectionFailure()
+        await fulfillment(of: [secondDelivery], timeout: 2)
+        secondReader.cancel()
+        await secondReader.value
+    }
+
     func testDerivedCommandIdsAreStableAndSeparatedByStep() {
         let parent = UUID(uuidString: "11111111-2222-4333-8444-555555555555")!
         let beginA = RemoteCommand.derivedCommandId(namespace: parent, label: "attachment:0:begin")
@@ -1318,6 +1363,30 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(recoveredRows.contains { $0.id == "live-partial-tail" })
         let visibleMessageIds = Set(store.messagesBySession["photo-upload", default: []].map(\.id))
         XCTAssertEqual(visibleMessageIds, expectedMessageIds, "Canonical history and unrelated original messages must remain visible")
+
+        // Delta can still succeed with a cancelled live stream. Require new live
+        // delivery before another head probe can conceal a dead subscription.
+        await mock.injectEvent(event(1205, "GENERATION_STARTED", [:], at: now.addingTimeInterval(0.04)), deliverLive: true)
+        for _ in 0..<80 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .busy {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy, "The replacement consumer must receive new live events")
+        await mock.injectEvent(event(1206, "GENERATION_STOPPED", [:], at: now.addingTimeInterval(0.05)), deliverLive: true)
+        for _ in 0..<80 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .idle {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+
+        await mock.injectHealth(TransportHealthEvent(channel: .relay, state: .connecting, at: now.addingTimeInterval(0.06), detail: nil))
+        for _ in 0..<80 where store.desktopRelayConnected != false {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(store.desktopRelayConnected, false, "Health delivery must also survive replacement of its cancelled consumer")
+        await mock.injectHealth(TransportHealthEvent(channel: .relay, state: .online, at: now.addingTimeInterval(0.07), detail: nil))
+        for _ in 0..<80 where store.desktopRelayConnected != true {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(store.desktopRelayConnected, true)
         await store.suspend()
     }
 

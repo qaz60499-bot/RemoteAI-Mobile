@@ -15,8 +15,13 @@ actor MockTransport: Transport {
     private var sequence: Int64 = initialChangelogBaselineSequence
     private var continuation: AsyncStream<RemoteEvent>.Continuation?
     private var stream: AsyncStream<RemoteEvent>?
+    // These are single-consumer pipes. The first subscription uses the init-created
+    // streams so pre-connect deliveries remain buffered; later subscriptions replace
+    // cancelled streams with fresh pipes.
+    private var hasIssuedEventStream = false
     private var healthContinuation: AsyncStream<TransportHealthEvent>.Continuation?
     private var healthEventStream: AsyncStream<TransportHealthEvent>?
+    private var hasIssuedHealthStream = false
     private var processedCommands: [UUID: CommandResponseEnvelope] = [:]
     private var history: [String: [ServerMessage]] = [:]
     private var eventLog: [RemoteEvent] = []
@@ -332,21 +337,31 @@ actor MockTransport: Transport {
     func disconnect() async { connected = false }
 
     func eventStream() async -> AsyncStream<RemoteEvent> {
-        if let stream { return stream }
-        var captured: AsyncStream<RemoteEvent>.Continuation?
-        let created = AsyncStream<RemoteEvent> { captured = $0 }
-        continuation = captured
-        stream = created
-        return created
+        if hasIssuedEventStream {
+            let oldContinuation = continuation
+            let eventPipe = AsyncStream<RemoteEvent>.makeStream()
+            continuation = eventPipe.continuation
+            stream = eventPipe.stream
+            oldContinuation?.finish()
+        } else {
+            hasIssuedEventStream = true
+        }
+        guard let stream else { return AsyncStream { $0.finish() } }
+        return stream
     }
 
     func healthStream() async -> AsyncStream<TransportHealthEvent> {
-        if let healthEventStream { return healthEventStream }
-        var captured: AsyncStream<TransportHealthEvent>.Continuation?
-        let created = AsyncStream<TransportHealthEvent> { captured = $0 }
-        healthContinuation = captured
-        healthEventStream = created
-        return created
+        if hasIssuedHealthStream {
+            let oldContinuation = healthContinuation
+            let healthPipe = AsyncStream<TransportHealthEvent>.makeStream()
+            healthContinuation = healthPipe.continuation
+            healthEventStream = healthPipe.stream
+            oldContinuation?.finish()
+        } else {
+            hasIssuedHealthStream = true
+        }
+        guard let healthEventStream else { return AsyncStream { $0.finish() } }
+        return healthEventStream
     }
 
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
