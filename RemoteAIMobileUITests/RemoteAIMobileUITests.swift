@@ -40,6 +40,25 @@ final class RemoteAIMobileUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Stop"].exists, "A completed cached conversation must not show Stop")
     }
 
+    func testRuntimeIssueSummaryOpensAndRefreshesCapabilities() throws {
+        let app = makeMockApp()
+        app.launch()
+        let entry = app.buttons["runtimeIssuesLink"]
+        if !entry.isHittable { app.swipeUp() }
+        XCTAssertTrue(entry.waitForExistence(timeout: 5))
+        entry.tap()
+        XCTAssertTrue(app.navigationBars["运行异常"].waitForExistence(timeout: 5))
+        let refresh = app.buttons["refreshRuntimeInstances"]
+        XCTAssertTrue(refresh.waitForExistence(timeout: 5))
+        XCTAssertTrue(refresh.isEnabled)
+        refresh.tap()
+        let enabled = NSPredicate(format: "enabled == true")
+        expectation(for: enabled, evaluatedWith: refresh)
+        waitForExpectations(timeout: 10)
+        XCTAssertFalse(app.buttons["Retry"].exists)
+        XCTAssertFalse(app.buttons["Stop"].exists)
+    }
+
     func testConversationOpensAtLatestAndOffersReturnToBottomAfterBrowsingHistory() throws {
         let app = makeMockApp()
         app.launch()

@@ -29,6 +29,7 @@ struct RootView: View {
     @State private var showingPair = false
     @State private var showingDiagnostics = false
     var body: some View {
+        let runtimeIssues = store.runtimeIssues
         NavigationView {
             List {
                 Section {
@@ -61,6 +62,21 @@ struct RootView: View {
                         }
                     }
                 }
+                if store.isPaired {
+                    Section("异常与投递状态") {
+                        NavigationLink(destination: RuntimeIssuesView()) {
+                            HStack {
+                                Label("查看异常总览", systemImage: "exclamationmark.bubble")
+                                Spacer()
+                                Text(runtimeIssues.isEmpty ? "未发现已知异常" : "\(runtimeIssues.count) 项需关注")
+                                    .font(.caption).foregroundColor(.secondary)
+                            }
+                        }
+                        .accessibilityIdentifier("runtimeIssuesLink")
+                        Text("仅汇总已同步状态；未检测到异常不代表远端所有任务正常。")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+                }
                 if store.machine.state == .offline && !store.deferringTransientConnectionPresentation && store.isPaired {
                     Section {
                         Label("Cached workspaces remain available while the PC is offline.", systemImage: "wifi.slash").font(.footnote).foregroundColor(.secondary)
@@ -82,6 +98,66 @@ struct RootView: View {
         }.navigationViewStyle(.stack)
     }
     private func runtimeIcon(_ kind: RuntimeKind) -> String { switch kind { case .web: return "globe"; case .codex: return "terminal"; case .antigravity: return "sparkles" } }
+}
+
+struct RuntimeIssuesView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    @State private var refreshing = false
+
+    var body: some View {
+        let issues = store.runtimeIssues
+        List {
+            Section {
+                Text("这里只显示手机已经收到的连接、会话与投递状态。部分记录可能是缓存，不代表刚刚进行了实时检测。")
+                    .font(.footnote).foregroundColor(.secondary)
+                if let lastCheck = store.desktopStatusUpdatedAt {
+                    Text("电脑状态最近同步：\(lastCheck.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption2).foregroundColor(.secondary)
+                } else {
+                    Text("电脑状态同步时间未知").font(.caption2).foregroundColor(.secondary)
+                }
+                Button(refreshing ? "正在刷新实例状态…" : "刷新应用实例状态") {
+                    guard !refreshing, store.machine.state == .online else { return }
+                    refreshing = true
+                    Task { @MainActor in
+                        for runtime in store.runtimes { await store.refreshRuntime(runtime) }
+                        refreshing = false
+                    }
+                }
+                .accessibilityIdentifier("refreshRuntimeInstances")
+                .disabled(refreshing || store.machine.state != .online)
+                Text("此按钮只读取 Codex / Antigravity / Web 应用实例能力；会话、后台任务和消息收据仍须进入原会话确认。")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+            if issues.isEmpty {
+                Section {
+                    Label("没有发现已同步的异常；不能据此证明所有远程任务正常。",
+                          systemImage: "info.circle")
+                        .font(.footnote)
+                }
+            } else {
+                Section("需关注的状态") {
+                    ForEach(issues) { issue in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label(issue.title, systemImage: issue.level == .failure
+                                  ? "exclamationmark.triangle.fill" : "questionmark.circle")
+                                .font(.subheadline.weight(.medium))
+                            Text(issue.detail).font(.footnote).foregroundColor(.secondary)
+                            Text("建议：\(issue.suggestion)").font(.footnote)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+            Section {
+                Text("本页不会自动重发、Stop、重启 Agent 或修改网络。后台系统通知仍需单独实现及真机验收。")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("运行异常")
+        .navigationBarTitleDisplayMode(.inline)
+    }
 }
 
 private struct DiagnosticExportItem: Identifiable {

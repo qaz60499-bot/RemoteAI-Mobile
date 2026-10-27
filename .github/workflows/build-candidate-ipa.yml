@@ -6,7 +6,7 @@ on:
       gate:
         description: Validation scope
         type: choice
-        options: [candidate, streaming, sync, web-controls, copy-controls, web-tab-race]
+        options: [candidate, streaming, sync, web-controls, copy-controls, runtime-issues, web-tab-race]
         default: candidate
       unit_sanitizer:
         description: Optional unit-test memory diagnostic on the disposable simulator
@@ -103,7 +103,16 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "event=$GITHUB_EVENT_NAME"
             echo "validation_scope=${{ inputs.gate }}"
-            if [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
+            if [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+              echo "inherited_full_unit_security_baseline=a33e49f/run40468844319; inherited_streaming_baseline=a33e49f/run40504021022-attempt2 (historical evidence; not revalidated by this run)"
+              echo "security_audit=scripts/security_audit.sh rerun on this commit"
+              echo "protocol_security_fuzz=not_run_in_runtime_issues_gate"
+              echo "full_unit_suite=not_run_in_runtime_issues_gate"
+              echo "streaming_cadence_and_process_stress=not_run_in_runtime_issues_gate"
+              echo "runtime_issue_unit_scope=RuntimeIssueSummaryTests (6 methods); targeted PairingTests and RemoteAIMobileTests regressions"
+              echo "runtime_issue_ui_scope=testRuntimeIssueSummaryOpensAndRefreshesCapabilities;testOpenCachedWebConversation"
+              echo "workspace_store_lifecycle_scope=testWorkspaceCoalescesDuplicateInitializationAndLifecycleRace"
+            elif [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
               echo "unchanged_full_candidate_baseline=7fd609bde530269347b9089cbce0f2894ed9c232/run39204233990"
               echo "full_unit_and_stream_stress=not_rerun_views_only_controls_change"
             elif [[ '${{ inputs.gate }}' == 'copy-controls' ]]; then
@@ -160,7 +169,7 @@ jobs:
           echo "Created pinned simulator: $UDID"
 
       - name: Protocol Security / Fuzz
-        if: inputs.gate != 'streaming'
+        if: inputs.gate != 'streaming' && inputs.gate != 'runtime-issues'
         shell: bash
         run: |
           set -euo pipefail
@@ -203,7 +212,7 @@ jobs:
           PY
 
       - name: Unit tests
-        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls'
+        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'runtime-issues'
         shell: bash
         run: |
           set -euo pipefail
@@ -228,6 +237,32 @@ jobs:
           grep -E 'PROJECT_REFRESH_STRESS_TOTAL=2500' build/tests.log
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/tests.log | tail -1
 
+      - name: Runtime issue focused unit tests
+        if: inputs.gate == 'runtime-issues'
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          set --
+          if [[ '${{ inputs.unit_sanitizer }}' == 'address' ]]; then
+            set -- -enableAddressSanitizer YES
+          elif [[ '${{ inputs.unit_sanitizer }}' == 'thread' ]]; then
+            set -- -enableThreadSanitizer YES
+          fi
+          xcodebuild test \
+            -project RemoteAIMobile.xcodeproj \
+            -scheme RemoteAIMobile \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
+            -resultBundlePath build/runtime-issues-tests.xcresult \
+            "$@" \
+            -only-testing:RemoteAIMobileTests/RuntimeIssueSummaryTests \
+            -only-testing:RemoteAIMobileTests/PairingTests/testForegroundCallbacksAvoidUnnecessaryReconnectAndHideBriefStatusFlash \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testBackgroundTaskStatusStaysSeparateFromIdleAndStaleConversationStatus \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testWorkspaceCoalescesDuplicateInitializationAndLifecycleRace \
+            | tee build/runtime-issues-tests.log
+          grep -E 'Executed 9 tests?, with 0 failures' build/runtime-issues-tests.log | tail -1
+
       - name: Streaming unit tests
         if: inputs.gate == 'streaming'
         run: |
@@ -244,6 +279,13 @@ jobs:
               --udid '${{ steps.simulator.outputs.udid }}' \
               --only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable \
               --only testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable \
+              | tee build/ui-tests.log
+          elif [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+            # Exercise the runtime issue summary plus cached conversation navigation.
+            python3 scripts/run_candidate_ui_tests.py \
+              --udid '${{ steps.simulator.outputs.udid }}' \
+              --only testRuntimeIssueSummaryOpensAndRefreshesCapabilities \
+              --only testOpenCachedWebConversation \
               | tee build/ui-tests.log
           elif [[ '${{ inputs.gate }}' == 'web-controls' || '${{ inputs.gate }}' == 'copy-controls' ]]; then
             # Exercise hierarchy/cached-Chat navigation for both control scopes.
@@ -276,7 +318,7 @@ jobs:
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
 
       - name: Streaming cadence and process samples without accessibility polling
-        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'copy-controls'
+        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'copy-controls' && inputs.gate != 'runtime-issues'
         run: |
           set -euo pipefail
           python3 scripts/sample_streaming_performance.py --udid '${{ steps.simulator.outputs.udid }}' | tee build/stream-performance.log
@@ -396,8 +438,19 @@ jobs:
             echo '## RemoteAI Candidate IPA'
             echo '- Candidate only; not final release acceptance'
             echo '- External Live iOS Relay pairing smoke: intentionally excluded from this workflow'
-            echo '- Protocol Security / Fuzz: PASS'
-            if [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
+            if [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+              echo '- Static security audit (`scripts/security_audit.sh`): PASS on this commit'
+              echo '- Protocol Security / Fuzz: NOT RUN in this gate; inherited baseline run40468844319 is historical evidence and was not revalidated'
+              echo '- Full unit suite: NOT RUN; inherited baseline run40468844319 is historical evidence and was not revalidated'
+              echo '- Streaming cadence/process stress: NOT RUN; long-stream simulator baseline run40504021022-attempt2 is inherited; no new cadence measurement'
+              echo '- Runtime issue unit scope: PASS (6 RuntimeIssueSummaryTests plus 3 targeted regressions, including the WorkspaceStore lifecycle race)'
+              echo '- UI scope: PASS (runtime issue summary and cached conversation navigation; 2 tests)'
+            else
+              echo '- Protocol Security / Fuzz: PASS'
+            fi
+            if [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+              :
+            elif [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
               echo '- Validation scope: Web controls; 2 targeted UI/navigation tests'
               echo '- Full unit and long-stream stress: NOT RERUN; unchanged baseline run39204233990'
             elif [[ '${{ inputs.gate }}' == 'copy-controls' ]]; then
@@ -442,8 +495,10 @@ jobs:
           path: |
             build/ui-evidence
             build/unit-tests.xcresult
+            build/runtime-issues-tests.xcresult
             build/unit-crashes
             build/tests.log
+            build/runtime-issues-tests.log
             build/unit-actor-isolation-probe.json
           retention-days: 7
 

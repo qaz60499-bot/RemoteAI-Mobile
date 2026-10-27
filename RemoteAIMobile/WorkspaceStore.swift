@@ -98,6 +98,16 @@ final class WorkspaceStore: ObservableObject {
     @Published var attachmentTransferBySession: [String: AttachmentTransferProgress] = [:]
     @Published var commandStates: [UUID: CommandState] = [:]
     @Published var errors: [String: String] = [:]
+    /// Existing state only. This summary never calls the provider or changes delivery state.
+    var runtimeIssues: [RuntimeIssue] {
+        RuntimeIssueSummary.build(
+            paired: isPaired, machineState: machine.state, connectionPhase: connectionPhase,
+            transientPresentation: deferringTransientConnectionPresentation,
+            browserConnected: desktopBrowserConnected, relayConnected: desktopRelayConnected,
+            agentConnected: desktopAgentConnected, errors: errors,
+            runtimes: runtimes, instances: instances, sessions: sessions, commands: commandStates
+        )
+    }
     @Published var hasMoreBySession: [String: Bool] = [:]
     @Published var isPaired = false
     @Published var pairingStage: PairingStage?
@@ -110,7 +120,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var desktopBrowserConnected: Bool?
     @Published var desktopRelayConnected: Bool?
     @Published var desktopAgentConnected: Bool?
-    var desktopStatusUpdatedAt: Date?
+    @Published private(set) var desktopStatusUpdatedAt: Date?
     @Published private(set) var deferringTransientConnectionPresentation = false
 
     // UI-only grace: command gating and diagnostics still use authoritative state.
