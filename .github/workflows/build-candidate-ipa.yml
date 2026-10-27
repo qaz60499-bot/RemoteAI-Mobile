@@ -6,7 +6,7 @@ on:
       gate:
         description: Validation scope
         type: choice
-        options: [candidate, streaming, sync, web-controls, copy-controls, runtime-issues, web-tab-race]
+        options: [candidate, streaming, sync, web-controls, copy-controls, runtime-issues, runtime-issues-device, web-tab-race]
         default: candidate
       unit_sanitizer:
         description: Optional unit-test memory diagnostic on the disposable simulator
@@ -48,6 +48,53 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify inherited runtime issue unit evidence
+        if: inputs.gate == 'runtime-issues-device'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASELINE_SHA=450bf23bfd7d6e1d60fcfc6c60fd23e0d9e38c48
+          git cat-file -e "${BASELINE_SHA}^{commit}"
+          git diff --quiet "$BASELINE_SHA" "$GITHUB_SHA" -- \
+            RemoteAIMobile RemoteAIMobileTests RemoteAIMobileUITests project.yml
+          echo "Swift source tree and project.yml match $BASELINE_SHA."
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          api_url = os.environ["GITHUB_API_URL"].rstrip("/")
+          token = os.environ["GH_TOKEN"]
+          baseline_sha = "450bf23bfd7d6e1d60fcfc6c60fd23e0d9e38c48"
+          run_id = "40517450754"
+          attempt = "1"
+          url = (f"{api_url}/repos/{repository}/actions/runs/{run_id}/"
+                 f"attempts/{attempt}/jobs?per_page=100")
+          request = urllib.request.Request(url, headers={
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          })
+          with urllib.request.urlopen(request, timeout=20) as response:
+              payload = json.load(response)
+
+          jobs = payload.get("jobs", [])
+          matches = [(job, step) for job in jobs for step in job.get("steps", [])
+                     if step.get("name") == "Runtime issue focused unit tests"]
+          if len(matches) != 1:
+              raise SystemExit("The inherited focused-unit step was not found exactly once.")
+          job, step = matches[0]
+          if job.get("head_sha") != baseline_sha:
+              raise SystemExit("Inherited focused-unit job head SHA did not match the pinned baseline.")
+          if step.get("conclusion") != "success":
+              raise SystemExit("The inherited focused-unit step was not confirmed successful.")
+          print(f"Verified run {run_id} attempt {attempt} at {baseline_sha}: "
+                "Runtime issue focused unit tests concluded success.")
+          PY
 
       - name: Security and protocol audit
         shell: bash
@@ -103,7 +150,16 @@ jobs:
             echo "ref=$GITHUB_REF"
             echo "event=$GITHUB_EVENT_NAME"
             echo "validation_scope=${{ inputs.gate }}"
-            if [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+            if [[ '${{ inputs.gate }}' == 'runtime-issues-device' ]]; then
+              echo "device_validation_scope=iphoneos arm64 compile and candidate IPA package only"
+              echo "immutable_source_tree_sha=450bf23bfd7d6e1d60fcfc6c60fd23e0d9e38c48"
+              echo "inherited_native_unit_evidence=run40517450754/attempt1 Runtime issue focused unit tests (9 tests; source tree and step result verified by preflight)"
+              echo "ui_validation=not_run_by_this_gate; pending_USB_smoke; no_UI_PASS_claim"
+              echo "protocol_security_fuzz=not_run_in_runtime_issues_device_gate"
+              echo "full_unit_suite=not_run_in_runtime_issues_device_gate"
+              echo "streaming_cadence_and_process_stress=not_run_in_runtime_issues_device_gate"
+              echo "security_audit=scripts/security_audit.sh rerun on this commit"
+            elif [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
               echo "inherited_full_unit_security_baseline=a33e49f/run40468844319; inherited_streaming_baseline=a33e49f/run40504021022-attempt2 (historical evidence; not revalidated by this run)"
               echo "security_audit=scripts/security_audit.sh rerun on this commit"
               echo "protocol_security_fuzz=not_run_in_runtime_issues_gate"
@@ -129,6 +185,7 @@ jobs:
 
       - name: Create pinned iPhone 13 Pro simulator
         id: simulator
+        if: inputs.gate != 'runtime-issues-device'
         shell: bash
         run: |
           set -euo pipefail
@@ -169,7 +226,7 @@ jobs:
           echo "Created pinned simulator: $UDID"
 
       - name: Protocol Security / Fuzz
-        if: inputs.gate != 'streaming' && inputs.gate != 'runtime-issues'
+        if: inputs.gate != 'streaming' && inputs.gate != 'runtime-issues' && inputs.gate != 'runtime-issues-device'
         shell: bash
         run: |
           set -euo pipefail
@@ -185,7 +242,7 @@ jobs:
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/protocol-security.log | tail -1
 
       - name: Record pinned compiler nested actor isolation
-        if: inputs.unit_sanitizer != 'none' && inputs.unit_sanitizer != ''
+        if: inputs.unit_sanitizer != 'none' && inputs.unit_sanitizer != '' && inputs.gate != 'runtime-issues-device'
         shell: bash
         run: |
           python3 - <<'PY'
@@ -212,7 +269,7 @@ jobs:
           PY
 
       - name: Unit tests
-        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'runtime-issues'
+        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'runtime-issues' && inputs.gate != 'runtime-issues-device'
         shell: bash
         run: |
           set -euo pipefail
@@ -270,6 +327,7 @@ jobs:
           xcodebuild test -project RemoteAIMobile.xcodeproj -scheme RemoteAIMobile -configuration Debug -destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}' -only-testing:RemoteAIMobileTests/AssistantStreamTests | tee build/stream-unit.log
 
       - name: UI tests with isolated simulator process lifecycle
+        if: inputs.gate != 'runtime-issues-device'
         shell: bash
         run: |
           set -euo pipefail
@@ -318,7 +376,7 @@ jobs:
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
 
       - name: Streaming cadence and process samples without accessibility polling
-        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'copy-controls' && inputs.gate != 'runtime-issues'
+        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'copy-controls' && inputs.gate != 'runtime-issues' && inputs.gate != 'runtime-issues-device'
         run: |
           set -euo pipefail
           python3 scripts/sample_streaming_performance.py --udid '${{ steps.simulator.outputs.udid }}' | tee build/stream-performance.log
@@ -438,7 +496,15 @@ jobs:
             echo '## RemoteAI Candidate IPA'
             echo '- Candidate only; not final release acceptance'
             echo '- External Live iOS Relay pairing smoke: intentionally excluded from this workflow'
-            if [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+            if [[ '${{ inputs.gate }}' == 'runtime-issues-device' ]]; then
+              echo '- Static security audit (`scripts/security_audit.sh`): PASS on this commit'
+              echo '- Device validation: PASS (current iphoneos arm64 build, signing, IPA verification, and reproducible package)'
+              echo '- Inherited native unit evidence: PASS (9 focused tests; run40517450754 attempt 1, verified against SHA 450bf23bfd7d6e1d60fcfc6c60fd23e0d9e38c48)'
+              echo '- Runtime issue UI validation: PENDING USB smoke; not run or passed by this device-only gate'
+              echo '- Protocol Security / Fuzz: NOT RUN in this gate'
+              echo '- Full unit suite: NOT RUN in this gate'
+              echo '- Streaming cadence/process stress: NOT RUN in this gate'
+            elif [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
               echo '- Static security audit (`scripts/security_audit.sh`): PASS on this commit'
               echo '- Protocol Security / Fuzz: NOT RUN in this gate; inherited baseline run40468844319 is historical evidence and was not revalidated'
               echo '- Full unit suite: NOT RUN; inherited baseline run40468844319 is historical evidence and was not revalidated'
@@ -448,7 +514,7 @@ jobs:
             else
               echo '- Protocol Security / Fuzz: PASS'
             fi
-            if [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+            if [[ '${{ inputs.gate }}' == 'runtime-issues-device' || '${{ inputs.gate }}' == 'runtime-issues' ]]; then
               :
             elif [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
               echo '- Validation scope: Web controls; 2 targeted UI/navigation tests'
@@ -466,7 +532,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Collect bounded RemoteAI crash reports
-        if: always()
+        if: always() && inputs.gate != 'runtime-issues-device'
         shell: bash
         run: |
           python3 - <<'PY'
@@ -488,7 +554,7 @@ jobs:
           PY
 
       - name: Preserve test evidence
-        if: always()
+        if: always() && inputs.gate != 'runtime-issues-device'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: UI-evidence
