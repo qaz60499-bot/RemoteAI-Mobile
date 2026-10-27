@@ -356,9 +356,11 @@ final class WorkspaceStore: ObservableObject {
             }
         }
 
-        await loadCachedFirst()
+        let loadedCachedSessions = await loadCachedFirst()
         guard generation == lifecycleGeneration, !isSuspended else { return false }
-        await normalizeCachedTransientState()
+        if loadedCachedSessions {
+            await normalizeCachedTransientState()
+        }
         if !(transport is MockTransport) {
             await removeLegacyMockFixtures()
             await removeCloudCodeFromMobileCache()
@@ -3032,13 +3034,24 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func loadCachedFirst() async {
+    private func loadCachedFirst() async -> Bool {
         if let cached: MachineMetadata = try? await cache.get(MachineMetadata.self, key: "machine") {
             machine = MachineMetadata(id: cached.id, name: cached.name, state: .connecting)
         }
-        if let value: [RuntimeDescriptor] = try? await cache.get([RuntimeDescriptor].self, key: "runtimes") { runtimes = value }
-        if let value: [InstanceDescriptor] = try? await cache.get([InstanceDescriptor].self, key: "instances") { instances = value }
-        if let value: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") { sessions = value }
+        if runtimes.isEmpty,
+           let value: [RuntimeDescriptor] = try? await cache.get([RuntimeDescriptor].self, key: "runtimes") {
+            runtimes = value
+        }
+        if instances.isEmpty,
+           let value: [InstanceDescriptor] = try? await cache.get([InstanceDescriptor].self, key: "instances") {
+            instances = value
+        }
+        var loadedCachedSessions = false
+        if sessions.isEmpty,
+           let value: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") {
+            sessions = value
+            loadedCachedSessions = true
+        }
         if webProjects.isEmpty,
            let value: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
             webProjects = value
@@ -3049,7 +3062,10 @@ final class WorkspaceStore: ObservableObject {
             webProjectsSnapshotState = .staleCache
             hasLoadedWebProjects = !value.isEmpty
         }
-        tracker = SequenceTracker(lastSequence: (try? await cache.lastSequence()) ?? 0)
+        // The replay guard keeps applied live UUIDs while active streams may hold
+        // SQLite behind; never lower the matching applied sequence head here.
+        let cachedCursor = (try? await cache.lastSequence()) ?? 0
+        tracker.advanceMonotonically(to: cachedCursor)
         let process = ProcessInfo.processInfo
         if runtimes.isEmpty,
            process.arguments.contains("-UITestMockMode"),
@@ -3057,6 +3073,7 @@ final class WorkspaceStore: ObservableObject {
             seedFixtureMetadata()
             await persistMetadata()
         }
+        return loadedCachedSessions
     }
 
     private func normalizeCachedTransientState() async {

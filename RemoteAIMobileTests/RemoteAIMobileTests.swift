@@ -1170,6 +1170,8 @@ final class RemoteAIMobileTests: XCTestCase {
         let firstAppliedHead = try await cache.lastSequence()
         XCTAssertEqual(firstAppliedHead, 1200, "Busy state must not checkpoint over an active run")
 
+        await store.start()
+
         let replay = RemoteEvent(
             protocolVersion: 1,
             eventId: reusedId,
@@ -1190,6 +1192,132 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.errors["sync"], TransportError.replayDetected.localizedDescription)
         let replayHead = try await cache.lastSequence()
         XCTAssertEqual(replayHead, 1200, "A reused event id at a future sequence must not advance the durable cursor")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testRepeatedStartPreservesActiveReplayStateAndRecoversExactDeltaRemoval() async throws {
+        try await assertActiveReplayRecoverySurvivesLifecycleChange(.repeatedStart)
+    }
+
+    @MainActor
+    func testSuspendResumePreservesActiveReplayStateAndRecoversExactDeltaRemoval() async throws {
+        try await assertActiveReplayRecoverySurvivesLifecycleChange(.suspendResume)
+    }
+
+    private enum ActiveReplayLifecycleChange {
+        case repeatedStart
+        case suspendResume
+    }
+
+    @MainActor
+    private func assertActiveReplayRecoverySurvivesLifecycleChange(_ lifecycleChange: ActiveReplayLifecycleChange) async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 4)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first { $0.id == "runtime.web" })
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first { $0.id == "photo" })
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        await store.loadSession("photo-upload")
+
+        let originalRows = try await cache.recentMessages(sessionId: "photo-upload", limit: 10)
+        var expectedMessageIds = Set(originalRows.map(\.id))
+        XCTAssertEqual(expectedMessageIds, Set(["mock-1", "mock-2", "mock-3", "mock-4"]))
+        let initialCursor = try await cache.lastSequence()
+        XCTAssertEqual(initialCursor, 1200)
+
+        func event(_ sequence: Int64, _ type: String, _ payload: [String: JSONValue], at createdAt: Date) -> RemoteEvent {
+            RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: sequence,
+                machineId: "my-pc",
+                runtimeId: "runtime.web",
+                instanceId: "photo",
+                sessionId: "photo-upload",
+                type: type,
+                payload: payload,
+                createdAt: createdAt
+            )
+        }
+
+        let now = Date()
+        await mock.injectEvent(event(1201, "GENERATION_STARTED", [:], at: now), deliverLive: true)
+        await mock.injectEvent(event(
+            1202,
+            "MESSAGE_UPDATED",
+            [
+                "messageId": .string("live-partial-tail"),
+                "role": .string("assistant"),
+                "content": .string("unfinished response tail"),
+                "partial": .bool(true)
+            ],
+            at: now.addingTimeInterval(0.01)
+        ), deliverLive: true)
+
+        for _ in 0..<80 {
+            let isBusy = store.sessions.first(where: { $0.id == "photo-upload" })?.state == .busy
+            let tailIsVisible = store.messagesBySession["photo-upload", default: []].contains { $0.id == "live-partial-tail" }
+            if isBusy && tailIsVisible { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        XCTAssertEqual(store.messagesBySession["photo-upload"]?.first(where: { $0.id == "live-partial-tail" })?.text, "unfinished response tail")
+        let cursorBeforeLifecycleChange = try await cache.lastSequence()
+        XCTAssertEqual(cursorBeforeLifecycleChange, initialCursor, "A live partial tail must remain replayable from the prior durable cursor")
+        let cacheBeforeLifecycleChange = try await cache.recentMessages(sessionId: "photo-upload", limit: 10)
+        XCTAssertFalse(cacheBeforeLifecycleChange.contains { $0.id == "live-partial-tail" }, "The partial tail is process-local until a canonical terminal event arrives")
+
+        switch lifecycleChange {
+        case .repeatedStart:
+            let restarted = await store.start()
+            XCTAssertTrue(restarted)
+        case .suspendResume:
+            await store.suspend()
+            XCTAssertEqual(store.machine.state, .offline)
+            await store.resumeFromForeground()
+        }
+
+        XCTAssertEqual(store.machine.state, .online)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy, "A same-store lifecycle restart must preserve live busy state")
+        let cursorAfterLifecycleChange = try await cache.lastSequence()
+        XCTAssertEqual(cursorAfterLifecycleChange, initialCursor)
+        let cacheAfterLifecycleChange = try await cache.recentMessages(sessionId: "photo-upload", limit: 10)
+        XCTAssertFalse(cacheAfterLifecycleChange.contains { $0.id == "live-partial-tail" })
+        XCTAssertEqual(store.messagesBySession["photo-upload"]?.first(where: { $0.id == "live-partial-tail" })?.text, "unfinished response tail")
+
+        let finalMessage = ServerMessage(
+            messageId: "recovered-terminal-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "canonical response after reconnect",
+            externalId: nil,
+            createdAt: now.addingTimeInterval(0.02)
+        )
+        let finalPayload = try XCTUnwrap(JSONValue.encode(finalMessage).objectValue)
+        await mock.injectEvent(event(1203, "MESSAGE_ADDED", finalPayload, at: now.addingTimeInterval(0.02)))
+        await mock.injectEvent(event(
+            1204,
+            "MESSAGE_REMOVED",
+            ["messageId": .string("mock-2")],
+            at: now.addingTimeInterval(0.03)
+        ))
+        await store.verifyOnlineSyncHead()
+
+        let recoveredCursor = try await cache.lastSequence()
+        XCTAssertEqual(recoveredCursor, 1204, "Delta replay must skip already-applied live events and reach the current head")
+        XCTAssertNil(store.errors["sync"])
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+        expectedMessageIds.remove("mock-2")
+        expectedMessageIds.insert(finalMessage.messageId)
+
+        let recoveredRows = try await cache.recentMessages(sessionId: "photo-upload", limit: 10)
+        XCTAssertEqual(Set(recoveredRows.map(\.id)), expectedMessageIds, "Only the message named by MESSAGE_REMOVED may leave durable history")
+        XCTAssertFalse(recoveredRows.contains { $0.id == "live-partial-tail" })
+        let visibleMessageIds = Set(store.messagesBySession["photo-upload", default: []].map(\.id))
+        XCTAssertEqual(visibleMessageIds, expectedMessageIds, "Canonical history and unrelated original messages must remain visible")
         await store.suspend()
     }
 
