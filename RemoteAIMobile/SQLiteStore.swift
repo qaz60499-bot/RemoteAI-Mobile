@@ -5,6 +5,8 @@ actor SQLiteStore {
     static let maxKVBytes = 256 * 1024
     static let maxMessageBytes = 512 * 1024
     static let fileProtection = FileProtectionType.complete
+    private static let sessionCatalogInitializedKey = "sessions.catalog.initialized"
+    private static let legacySessionCatalogKey = "sessions"
 
     private var db: OpaquePointer?
     private let protectionURL: URL?
@@ -29,7 +31,7 @@ actor SQLiteStore {
             throw StoreError.openFailed
         }
         do {
-            try exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000; PRAGMA journal_size_limit=4194304; CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY,value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,sequence INTEGER NOT NULL,created_at REAL NOT NULL,json BLOB NOT NULL); CREATE INDEX IF NOT EXISTS idx_messages_session_sequence ON messages(session_id,sequence); CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id,created_at,id);")
+            try exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA trusted_schema=OFF; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000; PRAGMA journal_size_limit=4194304; CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY,value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,sequence INTEGER NOT NULL,created_at REAL NOT NULL,json BLOB NOT NULL); CREATE INDEX IF NOT EXISTS idx_messages_session_sequence ON messages(session_id,sequence); CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id,created_at,id); CREATE TABLE IF NOT EXISTS session_catalog(id TEXT PRIMARY KEY,position INTEGER NOT NULL,json BLOB NOT NULL);")
             protectDatabaseFiles()
         } catch {
             if let db { sqlite3_close(db) }
@@ -79,6 +81,50 @@ actor SQLiteStore {
             catch { throw StoreError.corruptData }
         }
         return result
+    }
+
+    func getSessionCatalog() throws -> [SessionDescriptor]? {
+        if let initialized = try get(String.self, key: Self.sessionCatalogInitializedKey) {
+            guard initialized == "1" else { throw StoreError.corruptData }
+            return try readSessionCatalog()
+        }
+        return try get([SessionDescriptor].self, key: Self.legacySessionCatalogKey)
+    }
+
+    func replaceSessionCatalog(_ sessions: [SessionDescriptor]) throws {
+        try exec("BEGIN IMMEDIATE;")
+        do {
+            try exec("DELETE FROM session_catalog;")
+            var stmt: OpaquePointer?
+            let sql = "INSERT OR REPLACE INTO session_catalog(id,position,json) VALUES(?,?,?)"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }
+            defer { sqlite3_finalize(stmt) }
+
+            for (position, session) in sessions.enumerated() {
+                let data = try encoder.encode(session)
+                guard data.count <= Self.maxKVBytes else { throw StoreError.valueTooLarge }
+                sqlite3_reset(stmt)
+                sqlite3_clear_bindings(stmt)
+                bindText(stmt, 1, session.id)
+                sqlite3_bind_int64(stmt, 2, Int64(position))
+                data.withUnsafeBytes { ptr in
+                    _ = sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(data.count), transient)
+                }
+                guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.stepFailed }
+            }
+
+            // The initialized marker makes an intentionally empty catalog distinct
+            // from a pre-migration database that still needs the legacy KV fallback.
+            // Removing the legacy value in this same transaction prevents stale rows
+            // from returning after a successful empty replacement.
+            try put("1", key: Self.sessionCatalogInitializedKey)
+            try exec("DELETE FROM kv WHERE key='\(Self.legacySessionCatalogKey)';")
+            try exec("COMMIT;")
+            protectDatabaseFiles()
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
     }
 
     func setLastSequence(_ value: Int64) throws {
@@ -216,7 +262,7 @@ actor SQLiteStore {
     func clearAll() throws {
         try exec("BEGIN IMMEDIATE;")
         do {
-            try exec("DELETE FROM messages; DELETE FROM kv; COMMIT;")
+            try exec("DELETE FROM messages; DELETE FROM kv; DELETE FROM session_catalog; COMMIT;")
             try exec("PRAGMA wal_checkpoint(TRUNCATE);")
             protectDatabaseFiles()
         } catch {
@@ -254,6 +300,24 @@ actor SQLiteStore {
             guard count >= 0, count <= Self.maxMessageBytes, let blob = sqlite3_column_blob(stmt, 0) else { throw StoreError.corruptData }
             let data = Data(bytes: blob, count: count)
             do { result.append(try decoder.decode(ChatMessage.self, from: data)) }
+            catch { throw StoreError.corruptData }
+        }
+        return result
+    }
+
+    private func readSessionCatalog() throws -> [SessionDescriptor] {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT json FROM session_catalog ORDER BY position", -1, &stmt, nil) == SQLITE_OK else { throw StoreError.prepareFailed }
+        defer { sqlite3_finalize(stmt) }
+        var result: [SessionDescriptor] = []
+        while true {
+            let step = sqlite3_step(stmt)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else { throw StoreError.stepFailed }
+            let count = Int(sqlite3_column_bytes(stmt, 0))
+            guard count >= 0, count <= Self.maxKVBytes, let blob = sqlite3_column_blob(stmt, 0) else { throw StoreError.corruptData }
+            let data = Data(bytes: blob, count: count)
+            do { result.append(try decoder.decode(SessionDescriptor.self, from: data)) }
             catch { throw StoreError.corruptData }
         }
         return result

@@ -165,7 +165,7 @@ jobs:
               echo "protocol_security_fuzz=not_run_in_runtime_issues_gate"
               echo "full_unit_suite=not_run_in_runtime_issues_gate"
               echo "streaming_cadence_and_process_stress=not_run_in_runtime_issues_gate"
-              echo "runtime_issue_unit_scope=RuntimeIssueSummaryTests (6 methods); targeted PairingTests and RemoteAIMobileTests regressions"
+              echo "runtime_issue_unit_scope=RuntimeIssueSummaryTests (6 methods); GenerationTerminalOutcomeTests (2 methods); SessionCatalogTests (4 methods); targeted PairingTests and RemoteAIMobileTests regressions"
               echo "runtime_issue_ui_scope=testRuntimeIssueSummaryOpensAndRefreshesCapabilities;testOpenCachedWebConversation"
               echo "workspace_store_lifecycle_scope=testWorkspaceCoalescesDuplicateInitializationAndLifecycleRace"
             elif [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
@@ -294,7 +294,7 @@ jobs:
           grep -E 'PROJECT_REFRESH_STRESS_TOTAL=2500' build/tests.log
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/tests.log | tail -1
 
-      - name: Reproduce terminal-state regression on the previous source
+      - name: Reproduce terminal and catalog regressions on the previous WorkspaceStore source
         if: inputs.gate == 'runtime-issues'
         shell: bash
         run: |
@@ -302,6 +302,7 @@ jobs:
           PATCHED_SOURCE="$RUNNER_TEMP/WorkspaceStore.terminal-fixed.swift"
           cp RemoteAIMobile/WorkspaceStore.swift "$PATCHED_SOURCE"
           trap 'cp "$PATCHED_SOURCE" RemoteAIMobile/WorkspaceStore.swift' EXIT
+          # Keep candidate SQLiteStore and the new tests; revert only WorkspaceStore for the baseline.
           git show d80e96069416671c36528e42d1857a3274b0c2af:RemoteAIMobile/WorkspaceStore.swift > RemoteAIMobile/WorkspaceStore.swift
           set +e
           xcodebuild test \
@@ -310,12 +311,16 @@ jobs:
             -configuration Debug \
             -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
             -only-testing:RemoteAIMobileTests/GenerationTerminalOutcomeTests \
+            -only-testing:RemoteAIMobileTests/SessionCatalogTests/testLiveRegistrationAdvancesCursorWith648RowCatalogOverKVLimit \
             -resultBundlePath build/terminal-before.xcresult \
             > build/terminal-before.log 2>&1
           BASELINE_EXIT=$?
           set -e
           test "$BASELINE_EXIT" -ne 0
           grep -E 'XCTAssert.*failed' build/terminal-before.log
+          grep -F "Test Case '-[RemoteAIMobileTests.GenerationTerminalOutcomeTests testAntigravityCanceledTerminalKeepsPartialAndDoesNotDuplicateIt]' failed" build/terminal-before.log
+          grep -F "Test Case '-[RemoteAIMobileTests.GenerationTerminalOutcomeTests testAntigravityInterruptedUnknownAndConfirmedFailureHaveDistinctTerminalStates]' failed" build/terminal-before.log
+          grep -F "Test Case '-[RemoteAIMobileTests.SessionCatalogTests testLiveRegistrationAdvancesCursorWith648RowCatalogOverKVLimit]' failed" build/terminal-before.log
           echo "TERMINAL_BEFORE_EXPECTED_FAILURE=$BASELINE_EXIT"
 
       - name: Runtime issue focused unit tests
@@ -339,11 +344,12 @@ jobs:
             "$@" \
             -only-testing:RemoteAIMobileTests/RuntimeIssueSummaryTests \
             -only-testing:RemoteAIMobileTests/GenerationTerminalOutcomeTests \
+            -only-testing:RemoteAIMobileTests/SessionCatalogTests \
             -only-testing:RemoteAIMobileTests/PairingTests/testForegroundCallbacksAvoidUnnecessaryReconnectAndHideBriefStatusFlash \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testBackgroundTaskStatusStaysSeparateFromIdleAndStaleConversationStatus \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testWorkspaceCoalescesDuplicateInitializationAndLifecycleRace \
             | tee build/runtime-issues-tests.log
-          grep -E 'Executed 11 tests?, with 0 failures' build/runtime-issues-tests.log | tail -1
+          grep -E 'Executed 15 tests?, with 0 failures' build/runtime-issues-tests.log | tail -1
 
       - name: Streaming unit tests
         if: inputs.gate == 'streaming'
@@ -534,7 +540,7 @@ jobs:
               echo '- Protocol Security / Fuzz: NOT RUN in this gate; inherited baseline run40468844319 is historical evidence and was not revalidated'
               echo '- Full unit suite: NOT RUN; inherited baseline run40468844319 is historical evidence and was not revalidated'
               echo '- Streaming cadence/process stress: NOT RUN; long-stream simulator baseline run40504021022-attempt2 is inherited; no new cadence measurement'
-              echo '- Runtime issue unit scope: PASS (6 RuntimeIssueSummaryTests plus 3 targeted regressions, including the WorkspaceStore lifecycle race)'
+              echo '- Runtime issue unit scope: PASS (6 RuntimeIssueSummaryTests, 2 GenerationTerminalOutcomeTests, 4 SessionCatalogTests, and 3 targeted regressions including the WorkspaceStore lifecycle race; 15 tests total)'
               echo '- UI scope: PASS (runtime issue summary and cached conversation navigation; 2 tests)'
             else
               echo '- Protocol Security / Fuzz: PASS'

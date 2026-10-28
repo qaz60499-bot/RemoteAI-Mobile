@@ -3072,7 +3072,7 @@ final class WorkspaceStore: ObservableObject {
         }
         var loadedCachedSessions = false
         if sessions.isEmpty,
-           let value: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") {
+           let value = try? await cache.getSessionCatalog() {
             sessions = value
             loadedCachedSessions = true
         }
@@ -3108,7 +3108,7 @@ final class WorkspaceStore: ObservableObject {
             errors[sessionId] = "Previous generation did not reach a terminal event before the app/connection ended. Its stale RUNNING state was reset."
             changed = true
         }
-        if changed { try? await cache.put(sessions, key: "sessions") }
+        if changed { try? await cache.replaceSessionCatalog(sessions) }
     }
 
     private func removeCloudCodeFromMobileCache() async {
@@ -3735,7 +3735,7 @@ final class WorkspaceStore: ObservableObject {
         try await cache.put(machine, key: "machine")
         try await cache.put(runtimes, key: "runtimes")
         try await cache.put(instances, key: "instances")
-        try await cache.put(snapshot ?? sessions, key: "sessions")
+        try await cache.replaceSessionCatalog(snapshot ?? sessions)
     }
 
     private func hasUnsettledEventStreamState(excludingSessionId: String? = nil) -> Bool {
