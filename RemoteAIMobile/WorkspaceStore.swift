@@ -1527,6 +1527,9 @@ final class WorkspaceStore: ObservableObject {
                         updated.backgroundTaskStatus = known
                         updated.backgroundTaskStatusReceivedAt = current.backgroundTaskStatusReceivedAt
                     }
+                    if Self.sessionDescriptorsEqualIgnoringStatusObservedAt(updated, current) {
+                        updated.statusObservedAt = current.statusObservedAt
+                    }
                 }
                 return updated
             }.sorted(by: Self.sessionOrdersBefore)
@@ -1874,7 +1877,7 @@ final class WorkspaceStore: ObservableObject {
                 if let activity = snapshot.lastActivityAt {
                     updated.lastActivityAt = max(updated.lastActivityAt ?? updated.updatedAt, activity)
                 }
-                if updated != current {
+                if !Self.sessionDescriptorsEqualIgnoringStatusObservedAt(updated, current) {
                     sessions[index] = updated
                 }
             }
@@ -3090,6 +3093,15 @@ final class WorkspaceStore: ObservableObject {
     private static func sessionOrdersBefore(_ lhs: SessionDescriptor, _ rhs: SessionDescriptor) -> Bool {
         if lhs.orderingDate != rhs.orderingDate { return lhs.orderingDate > rhs.orderingDate }
         return lhs.id < rhs.id
+    }
+
+    private static func sessionDescriptorsEqualIgnoringStatusObservedAt(
+        _ lhs: SessionDescriptor,
+        _ rhs: SessionDescriptor
+    ) -> Bool {
+        var lhs = lhs
+        lhs.statusObservedAt = rhs.statusObservedAt
+        return lhs == rhs
     }
 
     private func sortSessionsCanonical() {

@@ -3,6 +3,72 @@ import Security
 import Combine
 @testable import RemoteAIMobile
 
+private actor StatusObservedAtTransport: Transport {
+    private let base: MockTransport
+    private var observationCount = 0
+    private var statusSource = "codex-desktop-unloaded"
+    private var statusReason = "The Desktop Thread is not loaded"
+
+    init(base: MockTransport) { self.base = base }
+
+    func getSessionStatusAttemptCount() async -> Int {
+        await base.actionAttemptCount("getSessionStatus")
+    }
+
+    func setStatusSource(_ source: String, reason: String) {
+        statusSource = source
+        statusReason = reason
+    }
+
+    var isConnected: Bool { connected }
+    private var connected = false
+
+    func connect() async throws {
+        try await base.connect()
+        connected = true
+    }
+
+    func disconnect() async {
+        await base.disconnect()
+        connected = false
+    }
+
+    func eventStream() async -> AsyncStream<RemoteEvent> { await base.eventStream() }
+    func healthStream() async -> AsyncStream<TransportHealthEvent> { await base.healthStream() }
+
+    func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
+        let response = try await base.execute(command)
+        guard response.ok, let result = response.result else { return response }
+
+        if command.action == "listSessions", let rows = result.arrayValue {
+            let updatedRows = rows.map { row -> JSONValue in
+                guard var object = row.objectValue,
+                      object["sessionId"]?.stringValue == "photo-upload" else { return row }
+                applyNextObservation(to: &object)
+                return .object(object)
+            }
+            return CommandResponseEnvelope(ok: response.ok, result: .array(updatedRows), error: response.error, idempotentReplay: response.idempotentReplay)
+        }
+
+        if command.action == "getSessionStatus",
+           var object = result.objectValue,
+           object["sessionId"]?.stringValue == "photo-upload" {
+            applyNextObservation(to: &object)
+            return CommandResponseEnvelope(ok: response.ok, result: .object(object), error: response.error, idempotentReplay: response.idempotentReplay)
+        }
+
+        return response
+    }
+
+    private func applyNextObservation(to object: inout [String: JSONValue]) {
+        observationCount += 1
+        object["status"] = .string("unknown")
+        object["statusSource"] = .string(statusSource)
+        object["statusReason"] = .string(statusReason)
+        object["statusObservedAt"] = .string(RemoteAIDate.string(Date(timeIntervalSince1970: 1_700_000_000 + Double(observationCount))))
+    }
+}
+
 func fencedWritingBlock(_ body: String, leadingNewline: Bool = false, trailingNewline: Bool = false) -> String {
     var currentBackticks = 0
     var longestBacktickRun = 0
@@ -1634,6 +1700,8 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.refreshRuntime(runtime)
         let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
         await store.refreshSessions(runtime: runtime, instance: instance)
+        let initialSequence = try await cache.lastSequence()
+        XCTAssertEqual(initialSequence, 1200)
 
         await mock.setSessionStatus("photo-upload", status: "unknown")
         await mock.setResponseDelay(action: "getSessionStatus", nanoseconds: 300_000_000)
@@ -1661,11 +1729,14 @@ final class RemoteAIMobileTests: XCTestCase {
             createdAt: Date()
         ), deliverLive: true)
         for _ in 0..<100 {
-            if (try? await cache.lastSequence()) == 1201 { break }
+            if store.sessions.first(where: { $0.id == "photo-upload" })?.state == .busy,
+               store.liveRunStatusBySession["photo-upload"] != nil { break }
             try await Task.sleep(nanoseconds: 10_000_000)
         }
-        let appliedStartSequence = try await cache.lastSequence()
-        XCTAssertEqual(appliedStartSequence, 1201)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"], "The live run-start event must be applied before the delayed status response completes")
+        let durableSequenceDuringRun = try await cache.lastSequence()
+        XCTAssertEqual(durableSequenceDuringRun, initialSequence, "An active run must keep its transient event out of the durable replay cursor")
 
         await statusPoll.value
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
@@ -1747,6 +1818,54 @@ final class RemoteAIMobileTests: XCTestCase {
             XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "A stale Busy response must not revive progress after terminal completion")
             await store.suspend()
         }
+    }
+
+    @MainActor
+    func testStatusObservationTimestampOnlyUpdatesDoNotPublishSessionCatalog() async throws {
+        let transport = StatusObservedAtTransport(base: MockTransport(historyCount: 0))
+        try await transport.connect()
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        let runtime = RuntimeDescriptor(id: "runtime.web", machineId: "my-pc", kind: .web, name: "Web")
+        let instance = InstanceDescriptor(id: "photo", runtimeId: runtime.id, name: "Photo SaaS", subtitle: "cached-project")
+        store.machine = MachineMetadata(id: "my-pc", name: "My PC", state: .online)
+        store.runtimes = [runtime]
+        store.instances = [instance]
+
+        let initialRows = try await transport.listSessions(machineId: "my-pc", runtimeId: runtime.id, instanceId: instance.id)
+        let initialSession = try XCTUnwrap(initialRows.first(where: { $0.id == "photo-upload" }))
+        store.sessions = initialRows
+        let initialObservation = try XCTUnwrap(initialSession.statusObservedAt)
+
+        var sessionPublications = 0
+        let subscription = store.$sessions.sink { _ in sessionPublications += 1 }
+        let initialPublicationCount = sessionPublications
+
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        XCTAssertEqual(sessionPublications, initialPublicationCount, "A catalog response differing only in observation time should not publish the full session array")
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.statusObservedAt, initialObservation)
+
+        let statusRequestsBeforePoll = await transport.getSessionStatusAttemptCount()
+        await store.synchronizeVisibleSession("photo-upload")
+        let statusRequestsAfterPoll = await transport.getSessionStatusAttemptCount()
+        XCTAssertEqual(statusRequestsAfterPoll, statusRequestsBeforePoll + 1, "The timestamp-only check must exercise a real targeted status response")
+        XCTAssertEqual(sessionPublications, initialPublicationCount, "A visible status response differing only in observation time should not publish the full session array")
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.statusObservedAt, initialObservation)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.unknownStatusExplanation, "尚未载入 Codex Desktop")
+
+        await transport.setStatusSource("codex-desktop-unavailable", reason: "Desktop owner connection failed")
+        let publicationsBeforeSourceChange = sessionPublications
+        let statusRequestsBeforeSourceChange = await transport.getSessionStatusAttemptCount()
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        let statusRequestsAfterSourceChange = await transport.getSessionStatusAttemptCount()
+        XCTAssertEqual(statusRequestsAfterSourceChange, statusRequestsBeforeSourceChange + 1)
+        XCTAssertEqual(sessionPublications, publicationsBeforeSourceChange + 1, "A real source/reason change must publish the updated session")
+        let updatedSession = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(updatedSession.statusSource, "codex-desktop-unavailable")
+        XCTAssertEqual(updatedSession.statusReason, "Desktop owner connection failed")
+        XCTAssertEqual(updatedSession.unknownStatusExplanation, "无法连接 Codex Desktop")
+
+        subscription.cancel()
+        await store.suspend()
     }
 
     func testSessionStatusDecodesOptionalRemoteRevision() async throws {

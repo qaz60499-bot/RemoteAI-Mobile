@@ -155,4 +155,157 @@ final class CodexDirectoryTests: XCTestCase {
         XCTAssertNil(decoded.providerMessageId)
         XCTAssertEqual(decoded.id, message.id)
     }
+
+    // Captured through the real Windows CommandRouter and Desktop owner on 2026-10-28.
+    // Thread identities and workspace paths are anonymized; wire keys and values are preserved.
+    func testCapturedDesktopWireKeepsListAndTargetedStatusConsistent() async throws {
+        let data = Data(#"""
+        [
+          {
+            "before": {
+              "sessionId": "codex-codex-8-fixture-0",
+              "runtimeId": "runtime.codex",
+              "instanceId": "codex.8",
+              "externalId": "fixture-0",
+              "title": "Selected native Thread",
+              "canonicalUrl": null,
+              "status": "unknown",
+              "metadata": {
+                "cwd": "D:\\Work\\Project",
+                "originator": "Codex Desktop"
+              },
+              "projectAlias": null,
+              "createdAt": "2026-10-28T15:47:35.265Z",
+              "updatedAt": "2026-10-28T15:47:35.266Z",
+              "lastVisited": null,
+              "statusSource": "codex-desktop-not-queried",
+              "statusObservedAt": null,
+              "statusReason": "No Desktop owner status has been requested for this Chat",
+              "statusLastKnown": null,
+              "statusFresh": false
+            },
+            "status": {
+              "sessionId": "codex-codex-8-fixture-0",
+              "status": "generating",
+              "running": true,
+              "statusSource": "codex-desktop-owner",
+              "observedAt": "2026-10-28T17:29:55.377Z",
+              "statusObservedAt": "2026-10-28T17:29:55.377Z",
+              "statusReason": null,
+              "statusLastKnown": "generating",
+              "providerError": null,
+              "updatedAt": "2026-10-28T15:47:35.266Z",
+              "externalId": "fixture-0"
+            },
+            "after": {
+              "sessionId": "codex-codex-8-fixture-0",
+              "runtimeId": "runtime.codex",
+              "instanceId": "codex.8",
+              "externalId": "fixture-0",
+              "title": "Selected native Thread",
+              "canonicalUrl": null,
+              "status": "generating",
+              "metadata": {
+                "cwd": "D:\\Work\\Project",
+                "originator": "Codex Desktop"
+              },
+              "projectAlias": null,
+              "createdAt": "2026-10-28T15:47:35.265Z",
+              "updatedAt": "2026-10-28T15:47:35.266Z",
+              "lastVisited": null,
+              "statusSource": "codex-desktop-owner",
+              "statusObservedAt": "2026-10-28T17:29:55.377Z",
+              "statusReason": null,
+              "statusLastKnown": "generating",
+              "statusFresh": true
+            }
+          },
+          {
+            "before": {
+              "sessionId": "codex-codex-8-fixture-1",
+              "runtimeId": "runtime.codex",
+              "instanceId": "codex.8",
+              "externalId": "fixture-1",
+              "title": "Selected native Thread",
+              "canonicalUrl": null,
+              "status": "unknown",
+              "metadata": {
+                "cwd": "D:\\Work\\Project",
+                "originator": "Codex Desktop"
+              },
+              "projectAlias": null,
+              "createdAt": "2026-10-24T05:16:07.279Z",
+              "updatedAt": "2026-10-24T05:16:07.279Z",
+              "lastVisited": null,
+              "statusSource": "codex-desktop-not-queried",
+              "statusObservedAt": null,
+              "statusReason": "No Desktop owner status has been requested for this Chat",
+              "statusLastKnown": null,
+              "statusFresh": false
+            },
+            "status": {
+              "sessionId": "codex-codex-8-fixture-1",
+              "status": "unknown",
+              "running": null,
+              "statusSource": "codex-desktop-unloaded",
+              "observedAt": "2026-10-28T17:29:55.438Z",
+              "statusObservedAt": "2026-10-28T17:29:55.438Z",
+              "statusReason": "The selected Thread is not loaded by a Codex Desktop owner",
+              "statusLastKnown": null,
+              "providerError": null,
+              "updatedAt": "2026-10-24T05:16:07.279Z",
+              "externalId": "fixture-1"
+            },
+            "after": {
+              "sessionId": "codex-codex-8-fixture-1",
+              "runtimeId": "runtime.codex",
+              "instanceId": "codex.8",
+              "externalId": "fixture-1",
+              "title": "Selected native Thread",
+              "canonicalUrl": null,
+              "status": "unknown",
+              "metadata": {
+                "cwd": "D:\\Work\\Project",
+                "originator": "Codex Desktop"
+              },
+              "projectAlias": null,
+              "createdAt": "2026-10-24T05:16:07.279Z",
+              "updatedAt": "2026-10-24T05:16:07.279Z",
+              "lastVisited": null,
+              "statusSource": "codex-desktop-unloaded",
+              "statusObservedAt": "2026-10-28T17:29:55.438Z",
+              "statusReason": "The selected Thread is not loaded by a Codex Desktop owner",
+              "statusLastKnown": null,
+              "statusFresh": true
+            }
+          }
+        ]
+        """#.utf8)
+        let samples = try XCTUnwrap(try JSONDecoder.remoteAI.decode(JSONValue.self, from: data).arrayValue)
+        XCTAssertEqual(samples.count, 2)
+        for sample in samples {
+            let object = try XCTUnwrap(sample.objectValue)
+            let before = try JSONDecoder.remoteAI.decode(ServerSession.self,
+                from: JSONEncoder.remoteAI.encode(try XCTUnwrap(object["before"])))
+            let after = try JSONDecoder.remoteAI.decode(ServerSession.self,
+                from: JSONEncoder.remoteAI.encode(try XCTUnwrap(object["after"])))
+            let transport = StatusResponseTransport(result: try XCTUnwrap(object["status"]))
+            let snapshot = try await transport.sessionStatus(machineId: "test-machine", runtimeId: "runtime.codex",
+                instanceId: "codex.8", sessionId: before.descriptor.id)
+            XCTAssertEqual(before.descriptor.state, .unknown)
+            XCTAssertEqual(snapshot.state, after.descriptor.state)
+            XCTAssertEqual(snapshot.statusSource, after.descriptor.statusSource)
+            XCTAssertEqual(snapshot.statusReason, after.descriptor.statusReason)
+            XCTAssertEqual(snapshot.statusObservedAt, after.descriptor.statusObservedAt)
+            XCTAssertEqual(snapshot.updatedAt, after.updatedAt, "Real content revision must survive targeted status decoding")
+            XCTAssertEqual(before.descriptor.workingDirectory, after.descriptor.workingDirectory)
+            if snapshot.statusSource == "codex-desktop-owner" {
+                XCTAssertEqual(snapshot.state, .busy)
+                XCTAssertNil(after.descriptor.unknownStatusExplanation)
+            } else {
+                XCTAssertEqual(snapshot.state, .unknown)
+                XCTAssertEqual(after.descriptor.unknownStatusExplanation, "尚未载入 Codex Desktop")
+            }
+        }
+    }
 }

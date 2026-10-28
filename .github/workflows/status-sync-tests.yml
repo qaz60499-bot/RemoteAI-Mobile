@@ -55,6 +55,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          set +e
           xcodebuild test -project RemoteAIMobile.xcodeproj -scheme RemoteAIMobile \
             -configuration Debug -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
             -parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 \
@@ -64,13 +65,20 @@ jobs:
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testDelayedVisibleUnknownAndBusyStatusCannotOverrideNewerTerminalEvent \
             -only-testing:RemoteAIMobileTests/CodexDirectoryTests/testDesktopStatusProvenanceMapsListAndTargetedStatusAndKeepsOldWireCompatible \
             -only-testing:RemoteAIMobileTests/CodexDirectoryTests/testUnknownStatusExplanationIsLimitedToUnknownRows \
+            -only-testing:RemoteAIMobileTests/CodexDirectoryTests/testCapturedDesktopWireKeepsListAndTargetedStatusConsistent \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testUnchangedCatalogRefreshDoesNotRepublishChatAndInstanceLists \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testStatusObservationTimestampOnlyUpdatesDoNotPublishSessionCatalog \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testDeltaRecoveryTreatsLiveAndDeltaOverlapAsIdempotent \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testDeltaRecoveryKeepsLiveHeadMonotonicWhenDelayedPageFallsBehind \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testSessionStatusDecodesOptionalRemoteRevision \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testOrdinaryIdleSyncReloadsHistoryWhenRemoteRevisionChangesDespiteClockSkew \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testLiveWebRegistrationAndBusyStateCannotBeErasedByConcurrentOlderSessionRefresh \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testIdleStatusWithExplicitlyOlderRemoteEvidenceCannotEndNewerLiveRun \
             CODE_SIGNING_ALLOWED=NO | tee build/status-sync/tests.log
+          TEST_STATUS=${PIPESTATUS[0]}
+          set -e
           xcrun xcresulttool get test-results summary --path build/status-sync/tests.xcresult --format json > build/status-sync/test-summary.json
+          exit "$TEST_STATUS"
       - name: Compile arm64 app without signing or packaging
         shell: bash
         run: |
