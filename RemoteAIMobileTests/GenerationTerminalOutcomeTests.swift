@@ -93,7 +93,10 @@ final class GenerationTerminalOutcomeTests: XCTestCase {
         for (index, terminalCase) in cases.enumerated() {
             let (mock, store) = try await makeStartedStore()
             let now = Date()
-            let startSequence = Int64(1301 + index * 10)
+            // Each case creates a fresh MockTransport with a 1200 cursor baseline.
+            // Do not invent gaps (1301+) here: those exercise unrelated delta recovery
+            // and can prevent the terminal-state event from reaching WorkspaceStore.
+            let startSequence: Int64 = 1201
             let sessionId = "photo-upload"
             await inject(mock, sequence: startSequence, type: "GENERATION_STARTED", payload: [:], at: now)
             await inject(mock, sequence: startSequence + 1, type: "MESSAGE_UPDATED", payload: [
