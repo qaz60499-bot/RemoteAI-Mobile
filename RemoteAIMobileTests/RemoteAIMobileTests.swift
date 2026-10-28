@@ -1831,9 +1831,10 @@ final class RemoteAIMobileTests: XCTestCase {
         store.runtimes = [runtime]
         store.instances = [instance]
 
-        let initialRows = try await transport.listSessions(machineId: "my-pc", runtimeId: runtime.id, instanceId: instance.id)
-        let initialSession = try XCTUnwrap(initialRows.first(where: { $0.id == "photo-upload" }))
-        store.sessions = initialRows
+        // Establish the comparison point through the real catalog merge so the
+        // baseline has WorkspaceStore's canonical ordering and mapped metadata.
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        let initialSession = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
         let initialObservation = try XCTUnwrap(initialSession.statusObservedAt)
 
         var sessionPublications = 0

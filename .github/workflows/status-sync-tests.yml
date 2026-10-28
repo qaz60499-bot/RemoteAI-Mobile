@@ -80,6 +80,7 @@ jobs:
           xcrun xcresulttool get test-results summary --path build/status-sync/tests.xcresult --format json > build/status-sync/test-summary.json
           exit "$TEST_STATUS"
       - name: Compile arm64 app without signing or packaging
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -euo pipefail
