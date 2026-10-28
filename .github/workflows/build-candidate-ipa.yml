@@ -49,51 +49,114 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify inherited runtime issue unit evidence
+      - name: Verify inherited status-sync CI evidence
         if: inputs.gate == 'runtime-issues-device'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE_SHA=450bf23bfd7d6e1d60fcfc6c60fd23e0d9e38c48
+          BASELINE_SHA=78bca954398fd6cbf9412e4ac8edddebb7db32f4
+          RUN_ID=40740529775
+          RUN_ATTEMPT=1
           git cat-file -e "${BASELINE_SHA}^{commit}"
           git diff --quiet "$BASELINE_SHA" "$GITHUB_SHA" -- \
-            RemoteAIMobile RemoteAIMobileTests RemoteAIMobileUITests project.yml
-          echo "Swift source tree and project.yml match $BASELINE_SHA."
-          python3 - <<'PY'
+            RemoteAIMobile RemoteAIMobileTests RemoteAIMobileUITests
+          python3 - "$BASELINE_SHA" "$GITHUB_SHA" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          baseline_sha, candidate_sha = sys.argv[1:]
+          setting = re.compile(r"(?m)^(\s*CURRENT_PROJECT_VERSION:\s*)(\d+)(\s*)$")
+
+          def read_project(revision):
+              result = subprocess.run(
+                  ["git", "show", f"{revision}:project.yml"],
+                  check=True, capture_output=True, text=True)
+              text = result.stdout
+              matches = list(setting.finditer(text))
+              if len(matches) != 1:
+                  raise SystemExit(f"Expected exactly one CURRENT_PROJECT_VERSION in {revision}.")
+              return text, matches[0].group(2)
+
+          baseline_project, baseline_build = read_project(baseline_sha)
+          candidate_project, candidate_build = read_project(candidate_sha)
+          if baseline_build != "51" or candidate_build != "52":
+              raise SystemExit("The inherited source must be Build 51 and the candidate must be Build 52.")
+          normalize = lambda text: setting.sub(r"\g<1><BUILD_NUMBER>\g<3>", text)
+          if normalize(baseline_project) != normalize(candidate_project):
+              raise SystemExit("project.yml contains changes beyond CURRENT_PROJECT_VERSION 51 -> 52.")
+          print(f"Verified Swift source tree at {baseline_sha}; project.yml only changes build {baseline_build} -> {candidate_build}.")
+          PY
+          python3 - "$BASELINE_SHA" "$RUN_ID" "$RUN_ATTEMPT" <<'PY'
           import json
           import os
+          import sys
           import urllib.request
 
+          baseline_sha, run_id, attempt = sys.argv[1:]
           repository = os.environ["GITHUB_REPOSITORY"]
           api_url = os.environ["GITHUB_API_URL"].rstrip("/")
           token = os.environ["GH_TOKEN"]
-          baseline_sha = "450bf23bfd7d6e1d60fcfc6c60fd23e0d9e38c48"
-          run_id = "40517450754"
-          attempt = "1"
-          url = (f"{api_url}/repos/{repository}/actions/runs/{run_id}/"
-                 f"attempts/{attempt}/jobs?per_page=100")
-          request = urllib.request.Request(url, headers={
+          headers = {
               "Accept": "application/vnd.github+json",
               "Authorization": f"Bearer {token}",
               "X-GitHub-Api-Version": "2022-11-28",
-          })
-          with urllib.request.urlopen(request, timeout=20) as response:
-              payload = json.load(response)
+          }
 
-          jobs = payload.get("jobs", [])
-          matches = [(job, step) for job in jobs for step in job.get("steps", [])
-                     if step.get("name") == "Runtime issue focused unit tests"]
-          if len(matches) != 1:
-              raise SystemExit("The inherited focused-unit step was not found exactly once.")
-          job, step = matches[0]
-          if job.get("head_sha") != baseline_sha:
-              raise SystemExit("Inherited focused-unit job head SHA did not match the pinned baseline.")
-          if step.get("conclusion") != "success":
-              raise SystemExit("The inherited focused-unit step was not confirmed successful.")
-          print(f"Verified run {run_id} attempt {attempt} at {baseline_sha}: "
-                "Runtime issue focused unit tests concluded success.")
+          def get_json(path):
+              request = urllib.request.Request(f"{api_url}/repos/{repository}/{path}", headers=headers)
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  return json.load(response)
+
+          run = get_json(f"actions/runs/{run_id}")
+          if (run.get("head_sha") != baseline_sha or
+                  run.get("head_branch") != "fix/status-sync-ci-20261028" or
+                  run.get("event") != "push" or run.get("status") != "completed" or
+                  run.get("conclusion") != "success" or run.get("run_attempt") != int(attempt)):
+              raise SystemExit("Inherited status-sync run metadata did not match the pinned successful source run.")
+
+          jobs = get_json(f"actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100").get("jobs", [])
+          status_jobs = [job for job in jobs if job.get("name") == "status-sync"]
+          if len(status_jobs) != 1:
+              raise SystemExit("The inherited status-sync job was not found exactly once.")
+          job = status_jobs[0]
+          if job.get("head_sha") != baseline_sha or job.get("conclusion") != "success":
+              raise SystemExit("The inherited status-sync job did not succeed on the pinned source.")
+          steps = {step.get("name"): step.get("conclusion") for step in job.get("steps", [])}
+          if steps.get("New status tests and adjacent ordering regressions") != "success":
+              raise SystemExit("The inherited focused test step was not confirmed successful.")
+          if steps.get("Compile arm64 app without signing or packaging") != "success":
+              raise SystemExit("The inherited unsigned device compile step was not confirmed successful.")
+
+          artifacts = get_json(f"actions/runs/{run_id}/artifacts?per_page=100").get("artifacts", [])
+          evidence = [artifact for artifact in artifacts
+                      if artifact.get("name") == "status-sync-evidence" and not artifact.get("expired")]
+          if len(evidence) != 1:
+              raise SystemExit("The inherited status-sync evidence artifact is missing or expired.")
+          print(f"Verified completed successful run {run_id} attempt {attempt} at {baseline_sha}: "
+                "focused tests and unsigned arm64 compile steps succeeded; evidence artifact is available.")
+          PY
+          EVIDENCE_DIR="$RUNNER_TEMP/inherited-status-sync-evidence"
+          mkdir -p "$EVIDENCE_DIR"
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name status-sync-evidence --dir "$EVIDENCE_DIR"
+          python3 - "$EVIDENCE_DIR" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          evidence = pathlib.Path(sys.argv[1])
+          summary = json.loads((evidence / "test-summary.json").read_text())
+          if (summary.get("result") != "Passed" or summary.get("totalTestCount") != 14 or
+                  summary.get("passedTests") != 14 or summary.get("failedTests") != 0 or
+                  summary.get("skippedTests") != 0):
+              raise SystemExit("The inherited test summary did not confirm 14 passed, 0 failed, 0 skipped.")
+          compile_log = (evidence / "device-compile.log").read_text(errors="replace")
+          if "CODE_SIGNING_ALLOWED=NO" not in compile_log or "** BUILD SUCCEEDED **" not in compile_log:
+              raise SystemExit("The inherited device compile log did not confirm an unsigned successful build.")
+          print("Inherited evidence confirms 14/14 XCTest and unsigned generic iOS arm64 build; this gate does not rerun them.")
           PY
 
       - name: Security and protocol audit
@@ -152,9 +215,11 @@ jobs:
             echo "validation_scope=${{ inputs.gate }}"
             if [[ '${{ inputs.gate }}' == 'runtime-issues-device' ]]; then
               echo "device_validation_scope=iphoneos arm64 compile and candidate IPA package only"
-              echo "immutable_source_tree_sha=450bf23bfd7d6e1d60fcfc6c60fd23e0d9e38c48"
-              echo "inherited_native_unit_evidence=run40517450754/attempt1 Runtime issue focused unit tests (9 tests; source tree and step result verified by preflight)"
-              echo "ui_validation=not_run_by_this_gate; pending_USB_smoke; no_UI_PASS_claim"
+              echo "immutable_source_tree_sha=78bca954398fd6cbf9412e4ac8edddebb7db32f4"
+              echo "project_yml_build_number_change=51_to_52_only; normalized project.yml equals immutable source baseline"
+              echo "inherited_native_unit_evidence=run40740529775/attempt1 New status tests and adjacent ordering regressions (14 XCTest; source tree, API step result, and evidence artifact verified by preflight; not rerun in this gate)"
+              echo "wireless_device_smoke=pending; not_run_by_this_device_only_gate"
+              echo "ui_validation=not_run_by_this_gate; no_UI_PASS_claim"
               echo "protocol_security_fuzz=not_run_in_runtime_issues_device_gate"
               echo "full_unit_suite=not_run_in_runtime_issues_device_gate"
               echo "streaming_cadence_and_process_stress=not_run_in_runtime_issues_device_gate"
@@ -530,8 +595,9 @@ jobs:
             if [[ '${{ inputs.gate }}' == 'runtime-issues-device' ]]; then
               echo '- Static security audit (`scripts/security_audit.sh`): PASS on this commit'
               echo '- Device validation: PASS (current iphoneos arm64 build, signing, IPA verification, and reproducible package)'
-              echo '- Inherited native unit evidence: PASS (9 focused tests; run40517450754 attempt 1, verified against SHA 450bf23bfd7d6e1d60fcfc6c60fd23e0d9e38c48)'
-              echo '- Runtime issue UI validation: PENDING USB smoke; not run or passed by this device-only gate'
+              echo '- Inherited native unit evidence: PASS (14 XCTest; run40740529775 attempt 1 on SHA 78bca954398fd6cbf9412e4ac8edddebb7db32f4; verified from the prior run artifact, not rerun here)'
+              echo '- Wireless device smoke: PENDING; not run or passed by this device-only gate'
+              echo '- UI validation: NOT RUN by this device-only gate; no UI PASS claim'
               echo '- Protocol Security / Fuzz: NOT RUN in this gate'
               echo '- Full unit suite: NOT RUN in this gate'
               echo '- Streaming cadence/process stress: NOT RUN in this gate'
