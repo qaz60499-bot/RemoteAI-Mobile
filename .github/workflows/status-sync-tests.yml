@@ -41,11 +41,18 @@ jobs:
         run: |
           set -euo pipefail
           UDID=$(python3 - <<'PY'
-          import subprocess
+          import json, pathlib, subprocess
+          # Cold GitHub macOS runners can spend over 45s starting CoreSimulator.
+          # Warm it with a read-only query before the single create request.
+          runtimes = subprocess.run(['xcrun', 'simctl', 'list', 'runtimes', '--json'],
+              check=True, text=True, capture_output=True, timeout=120)
+          pathlib.Path('build/status-sync/simulator-runtimes.json').write_text(runtimes.stdout)
+          assert any(r.get('identifier') == 'com.apple.CoreSimulator.SimRuntime.iOS-18-5'
+              and r.get('isAvailable') for r in json.loads(runtimes.stdout)['runtimes'])
           r = subprocess.run(['xcrun', 'simctl', 'create', 'RemoteAI-Status-Sync',
               'com.apple.CoreSimulator.SimDeviceType.iPhone-13-Pro',
               'com.apple.CoreSimulator.SimRuntime.iOS-18-5'],
-              check=True, text=True, capture_output=True, timeout=45)
+              check=True, text=True, capture_output=True, timeout=180)
           print(r.stdout.strip())
           PY
           )
