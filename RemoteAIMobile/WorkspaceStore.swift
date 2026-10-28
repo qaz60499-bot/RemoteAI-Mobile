@@ -49,10 +49,18 @@ private struct StoredSessionSystemNotice {
     enum Kind: Equatable {
         case webBinding
         case providerSurface
+        case generationOutcome
     }
 
     let presentation: SystemNoticePresentation
     let kind: Kind
+}
+
+private enum GenerationTerminalOutcome: Equatable {
+    case canceled
+    case interrupted
+    case unknown
+    case failed
 }
 
 @MainActor
@@ -4367,6 +4375,9 @@ final class WorkspaceStore: ObservableObject {
         case "GENERATION_STARTED":
             if event.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
             if suppressTransientPresentation { return }
+            if sessionSystemNoticesBySession[sessionId]?.kind == .generationOutcome {
+                sessionSystemNoticesBySession.removeValue(forKey: sessionId)
+            }
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             setSessionState(sessionId, .busy)
             liveRunStatusBySession[sessionId] = generationStartedLabel(runtimeId: event.runtimeId)
@@ -4377,28 +4388,58 @@ final class WorkspaceStore: ObservableObject {
         case "GENERATION_STOPPED":
             if event.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
             if event.payload["ok"]?.boolValue == false {
-                // A provider can terminate a Web generation after exposing only a DOM
-                // prefix (for example when ChatGPT shows a strong rate-limit banner).
-                // That prefix is transient UI state, not a durable assistant reply.
-                // Remove any already-flushed Streaming bubble instead of promoting it
-                // to final content when the terminal event explicitly reports failure.
-                try await settleRunningToolRows(sessionId: sessionId)
-                discardStreamingPlaceholder(sessionId: sessionId)
-                setSessionState(sessionId, .error)
+                let outcome = generationTerminalOutcome(for: event.payload)
+                let isAntigravity = event.runtimeId == "runtime.antigravity"
+                if outcome == .failed && !isAntigravity {
+                    // Web DOM prefixes are transient and do not represent a durable reply.
+                    // Antigravity publishes partial output as a durable MESSAGE_ADDED event.
+                    discardStreamingPlaceholder(sessionId: sessionId)
+                } else {
+                    await preservePartialAssistantOutput(sessionId: sessionId)
+                }
+                try? await settleRunningToolRows(sessionId: sessionId, status: "Interrupted")
+                let state: SessionState
+                switch outcome {
+                case .canceled, .interrupted:
+                    state = .idle
+                case .unknown:
+                    state = .unknown
+                case .failed:
+                    state = .error
+                }
+                setSessionState(sessionId, state)
                 DiagnosticsLog.shared.record("generation_state_applied", fields: [
-                    "state": SessionState.error.rawValue,
+                    "state": state.rawValue,
                     "sequence": String(event.sequence),
                 ])
                 liveRunStatusBySession.removeValue(forKey: sessionId)
                 clearLiveRunActivity(sessionId: sessionId)
-                let code = event.payload["errorCode"]?.stringValue ?? "PROVIDER_UNAVAILABLE"
-                let message = event.payload["errorMessage"]?.stringValue
-                if let message, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    errors[sessionId] = message
-                } else if code == "PROVIDER_RATE_LIMITED" {
-                    errors[sessionId] = "ChatGPT 请求过快，当前会话已被临时限流。本次回答未完成，RemoteAI 没有保存截断内容，请稍后重试。"
+                let code = event.payload["errorCode"]?.stringValue ?? "GENERATION_FAILED"
+                let providerMessage = event.payload["errorMessage"]?.stringValue
+                let terminalMessage: String
+                if let providerMessage, !providerMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    terminalMessage = providerMessage
                 } else {
-                    errors[sessionId] = "ChatGPT 本次生成未完成（\(code)）。RemoteAI 没有保存截断回答。"
+                    switch outcome {
+                    case .canceled:
+                        terminalMessage = "生成已取消；已保留当前可见的部分输出。"
+                    case .interrupted:
+                        terminalMessage = "生成已中断；已保留当前可见的部分输出，请核对原会话后再重试。"
+                    case .unknown:
+                        terminalMessage = "生成结果未知；已保留当前可见的部分输出，请核对原会话后再重试。"
+                    case .failed:
+                        if code == "PROVIDER_RATE_LIMITED" {
+                            terminalMessage = "ChatGPT 请求过快，当前会话已被临时限流。本次回答未完成，RemoteAI 没有保存截断内容，请稍后重试。"
+                        } else {
+                            terminalMessage = "本次生成未完成（\(code)）。请核对原会话后再重试。"
+                        }
+                    }
+                }
+                if outcome == .failed {
+                    errors[sessionId] = terminalMessage
+                } else {
+                    errors[sessionId] = nil
+                    setSessionSystemNotice(terminalMessage, sessionId: sessionId, kind: .generationOutcome)
                 }
             } else {
                 flushStreaming(sessionId: sessionId)
@@ -4844,6 +4885,54 @@ final class WorkspaceStore: ObservableObject {
         return false
     }
 
+    private func generationTerminalOutcome(for payload: [String: JSONValue]) -> GenerationTerminalOutcome {
+        let reason = payload["reason"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let delivery = payload["delivery"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let code = payload["errorCode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() ?? ""
+
+        if delivery == "unknown" || reason.contains("unknown") { return .unknown }
+        if ["canceled", "cancelled"].contains(reason)
+            || code == "GENERATION_CANCELED"
+            || payload["stopped"]?.boolValue == true {
+            return .canceled
+        }
+        if reason == "interrupted" || code == "GENERATION_INTERRUPTED" { return .interrupted }
+        if ["failed", "error", "provider-error"].contains(reason) || !code.isEmpty {
+            return .failed
+        }
+        // A negative terminal event without a classified provider outcome is not
+        // proof of failure or cancellation. Keep the transcript recoverable.
+        return .unknown
+    }
+
+    private func preservePartialAssistantOutput(sessionId: String) async {
+        let streamedText = assistantStreams[sessionId]?.text
+        flushStreaming(sessionId: sessionId)
+        if let stream = assistantStreams[sessionId] {
+            stream.performance.stopFrames()
+            assistantStreams.removeValue(forKey: sessionId)
+        }
+        incompleteAssistantStreams.removeValue(forKey: sessionId)
+        if incompleteAssistantStreams.isEmpty, errors["sync"]?.hasPrefix("Streaming") == true {
+            errors.removeValue(forKey: "sync")
+        }
+        streamingBuffers.removeValue(forKey: sessionId)
+
+        guard var local = messagesBySession[sessionId] else { return }
+        var changed: [ChatMessage] = []
+        for index in local.indices where local[index].role == .assistant
+            && local[index].kind == .text
+            && local[index].toolStatus == "Streaming" {
+            if let streamedText { local[index].text = streamedText }
+            local[index].toolStatus = nil
+            changed.append(local[index])
+        }
+        if !changed.isEmpty {
+            try? await cache.upsertMessages(changed)
+            messagesBySession[sessionId] = local
+        }
+    }
+
     private func setSessionState(_ sessionId: String, _ state: SessionState) {
         if let index = sessions.firstIndex(where: { $0.id == sessionId }), sessions[index].state != state {
             sessions[index].state = state
@@ -5132,21 +5221,21 @@ final class WorkspaceStore: ObservableObject {
         try? await settleRunningToolRows(sessionId: sessionId)
     }
 
-    private func settleRunningToolRows(sessionId: String, toolName: String? = nil) async throws {
+    private func settleRunningToolRows(sessionId: String, toolName: String? = nil, status: String = "Completed") async throws {
         var changed: [ChatMessage] = []
         var updatedMessages: [ChatMessage]?
         if var local = messagesBySession[sessionId] {
             for index in local.indices where local[index].kind == .toolEvent
                 && local[index].toolStatus == "Running"
                 && (toolName == nil || local[index].toolName == toolName) {
-                local[index].toolStatus = "Completed"
+                local[index].toolStatus = status
                 changed.append(local[index])
             }
             if !changed.isEmpty { updatedMessages = local }
         }
         if !changed.isEmpty {
-            try await cache.upsertMessages(changed)
             if let updatedMessages { messagesBySession[sessionId] = updatedMessages }
+            try await cache.upsertMessages(changed)
         }
     }
 

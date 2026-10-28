@@ -294,6 +294,30 @@ jobs:
           grep -E 'PROJECT_REFRESH_STRESS_TOTAL=2500' build/tests.log
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/tests.log | tail -1
 
+      - name: Reproduce terminal-state regression on the previous source
+        if: inputs.gate == 'runtime-issues'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATCHED_SOURCE="$RUNNER_TEMP/WorkspaceStore.terminal-fixed.swift"
+          cp RemoteAIMobile/WorkspaceStore.swift "$PATCHED_SOURCE"
+          trap 'cp "$PATCHED_SOURCE" RemoteAIMobile/WorkspaceStore.swift' EXIT
+          git show d80e96069416671c36528e42d1857a3274b0c2af:RemoteAIMobile/WorkspaceStore.swift > RemoteAIMobile/WorkspaceStore.swift
+          set +e
+          xcodebuild test \
+            -project RemoteAIMobile.xcodeproj \
+            -scheme RemoteAIMobile \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
+            -only-testing:RemoteAIMobileTests/GenerationTerminalOutcomeTests \
+            -resultBundlePath build/terminal-before.xcresult \
+            > build/terminal-before.log 2>&1
+          BASELINE_EXIT=$?
+          set -e
+          test "$BASELINE_EXIT" -ne 0
+          grep -E 'XCTAssert.*failed' build/terminal-before.log
+          echo "TERMINAL_BEFORE_EXPECTED_FAILURE=$BASELINE_EXIT"
+
       - name: Runtime issue focused unit tests
         if: inputs.gate == 'runtime-issues'
         shell: bash
@@ -314,11 +338,12 @@ jobs:
             -resultBundlePath build/runtime-issues-tests.xcresult \
             "$@" \
             -only-testing:RemoteAIMobileTests/RuntimeIssueSummaryTests \
+            -only-testing:RemoteAIMobileTests/GenerationTerminalOutcomeTests \
             -only-testing:RemoteAIMobileTests/PairingTests/testForegroundCallbacksAvoidUnnecessaryReconnectAndHideBriefStatusFlash \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testBackgroundTaskStatusStaysSeparateFromIdleAndStaleConversationStatus \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testWorkspaceCoalescesDuplicateInitializationAndLifecycleRace \
             | tee build/runtime-issues-tests.log
-          grep -E 'Executed 9 tests?, with 0 failures' build/runtime-issues-tests.log | tail -1
+          grep -E 'Executed 11 tests?, with 0 failures' build/runtime-issues-tests.log | tail -1
 
       - name: Streaming unit tests
         if: inputs.gate == 'streaming'
