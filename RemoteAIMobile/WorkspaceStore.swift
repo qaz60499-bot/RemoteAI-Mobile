@@ -246,6 +246,9 @@ final class WorkspaceStore: ObservableObject {
     private var projectConversationRevisions: [String: UInt64] = [:]
     private var projectConversationSnapshotIds: [String: String] = [:]
     private var sessionRevisions: [String: UInt64] = [:]
+    private var sessionStatusEventRevisions: [String: UInt64] = [:]
+    private var sessionStatusSnapshotRevisions: [String: Date] = [:]
+    private var sessionStatusSnapshotReceivedAt: [String: Date] = [:]
     // Live events carry authoritative runtime/instance routing even when the mobile
     // catalog is still intentionally lazy. Keep that route so opening a conversation
     // can recover its history before the instance/session list has been expanded.
@@ -1483,6 +1486,7 @@ final class WorkspaceStore: ObservableObject {
         defer { sessionRefreshes.remove(instance.id) }
         let generation = lifecycleGeneration
         let revision = sessionRevisions[instance.id, default: 0]
+        let refreshStartedAt = Date()
         guard machine.state == .online else { return }
         do {
             let limit = runtime.kind == .codex ? codexSessionLimits[instance.id, default: 100] : nil
@@ -1497,11 +1501,32 @@ final class WorkspaceStore: ObservableObject {
             let currentById = Dictionary(uniqueKeysWithValues: currentRows.map { ($0.id, $0) })
             let remoteRows = remote.map { row in
                 var updated = row
-                if let current = currentById[row.id],
-                   let known = current.backgroundTaskStatus,
-                   known.observedAt >= (row.backgroundTaskStatus?.observedAt ?? .distantPast) {
-                    updated.backgroundTaskStatus = known
-                    updated.backgroundTaskStatusReceivedAt = current.backgroundTaskStatusReceivedAt
+                if let current = currentById[row.id] {
+                    let statusRevision = sessionStatusSnapshotRevisions[row.id]
+                    let statusPollCompletedDuringRefresh =
+                        sessionStatusSnapshotReceivedAt[row.id].map { $0 > refreshStartedAt } == true
+                    let statusRevisionMatchesCatalog = statusRevision.map { $0 == row.updatedAt } ?? true
+                    if statusPollCompletedDuringRefresh && statusRevisionMatchesCatalog {
+                        // getSessionStatus is the targeted recovery source for the
+                        // currently visible Chat. Reconcile only an equal opaque server
+                        // revision (or a legacy revisionless response) that completed
+                        // after this catalog request began.
+                        updated.state = current.state
+                        updated.lastProgressStatus = current.lastProgressStatus
+                        updated.lastProgressAt = current.lastProgressAt
+                        updated.statusSource = current.statusSource
+                        updated.statusReason = current.statusReason
+                        updated.statusObservedAt = current.statusObservedAt
+                        if let activity = current.lastActivityAt,
+                           activity > (row.lastActivityAt ?? .distantPast) {
+                            updated.lastActivityAt = activity
+                        }
+                    }
+                    if let known = current.backgroundTaskStatus,
+                       known.observedAt >= (row.backgroundTaskStatus?.observedAt ?? .distantPast) {
+                        updated.backgroundTaskStatus = known
+                        updated.backgroundTaskStatusReceivedAt = current.backgroundTaskStatusReceivedAt
+                    }
                 }
                 return updated
             }.sorted(by: Self.sessionOrdersBefore)
@@ -1785,15 +1810,30 @@ final class WorkspaceStore: ObservableObject {
 
     private func refreshVisibleSessionStatus(_ sessionId: String, rejectEvidencePoorIdle: Bool = false) async -> RemoteSessionStatusSnapshot? {
         guard let route = routeForSession(sessionId), machine.state == .online, !isSuspended else { return nil }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        let statusEventRevision = sessionStatusEventRevisions[sessionId, default: 0]
         let requestStartedAt = Date()
         do {
-            let snapshot = try await transport.sessionStatus(
-                machineId: machine.id,
+            let snapshot = try await activeTransport.sessionStatus(
+                machineId: activeMachineId,
                 runtimeId: route.runtimeId,
                 instanceId: route.instanceId,
                 sessionId: sessionId
             )
-            guard machine.state == .online, !isSuspended else { return nil }
+            guard generation == lifecycleGeneration,
+                  transport === activeTransport,
+                  machine.id == activeMachineId,
+                  machine.state == .online,
+                  !isSuspended else { return nil }
+            guard statusEventRevision == sessionStatusEventRevisions[sessionId, default: 0] else {
+                DiagnosticsLog.shared.record("stale_session_status_ignored", fields: [
+                    "session": sessionId,
+                    "reason": "newer_session_event",
+                ], level: "WARN")
+                return nil
+            }
             let liveActivityAt = liveRunActivityAtBySession[sessionId]
             let remoteEvidenceAt = [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
             let staleIdleSnapshot: Bool
@@ -1827,6 +1867,9 @@ final class WorkspaceStore: ObservableObject {
                     updated.state = snapshot.state
                     updated.lastProgressStatus = snapshot.lastProgressStatus
                     updated.lastProgressAt = snapshot.lastProgressAt
+                    updated.statusSource = snapshot.statusSource
+                    updated.statusReason = snapshot.statusReason
+                    updated.statusObservedAt = snapshot.statusObservedAt
                 }
                 if let activity = snapshot.lastActivityAt {
                     updated.lastActivityAt = max(updated.lastActivityAt ?? updated.updatedAt, activity)
@@ -1858,6 +1901,8 @@ final class WorkspaceStore: ObservableObject {
                 // repeated authoritative history recovery while the newer run is active.
                 return nil
             }
+            sessionStatusSnapshotRevisions[sessionId] = snapshot.updatedAt
+            sessionStatusSnapshotReceivedAt[sessionId] = Date()
             if snapshot.state == .busy || snapshot.state == .waiting {
                 if route.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
                 let activeAt = snapshot.lastProgressAt ?? snapshot.lastActivityAt ?? Date()
@@ -1897,10 +1942,18 @@ final class WorkspaceStore: ObservableObject {
             }
             return snapshot
         } catch let error as TransportError where error == .disconnected || error == .timeout || error == .offline {
+            guard generation == lifecycleGeneration,
+                  transport === activeTransport,
+                  machine.id == activeMachineId,
+                  !isSuspended else { return nil }
             markBackgroundTaskStatusUnavailable(sessionId, requestStartedAt: requestStartedAt)
             DiagnosticsLog.shared.record("session_status_deferred", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
             return nil
         } catch {
+            guard generation == lifecycleGeneration,
+                  transport === activeTransport,
+                  machine.id == activeMachineId,
+                  !isSuspended else { return nil }
             markBackgroundTaskStatusUnavailable(sessionId, requestStartedAt: requestStartedAt)
             DiagnosticsLog.shared.record("session_status_failed", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
             return nil
@@ -2647,6 +2700,9 @@ final class WorkspaceStore: ObservableObject {
         webProjectsRevision &+= 1
         projectConversationRevisions.removeAll()
         sessionRevisions.removeAll()
+        sessionStatusEventRevisions.removeAll()
+        sessionStatusSnapshotRevisions.removeAll()
+        sessionStatusSnapshotReceivedAt.removeAll()
 
         let config = RemoteAIConfig(relayBaseURL: baseURL, machineId: result.machineId)
         config.saveMetadata()
@@ -4112,6 +4168,7 @@ final class WorkspaceStore: ObservableObject {
             // definition. Without bumping the revision, its late response can delete a
             // newly registered desktop Chat or roll Busy/lastActivityAt back to idle.
             sessionRevisions[event.instanceId, default: 0] &+= 1
+            sessionStatusEventRevisions[sessionId, default: 0] &+= 1
         }
 
         sessionRouteHints[sessionId] = (event.machineId, event.runtimeId, event.instanceId)

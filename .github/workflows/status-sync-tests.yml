@@ -1,0 +1,92 @@
+name: Status Sync Focused Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/status-sync-ci-20261028]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remoteai-status-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  status-sync:
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Generate project with existing pinned toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(xcodebuild -version | sed -n '1p')" = 'Xcode 16.4'
+          test "$(xcodebuild -version | sed -n '2p')" = 'Build version 16F6'
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = '18.5'
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --output "$RUNNER_TEMP/xcodegen.zip" https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          echo "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP/status-sync-xcodegen"
+          "$RUNNER_TEMP/status-sync-xcodegen/xcodegen/bin/xcodegen" generate --spec project.yml
+          mkdir -p build/status-sync
+          git rev-parse HEAD | tee build/status-sync/commit.txt
+      - name: Create isolated simulator
+        id: simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          UDID=$(python3 - <<'PY'
+          import subprocess
+          r = subprocess.run(['xcrun', 'simctl', 'create', 'RemoteAI-Status-Sync',
+              'com.apple.CoreSimulator.SimDeviceType.iPhone-13-Pro',
+              'com.apple.CoreSimulator.SimRuntime.iOS-18-5'],
+              check=True, text=True, capture_output=True, timeout=45)
+          print(r.stdout.strip())
+          PY
+          )
+          [[ "$UDID" =~ ^[0-9A-Fa-f-]{36}$ ]]
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+      - name: New status tests and adjacent ordering regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild test -project RemoteAIMobile.xcodeproj -scheme RemoteAIMobile \
+            -configuration Debug -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
+            -parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 \
+            -resultBundlePath build/status-sync/tests.xcresult \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testSessionRefreshPreservesOverlappingVisibleStatusAndAcceptsOpaqueRevisions \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testDelayedUnknownStatusCannotOverwriteNewerLiveRunStart \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testDelayedVisibleUnknownAndBusyStatusCannotOverrideNewerTerminalEvent \
+            -only-testing:RemoteAIMobileTests/CodexDirectoryTests/testDesktopStatusProvenanceMapsListAndTargetedStatusAndKeepsOldWireCompatible \
+            -only-testing:RemoteAIMobileTests/CodexDirectoryTests/testUnknownStatusExplanationIsLimitedToUnknownRows \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testUnchangedCatalogRefreshDoesNotRepublishChatAndInstanceLists \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testSessionStatusDecodesOptionalRemoteRevision \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testOrdinaryIdleSyncReloadsHistoryWhenRemoteRevisionChangesDespiteClockSkew \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testLiveWebRegistrationAndBusyStateCannotBeErasedByConcurrentOlderSessionRefresh \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testIdleStatusWithExplicitlyOlderRemoteEvidenceCannotEndNewerLiveRun \
+            CODE_SIGNING_ALLOWED=NO | tee build/status-sync/tests.log
+          xcrun xcresulttool get test-results summary --path build/status-sync/tests.xcresult --format json > build/status-sync/test-summary.json
+      - name: Compile arm64 app without signing or packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build -project RemoteAIMobile.xcodeproj -scheme RemoteAIMobile \
+            -configuration Debug -destination 'generic/platform=iOS' \
+            -derivedDataPath build/status-sync/device-derived \
+            CODE_SIGNING_ALLOWED=NO | tee build/status-sync/device-compile.log
+      - name: Preserve focused evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: status-sync-evidence
+          retention-days: 14
+          path: |
+            build/status-sync/*.txt
+            build/status-sync/*.log
+            build/status-sync/*.json
+            build/status-sync/tests.xcresult

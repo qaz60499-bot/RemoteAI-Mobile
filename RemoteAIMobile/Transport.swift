@@ -107,6 +107,9 @@ struct RemoteSessionStatusSnapshot: Equatable {
     let lastProgressAt: Date?
     let providerSurfaceIssue: RemoteProviderSurfaceIssue?
     var backgroundTaskStatus: BackgroundTaskStatusSnapshot? = nil
+    var statusSource: String? = nil
+    var statusReason: String? = nil
+    var statusObservedAt: Date? = nil
 }
 
 enum TransportError: LocalizedError, Equatable {
@@ -311,7 +314,10 @@ extension Transport {
             lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
             lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse),
             providerSurfaceIssue: providerIssue,
-            backgroundTaskStatus: backgroundTaskStatus
+            backgroundTaskStatus: backgroundTaskStatus,
+            statusSource: object["statusSource"]?.stringValue,
+            statusReason: object["statusReason"]?.stringValue,
+            statusObservedAt: object["statusObservedAt"]?.stringValue.flatMap(RemoteAIDate.parse)
         )
     }
 

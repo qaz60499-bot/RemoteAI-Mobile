@@ -891,6 +891,9 @@ struct SessionRow: View {
                 Text(session.title)
                 FixedTimestamp(date: session.updatedAt, prefix: "最后更新")
                 FixedTimestamp(date: session.lastActivityAt ?? session.updatedAt, prefix: "最后进行")
+                if let explanation = session.unknownStatusExplanation {
+                    Text(explanation).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                }
                 if session.instanceId == "antigravity.desktop" {
                     BackgroundTaskStatusView(
                         snapshot: session.backgroundTaskStatus,

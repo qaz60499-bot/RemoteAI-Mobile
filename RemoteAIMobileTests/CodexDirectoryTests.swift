@@ -1,6 +1,25 @@
 import XCTest
 @testable import RemoteAIMobile
 
+private actor StatusResponseTransport: Transport {
+    private let result: JSONValue
+
+    init(result: JSONValue) { self.result = result }
+
+    var isConnected: Bool { true }
+    func connect() async throws {}
+    func disconnect() async {}
+    func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
+        CommandResponseEnvelope(ok: true, result: result, error: nil, idempotentReplay: nil)
+    }
+    func eventStream() async -> AsyncStream<RemoteEvent> {
+        AsyncStream { $0.finish() }
+    }
+    func healthStream() async -> AsyncStream<TransportHealthEvent> {
+        AsyncStream { $0.finish() }
+    }
+}
+
 final class CodexDirectoryTests: XCTestCase {
     func testDesktopCreateAvailabilityUsesCurrentServerCapabilityAndKeepsLegacyMetadataCompatible() throws {
         var instance = InstanceDescriptor(id: "codex.8", runtimeId: "runtime.codex", name: "Codex8", subtitle: nil)
@@ -41,6 +60,86 @@ final class CodexDirectoryTests: XCTestCase {
         let decoded = try JSONDecoder.remoteAI.decode(SessionDescriptor.self, from: encoded)
         XCTAssertNil(decoded.workingDirectory)
         XCTAssertEqual(decoded.id, legacy.id)
+        XCTAssertNil(decoded.statusSource)
+        XCTAssertNil(decoded.statusReason)
+        XCTAssertNil(decoded.statusObservedAt)
+    }
+
+    func testDesktopStatusProvenanceMapsListAndTargetedStatusAndKeepsOldWireCompatible() async throws {
+        let observedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let rowObject: [String: Any] = [
+            "sessionId": "thread-unloaded",
+            "runtimeId": "runtime.codex",
+            "instanceId": "codex.8",
+            "externalId": "native-thread-id",
+            "title": "Desktop Thread",
+            "canonicalUrl": NSNull(),
+            "status": "unknown",
+            "statusSource": "codex-desktop-unloaded",
+            "statusReason": "The selected Thread is not loaded by a Codex Desktop owner",
+            "statusObservedAt": RemoteAIDate.string(observedAt),
+            "metadata": [String: Any](),
+            "createdAt": RemoteAIDate.string(observedAt),
+            "updatedAt": RemoteAIDate.string(observedAt),
+            "lastVisited": NSNull(),
+        ]
+        let rowData = try JSONSerialization.data(withJSONObject: rowObject)
+        let serverSession = try JSONDecoder.remoteAI.decode(ServerSession.self, from: rowData)
+        let listed = serverSession.descriptor
+        XCTAssertEqual(listed.statusSource, "codex-desktop-unloaded")
+        XCTAssertEqual(listed.statusReason, "The selected Thread is not loaded by a Codex Desktop owner")
+        XCTAssertEqual(listed.statusObservedAt, observedAt)
+        XCTAssertEqual(listed.unknownStatusExplanation, "尚未载入 Codex Desktop")
+        XCTAssertFalse(listed.unknownStatusExplanation?.contains("The selected Thread") == true)
+
+        var legacyRowObject = rowObject
+        legacyRowObject.removeValue(forKey: "statusSource")
+        legacyRowObject.removeValue(forKey: "statusReason")
+        legacyRowObject.removeValue(forKey: "statusObservedAt")
+        let legacyServerSession = try JSONDecoder.remoteAI.decode(
+            ServerSession.self,
+            from: JSONSerialization.data(withJSONObject: legacyRowObject)
+        )
+        XCTAssertNil(legacyServerSession.statusSource)
+        XCTAssertNil(legacyServerSession.statusReason)
+        XCTAssertNil(legacyServerSession.statusObservedAt)
+        XCTAssertNil(legacyServerSession.descriptor.statusSource)
+
+        let statusTransport = StatusResponseTransport(result: .object([
+            "sessionId": .string("thread-unloaded"),
+            "status": .string("unknown"),
+            "statusSource": .string("codex-desktop-unavailable"),
+            "statusReason": .string("Desktop owner connection failed"),
+            "statusObservedAt": .string(RemoteAIDate.string(observedAt)),
+            "metadata": .object([:]),
+        ]))
+        let snapshot = try await statusTransport.sessionStatus(
+            machineId: "my-pc",
+            runtimeId: "runtime.codex",
+            instanceId: "codex.8",
+            sessionId: "thread-unloaded"
+        )
+        XCTAssertEqual(snapshot.statusSource, "codex-desktop-unavailable")
+        XCTAssertEqual(snapshot.statusReason, "Desktop owner connection failed")
+        XCTAssertEqual(snapshot.statusObservedAt, observedAt)
+
+        var targeted = listed
+        targeted.state = snapshot.state
+        targeted.statusSource = snapshot.statusSource
+        targeted.statusReason = snapshot.statusReason
+        targeted.statusObservedAt = snapshot.statusObservedAt
+        XCTAssertEqual(targeted.unknownStatusExplanation, "无法连接 Codex Desktop")
+    }
+
+    func testUnknownStatusExplanationIsLimitedToUnknownRows() {
+        var row = session("unqueried", cwd: nil)
+        row.state = .unknown
+        row.statusSource = "codex-desktop-not-queried"
+        XCTAssertEqual(row.unknownStatusExplanation, "尚未核验 Desktop 状态")
+        row.statusSource = "codex-desktop-stale-cache"
+        XCTAssertEqual(row.unknownStatusExplanation, "Desktop 状态已过期")
+        row.state = .busy
+        XCTAssertNil(row.unknownStatusExplanation)
     }
     func testNativeMessageAliasesAndUnknownStatePreserveTheirIdentity() throws {
         let row = ServerMessage(messageId: "original-client-id", sessionId: "original-thread", role: "user",

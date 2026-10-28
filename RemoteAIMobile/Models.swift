@@ -106,8 +106,24 @@ struct SessionDescriptor: Codable, Identifiable, Hashable {
     var backgroundTaskStatusReceivedAt: Date? = nil
     var workingDirectory: String? = nil
     var threadId: String? = nil
+    var statusSource: String? = nil
+    var statusReason: String? = nil
+    var statusObservedAt: Date? = nil
 
     var orderingDate: Date { max(updatedAt, lastActivityAt ?? updatedAt) }
+
+    var unknownStatusExplanation: String? {
+        guard state == .unknown else { return nil }
+        switch statusSource {
+        case "codex-desktop-unloaded": return "尚未载入 Codex Desktop"
+        case "codex-desktop-unavailable": return "无法连接 Codex Desktop"
+        case "codex-desktop-not-queried": return "尚未核验 Desktop 状态"
+        case "codex-desktop-stale-cache": return "Desktop 状态已过期"
+        case "codex-desktop-send-outcome-unknown": return "Desktop 生成结果尚未确认"
+        case "codex-desktop-owner": return "Codex Desktop 状态尚未确认"
+        default: return "当前状态尚未核验"
+        }
+    }
 
     // Group only provider-recorded working directories. Titles are never identity.
     var codexDirectoryKey: String? {
@@ -655,6 +671,9 @@ struct ServerSession: Codable {
     let createdAt: Date
     let updatedAt: Date
     let lastVisited: Date?
+    var statusSource: String? = nil
+    var statusReason: String? = nil
+    var statusObservedAt: Date? = nil
 }
 
 struct ServerMessage: Codable {
@@ -721,7 +740,10 @@ extension ServerSession {
             backgroundTaskStatus: backgroundTaskStatus,
             backgroundTaskStatusReceivedAt: backgroundTaskStatus == nil ? nil : Date(),
             workingDirectory: metadata["cwd"]?.stringValue,
-            threadId: externalId
+            threadId: externalId,
+            statusSource: statusSource,
+            statusReason: statusReason,
+            statusObservedAt: statusObservedAt
         )
     }
 }

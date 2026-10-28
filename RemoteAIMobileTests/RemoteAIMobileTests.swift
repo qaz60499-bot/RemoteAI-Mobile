@@ -1574,6 +1574,181 @@ final class RemoteAIMobileTests: XCTestCase {
         await store.suspend()
     }
 
+    @MainActor
+    func testSessionRefreshPreservesOverlappingVisibleStatusAndAcceptsOpaqueRevisions() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        let catalogRevision = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.updatedAt)
+
+        await mock.setResponseDelay(action: "listSessions", nanoseconds: 300_000_000)
+        let listAttemptsBeforeRefresh = await mock.actionAttemptCount("listSessions")
+        let catalogRefresh = Task { @MainActor in
+            await store.refreshSessions(runtime: runtime, instance: instance)
+        }
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("listSessions") > listAttemptsBeforeRefresh { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let listAttemptsDuringRefresh = await mock.actionAttemptCount("listSessions")
+        XCTAssertGreaterThan(listAttemptsDuringRefresh, listAttemptsBeforeRefresh, "The list response must be delayed before the targeted status poll completes")
+
+        await mock.setSessionStatus("photo-upload", status: "busy", updatedAt: catalogRevision)
+        await store.synchronizeVisibleSession("photo-upload")
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+
+        await catalogRefresh.value
+        XCTAssertEqual(
+            store.sessions.first(where: { $0.id == "photo-upload" })?.state,
+            .busy,
+            "A list request started before the visible status response must not replace that targeted state"
+        )
+
+        let staleRevision = catalogRevision.addingTimeInterval(-1)
+        await mock.setSessionStatus("photo-upload", status: "unknown", updatedAt: staleRevision)
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .unknown, "A lower timestamp token is still an opaque remote revision and must be accepted")
+
+        let terminalRevision = catalogRevision.addingTimeInterval(-2)
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: terminalRevision)
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle, "A terminal status with a different, lower timestamp token must replace the cached Unknown state")
+
+        await mock.setResponseDelay(action: "listSessions", nanoseconds: 0)
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle, "A later catalog refresh may converge to the terminal state")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testDelayedUnknownStatusCannotOverwriteNewerLiveRunStart() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+
+        await mock.setSessionStatus("photo-upload", status: "unknown")
+        await mock.setResponseDelay(action: "getSessionStatus", nanoseconds: 300_000_000)
+        let attemptsBeforePoll = await mock.actionAttemptCount("getSessionStatus")
+        let statusPoll = Task { @MainActor in
+            await store.synchronizeVisibleSession("photo-upload")
+        }
+        for _ in 0..<100 {
+            if await mock.actionAttemptCount("getSessionStatus") > attemptsBeforePoll { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let attemptsDuringPoll = await mock.actionAttemptCount("getSessionStatus")
+        XCTAssertGreaterThan(attemptsDuringPoll, attemptsBeforePoll, "The delayed status request must be in flight before the run-start event arrives")
+
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: instance.id,
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: Date()
+        ), deliverLive: true)
+        for _ in 0..<100 {
+            if (try? await cache.lastSequence()) == 1201 { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let appliedStartSequence = try await cache.lastSequence()
+        XCTAssertEqual(appliedStartSequence, 1201)
+
+        await statusPoll.value
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
+        await store.suspend()
+    }
+
+    @MainActor
+    func testDelayedVisibleUnknownAndBusyStatusCannotOverrideNewerTerminalEvent() async throws {
+        for staleStatus in ["unknown", "busy"] {
+            let cache = try SQLiteStore.inMemory()
+            let mock = MockTransport(historyCount: 0)
+            let store = WorkspaceStore(transport: mock, cache: cache)
+            await store.start()
+            let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+            await store.refreshRuntime(runtime)
+            let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+            await store.refreshSessions(runtime: runtime, instance: instance)
+
+            let startedAt = Date()
+            await mock.injectEvent(RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: 1201,
+                machineId: "my-pc",
+                runtimeId: "runtime.web",
+                instanceId: instance.id,
+                sessionId: "photo-upload",
+                type: "GENERATION_STARTED",
+                payload: [:],
+                createdAt: startedAt
+            ), deliverLive: true)
+            for _ in 0..<100 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .busy {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+
+            await mock.setSessionStatus("photo-upload", status: staleStatus)
+            await mock.setResponseDelay(action: "getSessionStatus", nanoseconds: 300_000_000)
+            let statusAttemptsBeforePoll = await mock.actionAttemptCount("getSessionStatus")
+            let statusPoll = Task { @MainActor in
+                await store.synchronizeVisibleSession("photo-upload")
+            }
+            for _ in 0..<100 {
+                if await mock.actionAttemptCount("getSessionStatus") > statusAttemptsBeforePoll { break }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            let attemptsDuringPoll = await mock.actionAttemptCount("getSessionStatus")
+            XCTAssertGreaterThan(attemptsDuringPoll, statusAttemptsBeforePoll, "The delayed status request must be in flight before the terminal event arrives")
+
+            let stoppedAt = Date()
+            await mock.injectEvent(RemoteEvent(
+                protocolVersion: 1,
+                eventId: UUID(),
+                sequence: 1202,
+                machineId: "my-pc",
+                runtimeId: "runtime.web",
+                instanceId: instance.id,
+                sessionId: "photo-upload",
+                type: "GENERATION_STOPPED",
+                payload: ["ok": .bool(true)],
+                createdAt: stoppedAt
+            ), deliverLive: true)
+            for _ in 0..<100 {
+                if (try? await cache.lastSequence()) == 1202 { break }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let appliedTerminalSequence = try await cache.lastSequence()
+            XCTAssertEqual(appliedTerminalSequence, 1202)
+            XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+            XCTAssertNil(store.liveRunStatusBySession["photo-upload"])
+
+            await statusPoll.value
+            XCTAssertEqual(
+                store.sessions.first(where: { $0.id == "photo-upload" })?.state,
+                .idle,
+                "A delayed \(staleStatus) response must not overwrite the newer terminal event"
+            )
+            XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "A stale Busy response must not revive progress after terminal completion")
+            await store.suspend()
+        }
+    }
+
     func testSessionStatusDecodesOptionalRemoteRevision() async throws {
         let mock = MockTransport(historyCount: 0)
         try await mock.connect()
