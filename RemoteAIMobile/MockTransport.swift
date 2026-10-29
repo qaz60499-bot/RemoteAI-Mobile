@@ -96,7 +96,11 @@ actor MockTransport: Transport {
                     messageId: "mock-\(i)",
                     sessionId: "photo-upload",
                     role: assistant ? "assistant" : "user",
-                    content: assistant ? "Mock assistant response \(i). This verifies long-history pagination without rendering everything at once." + (stressChars > 0 ? String(repeating: "\n历史 Markdown **文字** `code` 中文🙂", count: 500) : "") : "Mock user message \(i)",
+                    // Retain all 1,200 history rows for pagination/scroll testing. Do not
+                    // inflate 600 unrelated historical assistants with thousands of
+                    // repeated characters during a 30k/50k live-stream test: that
+                    // measures a different workload and can monopolize XCUI snapshots.
+                    content: assistant ? "Mock assistant response \(i). This verifies long-history pagination without rendering everything at once." : "Mock user message \(i)",
                     externalId: nil,
                     createdAt: now.addingTimeInterval(Double(i - historyCount) * 30)
                 ))
