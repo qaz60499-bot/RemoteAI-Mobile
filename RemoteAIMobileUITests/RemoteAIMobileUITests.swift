@@ -154,14 +154,24 @@ final class RemoteAIMobileUITests: XCTestCase {
         latest.tap()
         print("STREAM_UI chars=\(chars) historyAndReturnInteractionMs=\((ProcessInfo.processInfo.systemUptime - scrollingBegan) * 1000)")
         let marker = "STRESS_BEGIN_\(chars)"
-        let final = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", marker)).firstMatch
-        let finished = NSPredicate { _, _ in !progress.exists && final.exists }
-        expectation(for: finished, evaluatedWith: nil)
+        // The final message has a unique, stable text identifier. A global
+        // staticTexts.containing(label CONTAINS ...) scan can stall XCTest's
+        // accessibility snapshot for 30 seconds under a long transcript.
+        // The final is emitted only after every delta is appended by MockTransport.
+        let final = app.staticTexts["message-content-stress-final-\(chars)-0"]
         // The UI-only fixture emits 100 characters at the configured chunk interval.
         // Budget its complete duration plus runner/accessibility slack instead of retaining the
         // old 40-second timeout that predates the deterministic slow fixture.
         let expectedFixtureSeconds = (Double(chars) / 100.0) * (Double(fixtureChunkMilliseconds) / 1000.0)
-        waitForExpectations(timeout: max(180, expectedFixtureSeconds + 90))
-        XCTAssertTrue(final.exists)
+        XCTAssertTrue(final.waitForExistence(timeout: max(180, expectedFixtureSeconds + 90)),
+                      "The actual final message must replace the streaming row")
+        XCTAssertTrue(final.label.contains(marker), "The rendered final message must have the expected contents")
+        // The draft remains populated: "Send correction" changes to "Send"
+        // only once the chat's authoritative generation state becomes idle.
+        // Check a positive, exact accessibility target rather than repeatedly
+        // searching for a vanished progress label across a huge XCUI tree.
+        XCTAssertTrue(app.buttons["Send"].waitForExistence(timeout: 15),
+                      "Final delivery must clear active generation and restore normal sending")
+        XCTAssertEqual(composer.value as? String, "still responsive", "Final must preserve the unsent draft")
     }
 }

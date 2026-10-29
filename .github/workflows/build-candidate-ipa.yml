@@ -6,7 +6,7 @@ on:
       gate:
         description: Validation scope
         type: choice
-        options: [candidate, streaming]
+        options: [candidate, streaming, sync]
         default: candidate
 
 permissions:
@@ -190,6 +190,16 @@ jobs:
               --udid '${{ steps.simulator.outputs.udid }}' \
               --only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable \
               --only testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable \
+              | tee build/ui-tests.log
+          elif [[ '${{ inputs.gate }}' == 'sync' ]]; then
+            # Targeted regression gate for metadata/Project/Chat sync candidates.
+            # The full candidate gate (including both long-stream stress cases)
+            # remains unchanged and is independently required for final acceptance.
+            python3 scripts/run_candidate_ui_tests.py \
+              --udid '${{ steps.simulator.outputs.udid }}' \
+              --only testMachineRuntimeHierarchyOnIPhone \
+              --only testOpenCachedWebConversation \
+              --only testConversationOpensAtLatestAndOffersReturnToBottomAfterBrowsingHistory \
               | tee build/ui-tests.log
           else
             python3 scripts/run_candidate_ui_tests.py \

@@ -1092,6 +1092,31 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testUnchangedCatalogRefreshDoesNotRepublishChatAndInstanceLists() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        XCTAssertFalse(store.sessions.filter { $0.instanceId == instance.id }.isEmpty)
+
+        var sessionPublications = 0
+        let sessionSubscription = store.$sessions.sink { _ in sessionPublications += 1 }
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        XCTAssertEqual(sessionPublications, 1, "An identical listSessions response must not invalidate all Chat rows")
+        sessionSubscription.cancel()
+
+        var instancePublications = 0
+        let instanceSubscription = store.$instances.sink { _ in instancePublications += 1 }
+        await store.refreshRuntime(runtime)
+        XCTAssertEqual(instancePublications, 1, "An identical listInstances response must not redraw Runtime navigation")
+        instanceSubscription.cancel()
+        await store.suspend()
+    }
+
+    @MainActor
     func testVisibleSessionPollingRecoversMissedWebProgressAndFinalWithoutPushEvents() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
@@ -1119,6 +1144,196 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "poll-final" }.count, 1)
         let sequenceAfterFinalPolling = try await cache.lastSequence()
         XCTAssertEqual(sequenceAfterFinalPolling, initialSequence)
+        await store.suspend()
+    }
+
+    func testSessionStatusDecodesOptionalRemoteRevision() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let revision = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date(timeIntervalSince1970: 946_684_800.123))))
+
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: revision)
+        let status = try await mock.sessionStatus(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload"
+        )
+        XCTAssertEqual(status.updatedAt, revision)
+
+        await mock.setSessionStatus("photo-upload", status: "idle")
+        await mock.omitSessionStatusRevision("photo-upload")
+        let legacyStatus = try await mock.sessionStatus(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload"
+        )
+        XCTAssertNil(legacyStatus.updatedAt, "Older Agents without a session revision remain supported")
+        await mock.disconnect()
+    }
+
+    @MainActor
+    func testOrdinaryIdleSyncReloadsHistoryWhenRemoteRevisionChangesDespiteClockSkew() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+
+        let baselineRevision = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date(timeIntervalSince1970: 946_684_800))))
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: baselineRevision)
+        await store.loadSession("photo-upload", remoteRevision: baselineRevision)
+
+        let catalogUpdatedAt = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.updatedAt)
+        let remoteRevision = baselineRevision.addingTimeInterval(-1)
+        XCTAssertGreaterThan(catalogUpdatedAt, remoteRevision, "The test models a PC clock behind the phone's catalog timestamp")
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: remoteRevision)
+        await mock.appendHistoryMessage(ServerMessage(
+            messageId: "idle-revision-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "updated while the chat stayed idle",
+            externalId: nil,
+            createdAt: Date()
+        ))
+        let beforeSync = await mock.actionAttemptCount("loadRecentMessages")
+
+        await store.synchronizeVisibleSession("photo-upload")
+
+        let afterSync = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(afterSync, beforeSync + 1, "An ordinary idle status revision must trigger one authoritative history read")
+        XCTAssertEqual(store.messagesBySession["photo-upload"]?.last?.id, "idle-revision-final")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testLegacyStatusWithoutRevisionKeepsTerminalActivityFallback() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        await store.loadSession("photo-upload")
+
+        let catalogUpdatedAt = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.updatedAt)
+        let remoteActivity = catalogUpdatedAt.addingTimeInterval(30)
+        await mock.setSessionStatus("photo-upload", status: "idle", lastActivityAt: remoteActivity)
+        await mock.omitSessionStatusRevision("photo-upload")
+        await mock.appendHistoryMessage(ServerMessage(
+            messageId: "legacy-status-final",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "recovered from legacy terminal activity",
+            externalId: nil,
+            createdAt: remoteActivity
+        ))
+        let beforeSync = await mock.actionAttemptCount("loadRecentMessages")
+
+        await store.synchronizeVisibleSession("photo-upload")
+
+        let afterSync = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(afterSync, beforeSync + 1, "An older Agent with no updatedAt must retain its terminal timestamp fallback")
+        XCTAssertEqual(store.messagesBySession["photo-upload"]?.last?.id, "legacy-status-final")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testUnchangedRemoteRevisionDoesNotReloadHistoryAndBusyRevisionStaysProtected() {
+        let revision = Date(timeIntervalSince1970: 946_684_800)
+        XCTAssertFalse(WorkspaceStore.visibleHistoryReloadDue(
+            force: false,
+            hasSuccessfulHistory: true,
+            terminalTransition: false,
+            remoteStatusIsTerminal: true,
+            remoteRevision: revision,
+            lastSuccessfulRemoteRevision: revision
+        ), "An unchanged terminal status revision must not reload history")
+        XCTAssertFalse(WorkspaceStore.visibleHistoryReloadDue(
+            force: false,
+            hasSuccessfulHistory: true,
+            terminalTransition: false,
+            remoteStatusIsTerminal: false,
+            remoteRevision: revision.addingTimeInterval(1),
+            lastSuccessfulRemoteRevision: revision
+        ), "A changed revision must not trigger a history reload while the remote run is busy")
+    }
+
+    @MainActor
+    func testFailedHistoryReadKeepsRemoteRevisionRetryableDespiteNewerCatalogDate() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+
+        let baselineRevision = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date(timeIntervalSince1970: 946_684_800))))
+        let remoteRevision = baselineRevision.addingTimeInterval(-1)
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: baselineRevision)
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        let catalogUpdatedAt = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" })?.updatedAt)
+        XCTAssertGreaterThan(catalogUpdatedAt, baselineRevision)
+        await mock.setSessionStatus("photo-upload", status: "idle", updatedAt: remoteRevision)
+        await mock.appendHistoryMessage(ServerMessage(
+            messageId: "retry-after-history-failure",
+            sessionId: "photo-upload",
+            role: "assistant",
+            content: "retry recovered this final",
+            externalId: nil,
+            createdAt: Date()
+        ))
+        await mock.failNextAction("loadRecentMessages")
+        let beforeRetry = await mock.actionAttemptCount("loadRecentMessages")
+
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        let afterFailure = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(afterFailure, beforeRetry + 1)
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.id == "retry-after-history-failure" })
+
+        XCTAssertTrue(WorkspaceStore.visibleHistoryReloadDue(
+            force: false,
+            hasSuccessfulHistory: true,
+            terminalTransition: false,
+            remoteStatusIsTerminal: true,
+            remoteRevision: remoteRevision,
+            lastSuccessfulRemoteRevision: baselineRevision
+        ), "A failed read leaves the remote revision unmatched, so the next ordinary idle poll remains due")
+
+        // Force only bypasses the normal idle status-poll interval in this test; the
+        // policy assertion above verifies the failed revision itself stayed due.
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        let afterSuccess = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertEqual(afterSuccess, afterFailure + 1, "A failed history read must not advance the successful remote revision watermark")
+        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.id == "retry-after-history-failure" })
+        await store.suspend()
+    }
+
+    @MainActor
+    func testCreateSessionUndecodableFirstReplyReusesOriginalCommandWithoutDuplicate() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .malformedCreateReplyAfterCommit, historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.codex" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "codex.6" }))
+
+        let created = await store.createSession(runtime: runtime, instance: instance, title: "Ambiguous CLI Draft")
+        XCTAssertFalse(created, "A malformed result is not proof of a created Chat")
+        XCTAssertTrue(store.errors[instance.id]?.contains("CREATE_SESSION_RESULT_UNVERIFIED") == true)
+        let recovered = await store.createSession(runtime: runtime, instance: instance, title: "Ambiguous CLI Draft")
+        XCTAssertTrue(recovered, "Retry with the original operation ID recovers the server result")
+        let remote = try await mock.listSessions(machineId: "my-pc", runtimeId: runtime.id, instanceId: instance.id)
+        XCTAssertEqual(remote.filter { $0.title == "Ambiguous CLI Draft" }.count, 1,
+                       "Unknown delivery must never create a second Chat")
+        let attempts = await mock.actionAttemptCount("createSession")
+        XCTAssertEqual(attempts, 2)
         await store.suspend()
     }
 
@@ -1290,6 +1505,42 @@ final class RemoteAIMobileTests: XCTestCase {
         let afterActiveAutomatic = await mock.actionAttemptCount("listProjects")
         XCTAssertEqual(afterActiveAutomatic, beforeActiveAutomatic, "Automatic Project discovery must yield while a ChatGPT Web conversation is active")
 
+        await store.suspend()
+    }
+
+    @MainActor
+    func testDeferredProjectRefreshResumesAfterActiveWebChatCatalogReconciliation() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.refreshWebProjects(force: true)
+        let before = await mock.actionAttemptCount("listProjects")
+
+        // Root and Project Chats share the same browser. A busy root Chat must
+        // not let a discovery scan disturb its tab, but must not permanently
+        // suppress the Project catalog either.
+        store.sessions.append(SessionDescriptor(
+            id: "unsent-root-web-active", instanceId: "web.chatgpt",
+            title: "Active root Chat", state: .busy, updatedAt: Date()
+        ))
+        await store.refreshWebProjects(force: false)
+        let whileBusy = await mock.actionAttemptCount("listProjects")
+        XCTAssertEqual(whileBusy, before)
+
+        let web = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(web)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "web.chatgpt" }))
+        // The authoritative catalog no longer contains the injected busy row.
+        // Reconciliation must drain the deferred request even if the 20s TTL
+        // has not expired.
+        await store.refreshSessions(runtime: web, instance: instance)
+        for _ in 0..<200 {
+            if await mock.actionAttemptCount("listProjects") > before { break }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        let afterReconciliation = await mock.actionAttemptCount("listProjects")
+        XCTAssertEqual(afterReconciliation, before + 1)
+        XCTAssertEqual(store.webProjectsSnapshotState, .authoritativeLiveDOM)
         await store.suspend()
     }
 
@@ -2110,6 +2361,31 @@ final class RemoteAIMobileTests: XCTestCase {
             WorkspaceStore.staleAntigravityAssistantIDs(local: local, authoritative: authoritative),
             Set(["legacy-random-final"])
         )
+    }
+
+    @MainActor
+    func testAntigravityHistoryReplacementPublishesOneMergedTranscript() async throws {
+        let base = Date(timeIntervalSince1970: 1_790_167_500)
+        let store = WorkspaceStore(transport: MockTransport(historyCount: 0), cache: try SQLiteStore.inMemory())
+        let local = [
+            ChatMessage(id: "older-assistant", sessionId: "ag", sequence: 1, role: .assistant, kind: .text, text: "older page", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(-60)),
+            ChatMessage(id: "ag-user", sessionId: "ag", sequence: 2, role: .user, kind: .text, text: "question", toolName: nil, toolStatus: nil, detail: nil, createdAt: base),
+            ChatMessage(id: "legacy-final", sessionId: "ag", sequence: 3, role: .assistant, kind: .text, text: "intermediate answer", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(6)),
+            ChatMessage(id: "unrelated-tool", sessionId: "ag", sequence: 4, role: .tool, kind: .toolEvent, text: "", toolName: "DevSpace", toolStatus: "Completed", detail: nil, createdAt: base.addingTimeInterval(8)),
+        ]
+        let canonical = ChatMessage(id: "canonical-final", sessionId: "ag", sequence: 5, role: .assistant, kind: .text, text: "canonical answer", toolName: nil, toolStatus: nil, detail: nil, createdAt: base.addingTimeInterval(7))
+        store.messagesBySession["ag"] = local
+
+        var publishedIDs: [[String]] = []
+        let subscription = store.$messagesBySession.dropFirst().sink { snapshot in
+            publishedIDs.append(snapshot["ag", default: []].map(\.id))
+        }
+
+        await store.reconcileAntigravityAuthoritativeAssistantWindow([canonical], sessionId: "ag")
+
+        XCTAssertEqual(publishedIDs, [["older-assistant", "ag-user", "canonical-final", "unrelated-tool"]],
+                       "Replacing stale assistant history must publish the merged transcript once, never a delete-only intermediate list")
+        withExtendedLifetime(subscription) {}
     }
 
     @MainActor
@@ -3558,6 +3834,89 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(server.descriptor.updatedAt, updated)
         XCTAssertEqual(server.descriptor.lastActivityAt, activity)
         XCTAssertEqual(server.descriptor.orderingDate, activity)
+        XCTAssertNil(server.descriptor.backgroundTaskStatus, "Older session metadata must remain decodable and missing task state must stay unknown")
+        XCTAssertNil(server.descriptor.backgroundTaskStatusReceivedAt, "Missing task snapshots must not invent a local receipt time")
+    }
+
+    func testServerSessionDescriptorRecordsLocalReceiptForBackgroundTaskSnapshot() throws {
+        let observedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date().addingTimeInterval(-120))))
+        let snapshot = BackgroundTaskStatusSnapshot(
+            state: .available,
+            observedAt: observedAt,
+            tasks: [BackgroundTaskDescriptor(id: "task-1", title: "Task", status: .running, progress: nil)]
+        )
+        let server = ServerSession(
+            sessionId: "task-session",
+            runtimeId: "runtime.antigravity",
+            instanceId: "antigravity.desktop",
+            externalId: nil,
+            title: "Task Session",
+            canonicalUrl: nil,
+            status: "idle",
+            metadata: ["backgroundTaskStatus": (try JSONValue.encode(snapshot))],
+            createdAt: observedAt,
+            updatedAt: observedAt,
+            lastVisited: observedAt
+        )
+
+        let descriptor = server.descriptor
+        XCTAssertEqual(descriptor.backgroundTaskStatus, snapshot)
+        XCTAssertLessThan(abs(try XCTUnwrap(descriptor.backgroundTaskStatusReceivedAt).timeIntervalSinceNow), 2)
+    }
+
+    func testBackgroundTaskStatusDecodesContractAndRejectsMissingTaskList() throws {
+        let observedAt = Date(timeIntervalSince1970: 1_788_596_045)
+        let metadata = JSONValue.object([
+            "state": .string("available"),
+            "observedAt": .string(RemoteAIDate.string(observedAt)),
+            "tasks": .array([
+                .object([
+                    "id": .string("task-1"),
+                    "title": .string("Inspect build"),
+                    "status": .string("running"),
+                    "progress": .string("Reading files")
+                ])
+            ])
+        ])
+        let snapshot = try metadata.decode(BackgroundTaskStatusSnapshot.self)
+        XCTAssertEqual(snapshot.state, .available)
+        XCTAssertEqual(snapshot.observedAt, observedAt)
+        XCTAssertEqual(snapshot.tasks.first?.status, .running)
+        XCTAssertEqual(snapshot.tasks.first?.progress, "Reading files")
+
+        let missingTasks = JSONValue.object([
+            "state": .string("available"),
+            "observedAt": .string(RemoteAIDate.string(observedAt))
+        ])
+        XCTAssertThrowsError(try missingTasks.decode(BackgroundTaskStatusSnapshot.self), "A missing task list must not decode as an available empty list")
+    }
+
+    func testWebProviderSurfaceStatusSnapshotPreservesOriginalMessageAndUnknownFreshness() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let errorAt = Date(timeIntervalSince1970: 1_788_596_045)
+        let checkedAt = errorAt.addingTimeInterval(5)
+        let issue = RemoteProviderSurfaceIssue(
+            code: "PROVIDER_UNAVAILABLE",
+            state: "connection-lost",
+            message: "电脑端 ChatGPT 网页连接已中断；RemoteAI 正在等待网页恢复。",
+            retryable: true,
+            at: errorAt,
+            originalMessage: "Failed to fetch"
+        )
+        await mock.setProviderSurfaceStatus("photo-upload", state: "unknown", observedAt: checkedAt, issue: issue)
+
+        let snapshot = try await mock.sessionStatus(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload"
+        )
+        XCTAssertEqual(snapshot.providerSurfaceState, "unknown")
+        XCTAssertEqual(snapshot.providerSurfaceObservedAt, checkedAt)
+        XCTAssertEqual(snapshot.providerSurfaceIssue?.originalMessage, "Failed to fetch")
+        XCTAssertEqual(snapshot.providerSurfaceIssue?.at, errorAt, "The unknown status check must not replace the error's first observation time")
+        await mock.disconnect()
     }
 
     @MainActor
@@ -3566,7 +3925,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let mock = MockTransport(historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
-        let now = Date()
+        let now = Date(timeIntervalSince1970: 1_788_596_045)
 
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
@@ -3583,6 +3942,7 @@ final class RemoteAIMobileTests: XCTestCase {
                 "providerState": .string("connection-lost"),
                 "code": .string("PROVIDER_UNAVAILABLE"),
                 "message": .string("电脑端 ChatGPT 网页连接已中断；Windows Agent 仍在线，RemoteAI 正在等待 ChatGPT 恢复。"),
+                "originalMessage": .string("Failed to fetch"),
                 "retryable": .bool(true),
                 "at": .string(RemoteAIDate.string(now))
             ],
@@ -3595,7 +3955,17 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
         XCTAssertEqual(store.errors["photo-upload"], "电脑端 ChatGPT 网页连接已中断；Windows Agent 仍在线，RemoteAI 正在等待 ChatGPT 恢复。")
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "An idle provider outage must not look like an active generation")
+        let issue = try XCTUnwrap(store.webProviderIssuesBySession["photo-upload"])
+        XCTAssertEqual(issue.code, "PROVIDER_UNAVAILABLE")
+        XCTAssertEqual(issue.state, "connection-lost")
+        XCTAssertEqual(issue.originalMessage, "Failed to fetch")
+        XCTAssertEqual(issue.at, now)
+        XCTAssertEqual(issue.chineseStateName, "网页连接中断")
+        XCTAssertEqual(store.webProviderSurfaceStateBySession["photo-upload"], "degraded")
+        XCTAssertEqual(store.webProviderSurfaceObservedAtBySession["photo-upload"], now)
+        XCTAssertNil(store.webProviderIssuesBySession["other-chat"], "Provider errors belong only to the matching Chat")
 
+        let unknownObservedAt = now.addingTimeInterval(0.5)
         await mock.injectEvent(RemoteEvent(
             protocolVersion: 1,
             eventId: UUID(),
@@ -3607,20 +3977,78 @@ final class RemoteAIMobileTests: XCTestCase {
             type: "SESSION_STATUS",
             payload: [
                 "providerSurface": .bool(true),
+                "state": .string("unknown"),
+                "providerState": .string("identity-unverified"),
+                "issueState": .string("connection-lost"),
+                "code": .string("PROVIDER_UNAVAILABLE"),
+                "message": .string("电脑端 ChatGPT 网页连接已中断；Windows Agent 仍在线，RemoteAI 正在等待 ChatGPT 恢复。"),
+                "originalMessage": .string("Failed to fetch"),
+                "retryable": .bool(true),
+                "at": .string(RemoteAIDate.string(now)),
+                "statusObservedAt": .string(RemoteAIDate.string(unknownObservedAt))
+            ],
+            createdAt: unknownObservedAt
+        ), deliverLive: true)
+
+        for _ in 0..<80 where store.webProviderSurfaceStateBySession["photo-upload"] != "unknown" {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let retainedIssue = try XCTUnwrap(store.webProviderIssuesBySession["photo-upload"])
+        XCTAssertEqual(retainedIssue.originalMessage, "Failed to fetch")
+        XCTAssertEqual(retainedIssue.at, now, "An unverified page must not replace the original error observation time")
+        XCTAssertEqual(store.webProviderSurfaceStateBySession["photo-upload"], "unknown")
+        XCTAssertEqual(store.webProviderSurfaceObservedAtBySession["photo-upload"], unknownObservedAt)
+        XCTAssertNotNil(store.errors["photo-upload"], "Unknown page state must not clear the retained error")
+
+        let recoveredAt = now.addingTimeInterval(1)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1203,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "SESSION_STATUS",
+            payload: [
+                "providerSurface": .bool(true),
                 "state": .string("online"),
                 "providerState": .string("online"),
                 "recovered": .bool(true),
-                "at": .string(RemoteAIDate.string(now.addingTimeInterval(1)))
+                "at": .string(RemoteAIDate.string(recoveredAt)),
+                "statusObservedAt": .string(RemoteAIDate.string(recoveredAt))
             ],
-            createdAt: now.addingTimeInterval(1)
+            createdAt: recoveredAt
         ), deliverLive: true)
 
         for _ in 0..<80 where store.errors["photo-upload"] != nil {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTAssertNil(store.errors["photo-upload"])
-        XCTAssertTrue(store.recentSystemNotice?.contains("ChatGPT 网页已恢复") == true)
+        XCTAssertNil(store.webProviderIssuesBySession["photo-upload"])
+        XCTAssertEqual(store.webProviderRecoveryObservedAtBySession["photo-upload"], recoveredAt)
+        XCTAssertEqual(store.webProviderSurfaceStateBySession["photo-upload"], "online")
+        XCTAssertNil(store.recentSystemNotice, "A per-chat provider recovery must not be broadcast as a global notice")
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
+
+        // A later-delivered event may carry an older provider observation;
+        // it must not revive an already resolved Failed to fetch / Try Again.
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1, eventId: UUID(), sequence: 1204,
+            machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo",
+            sessionId: "photo-upload", type: "SESSION_STATUS",
+            payload: ["providerSurface": .bool(true), "state": .string("degraded"),
+                      "providerState": .string("connection-lost"),
+                      "code": .string("PROVIDER_UNAVAILABLE"),
+                      "message": .string("Old connection failure"),
+                      "originalMessage": .string("Failed to fetch"),
+                      "statusObservedAt": .string(RemoteAIDate.string(now))],
+            createdAt: recoveredAt.addingTimeInterval(2)
+        ), deliverLive: true)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(store.webProviderSurfaceStateBySession["photo-upload"], "online")
+        XCTAssertNil(store.webProviderIssuesBySession["photo-upload"])
+        XCTAssertEqual(store.webProviderRecoveryObservedAtBySession["photo-upload"], recoveredAt)
         await store.suspend()
     }
 
@@ -3969,6 +4397,109 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
         XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
         XCTAssertEqual(historyAfter, historyBefore)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testBackgroundTaskStatusStaysSeparateFromIdleAndStaleConversationStatus() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
+
+        let initialObservedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date().addingTimeInterval(-120))))
+        await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
+            state: .available,
+            observedAt: initialObservedAt,
+            tasks: [BackgroundTaskDescriptor(id: "task-1", title: "Background task", status: .running, progress: "Preparing")]
+        ))
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+
+        var session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.state, .idle, "A running background task must not make an idle conversation Busy")
+        XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.status, .running)
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, initialObservedAt, "A server timestamp 120 seconds behind the phone must remain the source timestamp")
+        let initialReceipt = try XCTUnwrap(session.backgroundTaskStatusReceivedAt)
+        XCTAssertLessThan(abs(initialReceipt.timeIntervalSinceNow), 2, "Freshness must use the phone's local receipt time")
+
+        await mock.setBackgroundTaskStatus("photo-upload", snapshot: nil)
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.backgroundTaskStatus?.state, .unavailable)
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, initialObservedAt, "Unavailable status must retain the server time domain")
+        let unavailableReceipt = try XCTUnwrap(session.backgroundTaskStatusReceivedAt)
+        XCTAssertLessThan(abs(unavailableReceipt.timeIntervalSinceNow), 2)
+
+        let recoveredObservedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(initialObservedAt.addingTimeInterval(1))))
+        await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
+            state: .available,
+            observedAt: recoveredObservedAt,
+            tasks: [BackgroundTaskDescriptor(id: "task-1", title: "Background task", status: .waiting, progress: "Recovered")]
+        ))
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertEqual(session.backgroundTaskStatus?.state, .available, "A newer source snapshot must replace a local unavailable marker")
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, recoveredObservedAt)
+        XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.status, .waiting)
+        let recoveredReceipt = try XCTUnwrap(session.backgroundTaskStatusReceivedAt)
+        XCTAssertGreaterThan(recoveredReceipt, unavailableReceipt)
+        XCTAssertLessThan(abs(recoveredReceipt.timeIntervalSinceNow), 2)
+
+        let liveAt = Date()
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1201,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "GENERATION_STARTED",
+            payload: [:],
+            createdAt: liveAt
+        ), deliverLive: true)
+        for _ in 0..<80 where store.sessions.first(where: { $0.id == "photo-upload" })?.state != .busy {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+
+        let newerObservedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(recoveredObservedAt.addingTimeInterval(1))))
+        await mock.setSessionStatus("photo-upload", status: "idle", lastActivityAt: liveAt.addingTimeInterval(-5))
+        await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
+            state: .available,
+            observedAt: newerObservedAt,
+            tasks: [BackgroundTaskDescriptor(id: "task-1", title: "Background task", status: .waiting, progress: "Waiting for a slot")]
+        ))
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+
+        session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.state, .busy, "An evidence-poor Idle response must not end newer conversation activity")
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, newerObservedAt, "A newer background snapshot must still apply when session Idle is rejected")
+        XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.progress, "Waiting for a slot")
+        let newerReceipt = try XCTUnwrap(session.backgroundTaskStatusReceivedAt)
+        XCTAssertLessThan(abs(newerReceipt.timeIntervalSinceNow), 2)
+
+        await mock.setBackgroundTaskStatus("photo-upload", snapshot: BackgroundTaskStatusSnapshot(
+            state: .available,
+            observedAt: newerObservedAt.addingTimeInterval(-10),
+            tasks: [BackgroundTaskDescriptor(id: "task-1", title: "Background task", status: .queued, progress: "Older snapshot")]
+        ))
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+
+        session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.state, .busy)
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, newerObservedAt, "An older background snapshot must not roll state back")
+        XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.progress, "Waiting for a slot")
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        session = try XCTUnwrap(store.sessions.first(where: { $0.id == "photo-upload" }))
+        XCTAssertEqual(session.backgroundTaskStatus?.observedAt, newerObservedAt, "A catalog response must not erase a newer status snapshot")
+        XCTAssertEqual(session.backgroundTaskStatus?.tasks.first?.progress, "Waiting for a slot")
+        XCTAssertEqual(session.backgroundTaskStatusReceivedAt, newerReceipt, "A catalog replay must not extend local receipt freshness")
         await store.suspend()
     }
 

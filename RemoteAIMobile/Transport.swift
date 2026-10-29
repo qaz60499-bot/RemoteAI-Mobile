@@ -93,18 +93,32 @@ struct RemoteProviderSurfaceIssue: Equatable {
     let code: String
     let state: String
     let message: String
+    let originalMessage: String?
     let retryable: Bool
     let at: Date?
+
+    init(code: String, state: String, message: String, retryable: Bool, at: Date?, originalMessage: String? = nil) {
+        self.code = code
+        self.state = state
+        self.message = message
+        self.originalMessage = originalMessage
+        self.retryable = retryable
+        self.at = at
+    }
 }
 
 struct RemoteSessionStatusSnapshot: Equatable {
     let sessionId: String
     let state: SessionState
     let browserConnected: Bool?
+    var updatedAt: Date? = nil
     let lastActivityAt: Date?
     let lastProgressStatus: String?
     let lastProgressAt: Date?
     let providerSurfaceIssue: RemoteProviderSurfaceIssue?
+    let providerSurfaceState: String?
+    let providerSurfaceObservedAt: Date?
+    var backgroundTaskStatus: BackgroundTaskStatusSnapshot? = nil
 }
 
 enum TransportError: LocalizedError, Equatable {
@@ -169,6 +183,37 @@ extension RemoteCommand {
     }
 }
 
+struct WebTabDiagnosis: Decodable {
+    let tabId: Int
+    let state: String
+    let issueCode: String?
+    let issueMessage: String?
+    let observedAt: String?
+    let generating: Bool?
+    let composerReady: Bool?
+    let draftPresent: Bool?
+    let pendingUploads: Bool?
+    let busy: Bool?
+}
+
+struct OpenWebTab: Decodable, Identifiable {
+    let tabId: Int
+    let title: String
+    let canonicalUrl: String
+    let active: Bool
+    let loading: Bool
+    let kind: String
+    let sessionId: String?
+    let busy: Bool
+    var executionState: String? = nil
+    var lastActivityAt: String? = nil
+    var lastProgressAt: String? = nil
+    var lastProgressSummary: String? = nil
+
+    var id: Int { tabId }
+    var isChat: Bool { kind.contains("conversation") || sessionId != nil }
+}
+
 extension Transport {
     func healthStream() async -> AsyncStream<TransportHealthEvent> {
         AsyncStream { _ in }
@@ -221,8 +266,9 @@ extension Transport {
         return try response.decode([ServerInstance].self).map(\.descriptor)
     }
 
-    func listSessions(machineId: String, runtimeId: String, instanceId: String) async throws -> [SessionDescriptor] {
-        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, action: "listSessions")
+    func listSessions(machineId: String, runtimeId: String, instanceId: String, limit: Int? = nil) async throws -> [SessionDescriptor] {
+        let payload: [String: JSONValue] = limit.map { ["limit": .number(Double($0))] } ?? [:]
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, action: "listSessions", payload: payload)
         let response = try await requireSuccess(execute(command))
         return try response.decode([ServerSession].self).map(\.descriptor)
     }
@@ -234,6 +280,10 @@ extension Transport {
               object["sessionId"]?.stringValue == sessionId,
               let status = object["status"]?.stringValue else { throw TransportError.malformedData }
         let metadata = object["metadata"]?.objectValue ?? [:]
+        let backgroundTaskStatus: BackgroundTaskStatusSnapshot? = {
+            guard let value = metadata["backgroundTaskStatus"] else { return nil }
+            return try? value.decode(BackgroundTaskStatusSnapshot.self)
+        }()
         let providerIssueObject = metadata["providerSurfaceIssue"]?.objectValue
         let providerIssue: RemoteProviderSurfaceIssue? = {
             guard let providerIssueObject,
@@ -245,24 +295,87 @@ extension Transport {
                 state: state,
                 message: message,
                 retryable: providerIssueObject["retryable"]?.boolValue == true,
-                at: providerIssueObject["at"]?.stringValue.flatMap(RemoteAIDate.parse)
+                at: providerIssueObject["at"]?.stringValue.flatMap(RemoteAIDate.parse),
+                originalMessage: providerIssueObject["originalMessage"]?.stringValue
             )
         }()
         return RemoteSessionStatusSnapshot(
             sessionId: sessionId,
             state: .server(status),
             browserConnected: object["browserConnected"]?.boolValue,
+            updatedAt: object["updatedAt"]?.stringValue.flatMap(RemoteAIDate.parse),
             lastActivityAt: metadata["lastActivityAt"]?.stringValue.flatMap(RemoteAIDate.parse),
             lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
             lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse),
-            providerSurfaceIssue: providerIssue
+            providerSurfaceIssue: providerIssue,
+            providerSurfaceState: metadata["providerSurfaceState"]?.stringValue,
+            providerSurfaceObservedAt: metadata["providerSurfaceObservedAt"]?.stringValue.flatMap(RemoteAIDate.parse),
+            backgroundTaskStatus: backgroundTaskStatus
         )
     }
 
     func createSession(machineId: String, runtimeId: String, instanceId: String, payload: [String: JSONValue], commandId: UUID = UUID()) async throws -> SessionDescriptor? {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, action: "createSession", payload: payload, commandId: commandId)
         let response = try await requireSuccess(execute(command))
-        return try? response.decode(ServerSession.self).descriptor
+        // A successful command envelope without a decodable Session identity
+        // is an unknown create outcome, not a successful mobile Chat creation.
+        // Preserve its command ID so an explicit retry can reconcile the same
+        // operation instead of silently creating another Chat.
+        guard let serverSession = try? response.decode(ServerSession.self),
+              !serverSession.sessionId.isEmpty,
+              serverSession.runtimeId == runtimeId,
+              serverSession.instanceId == instanceId else {
+            throw TransportError.remote("CREATE_SESSION_RESULT_UNVERIFIED",
+                "Server acknowledged creation but returned no matching Chat identity; retry must reuse the original command ID.")
+        }
+        return serverSession.descriptor
+    }
+
+    func listAntigravityProjects(machineId: String) async throws -> [WebProjectDescriptor] {
+        let command = RemoteCommand.make(
+            machineId: machineId,
+            runtimeId: "runtime.antigravity",
+            instanceId: "antigravity.desktop",
+            action: "listProjects"
+        )
+        let response = try await requireSuccess(execute(command))
+        return try response.decode([WebProjectDescriptor].self)
+    }
+
+    func deleteSession(machineId: String, runtimeId: String, instanceId: String, sessionId: String, commandId: UUID = UUID()) async throws {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "deleteSession", commandId: commandId)
+        _ = try await requireSuccess(execute(command))
+    }
+
+    func listOpenWebTabs(machineId: String) async throws -> [OpenWebTab] {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "listOpenWebTabs")
+        let response = try await requireSuccess(execute(command))
+        return try response.decode([OpenWebTab].self)
+    }
+
+    func inspectOpenWebTab(machineId: String, tab: OpenWebTab) async throws -> WebTabDiagnosis {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt",
+            action: "inspectOpenWebTab", payload: [
+                "tabId": .number(Double(tab.tabId)),
+                "expectedUrl": .string(tab.canonicalUrl)
+            ])
+        return try await requireSuccess(execute(command)).decode(WebTabDiagnosis.self)
+    }
+
+    func reopenVerifiedWebConversation(machineId: String, sessionId: String) async throws {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web",
+            instanceId: "web.chatgpt", sessionId: sessionId, action: "resumeSession")
+        _ = try await requireSuccess(execute(command))
+    }
+
+    func manageOpenWebTab(machineId: String, tab: OpenWebTab, operation: String, commandId: UUID = UUID()) async throws {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "manageOpenWebTab", payload: [
+            "tabId": .number(Double(tab.tabId)),
+            "expectedUrl": .string(tab.canonicalUrl),
+            "operation": .string(operation),
+            "sessionId": tab.sessionId.map(JSONValue.string) ?? .null
+        ], commandId: commandId)
+        _ = try await requireSuccess(execute(command))
     }
 
     func listProjectsResponse(machineId: String, forceRefresh: Bool = false) async throws -> WebProjectListResponse {

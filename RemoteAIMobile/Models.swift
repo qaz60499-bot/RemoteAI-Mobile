@@ -42,7 +42,7 @@ enum ConnectionDiagnosticPhase: String, Codable, Equatable {
         }
     }
 }
-enum SessionState: String, Codable { case idle = "Idle", busy = "Busy", waiting = "Waiting", sleeping = "Sleeping", error = "Error" }
+enum SessionState: String, Codable { case idle = "Idle", busy = "Busy", waiting = "Waiting", sleeping = "Sleeping", error = "Error", unknown = "Unknown" }
 enum CommandState: String, Codable { case pending = "Pending", acknowledged = "Acknowledged", executing = "Executing", completed = "Completed", failed = "Failed", unknown = "Unknown" }
 enum WebState: String, Codable { case registered = "Registered", browserClosed = "BrowserClosed", attached = "Attached", unsupported = "Unsupported" }
 enum MessageRole: String, Codable { case user, assistant, system, tool }
@@ -96,8 +96,81 @@ struct SessionDescriptor: Codable, Identifiable, Hashable {
     var lastActivityAt: Date? = nil
     var lastProgressStatus: String? = nil
     var lastProgressAt: Date? = nil
+    var backgroundTaskStatus: BackgroundTaskStatusSnapshot? = nil
+    var backgroundTaskStatusReceivedAt: Date? = nil
+    var workingDirectory: String? = nil
+    var threadId: String? = nil
+    var modelId: String? = nil
 
     var orderingDate: Date { max(updatedAt, lastActivityAt ?? updatedAt) }
+
+    // Group only provider-recorded working directories. Titles are never identity.
+    var codexDirectoryKey: String? {
+        guard var path = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty else { return nil }
+        if path.hasPrefix("\\\\?\\") { path.removeFirst(4) }
+        let isWindows = path.contains("\\") || (path.count > 1 && path.dropFirst().first == ":")
+        path = path.replacingOccurrences(of: "\\", with: "/")
+        while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+        return isWindows ? path.lowercased() : path
+    }
+}
+
+struct CodexDirectoryGroup: Identifiable {
+    let id: String
+    let path: String
+    let sessions: [SessionDescriptor]
+    var latestActivity: Date { sessions.first?.orderingDate ?? .distantPast }
+
+    static func make(_ sessions: [SessionDescriptor]) -> [CodexDirectoryGroup] {
+        let grouped = Dictionary(grouping: sessions.filter { $0.codexDirectoryKey != nil },
+                                 by: { $0.codexDirectoryKey! })
+        return grouped.map { key, rows in
+            let ordered = rows.sorted { $0.orderingDate == $1.orderingDate ? $0.id < $1.id : $0.orderingDate > $1.orderingDate }
+            return CodexDirectoryGroup(id: key, path: ordered.first?.workingDirectory ?? key, sessions: ordered)
+        }.sorted { $0.latestActivity == $1.latestActivity ? $0.id < $1.id : $0.latestActivity > $1.latestActivity }
+    }
+}
+
+enum BackgroundTaskAvailability: String, Codable, Hashable {
+    case available
+    case unavailable
+}
+
+enum BackgroundTaskState: String, Codable, Hashable {
+    case running
+    case waiting
+    case queued
+    case completed
+    case canceled
+    case failed
+    case unknown
+}
+
+struct BackgroundTaskDescriptor: Codable, Hashable, Identifiable {
+    let id: String
+    let title: String
+    let status: BackgroundTaskState
+    let progress: String?
+}
+
+struct BackgroundTaskStatusSnapshot: Codable, Hashable {
+    let state: BackgroundTaskAvailability
+    let observedAt: Date
+    let tasks: [BackgroundTaskDescriptor]
+    let error: String?
+
+    init(
+        state: BackgroundTaskAvailability,
+        observedAt: Date,
+        tasks: [BackgroundTaskDescriptor] = [],
+        error: String? = nil
+    ) {
+        self.state = state
+        self.observedAt = observedAt
+        self.tasks = tasks
+        self.error = error
+    }
 }
 
 struct AttachmentTransferProgress: Equatable {
@@ -322,6 +395,7 @@ struct ChatMessage: Codable, Identifiable, Hashable {
     var detail: String?
     var attachments: [MessageAttachment]? = nil
     let createdAt: Date
+    var providerMessageId: String? = nil
 
     var cursor: MessageCursor { MessageCursor(createdAt: createdAt, messageId: id) }
 
@@ -595,6 +669,7 @@ extension SessionState {
         case "running", "busy", "generating": return .busy
         case "waiting": return .waiting
         case "sleeping": return .sleeping
+        case "unknown": return .unknown
         // "interrupted" is an Agent-lifecycle recovery marker, not a current
         // provider failure. Rendering every historical restart marker as a red Error
         // makes healthy old chats look broken until each one is opened and reconciled.
@@ -602,6 +677,38 @@ extension SessionState {
         // and performs authoritative recovery when that chat is opened.
         case "interrupted": return .idle
         default: return raw.lowercased().contains("error") || raw.lowercased().contains("fail") ? .error : .idle
+        }
+    }
+
+    var chineseStatusName: String {
+        switch self {
+        case .idle: return "空闲"
+        case .busy: return "生成中"
+        case .waiting: return "等待中"
+        case .sleeping: return "暂停"
+        case .error: return "错误"
+        case .unknown: return "未知"
+        }
+    }
+}
+
+extension RemoteProviderSurfaceIssue {
+    var chineseStateName: String {
+        switch state.lowercased() {
+        case "connection-lost": return "网页连接中断"
+        case "response-incomplete": return "回复未完成"
+        case "delivery-unknown": return "消息是否送达尚未确认"
+        case "response-network-error": return "网页回复出现网络错误"
+        case "response-unavailable": return "网页回复无法加载"
+        case "retry-visible": return "网页显示 Retry，回复可能失败"
+        case "provider-error": return "网页报告错误"
+        case "rate-limited": return "网页请求受限"
+        case "verification-required": return "网页需要安全验证"
+        case "auth-required": return "网页登录状态失效"
+        case "conversation-unavailable": return "当前对话无法加载"
+        case "service-error": return "网页服务异常"
+        case "page-translated": return "网页被浏览器翻译"
+        default: return "网页状态：\(state)"
         }
     }
 }
@@ -622,6 +729,9 @@ extension ServerInstance {
 extension ServerSession {
     var descriptor: SessionDescriptor {
         let persistedActivity = metadata["lastActivityAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+        let backgroundTaskStatus = metadata["backgroundTaskStatus"].flatMap {
+            try? $0.decode(BackgroundTaskStatusSnapshot.self)
+        }
         return SessionDescriptor(
             id: sessionId,
             instanceId: instanceId,
@@ -634,7 +744,12 @@ extension ServerSession {
             // ordering. lastVisited can be refreshed by DOM discovery alone.
             lastActivityAt: persistedActivity,
             lastProgressStatus: metadata["lastProgressStatus"]?.stringValue,
-            lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+            lastProgressAt: metadata["lastProgressAt"]?.stringValue.flatMap(RemoteAIDate.parse),
+            backgroundTaskStatus: backgroundTaskStatus,
+            backgroundTaskStatusReceivedAt: backgroundTaskStatus == nil ? nil : Date(),
+            workingDirectory: metadata["cwd"]?.stringValue,
+            threadId: externalId,
+            modelId: metadata["model"]?.stringValue
         )
     }
 }
@@ -642,6 +757,8 @@ extension ServerSession {
 extension ServerMessage {
     var chatMessage: ChatMessage {
         let mappedRole = MessageRole(rawValue: role.lowercased()) ?? .system
-        return ChatMessage(id: messageId, sessionId: sessionId, sequence: nil, role: mappedRole, kind: .text, text: content, toolName: nil, toolStatus: nil, detail: nil, attachments: attachments, createdAt: createdAt)
+        var message = ChatMessage(id: messageId, sessionId: sessionId, sequence: nil, role: mappedRole, kind: .text, text: content, toolName: nil, toolStatus: nil, detail: nil, attachments: attachments, createdAt: createdAt)
+        message.providerMessageId = externalId
+        return message
     }
 }
