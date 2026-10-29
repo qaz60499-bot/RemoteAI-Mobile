@@ -1709,7 +1709,7 @@ final class WorkspaceStore: ObservableObject {
             if sessions.first(where: { $0.id == sessionId })?.state != .error,
                errors[sessionId] != nil,
                !pendingUnknownSend {
-                errors.removeValue(forKey: sessionId)
+                clearSessionOperationError(sessionId)
             }
             // A successful authoritative history read is the recovery watermark for
             // this visible conversation. Periodic status probes must not immediately
@@ -2236,7 +2236,7 @@ final class WorkspaceStore: ObservableObject {
             let insertedIDs = Set(page.items.map { $0.id }).subtracting(presentIDs)
             merge(page.items, into: sessionId)
             hasMoreBySession[sessionId] = page.hasMore
-            errors[sessionId] = nil
+            clearSessionOperationError(sessionId)
             let updated = messagesBySession[sessionId, default: []]
             guard let anchorIndex = updated.firstIndex(where: { $0.id == first.id }) else { return false }
             return updated[..<anchorIndex].contains(where: { insertedIDs.contains($0.id) })
@@ -2382,7 +2382,7 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             try? await cache.saveDraft("", sessionId: sessionId)
-            if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = nil }
+            if generation == lifecycleGeneration, !isSuspended { clearSessionOperationError(sessionId) }
             DiagnosticsLog.shared.record("send_ok", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "state": finalState.rawValue, "durationMs": Self.durationMilliseconds(since: sendStartedAt)])
             return true
         } catch is CancellationError {
@@ -2423,7 +2423,7 @@ final class WorkspaceStore: ObservableObject {
                         await recoverDelta()
                         try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
                         try? await cache.saveDraft("", sessionId: sessionId)
-                        errors[sessionId] = nil
+                        clearSessionOperationError(sessionId)
                         if messagesBySession[sessionId, default: []].last?.role == .user {
                             let recoveredSendAt = Date()
                             setSessionState(sessionId, .busy)
@@ -2505,7 +2505,7 @@ final class WorkspaceStore: ObservableObject {
                 if commandStates[commandId] == .completed {
                     try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
                     try? await cache.saveDraft("", sessionId: sessionId)
-                    errors[sessionId] = nil
+                    clearSessionOperationError(sessionId)
                     // If reconciliation found only the committed provider user turn,
                     // keep the visible chat in active-poll mode until an authoritative
                     // assistant final arrives. If loadSession already found that final,
@@ -2779,7 +2779,7 @@ final class WorkspaceStore: ObservableObject {
             if stopRunIdentitiesBySession[sessionId] == runIdentity {
                 if stopEventRevision == sessionStatusEventRevisions[sessionId, default: 0] {
                     setSessionState(sessionId, .idle)
-                    errors[sessionId] = nil
+                    clearSessionOperationError(sessionId)
                 } else {
                     // A run/status event raced the ACK. Only fresh authoritative status
                     // may decide whether this Stop still describes the current run.
@@ -3084,7 +3084,7 @@ final class WorkspaceStore: ObservableObject {
         do {
             try await cache.saveDraft(text, sessionId: sessionId)
             if errors[sessionId]?.hasPrefix("草稿保存失败：") == true {
-                errors[sessionId] = nil
+                clearSessionOperationError(sessionId)
             }
         } catch {
             if let storeError = error as? StoreError, storeError == .valueTooLarge {
@@ -3095,6 +3095,13 @@ final class WorkspaceStore: ObservableObject {
             throw error
         }
     }
+    private func clearSessionOperationError(_ sessionId: String) {
+        // A history read, successful send/Stop, or cached final is not evidence
+        // that a current provider error disappeared. Only provider observation
+        // recovery clears its separately retained issue.
+        errors[sessionId] = webProviderIssueMessageBySession[sessionId]
+    }
+
     func clearError(sessionId: String) { errors[sessionId] = nil }
 
     func clearError(
@@ -4836,7 +4843,7 @@ final class WorkspaceStore: ObservableObject {
                 if outcome == .failed {
                     errors[sessionId] = terminalMessage
                 } else {
-                    errors[sessionId] = nil
+                    clearSessionOperationError(sessionId)
                     setSessionSystemNotice(terminalMessage, sessionId: sessionId, kind: .generationOutcome)
                 }
             } else {
@@ -4848,7 +4855,7 @@ final class WorkspaceStore: ObservableObject {
                 ])
                 liveRunStatusBySession.removeValue(forKey: sessionId)
                 clearLiveRunActivity(sessionId: sessionId)
-                errors[sessionId] = nil
+                clearSessionOperationError(sessionId)
             }
         case "SESSION_STATUS":
             if event.payload["providerSurface"]?.boolValue == true {
@@ -5677,7 +5684,7 @@ final class WorkspaceStore: ObservableObject {
         if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
         clearLiveRunActivity(sessionId: sessionId)
         setSessionState(sessionId, .idle)
-        if errors[sessionId] != nil { errors.removeValue(forKey: sessionId) }
+        if errors[sessionId] != nil { clearSessionOperationError(sessionId) }
 
         try? await settleRunningToolRows(sessionId: sessionId)
     }
