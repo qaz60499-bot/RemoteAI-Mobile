@@ -8,7 +8,6 @@ private actor ControlledStopTransport: Transport {
     private var shouldTimeoutNextStop = false
     private var stopCommands: [RemoteCommand] = []
     private var stopResponseContinuations: [UUID: CheckedContinuation<CommandResponseEnvelope, Error>] = [:]
-    private var stopCommandWaiters: [(Int, CheckedContinuation<[RemoteCommand], Never>)] = []
 
     init(base: MockTransport, holdStopResponses: Bool = true) {
         self.base = base
@@ -26,7 +25,6 @@ private actor ControlledStopTransport: Transport {
         guard command.action == "stopGeneration" else { return try await base.execute(command) }
         try ProtocolSecurity.validate(command, expectedMachineId: "my-pc")
         stopCommands.append(command)
-        resumeStopCommandWaiters()
         if shouldTimeoutNextStop {
             shouldTimeoutNextStop = false
             throw TransportError.timeout
@@ -48,28 +46,18 @@ private actor ControlledStopTransport: Transport {
     func failNextStopWithTimeout() { shouldTimeoutNextStop = true }
 
     func waitForStopCommandCount(_ count: Int) async -> [RemoteCommand] {
-        if stopCommands.count >= count { return stopCommands }
-        return await withCheckedContinuation { continuation in
-            stopCommandWaiters.append((count, continuation))
+        // Broken test setup must fail rather than strand a CI runner indefinitely.
+        for _ in 0..<100 {
+            if stopCommands.count >= count { return stopCommands }
+            try? await Task.sleep(nanoseconds: 50_000_000)
         }
+        return stopCommands
     }
 
     func currentStopCommands() -> [RemoteCommand] { stopCommands }
 
     func releaseStopResponse(commandId: UUID) {
         stopResponseContinuations.removeValue(forKey: commandId)?.resume(returning: Self.successEnvelope)
-    }
-
-    private func resumeStopCommandWaiters() {
-        var pending: [(Int, CheckedContinuation<[RemoteCommand], Never>)] = []
-        for (count, continuation) in stopCommandWaiters {
-            if stopCommands.count >= count {
-                continuation.resume(returning: stopCommands)
-            } else {
-                pending.append((count, continuation))
-            }
-        }
-        stopCommandWaiters = pending
     }
 
     private static let successEnvelope = CommandResponseEnvelope(
@@ -81,6 +69,18 @@ private actor ControlledStopTransport: Transport {
 }
 
 final class StopIdentityTests: XCTestCase {
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        // ControlledStopTransport wraps MockTransport but is not itself MockTransport.
+        // WorkspaceStore therefore requires an explicit test pairing before start().
+        try PairingKeyStore.savePairing(machineId: "my-pc", sharedKey: Data(repeating: 0x53, count: 32))
+    }
+
+    override func tearDownWithError() throws {
+        PairingKeyStore.deletePairing(machineId: "my-pc")
+        try super.tearDownWithError()
+    }
+
     @MainActor
     func testLateStopAckCannotIdleNewGenerationAndStop2UsesNewCommandId() async throws {
         let base = MockTransport(historyCount: 0)
@@ -206,6 +206,7 @@ final class StopIdentityTests: XCTestCase {
     @MainActor
     private func makeStartedStore(transport: ControlledStopTransport, cache: SQLiteStore) async -> WorkspaceStore {
         let store = WorkspaceStore(transport: transport, cache: cache)
+        store.machine = MachineMetadata(id: "my-pc", name: "Stop Identity Test", state: .connecting)
         _ = await store.start()
         if let runtime = store.runtimes.first(where: { $0.id == "runtime.web" }) {
             await store.refreshRuntime(runtime)
