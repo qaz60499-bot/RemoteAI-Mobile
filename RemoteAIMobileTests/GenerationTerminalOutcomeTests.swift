@@ -87,7 +87,10 @@ final class GenerationTerminalOutcomeTests: XCTestCase {
         for (index, terminalCase) in cases.enumerated() {
             let (mock, store) = try await makeStartedStore()
             let now = Date()
-            let startSequence = Int64(1301 + index * 10)
+            // Each case creates a fresh MockTransport whose event cursor starts at 1200.
+            // Keep the first live event contiguous, rather than creating an artificial
+            // recovery gap that stops the terminal events from reaching the store.
+            let startSequence: Int64 = 1201
             let sessionId = "photo-upload"
             await inject(mock, sequence: startSequence, type: "GENERATION_STARTED", payload: [:], at: now)
             await inject(mock, sequence: startSequence + 1, type: "MESSAGE_UPDATED", payload: [
