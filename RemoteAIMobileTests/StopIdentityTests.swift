@@ -182,7 +182,14 @@ final class StopIdentityTests: XCTestCase {
         let current = try await cache.get(RemoteCommand.self, key: key)
 
         XCTAssertFalse(removed)
-        XCTAssertEqual(current, newRecord)
+        // SQLite encodes Date with lower precision than an in-memory command.
+        // Compare durable identity and routing fields, not sub-ms timestamps.
+        XCTAssertEqual(current?.commandId, newRecord.commandId)
+        XCTAssertEqual(current?.machineId, newRecord.machineId)
+        XCTAssertEqual(current?.runtimeId, newRecord.runtimeId)
+        XCTAssertEqual(current?.instanceId, newRecord.instanceId)
+        XCTAssertEqual(current?.sessionId, newRecord.sessionId)
+        XCTAssertEqual(current?.action, newRecord.action)
     }
 
     func testStaleStopPreparationCannotOverwriteReplacementRecord() async throws {
@@ -200,7 +207,12 @@ final class StopIdentityTests: XCTestCase {
         let current = try await cache.get(RemoteCommand.self, key: key)
 
         XCTAssertFalse(replaced)
-        XCTAssertEqual(current, replacementRecord)
+        XCTAssertEqual(current?.commandId, replacementRecord.commandId)
+        XCTAssertEqual(current?.machineId, replacementRecord.machineId)
+        XCTAssertEqual(current?.runtimeId, replacementRecord.runtimeId)
+        XCTAssertEqual(current?.instanceId, replacementRecord.instanceId)
+        XCTAssertEqual(current?.sessionId, replacementRecord.sessionId)
+        XCTAssertEqual(current?.action, replacementRecord.action)
     }
 
     @MainActor
