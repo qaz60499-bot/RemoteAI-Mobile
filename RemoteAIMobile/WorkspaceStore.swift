@@ -3933,6 +3933,12 @@ final class WorkspaceStore: ObservableObject {
                 return false
             }
             return true
+        }.sorted { lhs, rhs in
+            // Provider order is the pagination authority, not guaranteed recent
+            // activity order. Sort only the visible tail by the same updatedAt
+            // timestamp shown in its Chat rows; never treat lastVisited/DOM
+            // inspection as message activity or mutate the provider snapshot.
+            lhs.updatedAt > rhs.updatedAt
         }
 
         // Final presentation-level identity collapse. This intentionally leaves the

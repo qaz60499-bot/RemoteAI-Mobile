@@ -2594,6 +2594,94 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectRecentDisplaySortsTimestampsWithoutMutatingProviderPages() async throws {
+        let mock = MockTransport(historyCount: 0)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+
+        let providerRows = try XCTUnwrap(store.projectConversationsByAlias["g-p-remoteai"])
+        let newestProviderRow = try XCTUnwrap(providerRows.first(where: { $0.conversationAlias == "seed-0" }))
+        let olderProviderRow = try XCTUnwrap(providerRows.first(where: { $0.conversationAlias == "seed-1" }))
+
+        func row(_ source: WebConversationDescriptor, updatedAt: Date, lastVisited: Date) -> WebConversationDescriptor {
+            WebConversationDescriptor(
+                localConversationId: source.localConversationId,
+                canonicalUrl: source.canonicalUrl,
+                projectId: source.projectId,
+                displayTitle: source.displayTitle,
+                projectAlias: source.projectAlias,
+                conversationAlias: source.conversationAlias,
+                lastVisited: lastVisited,
+                updatedAt: updatedAt
+            )
+        }
+
+        let newestByContent = row(
+            newestProviderRow,
+            updatedAt: newestProviderRow.updatedAt,
+            lastVisited: olderProviderRow.updatedAt.addingTimeInterval(-60)
+        )
+        let olderByContent = row(
+            olderProviderRow,
+            updatedAt: olderProviderRow.updatedAt,
+            lastVisited: newestProviderRow.updatedAt.addingTimeInterval(60)
+        )
+        store.projectConversationsByAlias["g-p-remoteai"] = [olderByContent, newestByContent]
+        XCTAssertEqual(
+            store.displayedProjectConversations(projectAlias: "g-p-remoteai").map(\.conversationAlias),
+            ["seed-0", "seed-1"],
+            "The display must sort by updatedAt even when lastVisited and provider order disagree"
+        )
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-1", "seed-0"],
+            "Presentation sorting must not mutate provider pagination/order authority"
+        )
+
+        let openedOlderConversation = row(
+            olderByContent,
+            updatedAt: olderProviderRow.updatedAt,
+            lastVisited: newestProviderRow.updatedAt.addingTimeInterval(120)
+        )
+        store.projectConversationsByAlias["g-p-remoteai"] = [openedOlderConversation, newestByContent]
+        XCTAssertEqual(
+            store.displayedProjectConversations(projectAlias: "g-p-remoteai").map(\.conversationAlias),
+            ["seed-0", "seed-1"],
+            "Reading an older Chat must not promote it through lastVisited"
+        )
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-1", "seed-0"]
+        )
+
+        let incrementedUpdatedAt = newestProviderRow.updatedAt.addingTimeInterval(1)
+        let newestWithRecentVisit = row(
+            newestProviderRow,
+            updatedAt: newestProviderRow.updatedAt,
+            lastVisited: incrementedUpdatedAt.addingTimeInterval(120)
+        )
+        let olderWithIncrementedUpdate = row(
+            olderProviderRow,
+            updatedAt: incrementedUpdatedAt,
+            lastVisited: olderProviderRow.updatedAt.addingTimeInterval(-120)
+        )
+        store.projectConversationsByAlias["g-p-remoteai"] = [newestWithRecentVisit, olderWithIncrementedUpdate]
+        XCTAssertEqual(
+            store.displayedProjectConversations(projectAlias: "g-p-remoteai").map(\.conversationAlias),
+            ["seed-1", "seed-0"],
+            "A newer incremental updatedAt must reorder the visible tail even when lastVisited favors the other Chat"
+        )
+        XCTAssertEqual(
+            store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias),
+            ["seed-0", "seed-1"],
+            "Incremental display sorting must leave provider pagination order intact"
+        )
+        await store.suspend()
+    }
+
+    @MainActor
     func testPhoneSendKeepsProviderProjectOrderWhileShowingBusyState() async throws {
         let mock = MockTransport(scenario: .deltaOnlySend, historyCount: 0)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 2)

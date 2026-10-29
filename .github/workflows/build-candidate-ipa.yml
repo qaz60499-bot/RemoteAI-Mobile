@@ -391,6 +391,31 @@ jobs:
           grep -F "Test Case '-[RemoteAIMobileTests.SessionCatalogTests testLiveRegistrationAdvancesCursorWith648RowCatalogOverKVLimit]' failed" build/terminal-before.log
           echo "TERMINAL_BEFORE_EXPECTED_FAILURE=$BASELINE_EXIT"
 
+      - name: Reproduce recent sorting on installed Build54 source
+        if: inputs.gate == 'provider-observation'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATCHED_SOURCE="$RUNNER_TEMP/WorkspaceStore.recent-sorted.swift"
+          cp RemoteAIMobile/WorkspaceStore.swift "$PATCHED_SOURCE"
+          trap 'cp "$PATCHED_SOURCE" RemoteAIMobile/WorkspaceStore.swift' EXIT
+          git show de0d8f0baeaa3beb8dd38f0fe8071d690ee3bf38:RemoteAIMobile/WorkspaceStore.swift > RemoteAIMobile/WorkspaceStore.swift
+          set +e
+          xcodebuild test -project RemoteAIMobile.xcodeproj -scheme RemoteAIMobile \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}" \
+            -resultBundlePath build/recent-sort-baseline.xcresult \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testProjectRecentDisplaySortsTimestampsWithoutMutatingProviderPages \
+            > build/recent-sort-baseline.log 2>&1
+          RESULT=$?
+          set -e
+          if [[ "$RESULT" -eq 0 ]]; then
+            echo 'The new regression did not reproduce on the installed Build54 source.'
+            exit 1
+          fi
+          grep -E "Test Case .*testProjectRecentDisplaySortsTimestampsWithoutMutatingProviderPages.*failed" build/recent-sort-baseline.log
+          grep -F 'The display must sort by updatedAt' build/recent-sort-baseline.log
+
       - name: Runtime issue focused unit tests
         if: inputs.gate == 'runtime-issues' || inputs.gate == 'provider-observation'
         id: runtimeIssueTests
@@ -414,6 +439,7 @@ jobs:
             -only-testing:RemoteAIMobileTests/RuntimeIssueSummaryTests \
             -only-testing:RemoteAIMobileTests/GenerationTerminalOutcomeTests \
             -only-testing:RemoteAIMobileTests/SessionCatalogTests \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testProjectRecentDisplaySortsTimestampsWithoutMutatingProviderPages \
             -only-testing:RemoteAIMobileTests/PairingTests/testForegroundCallbacksAvoidUnnecessaryReconnectAndHideBriefStatusFlash \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testBackgroundTaskStatusStaysSeparateFromIdleAndStaleConversationStatus \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testWorkspaceCoalescesDuplicateInitializationAndLifecycleRace \
@@ -446,6 +472,7 @@ jobs:
           summary = json.loads(Path('build/runtime-issues-tests-summary.json').read_text())
           test_nodes = json.loads(Path('build/runtime-issues-test-nodes.json').read_text())
           required = {
+              'testProjectRecentDisplaySortsTimestampsWithoutMutatingProviderPages',
               'testRetryWithMissingOrCorruptOriginalCommandStaysUnknownAndDoesNotDropModelOrAttachments',
               'testOversizedPendingCommandFailsBeforeProviderSend',
               'testTransportDisconnectAutoReconnectsAndReplaysExactCommandWithoutDuplicateSideEffect',
