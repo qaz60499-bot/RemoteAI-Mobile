@@ -1764,6 +1764,33 @@ struct ChatView: View {
                     }
                 }
             }
+            if runtime.id == "runtime.web", instance.id == "web.chatgpt",
+               let surfaceState = store.webProviderSurfaceState(forSessionId: session.id) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("网页状态：\(WebProviderSurfaceState(rawValue: surfaceState)?.displayName ?? surfaceState)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    if let issueState = store.webProviderIssueState(forSessionId: session.id) {
+                        Text("网页错误分类：\(WebProviderSurfaceState.issueDisplayName(issueState))")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    if let originalMessage = store.webProviderIssueOriginalMessage(forSessionId: session.id) {
+                        Text("网页原始错误短文本：\(originalMessage)")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    if let issueAt = store.webProviderIssueObservedAt(forSessionId: session.id) {
+                        FixedTimestamp(date: issueAt, prefix: "错误观测时间")
+                    }
+                    if let observedAt = store.webProviderSurfaceObservedAt(forSessionId: session.id) {
+                        FixedTimestamp(date: observedAt, prefix: "网页状态观测时间")
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+            }
             if let attachmentError { ErrorBanner(text: attachmentError) { self.attachmentError = nil } }
             if let voiceError = speechInput.errorMessage { ErrorBanner(text: voiceError) { speechInput.dismissError() } }
             ScrollViewReader { proxy in

@@ -30,6 +30,8 @@ actor MockTransport: Transport {
     private var sessionStatusOverrides: [String: String] = [:]
     private var sessionStatusActivityOverrides: [String: Date] = [:]
     private var sessionStatusRevisionOverrides: [String: Date] = [:]
+    private var sessionInterruptionOverrides: [String: Date] = [:]
+    private var sessionStatusMetadataOverrides: [String: [String: JSONValue]] = [:]
     private var sessionsWithoutStatusRevision = Set<String>()
     private var sessionBackgroundTaskStatusOverrides: [String: JSONValue] = [:]
     private var webProjects: [WebProjectDescriptor] = []
@@ -186,8 +188,9 @@ actor MockTransport: Transport {
         sessionStatusOverrides[sessionId] = "idle"
     }
     func setScenario(_ value: MockScenario) { scenario = value }
-    func setSessionStatus(_ sessionId: String, status: String, lastActivityAt: Date? = nil, updatedAt: Date? = nil) {
+    func setSessionStatus(_ sessionId: String, status: String, lastActivityAt: Date? = nil, updatedAt: Date? = nil, interruptedAt: Date? = nil) {
         sessionStatusOverrides[sessionId] = status
+        sessionInterruptionOverrides[sessionId] = interruptedAt
         if let lastActivityAt {
             sessionStatusActivityOverrides[sessionId] = lastActivityAt
         } else {
@@ -201,6 +204,9 @@ actor MockTransport: Transport {
         }
     }
     func omitSessionStatusRevision(_ sessionId: String) { sessionsWithoutStatusRevision.insert(sessionId) }
+    func setSessionStatusMetadata(_ sessionId: String, metadata: [String: JSONValue]) {
+        sessionStatusMetadataOverrides[sessionId] = metadata
+    }
     func setBackgroundTaskStatus(_ sessionId: String, snapshot: BackgroundTaskStatusSnapshot?) {
         guard let snapshot, let value = try? JSONValue.encode(snapshot) else {
             sessionBackgroundTaskStatusOverrides.removeValue(forKey: sessionId)
@@ -641,6 +647,10 @@ actor MockTransport: Transport {
             if let backgroundTaskStatus = sessionBackgroundTaskStatusOverrides[sessionId] {
                 metadata["backgroundTaskStatus"] = backgroundTaskStatus
             }
+            if let interruptedAt = sessionInterruptionOverrides[sessionId] {
+                metadata["webInterruptedTurn"] = .object(["interruptedAt": .string(RemoteAIDate.string(interruptedAt))])
+            }
+            metadata.merge(sessionStatusMetadataOverrides[sessionId] ?? [:]) { _, newer in newer }
             var statusResponse: [String: JSONValue] = [
                 "sessionId": .string(sessionId),
                 "status": .string(sessionStatusOverrides[sessionId] ?? (active ? "generating" : (stored?.status ?? "idle"))),

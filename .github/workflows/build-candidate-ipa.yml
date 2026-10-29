@@ -6,7 +6,7 @@ on:
       gate:
         description: Validation scope
         type: choice
-        options: [candidate, streaming, sync, web-controls, copy-controls, runtime-issues, runtime-issues-device, web-tab-race]
+        options: [candidate, streaming, sync, web-controls, copy-controls, runtime-issues, runtime-issues-device, web-tab-race, provider-observation]
         default: candidate
       unit_sanitizer:
         description: Optional unit-test memory diagnostic on the disposable simulator
@@ -224,15 +224,18 @@ jobs:
               echo "full_unit_suite=not_run_in_runtime_issues_device_gate"
               echo "streaming_cadence_and_process_stress=not_run_in_runtime_issues_device_gate"
               echo "security_audit=scripts/security_audit.sh rerun on this commit"
-            elif [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+            elif [[ '${{ inputs.gate }}' == 'runtime-issues' || '${{ inputs.gate }}' == 'provider-observation' ]]; then
               echo "inherited_full_unit_security_baseline=a33e49f/run40468844319; inherited_streaming_baseline=a33e49f/run40504021022-attempt2 (historical evidence; not revalidated by this run)"
               echo "security_audit=scripts/security_audit.sh rerun on this commit"
               echo "protocol_security_fuzz=not_run_in_runtime_issues_gate"
               echo "full_unit_suite=not_run_in_runtime_issues_gate"
               echo "streaming_cadence_and_process_stress=not_run_in_runtime_issues_gate"
-              echo "runtime_issue_unit_scope=RuntimeIssueSummaryTests (6 methods); GenerationTerminalOutcomeTests (2 methods); SessionCatalogTests (4 methods); targeted PairingTests and RemoteAIMobileTests regressions"
+              echo "runtime_issue_unit_scope=RuntimeIssueSummaryTests (6 methods); GenerationTerminalOutcomeTests (2 methods); SessionCatalogTests (4 methods); provider surface state/observation tests (2 methods); InterruptedSessionStatusTests (3 methods); ProviderObservationOrderingTests (1 method); targeted PairingTests and RemoteAIMobileTests regressions"
               echo "runtime_issue_ui_scope=testRuntimeIssueSummaryOpensAndRefreshesCapabilities;testOpenCachedWebConversation"
               echo "workspace_store_lifecycle_scope=testWorkspaceCoalescesDuplicateInitializationAndLifecycleRace"
+              if [[ '${{ inputs.gate }}' == 'provider-observation' ]]; then
+                echo "previous_source_reproduction=not_rerun; inherited_verified_failure_from_run40821539793; new_observation_getters_absent_in_old_source"
+              fi
             elif [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
               echo "unchanged_full_candidate_baseline=7fd609bde530269347b9089cbce0f2894ed9c232/run39204233990"
               echo "full_unit_and_stream_stress=not_rerun_views_only_controls_change"
@@ -291,7 +294,7 @@ jobs:
           echo "Created pinned simulator: $UDID"
 
       - name: Protocol Security / Fuzz
-        if: inputs.gate != 'streaming' && inputs.gate != 'runtime-issues' && inputs.gate != 'runtime-issues-device'
+        if: inputs.gate != 'streaming' && inputs.gate != 'runtime-issues' && inputs.gate != 'provider-observation' && inputs.gate != 'runtime-issues-device'
         shell: bash
         run: |
           set -euo pipefail
@@ -334,7 +337,7 @@ jobs:
           PY
 
       - name: Unit tests
-        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'runtime-issues' && inputs.gate != 'runtime-issues-device'
+        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'runtime-issues' && inputs.gate != 'provider-observation' && inputs.gate != 'runtime-issues-device'
         shell: bash
         run: |
           set -euo pipefail
@@ -389,7 +392,7 @@ jobs:
           echo "TERMINAL_BEFORE_EXPECTED_FAILURE=$BASELINE_EXIT"
 
       - name: Runtime issue focused unit tests
-        if: inputs.gate == 'runtime-issues'
+        if: inputs.gate == 'runtime-issues' || inputs.gate == 'provider-observation'
         id: runtimeIssueTests
         shell: bash
         run: |
@@ -420,9 +423,13 @@ jobs:
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testAlreadyExecutedIsRecoveredAsSameCommandInsteadOfRollingBackComposer \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testWorkspaceStoreStopReturnsSuccessAndConvergesSessionIdle \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testConcurrentStopRequestsShareOneIdempotentRemoteCommand \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testWebProviderSurfaceIssueShowsOnPhoneWithoutFabricatingBusyStateAndClearsOnRecovery \
+            -only-testing:RemoteAIMobileTests/CodexDirectoryTests/testWebProviderStatusSnapshotDecodesOriginalMessageAndObservationTimes \
             -only-testing:RemoteAIMobileTests/CloudflareTransportPoisonReplayTests \
             -only-testing:RemoteAIMobileTests/WebTabTests \
             -only-testing:RemoteAIMobileTests/StopIdentityTests \
+            -only-testing:RemoteAIMobileTests/InterruptedSessionStatusTests \
+            -only-testing:RemoteAIMobileTests/ProviderObservationOrderingTests \
             | tee build/runtime-issues-tests.log
           xcrun xcresulttool get test-results summary \
             --path build/runtime-issues-tests.xcresult --format json \
@@ -445,11 +452,15 @@ jobs:
               'testAlreadyExecutedIsRecoveredAsSameCommandInsteadOfRollingBackComposer',
               'testWorkspaceStoreStopReturnsSuccessAndConvergesSessionIdle',
               'testConcurrentStopRequestsShareOneIdempotentRemoteCommand',
+              'testWebProviderSurfaceIssueShowsOnPhoneWithoutFabricatingBusyStateAndClearsOnRecovery',
+              'testWebProviderStatusSnapshotDecodesOriginalMessageAndObservationTimes',
           }
           for source in (
               'RemoteAIMobileTests/CloudflareTransportPoisonReplayTests.swift',
               'RemoteAIMobileTests/WebTabTests.swift',
               'RemoteAIMobileTests/StopIdentityTests.swift',
+              'RemoteAIMobileTests/InterruptedSessionStatusTests.swift',
+              'RemoteAIMobileTests/ProviderObservationOrderingTests.swift',
           ):
               text = Path(source).read_text()
               cases = re.findall(r'^\s*func\s+(test[A-Za-z0-9_]+)\s*\(', text, re.MULTILINE)
@@ -492,7 +503,7 @@ jobs:
               --only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable \
               --only testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable \
               | tee build/ui-tests.log
-          elif [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+          elif [[ '${{ inputs.gate }}' == 'runtime-issues' || '${{ inputs.gate }}' == 'provider-observation' ]]; then
             # Exercise the runtime issue summary plus cached conversation navigation.
             python3 scripts/run_candidate_ui_tests.py \
               --udid '${{ steps.simulator.outputs.udid }}' \
@@ -530,7 +541,7 @@ jobs:
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
 
       - name: Streaming cadence and process samples without accessibility polling
-        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'copy-controls' && inputs.gate != 'runtime-issues' && inputs.gate != 'runtime-issues-device'
+        if: inputs.gate != 'streaming' && inputs.gate != 'web-controls' && inputs.gate != 'copy-controls' && inputs.gate != 'runtime-issues' && inputs.gate != 'provider-observation' && inputs.gate != 'runtime-issues-device'
         run: |
           set -euo pipefail
           python3 scripts/sample_streaming_performance.py --udid '${{ steps.simulator.outputs.udid }}' | tee build/stream-performance.log
@@ -659,7 +670,7 @@ jobs:
               echo '- Protocol Security / Fuzz: NOT RUN in this gate'
               echo '- Full unit suite: NOT RUN in this gate'
               echo '- Streaming cadence/process stress: NOT RUN in this gate'
-            elif [[ '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+            elif [[ '${{ inputs.gate }}' == 'runtime-issues' || '${{ inputs.gate }}' == 'provider-observation' ]]; then
               echo '- Static security audit (`scripts/security_audit.sh`): PASS on this commit'
               echo '- Protocol Security / Fuzz: NOT RUN in this gate; inherited baseline run40468844319 is historical evidence and was not revalidated'
               echo '- Full unit suite: NOT RUN; inherited baseline run40468844319 is historical evidence and was not revalidated'
@@ -669,7 +680,7 @@ jobs:
             else
               echo '- Protocol Security / Fuzz: PASS'
             fi
-            if [[ '${{ inputs.gate }}' == 'runtime-issues-device' || '${{ inputs.gate }}' == 'runtime-issues' ]]; then
+            if [[ '${{ inputs.gate }}' == 'runtime-issues-device' || '${{ inputs.gate }}' == 'runtime-issues' || '${{ inputs.gate }}' == 'provider-observation' ]]; then
               :
             elif [[ '${{ inputs.gate }}' == 'web-controls' ]]; then
               echo '- Validation scope: Web controls; 2 targeted UI/navigation tests'

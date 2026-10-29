@@ -4820,8 +4820,10 @@ final class RemoteAIMobileTests: XCTestCase {
                 "providerState": .string("connection-lost"),
                 "code": .string("PROVIDER_UNAVAILABLE"),
                 "message": .string("电脑端 ChatGPT 网页连接已中断；Windows Agent 仍在线，RemoteAI 正在等待 ChatGPT 恢复。"),
+                "originalMessage": .string("Something went wrong. Please try again."),
                 "retryable": .bool(true),
-                "at": .string(RemoteAIDate.string(now))
+                "at": .string(RemoteAIDate.string(now)),
+                "statusObservedAt": .string(RemoteAIDate.string(now.addingTimeInterval(0.1)))
             ],
             createdAt: now
         ), deliverLive: true)
@@ -4831,6 +4833,10 @@ final class RemoteAIMobileTests: XCTestCase {
         }
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
         XCTAssertEqual(store.errors["photo-upload"], "电脑端 ChatGPT 网页连接已中断；Windows Agent 仍在线，RemoteAI 正在等待 ChatGPT 恢复。")
+        XCTAssertEqual(store.webProviderIssueOriginalMessage(forSessionId: "photo-upload"), "Something went wrong. Please try again.")
+        XCTAssertEqual(store.webProviderIssueObservedAt(forSessionId: "photo-upload"), try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(now))))
+        XCTAssertEqual(store.webProviderSurfaceState(forSessionId: "photo-upload"), "degraded")
+        XCTAssertEqual(store.webProviderSurfaceObservedAt(forSessionId: "photo-upload"), try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(now.addingTimeInterval(0.1)))))
         XCTAssertNil(store.liveRunStatusBySession["photo-upload"], "An idle provider outage must not look like an active generation")
         let aIssue = try XCTUnwrap(store.systemNotice(forSessionId: "photo-upload"))
         XCTAssertEqual(aIssue.scope, .session("photo-upload"))
@@ -4982,6 +4988,97 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertNil(store.errors["photo-upload"])
         XCTAssertEqual(store.systemNotice(forSessionId: "photo-upload")?.id, newerGlobal.id, "Dismissing the matching session error preserves the global notice")
         XCTAssertEqual(store.systemNotice(forSessionId: "photo-ios")?.id, bRecovery.id, "Dismissing A's error must preserve B's recovery notice")
+
+        let latestIssueAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(now.addingTimeInterval(4))))
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1206,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "SESSION_STATUS",
+            payload: [
+                "providerSurface": .bool(true),
+                "state": .string("degraded"),
+                "providerState": .string("connection-lost"),
+                "issueState": .string("retry-visible"),
+                "code": .string("PROVIDER_UNAVAILABLE"),
+                "message": .string("网页错误仍在等待恢复。"),
+                "originalMessage": .string("Something went wrong; try again."),
+                "retryable": .bool(false),
+                "at": .string(RemoteAIDate.string(latestIssueAt)),
+                "statusObservedAt": .string(RemoteAIDate.string(latestIssueAt))
+            ],
+            createdAt: latestIssueAt
+        ), deliverLive: true)
+        for _ in 0..<80 where store.errors["photo-upload"] != "网页错误仍在等待恢复。" {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.webProviderIssueState(forSessionId: "photo-upload"), "retry-visible")
+
+        let unverifiableAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(now.addingTimeInterval(5))))
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1207,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "SESSION_STATUS",
+            payload: [
+                "providerSurface": .bool(true),
+                "state": .string("unknown"),
+                "providerState": .string("identity-unverified"),
+                "at": .string(RemoteAIDate.string(latestIssueAt)),
+                "statusObservedAt": .string(RemoteAIDate.string(unverifiableAt))
+            ],
+            createdAt: unverifiableAt
+        ), deliverLive: true)
+        for _ in 0..<80 where store.webProviderSurfaceState(forSessionId: "photo-upload") != "unknown" {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(store.errors["photo-upload"], "网页错误仍在等待恢复。")
+        XCTAssertEqual(store.webProviderIssueObservedAt(forSessionId: "photo-upload"), latestIssueAt)
+        XCTAssertEqual(store.webProviderIssueOriginalMessage(forSessionId: "photo-upload"), "Something went wrong; try again.")
+        XCTAssertEqual(store.webProviderSurfaceObservedAt(forSessionId: "photo-upload"), unverifiableAt)
+
+        // Older Agents omit provider metadata, which is not proof of recovery.
+        await store.synchronizeVisibleSession("photo-upload", force: true)
+        XCTAssertEqual(store.errors["photo-upload"], "网页错误仍在等待恢复。")
+        XCTAssertEqual(store.webProviderIssueObservedAt(forSessionId: "photo-upload"), latestIssueAt)
+        XCTAssertEqual(store.webProviderSurfaceState(forSessionId: "photo-upload"), "unknown")
+        XCTAssertEqual(store.webProviderSurfaceObservedAt(forSessionId: "photo-upload"), unverifiableAt)
+
+        let recoveredAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(now.addingTimeInterval(6))))
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1208,
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            type: "SESSION_STATUS",
+            payload: [
+                "providerSurface": .bool(true),
+                "state": .string("online"),
+                "providerState": .string("online"),
+                "recovered": .bool(true),
+                "at": .string(RemoteAIDate.string(latestIssueAt)),
+                "statusObservedAt": .string(RemoteAIDate.string(recoveredAt))
+            ],
+            createdAt: recoveredAt
+        ), deliverLive: true)
+        for _ in 0..<80 where store.errors["photo-upload"] != nil {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNil(store.errors["photo-upload"])
+        XCTAssertNil(store.webProviderIssueOriginalMessage(forSessionId: "photo-upload"))
+        XCTAssertEqual(store.webProviderSurfaceState(forSessionId: "photo-upload"), "online")
+        XCTAssertEqual(store.webProviderSurfaceObservedAt(forSessionId: "photo-upload"), recoveredAt)
         await store.suspend()
     }
 

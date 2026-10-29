@@ -93,13 +93,14 @@ struct RemoteProviderSurfaceIssue: Equatable {
     let code: String
     let state: String
     let message: String
+    let originalMessage: String?
     let retryable: Bool
     let at: Date?
 }
 
 struct RemoteSessionStatusSnapshot: Equatable {
     let sessionId: String
-    let state: SessionState
+    var state: SessionState
     let browserConnected: Bool?
     var updatedAt: Date? = nil
     let lastActivityAt: Date?
@@ -110,6 +111,10 @@ struct RemoteSessionStatusSnapshot: Equatable {
     var statusSource: String? = nil
     var statusReason: String? = nil
     var statusObservedAt: Date? = nil
+    var providerSurfaceState: String? = nil
+    var providerSurfaceObservedAt: Date? = nil
+    var rawServerStatus: String? = nil
+    var interruptedAt: Date? = nil
 }
 
 enum TransportError: LocalizedError, Equatable {
@@ -301,6 +306,7 @@ extension Transport {
                 code: code,
                 state: state,
                 message: message,
+                originalMessage: providerIssueObject["originalMessage"]?.stringValue.map { String($0.prefix(500)) },
                 retryable: providerIssueObject["retryable"]?.boolValue == true,
                 at: providerIssueObject["at"]?.stringValue.flatMap(RemoteAIDate.parse)
             )
@@ -317,7 +323,11 @@ extension Transport {
             backgroundTaskStatus: backgroundTaskStatus,
             statusSource: object["statusSource"]?.stringValue,
             statusReason: object["statusReason"]?.stringValue,
-            statusObservedAt: object["statusObservedAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+            statusObservedAt: object["statusObservedAt"]?.stringValue.flatMap(RemoteAIDate.parse),
+            providerSurfaceState: metadata["providerSurfaceState"]?.stringValue,
+            providerSurfaceObservedAt: metadata["providerSurfaceObservedAt"]?.stringValue.flatMap(RemoteAIDate.parse),
+            rawServerStatus: status,
+            interruptedAt: metadata["webInterruptedTurn"]?.objectValue?["interruptedAt"]?.stringValue.flatMap(RemoteAIDate.parse)
         )
     }
 

@@ -240,6 +240,10 @@ final class WorkspaceStore: ObservableObject {
     private var systemTransportOfflineChannels = Set<String>()
     private var webProviderIssueMessageBySession: [String: String] = [:]
     private var webProviderIssueStateBySession: [String: String] = [:]
+    private var webProviderIssueOriginalMessageBySession: [String: String] = [:]
+    private var webProviderIssueObservedAtBySession: [String: Date] = [:]
+    @Published private var webProviderSurfaceStateBySession: [String: String] = [:]
+    @Published private var webProviderSurfaceObservedAtBySession: [String: Date] = [:]
     private var webBindingDetachedSessions = Set<String>()
     private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 2.5
     private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 20
@@ -1856,7 +1860,7 @@ final class WorkspaceStore: ObservableObject {
         let statusEventRevision = sessionStatusEventRevisions[sessionId, default: 0]
         let requestStartedAt = Date()
         do {
-            let snapshot = try await activeTransport.sessionStatus(
+            var snapshot = try await activeTransport.sessionStatus(
                 machineId: activeMachineId,
                 runtimeId: route.runtimeId,
                 instanceId: route.instanceId,
@@ -1875,6 +1879,22 @@ final class WorkspaceStore: ObservableObject {
                 return nil
             }
             let liveActivityAt = liveRunActivityAtBySession[sessionId]
+            let observedInterruption = route.runtimeId == "runtime.web"
+                && snapshot.rawServerStatus?.lowercased() == "interrupted"
+            if observedInterruption {
+                // A restart marker is distinct from successful idle. A fresh marker
+                // can retire phantom Busy after a missed terminal push, but cannot
+                // overwrite a newer live run or an in-flight status/event race.
+                if let liveActivityAt,
+                   (liveActivityAt > requestStartedAt
+                    || (snapshot.interruptedAt.map({ $0 < liveActivityAt }) ?? true)) {
+                    return nil
+                }
+                snapshot.state = .unknown
+                snapshot.statusSource = "web-agent-interruption"
+                snapshot.statusReason = "Windows Agent 已中断此轮跟踪；网页当前运行状态未确认，已保留部分内容，请核对电脑端原会话。"
+                snapshot.statusObservedAt = snapshot.interruptedAt
+            }
             let remoteEvidenceAt = [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
             let staleIdleSnapshot: Bool
             if snapshot.state == .idle, let liveActivityAt {
@@ -1907,6 +1927,10 @@ final class WorkspaceStore: ObservableObject {
                     updated.state = snapshot.state
                     updated.lastProgressStatus = snapshot.lastProgressStatus
                     updated.lastProgressAt = snapshot.lastProgressAt
+                    if observedInterruption {
+                        updated.lastProgressStatus = nil
+                        updated.lastProgressAt = nil
+                    }
                     updated.statusSource = snapshot.statusSource
                     updated.statusReason = snapshot.statusReason
                     updated.statusObservedAt = snapshot.statusObservedAt
@@ -1943,7 +1967,16 @@ final class WorkspaceStore: ObservableObject {
             }
             sessionStatusSnapshotRevisions[sessionId] = snapshot.updatedAt
             sessionStatusSnapshotReceivedAt[sessionId] = Date()
-            if snapshot.state == .busy || snapshot.state == .waiting {
+            if observedInterruption {
+                // Preserve the partial row as Streaming so cached history cannot
+                // later mistake it for a confirmed final assistant answer.
+                flushStreaming(sessionId: sessionId)
+                assistantStreams[sessionId]?.performance.stopFrames()
+                liveRunStatusBySession.removeValue(forKey: sessionId)
+                clearLiveRunActivity(sessionId: sessionId)
+                setSessionSystemNotice(snapshot.statusReason ?? "运行状态未确认；请核对电脑端原会话。", sessionId: sessionId, kind: .generationOutcome)
+                try? await settleRunningToolRows(sessionId: sessionId, status: "Interrupted")
+            } else if snapshot.state == .busy || snapshot.state == .waiting {
                 if route.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
                 let activeAt = snapshot.lastProgressAt ?? snapshot.lastActivityAt ?? Date()
                 markLiveRunActivity(sessionId: sessionId, at: activeAt)
@@ -1973,12 +2006,20 @@ final class WorkspaceStore: ObservableObject {
                 clearLiveRunActivity(sessionId: sessionId)
                 try? await settleRunningToolRows(sessionId: sessionId)
             }
-            if route.runtimeId == "runtime.web" {
+            if route.runtimeId == "runtime.web",
+               statusEventRevision == sessionStatusEventRevisions[sessionId, default: 0] {
                 // SESSION_STATUS push is the fast path. The authoritative session-status
                 // poll carries the same providerSurfaceIssue metadata so a phone that
                 // was backgrounded or briefly disconnected still converges to the real
                 // ChatGPT page state after reconnect.
-                applyWebProviderSurfaceIssue(sessionId: sessionId, issue: snapshot.providerSurfaceIssue)
+                if snapshot.providerSurfaceState != nil || snapshot.providerSurfaceIssue != nil {
+                    applyWebProviderSurfaceIssue(
+                        sessionId: sessionId,
+                        issue: snapshot.providerSurfaceIssue,
+                        state: snapshot.providerSurfaceState,
+                        observedAt: snapshot.providerSurfaceObservedAt
+                    )
+                }
             }
             return snapshot
         } catch let error as TransportError where error == .disconnected || error == .timeout || error == .offline {
@@ -2951,6 +2992,10 @@ final class WorkspaceStore: ObservableObject {
         liveRunActivityAtBySession.removeAll()
         webProviderIssueMessageBySession.removeAll()
         webProviderIssueStateBySession.removeAll()
+        webProviderIssueOriginalMessageBySession.removeAll()
+        webProviderIssueObservedAtBySession.removeAll()
+        webProviderSurfaceStateBySession.removeAll()
+        webProviderSurfaceObservedAtBySession.removeAll()
         webBindingDetachedSessions.removeAll()
         webProjectsSnapshotId = nil
         projectConversationSnapshotIds.removeAll()
@@ -4807,15 +4852,24 @@ final class WorkspaceStore: ObservableObject {
             }
         case "SESSION_STATUS":
             if event.payload["providerSurface"]?.boolValue == true {
-                let degraded = event.payload["state"]?.stringValue == "degraded"
-                let issue: RemoteProviderSurfaceIssue? = degraded ? RemoteProviderSurfaceIssue(
+                let state = event.payload["state"]?.stringValue
+                let hasIssueDetails = state == "degraded"
+                    || (state == "unknown" && event.payload["code"]?.stringValue != nil && event.payload["message"]?.stringValue != nil)
+                let issue: RemoteProviderSurfaceIssue? = hasIssueDetails ? RemoteProviderSurfaceIssue(
                     code: event.payload["code"]?.stringValue ?? "PROVIDER_UNAVAILABLE",
-                    state: event.payload["providerState"]?.stringValue ?? "degraded",
+                    state: event.payload["issueState"]?.stringValue ?? event.payload["providerState"]?.stringValue ?? "degraded",
                     message: event.payload["message"]?.stringValue ?? "ChatGPT 网页当前不可用，RemoteAI 正在等待恢复。",
+                    originalMessage: event.payload["originalMessage"]?.stringValue,
                     retryable: event.payload["retryable"]?.boolValue == true,
                     at: event.payload["at"]?.stringValue.flatMap(RemoteAIDate.parse)
                 ) : nil
-                applyWebProviderSurfaceIssue(sessionId: sessionId, issue: issue)
+                applyWebProviderSurfaceIssue(
+                    sessionId: sessionId,
+                    issue: issue,
+                    state: state,
+                    observedAt: event.payload["statusObservedAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+                        ?? event.payload["at"]?.stringValue.flatMap(RemoteAIDate.parse)
+                )
                 return
             }
             await requestMetadataRefresh()
@@ -4885,8 +4939,27 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func applyWebProviderSurfaceIssue(sessionId: String, issue: RemoteProviderSurfaceIssue?) {
-        if let issue {
+    private func applyWebProviderSurfaceIssue(
+        sessionId: String,
+        issue: RemoteProviderSurfaceIssue?,
+        state explicitState: String? = nil,
+        observedAt: Date? = nil
+    ) {
+        let state = explicitState ?? (issue == nil ? nil : "degraded")
+        let observationTime = observedAt ?? issue?.at
+        if let previousTime = webProviderSurfaceObservedAtBySession[sessionId],
+           observationTime.map({ $0 < previousTime }) ?? true {
+            return
+        }
+        if state == "online", observationTime == nil,
+           webProviderIssueMessageBySession[sessionId] != nil {
+            return
+        }
+        if let state {
+            webProviderSurfaceStateBySession[sessionId] = state
+            webProviderSurfaceObservedAtBySession[sessionId] = observationTime
+        }
+        if let issue, state != "online" {
             let message = issue.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "ChatGPT 网页当前不可用，RemoteAI 正在等待恢复。"
                 : issue.message
@@ -4894,6 +4967,8 @@ final class WorkspaceStore: ObservableObject {
             let previousState = webProviderIssueStateBySession[sessionId]
             webProviderIssueMessageBySession[sessionId] = message
             webProviderIssueStateBySession[sessionId] = issue.state
+            webProviderIssueOriginalMessageBySession[sessionId] = issue.originalMessage.map { String($0.prefix(500)) }
+            webProviderIssueObservedAtBySession[sessionId] = issue.at
             errors[sessionId] = message
 
             let currentState = sessions.first(where: { $0.id == sessionId })?.state
@@ -4912,8 +4987,15 @@ final class WorkspaceStore: ObservableObject {
             return
         }
 
+        // Unknown means the page identity or health could not be verified. Keep the
+        // last real provider error and its original observation time until a verified
+        // online status arrives. Missing status metadata is filtered by the caller.
+        guard state == "online" else { return }
+
         guard let previousMessage = webProviderIssueMessageBySession.removeValue(forKey: sessionId) else { return }
         let previousState = webProviderIssueStateBySession.removeValue(forKey: sessionId) ?? "degraded"
+        webProviderIssueOriginalMessageBySession.removeValue(forKey: sessionId)
+        webProviderIssueObservedAtBySession.removeValue(forKey: sessionId)
         if errors[sessionId] == previousMessage { errors[sessionId] = nil }
         if liveRunStatusBySession[sessionId] == previousMessage {
             let currentState = sessions.first(where: { $0.id == sessionId })?.state
@@ -4932,6 +5014,26 @@ final class WorkspaceStore: ObservableObject {
             "session": sessionId,
             "previousState": previousState,
         ])
+    }
+
+    func webProviderIssueOriginalMessage(forSessionId sessionId: String) -> String? {
+        webProviderIssueOriginalMessageBySession[sessionId]
+    }
+
+    func webProviderIssueObservedAt(forSessionId sessionId: String) -> Date? {
+        webProviderIssueObservedAtBySession[sessionId]
+    }
+
+    func webProviderIssueState(forSessionId sessionId: String) -> String? {
+        webProviderIssueStateBySession[sessionId]
+    }
+
+    func webProviderSurfaceState(forSessionId sessionId: String) -> String? {
+        webProviderSurfaceStateBySession[sessionId]
+    }
+
+    func webProviderSurfaceObservedAt(forSessionId sessionId: String) -> Date? {
+        webProviderSurfaceObservedAtBySession[sessionId]
     }
 
     func systemNotice(

@@ -43,6 +43,39 @@ enum ConnectionDiagnosticPhase: String, Codable, Equatable {
     }
 }
 enum SessionState: String, Codable { case idle = "Idle", busy = "Busy", waiting = "Waiting", sleeping = "Sleeping", error = "Error", unknown = "Unknown" }
+enum WebProviderSurfaceState: String {
+    case degraded
+    case online
+    case unknown
+
+    var displayName: String {
+        switch self {
+        case .degraded: return "网页异常"
+        case .online: return "网页已验证正常"
+        case .unknown: return "网页状态无法核验"
+        }
+    }
+
+    static func issueDisplayName(_ state: String) -> String {
+        switch state.lowercased() {
+        case "connection-lost": return "网页连接中断"
+        case "response-incomplete": return "回复未完成"
+        case "delivery-unknown": return "消息是否送达尚未确认"
+        case "response-network-error": return "网页回复出现网络错误"
+        case "response-unavailable": return "网页回复无法加载"
+        case "retry-visible": return "网页显示 Retry，回复可能失败"
+        case "provider-error": return "网页报告错误"
+        case "rate-limited": return "网页请求受限"
+        case "verification-required": return "网页需要安全验证"
+        case "auth-required": return "网页登录状态失效"
+        case "conversation-unavailable": return "当前对话无法加载"
+        case "service-error": return "网页服务异常"
+        case "page-translated": return "网页被浏览器翻译"
+        case "identity-unverified": return "网页身份尚未核验"
+        default: return "网页状态：\(state)"
+        }
+    }
+}
 enum CommandState: String, Codable { case pending = "Pending", acknowledged = "Acknowledged", executing = "Executing", completed = "Completed", failed = "Failed", unknown = "Unknown" }
 enum WebState: String, Codable { case registered = "Registered", browserClosed = "BrowserClosed", attached = "Attached", unsupported = "Unsupported" }
 enum MessageRole: String, Codable { case user, assistant, system, tool }

@@ -131,6 +131,40 @@ final class CodexDirectoryTests: XCTestCase {
         XCTAssertEqual(targeted.unknownStatusExplanation, "无法连接 Codex Desktop")
     }
 
+    func testWebProviderStatusSnapshotDecodesOriginalMessageAndObservationTimes() async throws {
+        let issueAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date(timeIntervalSince1970: 1_700_000_001))))
+        let observedAt = try XCTUnwrap(RemoteAIDate.parse(RemoteAIDate.string(Date(timeIntervalSince1970: 1_700_000_002))))
+        let transport = StatusResponseTransport(result: .object([
+            "sessionId": .string("web-chat"),
+            "status": .string("idle"),
+            "metadata": .object([
+                "providerSurfaceState": .string("unknown"),
+                "providerSurfaceObservedAt": .string(RemoteAIDate.string(observedAt)),
+                "providerSurfaceIssue": .object([
+                    "code": .string("PROVIDER_UNAVAILABLE"),
+                    "state": .string("connection-lost"),
+                    "message": .string("电脑端 ChatGPT 网页连接已中断，正在等待恢复。"),
+                    "originalMessage": .string("Something went wrong while loading the reply."),
+                    "retryable": .bool(false),
+                    "at": .string(RemoteAIDate.string(issueAt)),
+                ]),
+            ]),
+        ]))
+
+        let snapshot = try await transport.sessionStatus(
+            machineId: "my-pc",
+            runtimeId: "runtime.web",
+            instanceId: "web.chatgpt",
+            sessionId: "web-chat"
+        )
+
+        XCTAssertEqual(snapshot.providerSurfaceState, "unknown")
+        XCTAssertEqual(snapshot.providerSurfaceObservedAt, observedAt)
+        let issue = try XCTUnwrap(snapshot.providerSurfaceIssue)
+        XCTAssertEqual(issue.originalMessage, "Something went wrong while loading the reply.")
+        XCTAssertEqual(issue.at, issueAt, "Unknown health must preserve the original error observation time")
+    }
+
     func testUnknownStatusExplanationIsLimitedToUnknownRows() {
         var row = session("unqueried", cwd: nil)
         row.state = .unknown
