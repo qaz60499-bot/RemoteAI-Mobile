@@ -1372,8 +1372,11 @@ final class WorkspaceStore: ObservableObject {
             }
             try? await cache.upsertMessages(authoritativeItems)
             merge(authoritativeItems, into: sessionId)
-            if route.runtimeId == "runtime.web",
-               snapshot.providerSurfaceState != nil || snapshot.providerSurfaceIssue != nil {
+            if route.runtimeId == "runtime.web" {
+                // A verified history page is sufficient to clean legacy visual
+                // transcript artifacts. This load path has no status snapshot;
+                // provider issue observations are reconciled separately by
+                // refreshVisibleSessionStatus, not invented from this history read.
                 await collapseWebTranscriptArtifacts(sessionId: sessionId)
                 // A successful authoritative history read proves that this exact web
                 // conversation is available again, even if the WEB_BINDING_CHANGED
