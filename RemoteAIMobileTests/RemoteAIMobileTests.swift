@@ -3750,6 +3750,85 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testRetryWithMissingOrCorruptOriginalCommandStaysUnknownAndDoesNotDropModelOrAttachments() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .webSendDeliveryUnknown, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let commandId = UUID()
+        let attachment = PendingAttachment(
+            name: "proof.txt",
+            contentType: "text/plain",
+            data: Data("structured attachment payload".utf8)
+        )
+
+        let sent = await store.send(
+            text: "unknown-with-model-and-attachment",
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            attachments: [attachment],
+            model: "original-model",
+            commandId: commandId
+        )
+
+        XCTAssertFalse(sent)
+        XCTAssertEqual(store.commandStates[commandId], .unknown)
+        let pendingKey = "pending.command.my-pc.\(commandId.uuidString.lowercased())"
+        let savedOriginal: RemoteCommand? = try await cache.get(RemoteCommand.self, key: pendingKey)
+        let original = try XCTUnwrap(savedOriginal)
+        XCTAssertEqual(original.payload["model"]?.stringValue, "original-model")
+        let originalAttachmentIds = try XCTUnwrap(original.payload["attachmentIds"]?.arrayValue?.compactMap(\.stringValue))
+        XCTAssertEqual(originalAttachmentIds.count, 1)
+        let bubble = try XCTUnwrap(store.messagesBySession["photo-upload"]?.first { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame })
+        XCTAssertEqual(bubble.resolvedAttachments.compactMap(\.attachmentId), originalAttachmentIds)
+
+        // The visible bubble cannot recreate the original model or attachment route.
+        try await cache.remove(key: pendingKey)
+        await store.retry(message: bubble, runtimeId: "runtime.web", instanceId: "photo", model: "fallback-model")
+
+        XCTAssertEqual(store.commandStates[commandId], .unknown)
+        XCTAssertTrue(store.errors["photo-upload"]?.contains("original send command is unavailable") == true)
+        let sendAttempts = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sendAttempts, 1, "Retry without the durable original command must never replay a text-only or fallback-model command")
+
+        try await cache.put("not-a-remote-command", key: pendingKey)
+        await store.retry(message: bubble, runtimeId: "runtime.web", instanceId: "photo", model: "fallback-model")
+
+        XCTAssertEqual(store.commandStates[commandId], .unknown, "An unreadable durable command must remain unknown for authoritative reconciliation")
+        let sendAttemptsAfterCorruptRecord = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sendAttemptsAfterCorruptRecord, 1, "A corrupt original command must not trigger a reconstructed replay")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testOversizedPendingCommandFailsBeforeProviderSend() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let commandId = UUID()
+        let text = String(repeating: "x", count: SQLiteStore.maxKVBytes + 4_096)
+
+        let sent = await store.send(
+            text: text,
+            runtimeId: "runtime.web",
+            instanceId: "photo",
+            sessionId: "photo-upload",
+            commandId: commandId
+        )
+
+        XCTAssertFalse(sent)
+        XCTAssertEqual(store.commandStates[commandId], .failed)
+        XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame })
+        let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertNil(pending)
+        let sendAttempts = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sendAttempts, 0, "A command rejected by the durable pending-store limit must not reach the provider")
+        await store.suspend()
+    }
+
+    @MainActor
     func testOldHistoricalFinalDoesNotClearUnknownWebSendNotice() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .webSendDeliveryUnknown, historyCount: 1200)

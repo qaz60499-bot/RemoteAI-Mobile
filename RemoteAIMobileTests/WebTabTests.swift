@@ -98,6 +98,25 @@ final class WebTabTests: XCTestCase {
         XCTAssertEqual(transport.commands.first?.commandId, commands[0].commandId)
     }
 
+    func testOfflineInventoryCanRecoverAfterAgentReturnsWithoutDeclaringClosure() async throws {
+        let transport = TabTransport()
+        let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+        store.machine.state = .offline
+
+        await store.refreshOpenWebTabs()
+        XCTAssertTrue(store.openWebTabsQueryFailed)
+        XCTAssertFalse(store.hasLoadedOpenWebTabs)
+        XCTAssertEqual(transport.commands.filter { $0.action == "listOpenWebTabs" }.count, 0)
+
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+        XCTAssertFalse(store.openWebTabsQueryFailed)
+        XCTAssertTrue(store.hasLoadedOpenWebTabs)
+        XCTAssertEqual(store.openWebTabs.map(\.id), [7])
+        XCTAssertTrue(store.closedWebTabs.isEmpty)
+        XCTAssertEqual(transport.commands.filter { $0.action == "listOpenWebTabs" }.count, 1)
+    }
+
     func testInventoryFailureRetainsConfirmedTabsAndDoesNotDeclareClosure() async throws {
         let transport = TabTransport()
         let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())

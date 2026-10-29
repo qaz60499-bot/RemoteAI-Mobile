@@ -126,6 +126,7 @@ actor CloudflareTransport: Transport {
             }
             startHeartbeat(task)
         } catch {
+            await recordDiagnostic("relay_connect_failed", fields: Self.socketFailureDiagnosticFields(error, socket: attemptedSocket), level: "WARN")
             if let attemptedSocket, socket === attemptedSocket {
                 socket = nil
                 attemptedSocket.cancel(with: .goingAway, reason: nil)
@@ -237,6 +238,10 @@ actor CloudflareTransport: Transport {
                 try await handle(frame)
             } catch {
                 if socket === activeSocket {
+                    // Keep the original failure before pending commands are deliberately
+                    // normalized to disconnected. Numeric provenance distinguishes a
+                    // URLSession network failure from a protocol/decryption rejection.
+                    await recordDiagnostic("relay_receive_failed", fields: Self.socketFailureDiagnosticFields(error, socket: activeSocket), level: "WARN")
                     if (error as? TransportError) == .pairingRequired {
                         closeActiveSocket(activeSocket, pendingError: TransportError.pairingRequired)
                     } else {
@@ -459,6 +464,24 @@ actor CloudflareTransport: Transport {
         await MainActor.run {
             DiagnosticsLog.shared.record(event, fields: fields, level: level)
         }
+    }
+
+    static func socketFailureDiagnosticFields(_ error: Error, socket: URLSessionWebSocketTask?) -> [String: String] {
+        let native = error as NSError
+        var fields = [
+            "errorType": String(describing: type(of: error)),
+            "errorDomain": native.domain,
+            "errorCode": String(native.code),
+        ]
+        if let transportError = error as? TransportError {
+            fields.merge(transportError.diagnosticFields) { _, value in value }
+        }
+        if let socket {
+            fields["socketTaskId"] = String(socket.taskIdentifier)
+            fields["socketCloseCode"] = String(socket.closeCode.rawValue)
+        }
+        // Do not export localizedDescription, userInfo, URLs or frame contents.
+        return fields
     }
 
     private func closeActiveSocket(_ activeSocket: URLSessionWebSocketTask, pendingError: Error) {

@@ -805,6 +805,14 @@ struct InstanceView: View {
                 if isAntigravity { await store.refreshAntigravityProjects() }
             }
         }
+        .onChange(of: store.machine.state) { state in
+            // The Windows Agent can start after this catalog is already visible.
+            // Its first offline inventory must be rechecked as soon as the paired
+            // machine becomes online, instead of waiting for the 45s timer or
+            // requiring the user to leave/re-enter the screen.
+            guard isChatGPTWeb, scenePhase == .active, state == .online else { return }
+            Task { await store.refreshOpenWebTabs() }
+        }
         .refreshable {
             if isChatGPTWeb {
                 await store.refreshOpenWebTabs()

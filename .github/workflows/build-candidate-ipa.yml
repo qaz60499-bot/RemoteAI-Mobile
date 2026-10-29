@@ -390,6 +390,7 @@ jobs:
 
       - name: Runtime issue focused unit tests
         if: inputs.gate == 'runtime-issues'
+        id: runtimeIssueTests
         shell: bash
         run: |
           set -euo pipefail
@@ -413,8 +414,65 @@ jobs:
             -only-testing:RemoteAIMobileTests/PairingTests/testForegroundCallbacksAvoidUnnecessaryReconnectAndHideBriefStatusFlash \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testBackgroundTaskStatusStaysSeparateFromIdleAndStaleConversationStatus \
             -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testWorkspaceCoalescesDuplicateInitializationAndLifecycleRace \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testRetryWithMissingOrCorruptOriginalCommandStaysUnknownAndDoesNotDropModelOrAttachments \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testOversizedPendingCommandFailsBeforeProviderSend \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testTransportDisconnectAutoReconnectsAndReplaysExactCommandWithoutDuplicateSideEffect \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testAlreadyExecutedIsRecoveredAsSameCommandInsteadOfRollingBackComposer \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testWorkspaceStoreStopReturnsSuccessAndConvergesSessionIdle \
+            -only-testing:RemoteAIMobileTests/RemoteAIMobileTests/testConcurrentStopRequestsShareOneIdempotentRemoteCommand \
+            -only-testing:RemoteAIMobileTests/CloudflareTransportPoisonReplayTests \
+            -only-testing:RemoteAIMobileTests/WebTabTests \
+            -only-testing:RemoteAIMobileTests/StopIdentityTests \
             | tee build/runtime-issues-tests.log
-          grep -E 'Executed 15 tests?, with 0 failures' build/runtime-issues-tests.log | tail -1
+          xcrun xcresulttool get test-results summary \
+            --path build/runtime-issues-tests.xcresult --format json \
+            > build/runtime-issues-tests-summary.json
+          xcrun xcresulttool get test-results tests \
+            --path build/runtime-issues-tests.xcresult --format json \
+            > build/runtime-issues-test-nodes.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          summary = json.loads(Path('build/runtime-issues-tests-summary.json').read_text())
+          test_nodes = json.loads(Path('build/runtime-issues-test-nodes.json').read_text())
+          required = {
+              'testRetryWithMissingOrCorruptOriginalCommandStaysUnknownAndDoesNotDropModelOrAttachments',
+              'testOversizedPendingCommandFailsBeforeProviderSend',
+              'testTransportDisconnectAutoReconnectsAndReplaysExactCommandWithoutDuplicateSideEffect',
+              'testAlreadyExecutedIsRecoveredAsSameCommandInsteadOfRollingBackComposer',
+              'testWorkspaceStoreStopReturnsSuccessAndConvergesSessionIdle',
+              'testConcurrentStopRequestsShareOneIdempotentRemoteCommand',
+          }
+          for source in (
+              'RemoteAIMobileTests/CloudflareTransportPoisonReplayTests.swift',
+              'RemoteAIMobileTests/WebTabTests.swift',
+              'RemoteAIMobileTests/StopIdentityTests.swift',
+          ):
+              text = Path(source).read_text()
+              cases = re.findall(r'^\s*func\s+(test[A-Za-z0-9_]+)\s*\(', text, re.MULTILINE)
+              if not cases:
+                  raise SystemExit(f'No XCTest cases found in {source}')
+              required.update(cases)
+
+          result_tree = json.dumps(test_nodes, ensure_ascii=False)
+          missing = sorted(name for name in required if name not in result_tree)
+          if missing:
+              raise SystemExit('XCTest result bundle omitted requested cases: ' + ', '.join(missing))
+
+          total = summary.get('totalTestCount')
+          passed = summary.get('passedTests')
+          failed = summary.get('failedTests')
+          skipped = summary.get('skippedTests')
+          if (summary.get('result') != 'Passed' or failed != 0 or skipped != 0 or
+                  total != passed or total < 15 + len(required)):
+              raise SystemExit(f'Unexpected XCTest summary: {summary}')
+
+          print(f'RUNTIME_ISSUES_XCTEST_PASS={total}; required targeted cases present={len(required)}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'total_tests={total}\n')
 
       - name: Streaming unit tests
         if: inputs.gate == 'streaming'
@@ -606,7 +664,7 @@ jobs:
               echo '- Protocol Security / Fuzz: NOT RUN in this gate; inherited baseline run40468844319 is historical evidence and was not revalidated'
               echo '- Full unit suite: NOT RUN; inherited baseline run40468844319 is historical evidence and was not revalidated'
               echo '- Streaming cadence/process stress: NOT RUN; long-stream simulator baseline run40504021022-attempt2 is inherited; no new cadence measurement'
-              echo '- Runtime issue unit scope: PASS (6 RuntimeIssueSummaryTests, 2 GenerationTerminalOutcomeTests, 4 SessionCatalogTests, and 3 targeted regressions including the WorkspaceStore lifecycle race; 15 tests total)'
+              echo '- Runtime issue unit scope: PASS (${{ steps.runtimeIssueTests.outputs.total_tests }} XCTest cases verified from the result bundle, including the retry, Stop, tab inventory, and transport diagnostic regressions)'
               echo '- UI scope: PASS (runtime issue summary and cached conversation navigation; 2 tests)'
             else
               echo '- Protocol Security / Fuzz: PASS'
@@ -662,6 +720,8 @@ jobs:
             build/unit-crashes
             build/tests.log
             build/runtime-issues-tests.log
+            build/runtime-issues-tests-summary.json
+            build/runtime-issues-test-nodes.json
             build/unit-actor-isolation-probe.json
           retention-days: 7
 

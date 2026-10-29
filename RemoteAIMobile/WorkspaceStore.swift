@@ -63,6 +63,35 @@ private enum GenerationTerminalOutcome: Equatable {
     case failed
 }
 
+private struct PendingStopOperationRecord: Codable, Equatable {
+    let schemaVersion: Int
+    let commandId: UUID
+    let storeEpoch: UUID
+    let runIdentity: UUID
+    let issuedAt: Date
+    let issuedSequence: Int64
+
+    init(commandId: UUID, storeEpoch: UUID, runIdentity: UUID, issuedAt: Date, issuedSequence: Int64) {
+        self.schemaVersion = 1
+        self.commandId = commandId
+        self.storeEpoch = storeEpoch
+        self.runIdentity = runIdentity
+        self.issuedAt = issuedAt
+        self.issuedSequence = issuedSequence
+    }
+}
+
+private enum PendingStopCacheValue: Equatable {
+    case record(PendingStopOperationRecord)
+    case legacyString(String)
+}
+
+private enum PendingStopCacheRead {
+    case missing
+    case value(PendingStopCacheValue)
+    case unreadable
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     @Published var machine = MachineMetadata(id: "my-pc", name: "My PC", state: .connecting)
@@ -229,7 +258,15 @@ final class WorkspaceStore: ObservableObject {
     private var creatingWebProjects = Set<String>()
     private var creatingWebConversations = Set<String>()
     private var creatingSessions = Set<String>()
-    private var stopTasksBySession: [String: Task<Bool, Never>] = [:]
+    private struct StopTaskEntry {
+        let identity: UUID
+        let runIdentity: UUID
+        let task: Task<Bool, Never>
+    }
+    private var stopTasksBySession: [String: StopTaskEntry] = [:]
+    private var stopRunIdentitiesBySession: [String: UUID] = [:]
+    private var stopRunBoundariesBySession: [String: UUID] = [:]
+    private let stopStoreEpoch = UUID()
     private var commandSendsInFlight = Set<UUID>()
     private var metadataRefreshInFlight = false
     private var metadataRefreshQueued = false
@@ -2274,7 +2311,9 @@ final class WorkspaceStore: ObservableObject {
             if !model.isEmpty { payload["model"] = .string(model) }
             if !remoteAttachments.isEmpty { payload["attachmentIds"] = .array(remoteAttachments.map { .string($0.attachmentId) }) }
             let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "sendMessage", payload: payload, commandId: commandId)
-            try? await cache.put(command, key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
+            // Unknown-delivery recovery must replay the complete original payload.
+            // Do not dispatch if that durable identity could not be saved.
+            try await cache.put(command, key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             messageCommandPersisted = true
             commandStates[commandId] = .executing
@@ -2286,6 +2325,7 @@ final class WorkspaceStore: ObservableObject {
             // can be lost during a ChatGPT SPA document replacement even though Send was
             // accepted. The next authoritative final/delta will settle this state.
             let confirmedSendAt = Date()
+            markConfirmedRunBoundary(sessionId: sessionId)
             setSessionState(sessionId, .busy)
             markLiveRunActivity(sessionId: sessionId, at: confirmedSendAt)
             if runtimeId == "runtime.web" {
@@ -2475,15 +2515,11 @@ final class WorkspaceStore: ObservableObject {
         let activeTransport = transport
         let activeMachineId = machine.id
         do {
-            let command: RemoteCommand
-            if let stored = try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(commandId, machineId: activeMachineId)) {
-                command = stored
-            } else {
-                guard !message.text.contains("[Attachments:") else {
-                    errors[message.sessionId] = "The saved attachment retry payload is unavailable. Refresh the conversation before sending anything again."
-                    return
-                }
-                command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: message.sessionId, action: "sendMessage", payload: ["text": .string(message.text)], commandId: commandId)
+            guard let command = try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(commandId, machineId: activeMachineId)) else {
+                // A bubble cannot reconstruct the original model, attachments or route.
+                // Keep delivery unknown until an authoritative history read resolves it.
+                errors[message.sessionId] = "The original send command is unavailable. Refresh the conversation to check delivery before sending anything again."
+                return
             }
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
             commandStates[commandId] = .executing
@@ -2510,20 +2546,24 @@ final class WorkspaceStore: ObservableObject {
 
     @discardableResult
     func stop(runtimeId: String, instanceId: String, sessionId: String) async -> Bool {
-        if let inFlight = stopTasksBySession[sessionId] {
-            return await inFlight.value
+        let runIdentity = stopRunIdentity(for: sessionId)
+        if let inFlight = stopTasksBySession[sessionId], inFlight.runIdentity == runIdentity {
+            return await inFlight.task.value
         }
+        let entryIdentity = UUID()
         let task = Task { @MainActor [weak self] in
             guard let self else { return false }
-            return await self.performStop(runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId)
+            return await self.performStop(runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, runIdentity: runIdentity)
         }
-        stopTasksBySession[sessionId] = task
+        stopTasksBySession[sessionId] = StopTaskEntry(identity: entryIdentity, runIdentity: runIdentity, task: task)
         let result = await task.value
-        stopTasksBySession.removeValue(forKey: sessionId)
+        if stopTasksBySession[sessionId]?.identity == entryIdentity {
+            stopTasksBySession.removeValue(forKey: sessionId)
+        }
         return result
     }
 
-    private func performStop(runtimeId: String, instanceId: String, sessionId: String) async -> Bool {
+    private func performStop(runtimeId: String, instanceId: String, sessionId: String, runIdentity: UUID) async -> Bool {
         guard machine.state == .online else {
             errors[sessionId] = "PC Offline — stop will not be queued blindly."
             return false
@@ -2532,24 +2572,264 @@ final class WorkspaceStore: ObservableObject {
         let activeTransport = transport
         let activeMachineId = machine.id
         let operationKey = "stop.\(runtimeId).\(instanceId).\(sessionId)"
-        let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
-        guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+        let cacheKey = "pending.operation.\(activeMachineId).\(operationKey)"
+        guard stopRunIdentitiesBySession[sessionId] == runIdentity else { return false }
+
+        let pendingRead = await readPendingStopOperation(key: cacheKey)
+        guard generation == lifecycleGeneration,
+              transport === activeTransport,
+              machine.id == activeMachineId,
+              !isSuspended,
+              stopRunIdentitiesBySession[sessionId] == runIdentity else { return false }
+        if case .unreadable = pendingRead {
+            errors[sessionId] = "The saved Stop recovery record could not be read safely. Refresh the session before stopping again."
+            DiagnosticsLog.shared.record("stop_pending_record_unreadable", fields: ["session": sessionId], level: "ERROR")
+            return false
+        }
+
+        var commandId = UUID()
+        var issuedSequence = max(0, tracker.lastSequence)
+        if case .value(let value) = pendingRead {
+            let eventRevision = sessionStatusEventRevisions[sessionId, default: 0]
+            do {
+                let snapshot = try await activeTransport.sessionStatus(
+                    machineId: activeMachineId,
+                    runtimeId: runtimeId,
+                    instanceId: instanceId,
+                    sessionId: sessionId
+                )
+                guard generation == lifecycleGeneration,
+                      transport === activeTransport,
+                      machine.id == activeMachineId,
+                      !isSuspended,
+                      stopRunIdentitiesBySession[sessionId] == runIdentity,
+                      eventRevision == sessionStatusEventRevisions[sessionId, default: 0] else { return false }
+
+                switch snapshot.state {
+                case .busy, .waiting:
+                    let remoteSequence = try await activeTransport.latestSequence(machineId: activeMachineId)
+                    guard generation == lifecycleGeneration,
+                          transport === activeTransport,
+                          machine.id == activeMachineId,
+                          !isSuspended,
+                          stopRunIdentitiesBySession[sessionId] == runIdentity,
+                          eventRevision == sessionStatusEventRevisions[sessionId, default: 0] else { return false }
+                    issuedSequence = max(0, remoteSequence)
+                    if case .record(let record) = value,
+                       record.schemaVersion == 1,
+                       record.storeEpoch == stopStoreEpoch,
+                       record.runIdentity == runIdentity,
+                       remoteSequence == record.issuedSequence {
+                        commandId = record.commandId
+                        issuedSequence = record.issuedSequence
+                    }
+                case .idle:
+                    if isKnownRunBoundaryAfterPendingStop(value, sessionId: sessionId, runIdentity: runIdentity) {
+                        // A confirmed phone Send or a live GENERATION_STARTED may beat
+                        // the Agent's status projection. Keep the explicit Stop bound to
+                        // that newer run and issue a fresh identity.
+                        issuedSequence = max(0, try await activeTransport.latestSequence(machineId: activeMachineId))
+                        guard generation == lifecycleGeneration,
+                              transport === activeTransport,
+                              machine.id == activeMachineId,
+                              !isSuspended,
+                              stopRunIdentitiesBySession[sessionId] == runIdentity,
+                              eventRevision == sessionStatusEventRevisions[sessionId, default: 0] else { return false }
+                    } else {
+                        try await clearPendingStopOperation(key: cacheKey, matching: value)
+                        guard generation == lifecycleGeneration,
+                              transport === activeTransport,
+                              machine.id == activeMachineId,
+                              !isSuspended,
+                              stopRunIdentitiesBySession[sessionId] == runIdentity,
+                              eventRevision == sessionStatusEventRevisions[sessionId, default: 0] else { return false }
+                        setSessionState(sessionId, snapshot.state)
+                        return true
+                    }
+                case .sleeping, .error:
+                    try await clearPendingStopOperation(key: cacheKey, matching: value)
+                    guard generation == lifecycleGeneration,
+                          transport === activeTransport,
+                          machine.id == activeMachineId,
+                          !isSuspended,
+                          stopRunIdentitiesBySession[sessionId] == runIdentity,
+                          eventRevision == sessionStatusEventRevisions[sessionId, default: 0] else { return false }
+                    setSessionState(sessionId, snapshot.state)
+                    return true
+                case .unknown:
+                    errors[sessionId] = "The current session state is unknown. Refresh it before retrying Stop."
+                    return false
+                }
+            } catch {
+                guard generation == lifecycleGeneration,
+                      transport === activeTransport,
+                      machine.id == activeMachineId,
+                      !isSuspended else { return false }
+                errors[sessionId] = "Could not verify the current session before retrying Stop: \(error.localizedDescription)"
+                DiagnosticsLog.shared.record("stop_pending_snapshot_failed", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
+                return false
+            }
+        }
+
+        let operationRecord = PendingStopOperationRecord(
+            commandId: commandId,
+            storeEpoch: stopStoreEpoch,
+            runIdentity: runIdentity,
+            issuedAt: Date(),
+            issuedSequence: issuedSequence
+        )
+        let recordWasSaved: Bool
+        do {
+            switch pendingRead {
+            case .missing:
+                recordWasSaved = try await cache.putIfAbsent(operationRecord, key: cacheKey)
+            case .value(.record(let oldRecord)):
+                recordWasSaved = try await cache.replace(operationRecord, key: cacheKey, matching: oldRecord)
+            case .value(.legacyString(let raw)):
+                recordWasSaved = try await cache.replace(operationRecord, key: cacheKey, matching: raw)
+            case .unreadable:
+                recordWasSaved = false
+            }
+        } catch {
+            guard generation == lifecycleGeneration,
+                  transport === activeTransport,
+                  machine.id == activeMachineId,
+                  !isSuspended else { return false }
+            errors[sessionId] = "The Stop recovery record could not be saved, so Stop was not sent: \(error.localizedDescription)"
+            DiagnosticsLog.shared.record("stop_pending_record_write_failed", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "ERROR")
+            return false
+        }
+        guard recordWasSaved else {
+            if generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended {
+                errors[sessionId] = "The Stop recovery record changed while Stop was being prepared. Refresh the session before retrying."
+                DiagnosticsLog.shared.record("stop_pending_record_changed", fields: ["session": sessionId], level: "WARN")
+            }
+            return false
+        }
+        guard generation == lifecycleGeneration,
+              transport === activeTransport,
+              machine.id == activeMachineId,
+              !isSuspended,
+              stopRunIdentitiesBySession[sessionId] == runIdentity else {
+            do { try await clearPendingStopOperation(key: cacheKey, matchingCommandId: commandId) }
+            catch { DiagnosticsLog.shared.record("stop_stale_record_cleanup_failed", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN") }
+            return false
+        }
+
         let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "stopGeneration", commandId: commandId)
         commandStates[command.commandId] = .pending
+        let stopEventRevision = sessionStatusEventRevisions[sessionId, default: 0]
         do {
             let state = try await activeTransport.send(command)
-            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+            guard generation == lifecycleGeneration,
+                  transport === activeTransport,
+                  machine.id == activeMachineId,
+                  !isSuspended else { return false }
             commandStates[command.commandId] = state
-            await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
-            setSessionState(sessionId, .idle)
-            errors[sessionId] = nil
+            do {
+                try await clearPendingStopOperation(key: cacheKey, matchingCommandId: commandId)
+            } catch {
+                DiagnosticsLog.shared.record("stop_pending_record_clear_failed", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
+            }
+            guard generation == lifecycleGeneration,
+                  transport === activeTransport,
+                  machine.id == activeMachineId,
+                  !isSuspended else { return false }
+            if stopRunIdentitiesBySession[sessionId] == runIdentity {
+                if stopEventRevision == sessionStatusEventRevisions[sessionId, default: 0] {
+                    setSessionState(sessionId, .idle)
+                    errors[sessionId] = nil
+                } else {
+                    // A run/status event raced the ACK. Only fresh authoritative status
+                    // may decide whether this Stop still describes the current run.
+                    _ = await refreshVisibleSessionStatus(sessionId, rejectEvidencePoorIdle: true)
+                }
+            }
             return true
         } catch {
-            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+            guard generation == lifecycleGeneration,
+                  transport === activeTransport,
+                  machine.id == activeMachineId,
+                  !isSuspended else { return false }
             commandStates[command.commandId] = isUnknownDelivery(error) ? .unknown : .failed
-            if !isUnknownDelivery(error) { await finishPendingOperation(key: operationKey, machineId: activeMachineId) }
-            errors[sessionId] = error.localizedDescription
+            if !isUnknownDelivery(error) {
+                do { try await clearPendingStopOperation(key: cacheKey, matchingCommandId: commandId) }
+                catch {
+                    DiagnosticsLog.shared.record("stop_pending_record_clear_failed", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
+                }
+            }
+            if stopRunIdentitiesBySession[sessionId] == runIdentity {
+                errors[sessionId] = error.localizedDescription
+            }
             return false
+        }
+    }
+
+    private func stopRunIdentity(for sessionId: String) -> UUID {
+        if let identity = stopRunIdentitiesBySession[sessionId] { return identity }
+        let identity = UUID()
+        stopRunIdentitiesBySession[sessionId] = identity
+        return identity
+    }
+
+    private func markConfirmedRunBoundary(sessionId: String) {
+        let identity = UUID()
+        stopRunIdentitiesBySession[sessionId] = identity
+        stopRunBoundariesBySession[sessionId] = identity
+    }
+
+    private func isKnownRunBoundaryAfterPendingStop(
+        _ value: PendingStopCacheValue,
+        sessionId: String,
+        runIdentity: UUID
+    ) -> Bool {
+        guard stopRunBoundariesBySession[sessionId] == runIdentity else { return false }
+        switch value {
+        case .record(let record):
+            return record.storeEpoch != stopStoreEpoch || record.runIdentity != runIdentity
+        case .legacyString:
+            return true
+        }
+    }
+
+    private func readPendingStopOperation(key: String) async -> PendingStopCacheRead {
+        do {
+            guard let record = try await cache.get(PendingStopOperationRecord.self, key: key) else { return .missing }
+            return .value(.record(record))
+        } catch StoreError.corruptData {
+            do {
+                guard let raw = try await cache.get(String.self, key: key) else { return .unreadable }
+                return .value(.legacyString(raw))
+            } catch {
+                return .unreadable
+            }
+        } catch {
+            return .unreadable
+        }
+    }
+
+    private func clearPendingStopOperation(key: String, matching value: PendingStopCacheValue) async throws {
+        switch value {
+        case .record(let record):
+            _ = try await cache.remove(key: key, matching: record)
+        case .legacyString(let raw):
+            _ = try await cache.remove(key: key, matching: raw)
+        }
+    }
+
+    private func clearPendingStopOperation(key: String, matchingCommandId commandId: UUID) async throws {
+        let read = await readPendingStopOperation(key: key)
+        guard case .value(let current) = read else {
+            if case .unreadable = read { throw StoreError.corruptData }
+            return
+        }
+        switch current {
+        case .record(let record) where record.commandId == commandId:
+            _ = try await cache.remove(key: key, matching: record)
+        case .legacyString(let raw) where UUID(uuidString: raw) == commandId:
+            _ = try await cache.remove(key: key, matching: raw)
+        default:
+            return
         }
     }
 
@@ -2695,8 +2975,10 @@ final class WorkspaceStore: ObservableObject {
         creatingWebProjects.removeAll()
         creatingWebConversations.removeAll()
         creatingSessions.removeAll()
-        for task in stopTasksBySession.values { task.cancel() }
+        for entry in stopTasksBySession.values { entry.task.cancel() }
         stopTasksBySession.removeAll()
+        stopRunIdentitiesBySession.removeAll()
+        stopRunBoundariesBySession.removeAll()
         commandSendsInFlight.removeAll()
         metadataRefreshInFlight = false
         metadataRefreshQueued = false
@@ -4444,6 +4726,8 @@ final class WorkspaceStore: ObservableObject {
         case "GENERATION_STARTED":
             if event.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
             if suppressTransientPresentation { return }
+            stopRunIdentitiesBySession[sessionId] = event.eventId
+            stopRunBoundariesBySession[sessionId] = event.eventId
             if sessionSystemNoticesBySession[sessionId]?.kind == .generationOutcome {
                 sessionSystemNoticesBySession.removeValue(forKey: sessionId)
             }
@@ -4769,8 +5053,14 @@ final class WorkspaceStore: ObservableObject {
                   generation == self.lifecycleGeneration,
                   !self.isSuspended,
                   self.machine.state == .online,
-                  self.desktopBrowserConnected != false,
-                  self.webProjectsRefreshNeedsConnectivityRetry else { return }
+                  self.desktopBrowserConnected != false else { return }
+            // A failed Chrome tab inventory is independent from Projects.
+            // Recheck it once when Windows/Browser Bridge connectivity returns.
+            // The inventory command never navigates or reloads any Chat.
+            if self.openWebTabsQueryFailed || !self.hasLoadedOpenWebTabs {
+                await self.refreshOpenWebTabs()
+            }
+            guard self.webProjectsRefreshNeedsConnectivityRetry else { return }
             self.webProjectsRefreshNeedsConnectivityRetry = false
             DiagnosticsLog.shared.record("projects_refresh_connectivity_recovery", fields: [
                 "reason": reason,

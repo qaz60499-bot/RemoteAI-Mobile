@@ -147,6 +147,30 @@ actor SQLiteStore {
         protectDatabaseFiles()
     }
 
+    func remove<T: Decodable & Equatable>(key: String, matching expected: T) throws -> Bool {
+        guard let current = try get(T.self, key: key), current == expected else { return false }
+        try remove(key: key)
+        return true
+    }
+
+    func putIfAbsent<T: Encodable>(_ value: T, key: String) throws -> Bool {
+        guard try getData(key: key) == nil else { return false }
+        try put(value, key: key)
+        return true
+    }
+
+    func replace<T: Encodable, Expected: Decodable & Equatable>(
+        _ value: T,
+        key: String,
+        matching expected: Expected
+    ) throws -> Bool {
+        guard let data = try getData(key: key),
+              let current = try? decoder.decode(Expected.self, from: data),
+              current == expected else { return false }
+        try put(value, key: key)
+        return true
+    }
+
     func upsertMessages(_ messages: [ChatMessage]) throws {
         guard !messages.isEmpty else { return }
         try exec("BEGIN IMMEDIATE;")

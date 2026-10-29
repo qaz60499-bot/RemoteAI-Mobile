@@ -2,6 +2,21 @@ import XCTest
 @testable import RemoteAIMobile
 
 final class CloudflareTransportPoisonReplayTests: XCTestCase {
+    func testSocketFailureRetainsNumericNetworkCauseWithoutPrivateUserInfo() {
+        let error = NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost,
+                            userInfo: [NSLocalizedDescriptionKey: "private-message-body",
+                                       NSURLErrorFailingURLStringErrorKey: "https://private.invalid/?token=secret"])
+        let fields = CloudflareTransport.socketFailureDiagnosticFields(error, socket: nil)
+        XCTAssertEqual(fields["errorDomain"], NSURLErrorDomain)
+        XCTAssertEqual(fields["errorCode"], String(NSURLErrorNetworkConnectionLost))
+        XCTAssertFalse(fields.values.contains { $0.contains("private") || $0.contains("secret") })
+    }
+
+    func testSocketFailureDistinguishesProtocolRejectionFromNetworkFailure() {
+        let fields = CloudflareTransport.socketFailureDiagnosticFields(TransportError.malformedData, socket: nil)
+        XCTAssertEqual(fields["transportKind"], "malformedData")
+    }
+
     func testMalformedReliableReplayIsQuarantinedInsteadOfDroppingSocket() {
         XCTAssertTrue(
             CloudflareTransport.shouldQuarantineInboundEncryptedFrame(TransportError.malformedData)
