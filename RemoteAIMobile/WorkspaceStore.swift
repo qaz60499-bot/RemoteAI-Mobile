@@ -588,9 +588,13 @@ final class WorkspaceStore: ObservableObject {
     private func resumeDeferredWebProjectsRefreshIfIdle() {
         guard webProjectsRefreshDeferredForActiveChat, !hasActiveChatGPTWebRun,
               machine.state == .online, !isSuspended else { return }
-        // Use the existing refresh gate and cache-first behavior, not a new
-        // browser-navigation path. A terminal event or session reconciliation
-        // may arrive while a provider generation is still settling.
+        // Reserve the deferred refresh synchronously. Several terminal/status
+        // callbacks can arrive before an asynchronous Task starts; without this
+        // reservation they each queue a refresh, and a later cache-first result
+        // can regress an already authoritative Project list back to stale.
+        // refreshWebProjects(force: false) will restore the deferred flag itself
+        // if another Chat begins before the scheduled read executes.
+        webProjectsRefreshDeferredForActiveChat = false
         Task { @MainActor [weak self] in
             await self?.refreshWebProjects(force: false)
         }
