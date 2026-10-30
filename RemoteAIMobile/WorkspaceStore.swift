@@ -456,10 +456,24 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func refreshOpenWebTabs() async {
-        guard machine.state == .online, !isSuspended else { return }
+        guard machine.state == .online, !isSuspended else {
+            // A visible refresh control must not silently leave a stale spinner
+            // when the phone is offline or the app's transport is suspended.
+            openWebTabsInventoryUnverified = true
+            errors["web.tabs"] = machine.state != .online
+                ? "Windows Agent 未连接，当前 Chrome 标签数无法确认。请在连接恢复后更新列表。"
+                : "手机连接已暂停，当前 Chrome 标签数无法确认。请恢复应用连接后更新列表。"
+            DiagnosticsLog.shared.record("web_tabs_request_skipped", fields: [
+                "machineState": String(describing: machine.state),
+                "suspended": String(isSuspended),
+            ], level: "WARN")
+            return
+        }
         let generation = lifecycleGeneration
+        let commandId = UUID()
+        DiagnosticsLog.shared.record("web_tabs_request_begin", fields: ["commandId": commandId.uuidString])
         do {
-            let tabs = try await transport.listOpenWebTabs(machineId: machine.id)
+            let tabs = try await transport.listOpenWebTabs(machineId: machine.id, commandId: commandId)
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
             // Only an authoritative Chrome inventory may establish disappearance.
             // A network/bridge error never means a tab was closed.
@@ -479,11 +493,13 @@ final class WorkspaceStore: ObservableObject {
             openWebTabsInventoryUnverified = false
             openWebTabsLastVerifiedAt = Date()
             errors["web.tabs"] = nil
+            DiagnosticsLog.shared.record("web_tabs_request_verified", fields: ["commandId": commandId.uuidString, "count": String(tabs.count)])
         } catch {
             if generation == lifecycleGeneration, !isSuspended {
                 // Keep the last verified inventory, but do not present its counts as current.
                 openWebTabsInventoryUnverified = true
                 errors["web.tabs"] = error.localizedDescription
+                DiagnosticsLog.shared.record("web_tabs_request_failed", fields: Self.diagnosticFields(for: error, adding: ["commandId": commandId.uuidString]), level: "WARN")
             }
         }
     }

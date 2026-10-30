@@ -4,6 +4,17 @@ import Combine
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
+    @MainActor
+    func testUnavailableWebTabInventoryDoesNotPretendChromeHasZeroTabs() async throws {
+        let store = WorkspaceStore(transport: MockTransport(historyCount: 0), cache: try SQLiteStore.inMemory())
+        store.machine.state = .offline
+        await store.refreshOpenWebTabs()
+        XCTAssertFalse(store.hasLoadedOpenWebTabs)
+        XCTAssertTrue(store.openWebTabsInventoryUnverified)
+        XCTAssertNotNil(store.errors["web.tabs"])
+        XCTAssertTrue(store.errors["web.tabs"]?.contains("无法确认") == true)
+    }
+
     func testSpeechInputLifecyclePermissionAndInterruptionStateMachine() {
         var state: SpeechInputLifecycleState = .idle
         state = SpeechInputLifecycleReducer.reduce(state, event: .startRequested)

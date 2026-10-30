@@ -347,8 +347,8 @@ extension Transport {
         _ = try await requireSuccess(execute(command))
     }
 
-    func listOpenWebTabs(machineId: String) async throws -> [OpenWebTab] {
-        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "listOpenWebTabs")
+    func listOpenWebTabs(machineId: String, commandId: UUID = UUID()) async throws -> [OpenWebTab] {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "listOpenWebTabs", commandId: commandId)
         let response = try await requireSuccess(execute(command))
         return try response.decode([OpenWebTab].self)
     }

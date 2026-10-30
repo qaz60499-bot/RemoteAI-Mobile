@@ -266,8 +266,13 @@ struct InstanceView: View {
             if isChatGPTWeb {
                 Section {
                     if !store.hasLoadedOpenWebTabs {
-                        Text("正在读取电脑 Chrome 当前打开的 ChatGPT 标签页…")
-                            .font(.caption).foregroundColor(.secondary)
+                        if store.errors["web.tabs"] != nil {
+                            Label("尚未验证 Chrome 标签列表；可在连接恢复后重新读取。", systemImage: "exclamationmark.triangle")
+                                .font(.caption).foregroundColor(.secondary)
+                        } else {
+                            Text("正在读取电脑 Chrome 当前打开的 ChatGPT 标签页…")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
                     } else if store.openWebTabs.isEmpty {
                         Text("电脑 Chrome 当前没有打开 ChatGPT 标签页。")
                             .font(.caption).foregroundColor(.secondary)
@@ -349,6 +354,7 @@ struct InstanceView: View {
                         .padding(.vertical, 3)
                     }
                     Button {
+                        DiagnosticsLog.shared.record("web_tabs_refresh_tapped")
                         Task { await store.refreshOpenWebTabs() }
                     } label: {
                         Label("更新实际打开的标签页列表", systemImage: "arrow.clockwise")
@@ -587,6 +593,12 @@ struct InstanceView: View {
                     if isAntigravity { await store.refreshAntigravityProjects() }
                 }
             }
+        }
+        .onChange(of: store.machine.state) { state in
+            // When the Web catalog was opened while offline, do not wait for
+            // its 45-second periodic refresh to discover that Agent is back.
+            guard state == .online, scenePhase == .active, isChatGPTWeb else { return }
+            Task { await store.refreshOpenWebTabs() }
         }
         .onChange(of: scenePhase) { phase in
             guard phase == .active, store.machine.state == .online else { return }
