@@ -8,6 +8,14 @@ enum MockScenario: String, CaseIterable {
     case malformedCreateReplyAfterCommit
 }
 
+enum MockProjectConversationPaginationFault: String, Equatable {
+    case missingContinuation
+    case repeatedContinuation
+    case emptyNonterminalPage
+    case changedSnapshot
+    case differentProject
+}
+
 actor MockTransport: Transport {
     private var connected = false
     private var scenario: MockScenario
@@ -36,6 +44,12 @@ actor MockTransport: Transport {
     private var executionDelayNanoseconds: UInt64 = 0
     private var requestDelayNanoseconds: [String: UInt64] = [:]
     private var responseDelayNanoseconds: [String: UInt64] = [:]
+    private var preferCacheHistoryByAction: [String: [Bool]] = [:]
+    private var projectConversationPaginationFault: MockProjectConversationPaginationFault?
+    private var enteredOpenWebTabFixture: [String: JSONValue]?
+    private var openWebTabCurrentURLOverrides: [Int: String] = [:]
+    private var openWebTabCurrentSessionOverrides: [Int: String] = [:]
+    private var closedOpenWebTabIDs = Set<Int>()
     private var deltaPageLimitForTests: Int? = nil
     private var finishedAttachmentData: [String: Data] = [:]
     private var activeMessageAttachmentReads = 0
@@ -97,10 +111,8 @@ actor MockTransport: Transport {
                     messageId: "mock-\(i)",
                     sessionId: "photo-upload",
                     role: assistant ? "assistant" : "user",
-                    // Retain all 1,200 history rows for pagination/scroll testing. Do not
-                    // inflate 600 unrelated historical assistants with thousands of
-                    // repeated characters during a 30k/50k live-stream test: that
-                    // measures a different workload and can monopolize XCUI snapshots.
+                    // Keep history pagination separate from the active 30k/50k
+                    // stream workload, as in the verified Build63 fixture.
                     content: assistant ? "Mock assistant response \(i). This verifies long-history pagination without rendering everything at once." : "Mock user message \(i)",
                     externalId: nil,
                     createdAt: now.addingTimeInterval(Double(i - historyCount) * 30)
@@ -189,10 +201,21 @@ actor MockTransport: Transport {
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
     func setRequestDelay(action: String, nanoseconds: UInt64) { requestDelayNanoseconds[action] = nanoseconds }
     func setResponseDelay(action: String, nanoseconds: UInt64) { responseDelayNanoseconds[action] = nanoseconds }
+    func setProjectConversationPaginationFault(_ value: MockProjectConversationPaginationFault?) {
+        projectConversationPaginationFault = value
+    }
+    func setEnteredOpenWebTabFixture(_ result: [String: JSONValue]?) { enteredOpenWebTabFixture = result }
+    func setOpenWebTabCurrentURLOverride(tabId: Int, canonicalUrl: String?) {
+        openWebTabCurrentURLOverrides[tabId] = canonicalUrl
+    }
+    func setOpenWebTabCurrentSessionOverride(tabId: Int, sessionId: String?) {
+        openWebTabCurrentSessionOverrides[tabId] = sessionId
+    }
     func setDeltaPageLimitForTests(_ value: Int) { deltaPageLimitForTests = max(1, value) }
     func failNextAction(_ action: String, count: Int = 1) { actionFailureCounts[action] = max(0, count) }
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
     func lastPreferCacheValue(_ action: String) -> Bool? { lastPreferCacheByAction[action] }
+    func preferCacheValues(_ action: String) -> [Bool] { preferCacheHistoryByAction[action, default: []] }
     func connectionAttemptCount() -> Int { connectAttempts }
     func projectCount() -> Int { webProjects.count }
     func projectConversationCount(_ alias: String) -> Int { webProjectConversations[alias, default: []].count }
@@ -319,6 +342,7 @@ actor MockTransport: Transport {
         commandAttempts[command.action, default: 0] += 1
         if let preferCache = command.payload["preferCache"]?.boolValue {
             lastPreferCacheByAction[command.action] = preferCache
+            preferCacheHistoryByAction[command.action, default: []].append(preferCache)
         }
         let tracksMessageAttachmentRead = command.action == "readMessageAttachmentChunk"
         if tracksMessageAttachmentRead {
@@ -403,6 +427,83 @@ actor MockTransport: Transport {
             response = try success(instances.filter { $0.runtimeId == command.runtimeId })
         case "listSessions":
             response = try success(sessions.filter { $0.instanceId == command.instanceId })
+        case "listOpenWebTabs":
+            let conversations = webProjectConversations["g-p-remoteai"] ?? []
+            let chat = conversations.first
+            let chatURL = openWebTabCurrentURLOverrides[12] ?? chat?.canonicalUrl ?? "https://chatgpt.com"
+            let rows: [[String: JSONValue]] = [
+                [
+                    "tabId": .number(12), "title": .string("Project smoke"),
+                    "canonicalUrl": .string(chatURL), "active": .bool(true),
+                    "loading": .bool(false), "kind": .string("conversation"),
+                    "sessionId": openWebTabCurrentSessionOverrides[12].map { JSONValue.string($0) }
+                        ?? chat.map { .string($0.localConversationId) } ?? .null,
+                    "busy": .bool(false)
+                ],
+                [
+                    "tabId": .number(13), "title": .string("RemoteAI Project"),
+                    "canonicalUrl": .string(webProjects[0].canonicalUrl), "active": .bool(false),
+                    "loading": .bool(false), "kind": .string("project"),
+                    "sessionId": .null, "busy": .bool(false)
+                ]
+            ]
+            response = CommandResponseEnvelope(ok: true,
+                result: .array(rows.filter { !closedOpenWebTabIDs.contains($0["tabId"]?.intValue ?? -1) }.map { JSONValue.object($0) }),
+                error: nil, idempotentReplay: nil)
+        case "inspectOpenWebTab":
+            let tabId = command.payload["tabId"]?.intValue ?? -1
+            let canonicalUrl = openWebTabCurrentURLOverrides[tabId] ?? command.payload["expectedUrl"]?.stringValue ?? ""
+            response = success([
+                "tabId": .number(Double(tabId)),
+                "state": .string("ready"),
+                "canonicalUrl": .string(canonicalUrl),
+                "generating": .bool(false), "composerReady": .bool(true),
+                "draftPresent": .bool(false), "pendingUploads": .bool(false), "busy": .bool(false)
+            ])
+        case "manageOpenWebTab":
+            let operation = command.payload["operation"]?.stringValue ?? ""
+            let tabId = command.payload["tabId"]?.intValue ?? -1
+            let expectedUrl = command.payload["expectedUrl"]?.stringValue ?? ""
+            if operation == "enter", let fixture = enteredOpenWebTabFixture {
+                response = success(fixture)
+            } else if operation == "enter", tabId == 12,
+               let conversation = webProjectConversations["g-p-remoteai"]?.first,
+               expectedUrl == (openWebTabCurrentURLOverrides[tabId] ?? conversation.canonicalUrl),
+               (command.payload["sessionId"]?.stringValue == nil
+                    || command.payload["sessionId"]?.stringValue == (openWebTabCurrentSessionOverrides[tabId] ?? conversation.localConversationId)) {
+                response = success([
+                    "tabId": .number(12),
+                    "conversation": try JSONValue.encode(conversation),
+                    "diagnosis": .object([
+                        "tabId": .number(12), "state": .string("ready"),
+                        "canonicalUrl": .string(expectedUrl), "generating": .bool(false),
+                        "composerReady": .bool(true), "draftPresent": .bool(false),
+                        "pendingUploads": .bool(false), "busy": .bool(false)
+                    ])
+                ])
+            } else if operation == "enter", tabId == 13,
+                      expectedUrl == webProjects[0].canonicalUrl {
+                response = success([
+                    "tabId": .number(13),
+                    "project": try JSONValue.encode(webProjects[0]),
+                    "diagnosis": .object([
+                        "tabId": .number(13), "state": .string("ready"),
+                        "canonicalUrl": .string(expectedUrl), "generating": .bool(false),
+                        "composerReady": .bool(true), "draftPresent": .bool(false),
+                        "pendingUploads": .bool(false), "busy": .bool(false)
+                    ])
+                ])
+            } else if ["close", "reload", "hardReload", "reopen"].contains(operation),
+                      ((tabId == 12 && expectedUrl == (openWebTabCurrentURLOverrides[tabId] ?? webProjectConversations["g-p-remoteai"]?.first?.canonicalUrl))
+                        || (tabId == 13 && expectedUrl == webProjects.first?.canonicalUrl)) {
+                if operation == "close" { closedOpenWebTabIDs.insert(tabId) }
+                response = success(["ok": .bool(true)])
+            } else {
+                response = CommandResponseEnvelope(ok: false, result: nil,
+                    error: RemoteErrorPayload(code: "BROWSER_BINDING_MISSING",
+                        message: "The selected Chrome tab no longer matches its verified identity",
+                        retryable: false, details: nil), idempotentReplay: nil)
+            }
         case "loadRecentMessages":
             let limit = Int(command.payload["limit"]?.intValue ?? 40)
             response = try success(Array(history[command.sessionId ?? "", default: []].suffix(max(1, min(limit, 100)))))
@@ -468,17 +569,37 @@ actor MockTransport: Transport {
             }
             let nextOffset = offset + slice.count
             let partialSource = partialHead ? "browser-dom-partial-head-merge" : "browser-dom-partial-title-hints"
+            let fault = projectConversationPaginationFault
+            let isMissingContinuation = fault == .missingContinuation && offset == 0
+            let isRepeatedContinuation = fault == .repeatedContinuation && offset > 0
+            let isEmptyNonterminalPage = fault == .emptyNonterminalPage && offset > 0
+            let isChangedSnapshot = fault == .changedSnapshot && offset > 0
+            let isDifferentProject = fault == .differentProject && offset > 0
+            let responseProject = isDifferentProject
+                ? (webProjects.first(where: { $0.projectAlias != alias }) ?? project)
+                : project
+            let responseItems = isEmptyNonterminalPage ? [] : slice
+            let responseNextCursor: String? = {
+                if isMissingContinuation { return nil }
+                if isRepeatedContinuation { return command.payload["cursor"]?.stringValue }
+                if isEmptyNonterminalPage { return "offset:\(offset + limit)" }
+                return degraded ? nil : (nextOffset < all.count ? "offset:\(nextOffset)" : nil)
+            }()
+            let responseHasMore = isMissingContinuation || isRepeatedContinuation || isEmptyNonterminalPage
+                ? true
+                : (degraded ? false : nextOffset < all.count)
+            let responseSnapshotId = degraded ? nil : "mock-conversations-\(alias)-\(all.count)\(isChangedSnapshot ? "-changed" : "")"
             response = try success(WebProjectConversationPage(
-                project: project,
-                items: slice,
+                project: responseProject,
+                items: responseItems,
                 cursor: command.payload["cursor"]?.stringValue,
-                nextCursor: degraded ? nil : (nextOffset < all.count ? "offset:\(nextOffset)" : nil),
-                hasMore: degraded ? false : nextOffset < all.count,
+                nextCursor: responseNextCursor,
+                hasMore: responseHasMore,
                 observedAt: Date(),
                 source: staleBootstrap ? "windows-last-known-good" : ((scenario == .partialWebCatalog || partialHead) ? partialSource : "browser-dom"),
                 stale: staleBootstrap ? true : ((scenario == .partialWebCatalog || partialHead) ? true : (scenario == .unclassifiedWebCatalog ? nil : false)),
                 state: staleBootstrap ? .staleCache : ((scenario == .partialWebCatalog || partialHead) ? .partialDOM : (scenario == .unclassifiedWebCatalog ? nil : .authoritativeLiveDOM)),
-                snapshotId: degraded ? nil : "mock-conversations-\(alias)-\(all.count)"
+                snapshotId: responseSnapshotId
             ))
         case "openProject":
             response = success(["focused": .bool(false)])

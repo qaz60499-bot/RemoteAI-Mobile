@@ -183,9 +183,20 @@ extension RemoteCommand {
     }
 }
 
+// The Windows adapter's "enter" action validates the selected live tab
+// before returning an existing Chat or Project identity. This restores the
+// original tap-to-open workflow without creating an extra browser tab.
+struct EnteredOpenWebTab: Decodable {
+    let tabId: Int
+    let conversation: WebConversationDescriptor?
+    let project: WebProjectDescriptor?
+    let diagnosis: WebTabDiagnosis
+}
+
 struct WebTabDiagnosis: Decodable {
     let tabId: Int
     let state: String
+    let canonicalUrl: String?
     let issueCode: String?
     let issueMessage: String?
     let observedAt: String?
@@ -212,6 +223,79 @@ struct OpenWebTab: Decodable, Identifiable {
 
     var id: Int { tabId }
     var isChat: Bool { kind.contains("conversation") || sessionId != nil }
+}
+
+private struct ChatGPTTargetIdentity {
+    let projectAlias: String?
+    let conversationAlias: String?
+    let normalizedPath: String
+}
+
+private func chatGPTTargetIdentity(_ value: String) -> ChatGPTTargetIdentity? {
+    guard let components = URLComponents(string: value),
+          components.scheme?.lowercased() == "https",
+          components.host?.lowercased() == "chatgpt.com",
+          components.user == nil,
+          components.password == nil,
+          components.port == nil || components.port == 443 else { return nil }
+    let parts = components.path.split(separator: "/").map(String.init)
+    let projectAlias = parts.first(where: { $0.hasPrefix("g-p-") })
+    let conversationIndex = parts.firstIndex(of: "c")
+    let conversationAlias = conversationIndex.flatMap { index in
+        parts.indices.contains(index + 1) ? parts[index + 1] : nil
+    }
+    let joinedPath = "/" + parts.joined(separator: "/")
+    let path = joinedPath.count > 1 && joinedPath.hasSuffix("/")
+        ? String(joinedPath.dropLast()) : joinedPath
+    return ChatGPTTargetIdentity(projectAlias: projectAlias,
+        conversationAlias: conversationAlias, normalizedPath: path)
+}
+
+private func canonicalProjectIdentity(_ alias: String?) -> String? {
+    guard let alias else { return nil }
+    let normalized = alias.lowercased()
+    guard normalized.hasPrefix("g-p-") else { return alias }
+    let suffix = String(normalized.dropFirst(4))
+    guard suffix.count >= 32 else { return alias }
+    let base = String(suffix.prefix(32))
+    let hexDigits = CharacterSet(charactersIn: "0123456789abcdef")
+    guard base.unicodeScalars.allSatisfy({ hexDigits.contains($0) }),
+          suffix.count == 32 || suffix.dropFirst(32).first == "-" else {
+        return alias
+    }
+    return "g-p-" + base
+}
+
+private func sameChatGPTTarget(_ left: String, _ right: String) -> Bool {
+    guard let a = chatGPTTargetIdentity(left), let b = chatGPTTargetIdentity(right) else { return false }
+    if a.conversationAlias != nil || b.conversationAlias != nil {
+        guard let aConversation = a.conversationAlias, let bConversation = b.conversationAlias,
+              aConversation.lowercased() == bConversation.lowercased() else { return false }
+        return canonicalProjectIdentity(a.projectAlias) == canonicalProjectIdentity(b.projectAlias)
+    }
+    if a.projectAlias != nil || b.projectAlias != nil {
+        guard let aProject = canonicalProjectIdentity(a.projectAlias),
+              let bProject = canonicalProjectIdentity(b.projectAlias) else { return false }
+        return aProject == bProject
+    }
+    return a.normalizedPath == b.normalizedPath
+}
+
+private func sameChatGPTConversation(_ conversation: WebConversationDescriptor, tab: OpenWebTab) -> Bool {
+    guard let selected = chatGPTTargetIdentity(tab.canonicalUrl),
+          let returned = chatGPTTargetIdentity(conversation.canonicalUrl) else { return false }
+    if let selectedAlias = selected.conversationAlias {
+        guard returned.conversationAlias?.lowercased() == selectedAlias.lowercased() else { return false }
+    } else if tab.sessionId == nil {
+        return false
+    }
+    if let selectedProjectAlias = selected.projectAlias {
+        let returnedProjectAlias = conversation.projectAlias ?? returned.projectAlias
+        guard canonicalProjectIdentity(selectedProjectAlias) == canonicalProjectIdentity(returnedProjectAlias) else {
+            return false
+        }
+    }
+    return tab.sessionId != nil || sameChatGPTTarget(conversation.canonicalUrl, tab.canonicalUrl)
 }
 
 extension Transport {
@@ -353,13 +437,56 @@ extension Transport {
         return try response.decode([OpenWebTab].self)
     }
 
+    func enterOpenWebTab(machineId: String, tab: OpenWebTab) async throws -> EnteredOpenWebTab {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web",
+            instanceId: "web.chatgpt", action: "manageOpenWebTab", payload: [
+                "tabId": .number(Double(tab.tabId)),
+                "expectedUrl": .string(tab.canonicalUrl),
+                "operation": .string("enter"),
+                "sessionId": tab.sessionId.map(JSONValue.string) ?? .null
+            ])
+        let result = try await requireSuccess(execute(command)).decode(EnteredOpenWebTab.self)
+        // Treat the receipt as the authority for one selected live document. A
+        // tab ID can be recycled while the command is in flight, so all returned
+        // identities and the DOM diagnosis must still name the selected target.
+        guard result.tabId == tab.tabId,
+              result.diagnosis.tabId == tab.tabId,
+              (result.conversation != nil) != (result.project != nil),
+              let diagnosisUrl = result.diagnosis.canonicalUrl,
+              sameChatGPTTarget(diagnosisUrl, tab.canonicalUrl) else {
+            throw TransportError.malformedData
+        }
+        if let conversation = result.conversation {
+            guard sameChatGPTConversation(conversation, tab: tab),
+                  tab.sessionId == nil || tab.sessionId == conversation.localConversationId,
+                  !conversation.localConversationId.isEmpty else {
+                throw TransportError.malformedData
+            }
+        }
+        if let project = result.project {
+            guard sameChatGPTTarget(project.canonicalUrl, tab.canonicalUrl),
+                  tab.sessionId == nil,
+                  canonicalProjectIdentity(project.projectAlias)
+                    == canonicalProjectIdentity(chatGPTTargetIdentity(tab.canonicalUrl)?.projectAlias) else {
+                throw TransportError.malformedData
+            }
+        }
+        return result
+    }
+
     func inspectOpenWebTab(machineId: String, tab: OpenWebTab) async throws -> WebTabDiagnosis {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt",
             action: "inspectOpenWebTab", payload: [
                 "tabId": .number(Double(tab.tabId)),
                 "expectedUrl": .string(tab.canonicalUrl)
             ])
-        return try await requireSuccess(execute(command)).decode(WebTabDiagnosis.self)
+        let diagnosis = try await requireSuccess(execute(command)).decode(WebTabDiagnosis.self)
+        guard diagnosis.tabId == tab.tabId,
+              let canonicalUrl = diagnosis.canonicalUrl,
+              sameChatGPTTarget(canonicalUrl, tab.canonicalUrl) else {
+            throw TransportError.malformedData
+        }
+        return diagnosis
     }
 
     func reopenVerifiedWebConversation(machineId: String, sessionId: String) async throws {

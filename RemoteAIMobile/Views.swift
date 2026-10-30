@@ -27,6 +27,7 @@ struct RootView: View {
     @EnvironmentObject var store: WorkspaceStore
     @State private var showingPair = false
     @State private var showingDiagnostics = false
+    private var runtimeIssues: [RuntimeIssue] { RuntimeIssueSummary.build(store: store) }
     var body: some View {
         NavigationView {
             List {
@@ -60,6 +61,23 @@ struct RootView: View {
                         }
                     }
                 }
+                if store.isPaired || !store.runtimes.isEmpty {
+                    Section("异常与投递状态") {
+                        NavigationLink(destination: RuntimeIssuesView()) {
+                            HStack {
+                                Label("查看异常总览", systemImage: "exclamationmark.bubble")
+                                Spacer()
+                                Text(runtimeIssues.isEmpty ? "未发现已知异常" : "\(runtimeIssues.count) 项需关注")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .accessibilityIdentifier("runtimeIssuesLink")
+                        Text("仅汇总手机已同步的状态；未发现异常不代表远端所有任务正常。")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
                 if store.machine.state == .offline && !store.deferringTransientConnectionPresentation && store.isPaired {
                     Section {
                         Label("Cached workspaces remain available while the PC is offline.", systemImage: "wifi.slash").font(.footnote).foregroundColor(.secondary)
@@ -81,6 +99,93 @@ struct RootView: View {
         }.navigationViewStyle(.stack)
     }
     private func runtimeIcon(_ kind: RuntimeKind) -> String { switch kind { case .web: return "globe"; case .codex: return "terminal"; case .antigravity: return "sparkles" } }
+}
+
+struct RuntimeIssuesView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    @State private var refreshing = false
+
+    private var issues: [RuntimeIssue] { RuntimeIssueSummary.build(store: store) }
+
+    var body: some View {
+        List {
+            Section {
+                Text("这里只显示手机已经收到的连接、会话与投递状态。部分记录可能是缓存，不代表刚刚进行了实时检测。")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                if let lastCheck = store.desktopStatusUpdatedAt {
+                    Text("电脑状态最近同步：\(lastCheck.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("电脑状态同步时间未知")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                Button(refreshing ? "正在刷新实例状态…" : "刷新应用实例状态") {
+                    guard !refreshing, store.machine.state == .online else { return }
+                    refreshing = true
+                    Task { @MainActor in
+                        for runtime in store.runtimes {
+                            await store.refreshRuntime(runtime)
+                        }
+                        refreshing = false
+                    }
+                }
+                .accessibilityIdentifier("refreshRuntimeInstances")
+                .disabled(refreshing || store.machine.state != .online)
+                Text("此按钮只读取 Codex、Antigravity 和 Web 应用实例状态；会话、后台任务与消息收据仍须进入原会话确认。")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
+            if issues.isEmpty {
+                Section {
+                    Label("没有发现已同步的异常；不能据此证明所有远程任务正常。",
+                          systemImage: "info.circle")
+                        .font(.footnote)
+                        .accessibilityIdentifier("runtimeIssueSummaryEmpty")
+                }
+            } else {
+                Section("需关注的状态") {
+                    ForEach(issues) { issue in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label(issue.title, systemImage: issue.level == .failure
+                                  ? "exclamationmark.triangle.fill" : "questionmark.circle")
+                                .font(.subheadline.weight(.medium))
+                            Text("来源：\(issue.source)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text(issue.detail)
+                                .font(.footnote)
+                                .textSelection(.enabled)
+                            if let observedAt = issue.observedAt {
+                                Text("最近观测：\(observedAt.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text("观测时间未知")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            Text("建议：\(issue.suggestion)")
+                                .font(.footnote)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+
+            Section {
+                Text("本页不会自动重发、Stop、重启 Agent 或修改网络。后台系统通知仍需单独实现及真机验收。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("运行异常")
+        .navigationBarTitleDisplayMode(.inline)
+    }
 }
 
 private struct DiagnosticExportItem: Identifiable {
@@ -195,6 +300,11 @@ struct InstanceView: View {
     @State private var creatingWebChat = false
     @State private var createdWebSession: SessionDescriptor?
     @State private var openCreatedWebSession = false
+    @State private var enteredWebTabSession: SessionDescriptor?
+    @State private var enteredWebTabProject: WebProjectDescriptor?
+    @State private var openEnteredWebTabSession = false
+    @State private var openEnteredWebTabProject = false
+    @State private var enteringWebTabId: Int?
     @State private var deleteCandidate: SessionDescriptor?
     @State private var showingDeleteConfirmation = false
     @State private var closingWebTab: OpenWebTab?
@@ -282,7 +392,30 @@ struct InstanceView: View {
                             Image(systemName: tab.isChat ? "bubble.left.and.bubble.right" : "folder")
                                 .foregroundColor(.secondary)
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(tab.title).font(.subheadline).lineLimit(2)
+                                Button {
+                                    guard enteringWebTabId == nil else { return }
+                                    enteringWebTabId = tab.id
+                                    Task {
+                                        let destination = await store.enterOpenWebTab(tab)
+                                        enteringWebTabId = nil
+                                        if let destination {
+                                            switch destination {
+                                            case .chat(let session):
+                                                enteredWebTabSession = session
+                                                openEnteredWebTabSession = true
+                                            case .project(let project):
+                                                enteredWebTabProject = project
+                                                openEnteredWebTabProject = true
+                                            }
+                                        }
+                                    }
+                                } label: {
+                                    HStack(spacing: 5) {
+                                        Text(tab.title).font(.subheadline).lineLimit(2)
+                                        Image(systemName: "chevron.right").font(.caption2)
+                                    }
+                                }
+                                .disabled(enteringWebTabId != nil || store.machine.state != .online)
                                 Text(tab.busy ? "正在生成 · 不可关闭/刷新" : (tab.loading ? "网页加载中" : (tab.active ? "电脑当前标签页" : "后台标签页")))
                                     .font(.caption2).foregroundColor(.secondary)
                                 Text(webTabStatus(tab))
@@ -537,6 +670,20 @@ struct InstanceView: View {
                     NavigationLink(
                         destination: ChatView(runtime: runtime, instance: instance, session: createdWebSession),
                         isActive: $openCreatedWebSession
+                    ) { EmptyView() }
+                    .hidden()
+                }
+                if let enteredWebTabSession {
+                    NavigationLink(
+                        destination: ChatView(runtime: runtime, instance: instance, session: enteredWebTabSession),
+                        isActive: $openEnteredWebTabSession
+                    ) { EmptyView() }
+                    .hidden()
+                }
+                if let enteredWebTabProject {
+                    NavigationLink(
+                        destination: WebProjectView(runtime: runtime, instance: instance, project: enteredWebTabProject),
+                        isActive: $openEnteredWebTabProject
                     ) { EmptyView() }
                     .hidden()
                 }
@@ -978,10 +1125,13 @@ struct WebProjectView: View {
             // An automatic Project open should reuse the verified catalog and
             // existing Web tab; only an explicit pull-to-refresh forces a DOM scan.
             await refreshProjectContext(force: false)
-            // Websocket events are the fast path, but a phone can miss the start of a
-            // desktop run while backgrounded or reconnecting. Poll only the cheap Agent
-            // session catalog while this Project view is visible; never open a browser
-            // just to discover Busy/Waiting state.
+            // Session status is cheap and can change while the user stays on this
+            // screen. Project membership is separate: without a periodic catalog
+            // read, desktop-created/deleted chats never appear until a manual pull.
+            // Read the Project catalog only every sixth status tick (30 seconds),
+            // and only while foregrounded. Keep the store's snapshot protections:
+            // partial/failed DOM reads must never erase verified conversations.
+            var statusTicks = 0
             while !Task.isCancelled {
                 do {
                     try await Task.sleep(nanoseconds: 5_000_000_000)
@@ -989,8 +1139,15 @@ struct WebProjectView: View {
                     break
                 }
                 guard !Task.isCancelled else { break }
-                if store.machine.state == .online {
+                if scenePhase == .active && store.machine.state == .online {
                     await store.refreshSessions(runtime: runtime, instance: instance)
+                    if !isAntigravity {
+                        statusTicks += 1
+                        if statusTicks >= 6 {
+                            statusTicks = 0
+                            await store.loadProjectConversations(projectAlias: project.projectAlias, force: false)
+                        }
+                    }
                 }
             }
         }
@@ -1258,8 +1415,12 @@ struct ChatView: View {
                             ForEach(modelOptions) { option in Text(option.label).tag(option.id) }
                         }
                         .pickerStyle(.menu)
-                        .onChange(of: selectedModel) { _ in selectedReasoningEffort = "" }
-                        if runtime.kind == .codex, session.id.hasPrefix("codex-pending-"), !selectedReasoningLevels.isEmpty {
+                        .onChange(of: selectedModel) { _ in
+                            if !selectedReasoningLevels.contains(selectedReasoningEffort) {
+                                selectedReasoningEffort = ""
+                            }
+                        }
+                        if runtime.kind == .codex, !selectedReasoningLevels.isEmpty {
                             Picker("推理强度", selection: $selectedReasoningEffort) {
                                 Text("默认").tag("")
                                 ForEach(selectedReasoningLevels, id: \.self) { level in
@@ -1363,6 +1524,9 @@ struct ChatView: View {
                         pendingAttachments.removeAll()
                         sending = true
                         sendTask = Task {
+                            // Drain older debounced writes before send() persists
+                            // its definitive empty/saved-on-failure draft outcome.
+                            await draft.flush()
                             if correctingActiveRun {
                                 let stopped = await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id)
                                 if !stopped {
@@ -1417,27 +1581,37 @@ struct ChatView: View {
         .sheet(item: $textSelectionRequest) { request in
             TextSelectionSheet(text: request.text, monospaced: request.monospaced)
         }
-        .onDisappear { speechInput.stop() }
+        .onDisappear {
+            speechInput.stop()
+            Task { await draft.flush() }
+        }
         .onChange(of: scenePhase) { phase in
             if phase != .active {
                 speechInput.stop()
+                Task { await draft.flush() }
             } else {
                 Task { await store.synchronizeVisibleSession(session.id, force: true) }
             }
         }
-        .task {
+        .task(id: session.id) {
+            draft.bind(sessionId: session.id,
+                load: { await store.draft(sessionId: $0) },
+                save: { id, text in await store.saveDraft(text, sessionId: id) })
             if supportsModelSelection, selectedModel.isEmpty {
                 selectedModel = [session.modelId, instance.configuredModel,
                     instance.modelCatalog?.defaultModel, modelOptions.first?.id]
                     .compactMap { $0 }
                     .first(where: { candidate in modelOptions.contains(where: { $0.id == candidate }) })
                     ?? ""
+                if let effort = currentSession.reasoningEffort,
+                   selectedReasoningLevels.contains(effort) {
+                    selectedReasoningEffort = effort
+                }
             }
             await store.loadSession(session.id)
             if let mock = store.transport as? MockTransport {
                 await mock.runStressIfRequested(sessionId: session.id)
             }
-            if input.isEmpty { input = await store.draft(sessionId: session.id) }
 
             // Push remains the primary path, but a logically-connected websocket can
             // still miss one event around SPA/document replacement. Reconcile only the
@@ -1502,10 +1676,6 @@ struct ChatView: View {
         }
         appendAttachments(loaded)
     }
-}
-
-final class ComposerDraft: ObservableObject {
-    @Published var text = ""
 }
 
 struct Composer: View {
@@ -1683,7 +1853,38 @@ struct MessageContentSegment: Identifiable, Equatable {
     var isEditBlock: Bool { !isCode && language == Self.editBlockMarker }
 
     static func parse(_ value: String) -> [MessageContentSegment] {
-        if value.range(of: "Edit", options: .caseInsensitive) == nil,
+        let writingScan = WritingBlockFenceParser.scan(value)
+        guard writingScan.containsWritingBlock else { return legacyParse(value, inferContinuation: true) }
+
+        var result: [MessageContentSegment] = []
+        let source = value as NSString
+        var cursor = 0
+        for block in writingScan.blocks {
+            if block.wrapperRange.location > cursor {
+                let ordinary = source.substring(with: NSRange(
+                    location: cursor,
+                    length: block.wrapperRange.location - cursor
+                ))
+                appendLegacySegments(ordinary, inferContinuation: false, to: &result)
+            }
+            let body = source.substring(with: block.bodyRange)
+            if !body.isEmpty {
+                result.append(MessageContentSegment(id: result.count, text: body, isCode: false, language: editBlockMarker))
+            }
+            cursor = NSMaxRange(block.wrapperRange)
+        }
+
+        let ordinaryEnd = writingScan.incompleteOpeningRange?.location ?? source.length
+        if ordinaryEnd > cursor {
+            let ordinary = source.substring(with: NSRange(location: cursor, length: ordinaryEnd - cursor))
+            appendLegacySegments(ordinary, inferContinuation: false, to: &result)
+        }
+        return result
+    }
+
+    private static func legacyParse(_ value: String, inferContinuation: Bool) -> [MessageContentSegment] {
+        if inferContinuation,
+           value.range(of: "Edit", options: .caseInsensitive) == nil,
            let inferred = inferredContinuationPrompt(in: value) {
             return [MessageContentSegment(id: 0, text: inferred, isCode: false, language: editBlockMarker)]
         }
@@ -1722,8 +1923,63 @@ struct MessageContentSegment: Identifiable, Equatable {
     }
 
     static func editBlocks(in value: String) -> [MessageContentSegment] {
-        let inferredPrompt = inferredContinuationPrompt(in: value)
-        guard value.range(of: "Edit", options: .caseInsensitive) != nil else { return continuationPromptBlocks(inferredPrompt) }
+        let writingScan = WritingBlockFenceParser.scan(value)
+        guard writingScan.containsWritingBlock else { return legacyEditBlocks(in: value, inferContinuation: true) }
+
+        let source = value as NSString
+        var blocks: [MessageContentSegment] = []
+        var cursor = 0
+        for block in writingScan.blocks {
+            if block.wrapperRange.location > cursor {
+                let ordinary = source.substring(with: NSRange(
+                    location: cursor,
+                    length: block.wrapperRange.location - cursor
+                ))
+                blocks.append(contentsOf: legacyEditBlocks(in: ordinary, inferContinuation: false))
+            }
+            let body = source.substring(with: block.bodyRange)
+            if !body.isEmpty {
+                blocks.append(MessageContentSegment(id: blocks.count, text: body, isCode: false, language: editBlockMarker))
+            }
+            cursor = NSMaxRange(block.wrapperRange)
+        }
+
+        let ordinaryEnd = writingScan.incompleteOpeningRange?.location ?? source.length
+        if ordinaryEnd > cursor {
+            let ordinary = source.substring(with: NSRange(location: cursor, length: ordinaryEnd - cursor))
+            blocks.append(contentsOf: legacyEditBlocks(in: ordinary, inferContinuation: false))
+        }
+        return blocks
+    }
+
+    static func copyableText(_ value: String) -> String {
+        WritingBlockFenceParser.copyableText(value)
+    }
+
+    static func containsWritingBlockFence(in value: String) -> Bool {
+        WritingBlockFenceParser.containsWritingBlock(value)
+    }
+
+    private static func appendLegacySegments(
+        _ value: String,
+        inferContinuation: Bool,
+        to result: inout [MessageContentSegment]
+    ) {
+        for segment in legacyParse(value, inferContinuation: inferContinuation) {
+            result.append(MessageContentSegment(
+                id: result.count,
+                text: segment.text,
+                isCode: segment.isCode,
+                language: segment.language
+            ))
+        }
+    }
+
+    private static func legacyEditBlocks(in value: String, inferContinuation: Bool) -> [MessageContentSegment] {
+        let inferredPrompt = inferContinuation ? inferredContinuationPrompt(in: value) : nil
+        guard value.range(of: "Edit", options: .caseInsensitive) != nil else {
+            return continuationPromptBlocks(inferredPrompt)
+        }
         let nsValue = value as NSString
         let matches = editMatches(in: value, nsValue: nsValue)
         guard !matches.isEmpty else { return [] }
@@ -1859,6 +2115,20 @@ struct TextSelectionSheet: View {
     @Environment(\.dismiss) private var dismiss
     let text: String
     let monospaced: Bool
+    @State private var copied = false
+    @State private var copyFeedbackToken: UUID?
+
+    private func copyAllText() {
+        UIPasteboard.general.string = text
+        copied = true
+        let token = UUID()
+        copyFeedbackToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard copyFeedbackToken == token else { return }
+            copied = false
+            copyFeedbackToken = nil
+        }
+    }
 
     var body: some View {
         NavigationView {
@@ -1869,7 +2139,7 @@ struct TextSelectionSheet: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .navigationBarLeading) {
-                        Button("全部复制") { UIPasteboard.general.string = text }
+                        Button(copied ? "已复制" : "全部复制", action: copyAllText)
                     }
                     ToolbarItem(placement: .navigationBarTrailing) {
                         Button("完成") { dismiss() }
@@ -1905,7 +2175,9 @@ final class MessageRenderContent: NSObject {
         // Parsing thousands of repeated inline fences/styles into many Text nodes
         // inflates SwiftUI layout and XCTest/VoiceOver accessibility snapshots.
         // Preserve existing Edit-block extraction and short-message formatting.
-        if isLarge && displayText.range(of: "Edit", options: .caseInsensitive) == nil {
+        if isLarge,
+           displayText.range(of: "Edit", options: .caseInsensitive) == nil,
+           !MessageContentSegment.containsWritingBlockFence(in: displayText) {
             segments = [MessageContentSegment(id: 0, text: inlinePreview, isCode: false, language: nil)]
         } else {
             segments = MessageContentSegment.parse(inlinePreview)
@@ -1949,9 +2221,23 @@ struct AssistantStreamRow: View, Equatable {
     var followTail: () -> Void = {}
     var onSelectText: ((String, Bool) -> Void)? = nil
     @State private var followTask: Task<Void, Never>?
+    @State private var copiedCurrentText = false
+    @State private var copyFeedbackToken: UUID?
 
     static func == (lhs: AssistantStreamRow, rhs: AssistantStreamRow) -> Bool {
         lhs.stream === rhs.stream && lhs.message == rhs.message
+    }
+
+    private func copyCurrentText() {
+        UIPasteboard.general.string = MessageContentSegment.copyableText(stream.text)
+        copiedCurrentText = true
+        let token = UUID()
+        copyFeedbackToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard copyFeedbackToken == token else { return }
+            copiedCurrentText = false
+            copyFeedbackToken = nil
+        }
     }
 
     var body: some View {
@@ -1970,15 +2256,15 @@ struct AssistantStreamRow: View, Equatable {
                     Text(visibleText)
                         .accessibilityHidden(true)
                     HStack(spacing: 12) {
-                        Button {
-                            UIPasteboard.general.string = stream.text
-                        } label: {
-                            Label("复制当前全文", systemImage: "doc.on.doc")
+                        Button(action: copyCurrentText) {
+                            Label(copiedCurrentText ? "已复制" : "复制当前全文",
+                                  systemImage: copiedCurrentText ? "checkmark" : "doc.on.doc")
                                 .font(.caption2)
                         }
                         .buttonStyle(.borderless)
+                        .accessibilityIdentifier("assistant-stream-current-copy")
                         Button("查看 / 选择当前全文") {
-                            onSelectText?(stream.text, false)
+                            onSelectText?(MessageContentSegment.copyableText(stream.text), false)
                         }
                         .font(.caption2)
                         .buttonStyle(.borderless)
@@ -2032,6 +2318,8 @@ struct MessageRow: View, Equatable {
             && (lhs.retry == nil) == (rhs.retry == nil) && lhs.retryContextKey == rhs.retryContextKey
     }
     @State private var toolExpanded = true
+    @State private var copiedActionID: String?
+    @State private var copyFeedbackToken: UUID?
     private var renderContent: MessageRenderContent { preparedRenderContent ?? MessageRenderCache.shared.content(for: message) }
     private var displayText: String { renderContent.displayText }
     private var displayAttachments: [MessageAttachment] { renderContent.attachments }
@@ -2046,6 +2334,24 @@ struct MessageRow: View, Equatable {
         fullStreamingText == nil ? renderContent.preservedEditBlocks : []
     }
     private var selectionText: String { fullStreamingText?() ?? displayText }
+
+    private func copyText(_ text: String, actionID: String) {
+        UIPasteboard.general.string = text
+        copiedActionID = actionID
+        let token = UUID()
+        copyFeedbackToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            guard copyFeedbackToken == token else { return }
+            copiedActionID = nil
+            copyFeedbackToken = nil
+        }
+    }
+
+    private func copyLabel(_ title: String, actionID: String) -> some View {
+        let isCopied = copiedActionID == actionID
+        return Label(isCopied ? "已复制" : title, systemImage: isCopied ? "checkmark" : "doc.on.doc")
+            .font(.caption2)
+    }
 
     var body: some View {
         Group {
@@ -2185,7 +2491,7 @@ struct MessageRow: View, Equatable {
                         }
                         if isLargeDisplayText {
                             Button {
-                                onSelectText?(selectionText, false)
+                                onSelectText?(MessageContentSegment.copyableText(selectionText), false)
                             } label: {
                                 Label(fullStreamingText != nil ? "查看全文（生成中）" : "查看全文（约 \(max(1, displayText.utf8.count / 1024)) KB）", systemImage: "doc.text.magnifyingglass")
                                     .font(.caption.weight(.medium))
@@ -2205,14 +2511,13 @@ struct MessageRow: View, Equatable {
                         if !displayText.isEmpty {
                             HStack(spacing: 12) {
                                 Button {
-                                    UIPasteboard.general.string = selectionText
+                                    copyText(MessageContentSegment.copyableText(selectionText), actionID: "message-full")
                                 } label: {
-                                    Label("复制全文", systemImage: "doc.on.doc")
-                                        .font(.caption2)
+                                    copyLabel("复制全文", actionID: "message-full")
                                 }
                                 .buttonStyle(.borderless)
                                 Button {
-                                    onSelectText?(selectionText, false)
+                                    onSelectText?(MessageContentSegment.copyableText(selectionText), false)
                                 } label: {
                                     Label("选择部分", systemImage: "text.cursor")
                                         .font(.caption2)
@@ -2246,10 +2551,9 @@ struct MessageRow: View, Equatable {
             }
             HStack(spacing: 12) {
                 Button {
-                    UIPasteboard.general.string = segment.text
+                    copyText(segment.text, actionID: "edit-\(segment.id)")
                 } label: {
-                    Label("复制整块", systemImage: "doc.on.doc")
-                        .font(.caption2)
+                    copyLabel("复制整块", actionID: "edit-\(segment.id)")
                 }
                 .buttonStyle(.borderless)
                 Button(isLargeEdit ? "查看 / 选择全文" : "选择部分") {

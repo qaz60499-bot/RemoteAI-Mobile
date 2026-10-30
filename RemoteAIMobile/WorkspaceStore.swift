@@ -8,6 +8,11 @@ private enum GenerationTerminalOutcome: Equatable {
     case failed
 }
 
+enum OpenWebTabDestination {
+    case chat(SessionDescriptor)
+    case project(WebProjectDescriptor)
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     @Published var machine = MachineMetadata(id: "my-pc", name: "My PC", state: .connecting)
@@ -519,18 +524,76 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    func enterOpenWebTab(_ tab: OpenWebTab) async -> OpenWebTabDestination? {
+        guard machine.state == .online, !isSuspended else {
+            errors["web.tabs"] = "Windows 未连接，无法打开当前 Chrome 网页。"
+            return nil
+        }
+        guard managingWebTabIds.insert(tab.id).inserted else { return nil }
+        defer { managingWebTabIds.remove(tab.id) }
+        webTabDiagnosesById.removeValue(forKey: tab.id)
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        do {
+            let entered = try await activeTransport.enterOpenWebTab(machineId: activeMachineId, tab: tab)
+            guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return nil }
+            webTabDiagnosesById[tab.id] = entered.diagnosis
+            errors["web.tabs"] = nil
+            if let conversation = entered.conversation {
+                // Enter returns a verified existing provider identity, not a
+                // new chat. Keep the live Agent status when already available.
+                let session = sessions.first(where: { $0.id == conversation.localConversationId })
+                    ?? conversation.session
+                if !sessions.contains(where: { $0.id == session.id }) {
+                    sessions.insert(session, at: 0)
+                    await persistMetadata()
+                }
+                guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return nil }
+                return .chat(session)
+            }
+            if let project = entered.project {
+                return .project(project)
+            }
+            errors["web.tabs"] = "Chrome 已响应，但没有返回可打开的 Chat 或 Project。"
+        } catch {
+            if isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) {
+                errors["web.tabs"] = "打开当前网页失败：\(error.localizedDescription)"
+                DiagnosticsLog.shared.record("web_tab_enter_failed",
+                    fields: Self.diagnosticFields(for: error, adding: ["tabId": String(tab.tabId)]),
+                    level: "WARN")
+            }
+        }
+        return nil
+    }
+
     func inspectOpenWebTab(_ tab: OpenWebTab) async {
         guard machine.state == .online, !isSuspended else {
             errors["web.tabs"] = "Windows 未连接，无法验证 Chrome 网页是否正常。"
             return
         }
+        guard managingWebTabIds.insert(tab.id).inserted else { return }
+        defer { managingWebTabIds.remove(tab.id) }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        webTabDiagnosesById.removeValue(forKey: tab.id)
+        await performInspectOpenWebTab(tab, generation: generation,
+            transport: activeTransport, machineId: activeMachineId)
+    }
+
+    private func performInspectOpenWebTab(_ tab: OpenWebTab, generation: UInt64,
+        transport activeTransport: Transport, machineId activeMachineId: String) async {
         do {
-            let diagnosis = try await transport.inspectOpenWebTab(machineId: machine.id, tab: tab)
+            let diagnosis = try await activeTransport.inspectOpenWebTab(machineId: activeMachineId, tab: tab)
+            guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
             webTabDiagnosesById[tab.id] = diagnosis
             errors["web.tabs"] = nil
         } catch {
             // This is a failed status check, not proof of a failed page load.
-            errors["web.tabs"] = "网页状态无法确认：\(error.localizedDescription)"
+            if isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) {
+                errors["web.tabs"] = "网页状态无法确认：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -550,14 +613,17 @@ final class WorkspaceStore: ObservableObject {
         guard machine.state == .online, !isSuspended, ["close", "reload", "hardReload", "reopen"].contains(operation) else { return }
         guard managingWebTabIds.insert(tab.id).inserted else { return }
         defer { managingWebTabIds.remove(tab.id) }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
         guard !tab.busy else {
             errors["web.tabs"] = "该 Chat 正在生成回复，不能关闭或刷新。"
             return
         }
         do {
-            webTabDiagnosesById.removeValue(forKey: tab.id)
             webTabActionNotesById[tab.id] = "正在执行操作，等待 Chrome 确认…"
-            try await transport.manageOpenWebTab(machineId: machine.id, tab: tab, operation: operation)
+            try await activeTransport.manageOpenWebTab(machineId: activeMachineId, tab: tab, operation: operation)
+            guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
             if operation == "close" {
                 explicitlyClosedWebTabIDs.insert(tab.id)
                 webTabActionNotesById[tab.id] = "Chrome 已接受关闭请求"
@@ -565,17 +631,28 @@ final class WorkspaceStore: ObservableObject {
                 webTabActionNotesById[tab.id] = "Chrome 已接受页面操作；尚未验证加载完成"
             }
             await refreshOpenWebTabs()
+            guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
             if operation != "close" {
                 // A browser navigation acknowledgement is NOT health proof.
                 // Check only the selected page after a short settle period.
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
-                await inspectOpenWebTab(tab)
+                await performInspectOpenWebTab(tab, generation: generation,
+                    transport: activeTransport, machineId: activeMachineId)
             }
         } catch {
+            guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
             errors["web.tabs"] = "网页操作未确认：\(error.localizedDescription)"
             webTabActionNotesById[tab.id] = "操作未确认；不能判定页面已经刷新或关闭"
             // Do not remove a tab from the UI on an unconfirmed browser action.
         }
+    }
+
+    private func isCurrentWebTabOperation(generation: UInt64, transport activeTransport: Transport, machineId activeMachineId: String) -> Bool {
+        generation == lifecycleGeneration
+            && transport === activeTransport
+            && machine.id == activeMachineId
+            && machine.state == .online
+            && !isSuspended
     }
 
     private var hasActiveChatGPTWebRun: Bool {
@@ -848,28 +925,30 @@ final class WorkspaceStore: ObservableObject {
         do {
             var page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, forceRefresh: force)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
-            // The ChatGPT sidebar lazily mounts Project conversation panels, and a live
-            // scan can transiently return partial/stale data even when the phone already
-            // has an older verified list. An explicit/foreground refresh must therefore
-            // make one bounded second live read instead of treating that old list as a
-            // reason to stop. Automatic background refreshes keep the cheaper bootstrap
-            // behavior unless the Project has no verified rows at all.
+            // An automatic read can intentionally prefer the Windows verified cache.
+            // If it is stale or partial, escalate exactly once to a live DOM read even
+            // when the phone already has rows; otherwise cached rows can permanently
+            // suppress convergence. This remains inside the existing per-Project
+            // refresh gate and automatic throttle, so it is bounded rather than polling.
             let shouldRetryIncompleteLiveRead = !page.isAuthoritativeLiveDOM
-                && (force || projectConversationsByAlias[projectAlias, default: []].isEmpty)
             if shouldRetryIncompleteLiveRead {
                 try? await Task.sleep(nanoseconds: 650_000_000)
                 if generation == lifecycleGeneration,
                    revision == projectConversationRevisions[projectAlias, default: 0],
                    machine.state == .online,
                    !isSuspended,
-                   let retry = try? await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, forceRefresh: force) {
+                   let retry = try? await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, forceRefresh: true) {
                     // Prefer any fresher retry. Authoritative live DOM is final; a partial
                     // retry may still contain a safe newest-head merge that the logic
                     // below can apply without deleting the verified tail.
-                    if retry.isAuthoritativeLiveDOM || retry.source == "browser-dom-partial-head-merge" {
+                    if retry.project.projectAlias == projectAlias,
+                       (retry.isAuthoritativeLiveDOM || retry.source == "browser-dom-partial-head-merge") {
                         page = retry
                     }
                 }
+            }
+            guard page.project.projectAlias == projectAlias else {
+                throw TransportError.malformedData
             }
             guard page.isAuthoritativeLiveDOM else {
                 // Windows can already hold a complete last-known Project catalog while
@@ -879,16 +958,20 @@ final class WorkspaceStore: ObservableObject {
                 // Projects look complete on the phone even though Windows had more.
                 if page.state == .staleCache,
                    let staleSnapshotId = page.snapshotId,
+                   !staleSnapshotId.isEmpty,
                    !page.items.isEmpty {
                     var staleItems = page.items
                     var seenIds = Set(staleItems.map(\.id))
                     var nextCursor = page.nextCursor
                     var hasMore = page.hasMore
                     var seenCursors = Set<String>()
-                    var pagingStoppedEarly = false
+                    var pagingStoppedEarly = hasMore
+                        && (nextCursor?.isEmpty != false || page.items.isEmpty || staleSnapshotId.isEmpty)
 
-                    while hasMore, let cursor = nextCursor {
-                        guard seenCursors.insert(cursor).inserted else {
+                    while hasMore, !pagingStoppedEarly {
+                        guard let cursor = nextCursor,
+                              !cursor.isEmpty,
+                              seenCursors.insert(cursor).inserted else {
                             pagingStoppedEarly = true
                             break
                         }
@@ -904,8 +987,17 @@ final class WorkspaceStore: ObservableObject {
                                   revision == projectConversationRevisions[projectAlias, default: 0],
                                   machine.state == .online,
                                   !isSuspended else { return }
-                            guard nextPage.state == .staleCache,
-                                  nextPage.snapshotId == staleSnapshotId else {
+                            let validContinuation: Bool
+                            if nextPage.hasMore {
+                                validContinuation = !nextPage.items.isEmpty
+                                    && nextPage.nextCursor.map { !$0.isEmpty && !seenCursors.contains($0) } == true
+                            } else {
+                                validContinuation = nextPage.nextCursor == nil
+                            }
+                            guard nextPage.project.projectAlias == projectAlias,
+                                  nextPage.state == .staleCache,
+                                  nextPage.snapshotId == staleSnapshotId,
+                                  validContinuation else {
                                 pagingStoppedEarly = true
                                 break
                             }
@@ -1043,11 +1135,16 @@ final class WorkspaceStore: ObservableObject {
             let authoritativeSnapshotId = page.snapshotId
             var seenIds = Set(authoritativeItems.map(\.id))
             var seenCursors = Set<String>()
-            var pagingStoppedEarly = false
+            var pagingStoppedEarly = hasMore
+                && (nextCursor?.isEmpty != false || page.items.isEmpty || authoritativeSnapshotId?.isEmpty != false)
+            if !hasMore, nextCursor != nil { pagingStoppedEarly = true }
 
-            while hasMore, let cursor = nextCursor {
-                guard seenCursors.insert(cursor).inserted,
-                      let expectedSnapshotId = authoritativeSnapshotId else {
+            while hasMore, !pagingStoppedEarly {
+                guard let cursor = nextCursor,
+                      !cursor.isEmpty,
+                      seenCursors.insert(cursor).inserted,
+                      let expectedSnapshotId = authoritativeSnapshotId,
+                      !expectedSnapshotId.isEmpty else {
                     pagingStoppedEarly = true
                     break
                 }
@@ -1063,8 +1160,17 @@ final class WorkspaceStore: ObservableObject {
                           revision == projectConversationRevisions[projectAlias, default: 0],
                           machine.state == .online,
                           !isSuspended else { return }
-                    guard nextPage.isAuthoritativeLiveDOM,
-                          nextPage.snapshotId == expectedSnapshotId else {
+                    let validContinuation: Bool
+                    if nextPage.hasMore {
+                        validContinuation = !nextPage.items.isEmpty
+                            && nextPage.nextCursor.map { !$0.isEmpty && !seenCursors.contains($0) } == true
+                    } else {
+                        validContinuation = nextPage.nextCursor == nil
+                    }
+                    guard nextPage.project.projectAlias == projectAlias,
+                          nextPage.isAuthoritativeLiveDOM,
+                          nextPage.snapshotId == expectedSnapshotId,
+                          validContinuation else {
                         pagingStoppedEarly = true
                         break
                     }
@@ -1145,10 +1251,17 @@ final class WorkspaceStore: ObservableObject {
         guard machine.state == .online,
               projectHasMoreByAlias[projectAlias] == true,
               let cursor = projectNextCursorByAlias[projectAlias],
-              let expectedSnapshotId = projectConversationSnapshotIds[projectAlias] else { return }
+              !cursor.isEmpty,
+              let expectedSnapshotId = projectConversationSnapshotIds[projectAlias],
+              !expectedSnapshotId.isEmpty else { return }
         do {
             let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, cursor: cursor, forceRefresh: true)
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
+            guard page.project.projectAlias == projectAlias else {
+                projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
+                errors["web.project.\(projectAlias)"] = "ChatGPT returned conversations for a different Project; keeping the last verified list."
+                return
+            }
             guard page.isAuthoritativeLiveDOM else {
                 projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
                 if mergeConversationTitleHints(page.items, projectAlias: projectAlias) {
@@ -1160,6 +1273,18 @@ final class WorkspaceStore: ObservableObject {
             }
             guard page.snapshotId == expectedSnapshotId else {
                 errors["web.project.\(projectAlias)"] = "ChatGPT conversation list changed while loading more; refresh to keep ordering consistent."
+                return
+            }
+            let validContinuation: Bool
+            if page.hasMore {
+                validContinuation = !page.items.isEmpty
+                    && page.nextCursor.map { !$0.isEmpty && $0 != cursor } == true
+            } else {
+                validContinuation = page.nextCursor == nil
+            }
+            guard validContinuation else {
+                projectConversationSnapshotStateByAlias[projectAlias] = .partialDOM
+                errors["web.project.\(projectAlias)"] = "ChatGPT conversation pagination was incomplete; keeping the last verified list."
                 return
             }
             var merged = projectConversationsByAlias[projectAlias, default: []]
@@ -1889,7 +2014,9 @@ final class WorkspaceStore: ObservableObject {
 
             var payload: [String: JSONValue] = ["text": .string(trimmed)]
             if !model.isEmpty { payload["model"] = .string(model) }
-            if runtimeId == "runtime.codex", !reasoningEffort.isEmpty { payload["reasoningEffort"] = .string(reasoningEffort) }
+            // Empty explicitly selects the CLI default. Omitting it would retain
+            // the previous model's effort after the user changes models.
+            if runtimeId == "runtime.codex" { payload["reasoningEffort"] = .string(reasoningEffort) }
             if !remoteAttachments.isEmpty { payload["attachmentIds"] = .array(remoteAttachments.map { .string($0.attachmentId) }) }
             let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "sendMessage", payload: payload, commandId: commandId)
             try? await cache.put(command, key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
@@ -2365,6 +2492,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func draft(sessionId: String) async -> String { (try? await cache.draft(sessionId: sessionId)) ?? "" }
+    func saveDraft(_ text: String, sessionId: String) async { try? await cache.saveDraft(text, sessionId: sessionId) }
     func clearError(sessionId: String) { errors[sessionId] = nil }
 
     private func pendingOperationCommandId(key: String, machineId: String) async -> UUID {
@@ -3637,7 +3765,12 @@ final class WorkspaceStore: ObservableObject {
                     // the only authority allowed to mutate current transport presentation.
                     if event.type != "TRANSPORT_STATUS" {
                         await applyEvent(event, suppressTransientPresentation: suppressEventPresentation)
-                        if !suppressEventPresentation,
+                        // A durable final may already be a few seconds old after a
+                        // disconnect. It still supersedes the frozen display copy;
+                        // unrelated sessions' historical pages must not hide it.
+                        let durableMessageBoundary = event.type == "MESSAGE_ADDED"
+                            || (event.type == "MESSAGE_UPDATED" && event.payload["partial"]?.boolValue == false)
+                        if (!suppressEventPresentation || durableMessageBoundary),
                            let sessionId = event.sessionId,
                            ["MESSAGE_ADDED", "MESSAGE_UPDATED", "MESSAGE_REMOVED", "SESSION_DELETED"].contains(event.type) {
                             releaseRecoveryDisplaySnapshot(for: sessionId)

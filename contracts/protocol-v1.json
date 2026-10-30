@@ -6,13 +6,13 @@
   "$defs": {
     "id": { "type": "string", "minLength": 1, "maxLength": 160 },
     "timestamp": { "type": "string", "format": "date-time" },
-    "runtimeKind": { "type": "string", "enum": ["Web", "CloudCode", "Codex"] },
+    "runtimeKind": { "type": "string", "enum": ["Web", "CloudCode", "Codex", "Antigravity"] },
     "action": {
       "type": "string",
       "enum": [
-        "getStatus", "listRuntimes", "listInstances", "listSessions",
+        "getStatus", "getDiagnostics", "listRuntimes", "listInstances", "listSessions",
         "createSession", "resumeSession", "stopSession", "getSessionStatus",
-        "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore",
+        "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore", "readMessageAttachmentChunk",
         "getChangesAfterCursor",
         "registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation",
         "listProjects", "listProjectConversations", "openProject", "createProject", "deleteSession",

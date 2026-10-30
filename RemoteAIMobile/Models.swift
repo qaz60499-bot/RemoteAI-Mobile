@@ -125,6 +125,7 @@ struct SessionDescriptor: Codable, Identifiable, Hashable {
     var workingDirectory: String? = nil
     var threadId: String? = nil
     var modelId: String? = nil
+    var reasoningEffort: String? = nil
 
     var orderingDate: Date { max(updatedAt, lastActivityAt ?? updatedAt) }
 
@@ -773,7 +774,8 @@ extension ServerSession {
             backgroundTaskStatusReceivedAt: backgroundTaskStatus == nil ? nil : Date(),
             workingDirectory: metadata["cwd"]?.stringValue,
             threadId: externalId,
-            modelId: metadata["model"]?.stringValue
+            modelId: metadata["model"]?.stringValue,
+            reasoningEffort: metadata["reasoningEffort"]?.stringValue
         )
     }
 }

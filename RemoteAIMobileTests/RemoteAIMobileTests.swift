@@ -4,6 +4,46 @@ import Combine
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
+    func testExistingWebTabEnterRestoresChatAndProjectWithoutCreatingAnything() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let tabs = try await mock.listOpenWebTabs(machineId: "my-pc")
+        XCTAssertEqual(tabs.count, 2)
+
+        let selectedChat = try await mock.enterOpenWebTab(machineId: "my-pc", tab: tabs[0])
+        XCTAssertEqual(selectedChat.tabId, tabs[0].tabId)
+        XCTAssertEqual(selectedChat.conversation?.localConversationId, "webconv-project-1")
+        XCTAssertNil(selectedChat.project)
+
+        let selectedProject = try await mock.enterOpenWebTab(machineId: "my-pc", tab: tabs[1])
+        XCTAssertEqual(selectedProject.project?.projectAlias, "g-p-remoteai")
+        XCTAssertNil(selectedProject.conversation)
+        let createAttempts = await mock.actionAttemptCount("createConversation")
+        XCTAssertEqual(createAttempts, 0, "Opening an existing Chrome tab must not create a Chat")
+    }
+
+    func testWebTabEnterRejectsStaleCanonicalURLWithoutMutatingChrome() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let tabs = try await mock.listOpenWebTabs(machineId: "my-pc")
+        let tab = try XCTUnwrap(tabs.first)
+        let stale = OpenWebTab(tabId: tab.tabId, title: tab.title,
+            canonicalUrl: "https://chatgpt.com/c/stale", active: tab.active,
+            loading: tab.loading, kind: tab.kind, sessionId: tab.sessionId,
+            busy: tab.busy)
+        do {
+            _ = try await mock.enterOpenWebTab(machineId: "my-pc", tab: stale)
+            XCTFail("Stale tab identity must not open another conversation")
+        } catch let error as TransportError {
+            guard case .remote(let code, _) = error else {
+                return XCTFail("Expected rejected browser binding")
+            }
+            XCTAssertEqual(code, "BROWSER_BINDING_MISSING")
+        }
+        let createAttempts = await mock.actionAttemptCount("createConversation")
+        XCTAssertEqual(createAttempts, 0)
+    }
+
     @MainActor
     func testUnavailableWebTabInventoryDoesNotPretendChromeHasZeroTabs() async throws {
         let store = WorkspaceStore(transport: MockTransport(historyCount: 0), cache: try SQLiteStore.inMemory())
@@ -579,8 +619,8 @@ final class RemoteAIMobileTests: XCTestCase {
             await mock.injectEvent(RemoteEvent(
                 protocolVersion: 1, eventId: UUID(), sequence: Int64(sequence),
                 machineId: "my-pc", runtimeId: "runtime.system",
-                // MockTransport Codable omits nil sessionId, unlike production wire.
-                // Use a benign session identifier to keep the strict test fixture valid.
+                // MockTransport's Codable omits nil sessionId; the strict delta
+                // decoder expects the key. Keep this fixture wire-valid.
                 instanceId: "agent", sessionId: "photo-upload", type: "TRANSPORT_STATUS",
                 payload: ["channel": .string("relay"), "state": .string("online")],
                 createdAt: old
@@ -1614,9 +1654,13 @@ final class RemoteAIMobileTests: XCTestCase {
         // Reconciliation must drain the deferred request even if the 20s TTL
         // has not expired.
         await store.refreshSessions(runtime: web, instance: instance)
-        for _ in 0..<200 {
-            if await mock.actionAttemptCount("listProjects") > before { break }
-            try await Task.sleep(nanoseconds: 2_000_000)
+        // Counted dispatch is not completed reconciliation. A CI scheduler may
+        // resume this test immediately after MockTransport records the attempt,
+        // before the authoritative response has reached WorkspaceStore.
+        for _ in 0..<600 {
+            if await mock.actionAttemptCount("listProjects") > before,
+               store.webProjectsSnapshotState == .authoritativeLiveDOM { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
         }
         let afterReconciliation = await mock.actionAttemptCount("listProjects")
         XCTAssertEqual(afterReconciliation, before + 1)

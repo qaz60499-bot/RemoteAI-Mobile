@@ -18,7 +18,7 @@ else
 fi
 
 "$PYTHON" -m json.tool contracts/protocol-v1.json >/dev/null
-EXPECTED_CONTRACT_SHA="000e459f7c2229c7753fb8d30cc70e1611c68db8e31d77d7b986f4b021bac6d0"
+EXPECTED_CONTRACT_SHA="92f21f8fa75a5a124749744a5f0e0ff7aa3d432bbe7285045233d7ebc387e59d"
 ACTUAL_CONTRACT_SHA="$("$PYTHON" -c 'import hashlib; print(hashlib.sha256(open("contracts/protocol-v1.json","rb").read()).hexdigest())')"
 [[ "$ACTUAL_CONTRACT_SHA" == "$EXPECTED_CONTRACT_SHA" ]] || fail "protocol-v1.json hash drifted: $ACTUAL_CONTRACT_SHA"
 
