@@ -135,7 +135,7 @@ final class ComposerDraft: ObservableObject {
         enqueueSave(sessionId: sessionId, text: text, using: saver)
     }
 
-    private func enqueueSave(sessionId: String, text: String, using saver: Saver) {
+    private func enqueueSave(sessionId: String, text: String, using saver: @escaping Saver) {
         let previousWrite = writeTask
         writeTask = Task { @MainActor in
             await previousWrite?.value

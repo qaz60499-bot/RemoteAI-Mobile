@@ -1552,7 +1552,7 @@ struct ChatView: View {
                                 let hasOptimisticMessage = store.messagesBySession[session.id, default: []].contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame }
                                 if state == .unknown && hasOptimisticMessage {
                                     // The final send may already have happened remotely. Keep the
-                                    // composer empty; the message-row Retry replays exactly once.
+                                    // composer empty; the message-row action checks delivery.
                                     composerCommandId = nil
                                     return
                                 }
@@ -2533,7 +2533,7 @@ struct MessageRow: View, Equatable {
                         if message.role == .user, let commandState {
                             Text(commandState.rawValue).font(.caption2).foregroundColor(commandState == .failed || commandState == .unknown ? .red : .secondary)
                         }
-                        if let retry { Button("恢复原命令（不新建消息）", action: retry).font(.caption) }
+                        if let retry { Button("核查送达状态", action: retry).font(.caption) }
                     }
                     .padding(.horizontal, 12).padding(.vertical, 9)
                     .background(RoundedRectangle(cornerRadius: 16).fill(message.role == .user ? Color.accentColor.opacity(0.18) : Color(.secondarySystemGroupedBackground)))

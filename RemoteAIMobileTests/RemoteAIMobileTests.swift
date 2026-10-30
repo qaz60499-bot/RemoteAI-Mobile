@@ -2993,7 +2993,7 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testTransportDisconnectAutoReconnectsAndReplaysExactCommandWithoutDuplicateSideEffect() async throws {
+    func testTransportDisconnectReconcilesWithoutReplayingUnknownSend() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .disconnectImmediatelyAfterSend, historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
@@ -3003,12 +3003,12 @@ final class RemoteAIMobileTests: XCTestCase {
 
         let sent = await store.send(text: "unknown-with-attachment", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", attachments: [attachment], commandId: commandId)
 
-        XCTAssertTrue(sent, "A 1006-style disconnect after send should reconnect immediately and replay the exact idempotent command")
+        XCTAssertTrue(sent, "A committed send is proved by read-only history after reconnect")
         XCTAssertEqual(store.commandStates[commandId], .completed)
         let sendAttempts = await mock.actionAttemptCount("sendMessage")
         let finalServerUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "unknown-with-attachment")
-        XCTAssertEqual(sendAttempts, 2, "One initial attempt plus one automatic idempotent replay is expected")
-        XCTAssertEqual(finalServerUserCount, 1, "Automatic replay must not create a second server user message")
+        XCTAssertEqual(sendAttempts, 1, "An interrupted acknowledgement must never automatically send again")
+        XCTAssertEqual(finalServerUserCount, 1, "The original committed turn is recovered without another send")
         let connectedAfterRecovery = await mock.isConnected
         XCTAssertTrue(connectedAfterRecovery, "The send recovery path should leave the transport connected")
         let pendingAfter: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
@@ -3017,7 +3017,7 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testAlreadyExecutedIsRecoveredAsSameCommandInsteadOfRollingBackComposer() async throws {
+    func testAlreadyExecutingWithoutDurableProofStaysUnknownWithoutReplay() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .alreadyExecutedThenSuccess, historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
@@ -3026,14 +3026,14 @@ final class RemoteAIMobileTests: XCTestCase {
 
         let sent = await store.send(text: "running-replay", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
 
-        XCTAssertTrue(sent, "ALREADY_EXECUTED is a transient idempotent state and must be resolved with the same command ID")
-        XCTAssertEqual(store.commandStates[commandId], .completed)
+        XCTAssertFalse(sent, "An executing receipt alone cannot prove delivery completed")
+        XCTAssertEqual(store.commandStates[commandId], .unknown)
         let sendAttempts = await mock.actionAttemptCount("sendMessage")
         let deliveredUserMessages = await mock.userMessageCount(sessionId: "photo-upload", text: "running-replay")
-        XCTAssertEqual(sendAttempts, 2)
-        XCTAssertEqual(deliveredUserMessages, 1)
+        XCTAssertEqual(sendAttempts, 1)
+        XCTAssertEqual(deliveredUserMessages, 0)
         let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
-        XCTAssertNil(pending)
+        XCTAssertEqual(pending?.commandId, commandId, "Keep the exact unresolved payload for evidence reconciliation")
         let draft = await store.draft(sessionId: "photo-upload")
         XCTAssertEqual(draft, "")
         await store.suspend()

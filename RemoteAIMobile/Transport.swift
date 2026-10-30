@@ -1,6 +1,56 @@
 import Foundation
 import CryptoKit
 
+private func attachmentDigestHex(_ digest: SHA256.Digest) -> String {
+    digest.map { String(format: "%02x", $0) }.joined()
+}
+
+private func attachmentSHA256Hex(_ data: Data) -> String {
+    attachmentDigestHex(SHA256.hash(data: data))
+}
+
+private func attachmentUploadFingerprint(_ attachment: PendingAttachment, contentDigest: SHA256.Digest) -> String {
+    var material = Data()
+    func appendLengthPrefixed(_ field: Data) {
+        var length = UInt64(field.count).bigEndian
+        withUnsafeBytes(of: &length) { material.append(contentsOf: $0) }
+        material.append(field)
+    }
+    appendLengthPrefixed(Data(attachment.name.utf8))
+    appendLengthPrefixed(Data(attachment.contentType.utf8))
+    appendLengthPrefixed(Data(String(attachment.sizeBytes).utf8))
+    appendLengthPrefixed(Data(contentDigest.map { $0 }))
+    return attachmentDigestHex(SHA256.hash(data: material))
+}
+
+private func requireConsistentAttachmentSHA256(_ expected: String?, _ received: String?) throws {
+    guard expected?.lowercased() == received?.lowercased() else { throw TransportError.malformedData }
+}
+
+private func verifyAttachmentSHA256(_ expected: String?, data: Data) throws {
+    guard let expected else { return }
+    let normalized = expected.lowercased()
+    guard normalized.utf8.count == 64,
+          normalized.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
+          normalized == attachmentSHA256Hex(data) else { throw TransportError.malformedData }
+}
+
+private func verifyAttachmentSHA256(_ expected: String?, fileURL: URL) throws {
+    guard let expected else { return }
+    let normalized = expected.lowercased()
+    guard normalized.utf8.count == 64,
+          normalized.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+        throw TransportError.malformedData
+    }
+    let handle = try FileHandle(forReadingFrom: fileURL)
+    defer { try? handle.close() }
+    var hasher = SHA256()
+    while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+        hasher.update(data: chunk)
+    }
+    guard normalized == attachmentDigestHex(hasher.finalize()) else { throw TransportError.malformedData }
+}
+
 struct RemoteAIConfig: Codable, Equatable {
     var relayBaseURL: URL
     var machineId: String
@@ -561,6 +611,12 @@ extension Transport {
     }
 
     func uploadAttachment(machineId: String, runtimeId: String, instanceId: String, sessionId: String, attachment: PendingAttachment, operationId: UUID = UUID(), attachmentIndex: Int = 0) async throws -> RemoteAttachmentDescriptor {
+        let localDigest = SHA256.hash(data: attachment.data)
+        let localSHA256 = attachmentDigestHex(localDigest)
+        // Reusing a composer command ID is safe only for the same immutable file.
+        // Include the file identity in every child command label so replacing or
+        // removing an attachment at the same index cannot replay earlier bytes.
+        let uploadLabel = "attachment:\(attachmentIndex):\(attachmentUploadFingerprint(attachment, contentDigest: localDigest))"
         let begin = RemoteCommand.make(
             machineId: machineId,
             runtimeId: runtimeId,
@@ -572,7 +628,7 @@ extension Transport {
                 "contentType": .string(attachment.contentType),
                 "sizeBytes": .number(Double(attachment.sizeBytes))
             ],
-            commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "attachment:\(attachmentIndex):begin")
+            commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "\(uploadLabel):begin")
         )
         let ticket = try await requireSuccess(execute(begin)).decode(AttachmentUploadTicket.self)
         let chunkSize = max(16 * 1024, min(ticket.chunkBytes, 128 * 1024))
@@ -594,7 +650,7 @@ extension Transport {
                         "index": .number(Double(index)),
                         "dataBase64": .string(chunk.base64EncodedString())
                     ],
-                    commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "attachment:\(attachmentIndex):chunk:\(index)")
+                    commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "\(uploadLabel):chunk:\(index)")
                 )
                 _ = try await requireSuccess(execute(command))
                 index += 1
@@ -607,9 +663,11 @@ extension Transport {
                 sessionId: sessionId,
                 action: "finishAttachmentUpload",
                 payload: ["uploadId": .string(ticket.uploadId)],
-                commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "attachment:\(attachmentIndex):finish")
+                commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "\(uploadLabel):finish")
             )
-            return try await requireSuccess(execute(finish)).decode(RemoteAttachmentDescriptor.self)
+            let descriptor = try await requireSuccess(execute(finish)).decode(RemoteAttachmentDescriptor.self)
+            guard descriptor.sha256.lowercased() == localSHA256 else { throw TransportError.malformedData }
+            return descriptor
         } catch {
             let keepForReplay: Bool = {
                 guard let transportError = error as? TransportError else { return false }
@@ -623,7 +681,7 @@ extension Transport {
                     sessionId: sessionId,
                     action: "discardAttachmentUpload",
                     payload: ["uploadId": .string(ticket.uploadId)],
-                    commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "attachment:\(attachmentIndex):discard")
+                    commandId: RemoteCommand.derivedCommandId(namespace: operationId, label: "\(uploadLabel):discard")
                 )
                 _ = try? await execute(discard)
             }
@@ -646,6 +704,7 @@ extension Transport {
         let totalChunks = (first.chunk.sizeBytes + first.chunk.chunkBytes - 1) / first.chunk.chunkBytes
         guard totalChunks >= 1, totalChunks <= MessageAttachmentTransferPolicy.maxDownloadChunks else { throw TransportError.frameTooLarge }
         if totalChunks == 1 {
+            try verifyAttachmentSHA256(first.chunk.sha256, data: first.data)
             return DownloadedMessageAttachment(
                 attachmentId: attachmentId,
                 name: first.chunk.name,
@@ -685,6 +744,7 @@ extension Transport {
                           item.chunk.chunkBytes == expectedChunkBytes,
                           item.chunk.name == expectedName,
                           item.chunk.contentType == expectedContentType else { throw TransportError.malformedData }
+                    try requireConsistentAttachmentSHA256(first.chunk.sha256, item.chunk.sha256)
                     return (index, item.data)
                 }
             }
@@ -708,6 +768,7 @@ extension Transport {
                               item.chunk.chunkBytes == expectedChunkBytes,
                               item.chunk.name == expectedName,
                               item.chunk.contentType == expectedContentType else { throw TransportError.malformedData }
+                        try requireConsistentAttachmentSHA256(first.chunk.sha256, item.chunk.sha256)
                         return (index, item.data)
                     }
                 }
@@ -721,6 +782,7 @@ extension Transport {
             data.append(part)
         }
         guard data.count == expectedSize else { throw TransportError.malformedData }
+        try verifyAttachmentSHA256(first.chunk.sha256, data: data)
         return DownloadedMessageAttachment(attachmentId: attachmentId, name: expectedName, contentType: expectedContentType, data: data)
     }
 
@@ -786,6 +848,7 @@ extension Transport {
                               item.chunk.chunkBytes == expectedChunkBytes,
                               item.chunk.name == expectedName,
                               item.chunk.contentType == expectedContentType else { throw TransportError.malformedData }
+                        try requireConsistentAttachmentSHA256(first.chunk.sha256, item.chunk.sha256)
                         return (index, item.data)
                     }
                 }
@@ -809,6 +872,7 @@ extension Transport {
                                   item.chunk.chunkBytes == expectedChunkBytes,
                                   item.chunk.name == expectedName,
                                   item.chunk.contentType == expectedContentType else { throw TransportError.malformedData }
+                            try requireConsistentAttachmentSHA256(first.chunk.sha256, item.chunk.sha256)
                             return (index, item.data)
                         }
                     }
@@ -822,6 +886,7 @@ extension Transport {
                 try? FileManager.default.removeItem(at: fileURL)
                 throw TransportError.malformedData
             }
+            try verifyAttachmentSHA256(first.chunk.sha256, fileURL: fileURL)
             return DownloadedMessageAttachmentFile(
                 attachmentId: attachmentId,
                 name: safeName,

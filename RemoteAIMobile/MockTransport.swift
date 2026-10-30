@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
@@ -6,6 +7,7 @@ enum MockScenario: String, CaseIterable {
     case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, webSendLegacyChromeChannelClosedAfterCommit, webSendLegacyUnrelatedSelectorFailure, alreadyExecutedThenSuccess, deltaOnlySend
     case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, staleThenFreshProjectConversations, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
     case malformedCreateReplyAfterCommit
+    case malformedSendReplyAfterCommit
 }
 
 enum MockProjectConversationPaginationFault: String, Equatable {
@@ -38,6 +40,8 @@ actor MockTransport: Transport {
     private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
     private var commandAttempts: [String: Int] = [:]
+    private var commandIdsByAction: [String: [UUID]] = [:]
+    private var disconnectAfterActionCounts: [String: Int] = [:]
     private var actionFailureCounts: [String: Int] = [:]
     private var lastPreferCacheByAction: [String: Bool] = [:]
     private var connectAttempts = 0
@@ -213,7 +217,14 @@ actor MockTransport: Transport {
     }
     func setDeltaPageLimitForTests(_ value: Int) { deltaPageLimitForTests = max(1, value) }
     func failNextAction(_ action: String, count: Int = 1) { actionFailureCounts[action] = max(0, count) }
+    func disconnectAfterNextAction(_ action: String, count: Int = 1) {
+        disconnectAfterActionCounts[action] = max(0, count)
+    }
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
+    func commandIds(action: String) -> [UUID] { commandIdsByAction[action, default: []] }
+    func eventCount(type: String, sessionId: String) -> Int {
+        eventLog.filter { $0.type == type && $0.sessionId == sessionId }.count
+    }
     func lastPreferCacheValue(_ action: String) -> Bool? { lastPreferCacheByAction[action] }
     func preferCacheValues(_ action: String) -> [Bool] { preferCacheHistoryByAction[action, default: []] }
     func connectionAttemptCount() -> Int { connectAttempts }
@@ -340,6 +351,7 @@ actor MockTransport: Transport {
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
         try ProtocolSecurity.validate(command, expectedMachineId: machineId)
         commandAttempts[command.action, default: 0] += 1
+        commandIdsByAction[command.action, default: []].append(command.commandId)
         if let preferCache = command.payload["preferCache"]?.boolValue {
             lastPreferCacheByAction[command.action] = preferCache
             preferCacheHistoryByAction[command.action, default: []].append(preferCache)
@@ -635,7 +647,8 @@ actor MockTransport: Transport {
                 response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "INVALID_COMMAND", message: "Incomplete mock attachment", retryable: false, details: nil), idempotentReplay: nil)
                 break
             }
-            let descriptor = RemoteAttachmentDescriptor(attachmentId: "attachment-\(UUID().uuidString.lowercased())", name: upload.name, contentType: upload.contentType, sizeBytes: upload.sizeBytes, sha256: String(repeating: "0", count: 64))
+            let digest = SHA256.hash(data: upload.data).map { String(format: "%02x", $0) }.joined()
+            let descriptor = RemoteAttachmentDescriptor(attachmentId: "attachment-\(UUID().uuidString.lowercased())", name: upload.name, contentType: upload.contentType, sizeBytes: upload.sizeBytes, sha256: digest)
             finishedAttachmentData[descriptor.attachmentId] = upload.data
             response = try success(descriptor)
         case "discardAttachmentUpload":
@@ -661,7 +674,7 @@ actor MockTransport: Transport {
                 name: responseName,
                 contentType: responseType,
                 sizeBytes: data.count,
-                sha256: nil,
+                sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),
                 index: index,
                 chunkBytes: chunkBytes,
                 dataBase64: chunkData.base64EncodedString(),
@@ -757,11 +770,19 @@ actor MockTransport: Transport {
             connected = false
             throw TransportError.disconnected
         }
+        if scenario == .malformedSendReplyAfterCommit, command.action == "sendMessage" {
+            throw TransportError.malformedData
+        }
         if scenario == .disconnectAfterAttachmentChunk, command.action == "uploadAttachmentChunk" {
             connected = false
             throw TransportError.disconnected
         }
         if scenario == .disconnectAfterCreateProject, command.action == "createProject" {
+            connected = false
+            throw TransportError.disconnected
+        }
+        if disconnectAfterActionCounts[command.action, default: 0] > 0 {
+            disconnectAfterActionCounts[command.action, default: 0] -= 1
             connected = false
             throw TransportError.disconnected
         }

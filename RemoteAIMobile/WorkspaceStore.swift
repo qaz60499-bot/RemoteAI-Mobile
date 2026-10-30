@@ -15,6 +15,48 @@ enum OpenWebTabDestination {
 
 @MainActor
 final class WorkspaceStore: ObservableObject {
+    private struct StopRunIdentity: Codable, Equatable {
+        let eventRevision: UInt64
+        let generationSequence: Int64?
+        let generationKey: String?
+        let activityAt: Date?
+
+        func identifiesSameRun(as other: StopRunIdentity) -> Bool {
+            if let generationKey, let otherKey = other.generationKey {
+                return generationKey == otherKey
+            }
+            if generationSequence != nil || other.generationSequence != nil {
+                return generationSequence == other.generationSequence
+            }
+            guard let activityAt, let otherActivityAt = other.activityAt else { return false }
+            return activityAt == otherActivityAt
+        }
+
+        func canCoalesceStopTask(as other: StopRunIdentity) -> Bool {
+            if let generationKey, let otherKey = other.generationKey {
+                return generationKey == otherKey
+            }
+            if generationSequence != nil || other.generationSequence != nil {
+                return generationSequence == other.generationSequence
+            }
+            // Without a start event there is no reliable run ID. Keep the existing
+            // per-session single-flight behavior and let the exact event-revision
+            // guard decide whether the old completion can change visible state.
+            return true
+        }
+    }
+
+    private struct PendingStopOperation: Codable {
+        let commandId: UUID
+        let runIdentity: StopRunIdentity?
+    }
+
+    private struct StopTaskEntry {
+        let token: UUID
+        let runIdentity: StopRunIdentity
+        let task: Task<Bool, Never>
+    }
+
     @Published var machine = MachineMetadata(id: "my-pc", name: "My PC", state: .connecting)
     @Published var runtimes: [RuntimeDescriptor] = []
     @Published var instances: [InstanceDescriptor] = []
@@ -159,12 +201,11 @@ final class WorkspaceStore: ObservableObject {
         if bytes < 64 * 1024 { return 70_000_000 }
         return 90_000_000
     }
-    private static let sendRecoveryBackoffNanoseconds: [UInt64] = [0, 500_000_000, 1_500_000_000]
     private var olderMessageLoads = Set<String>()
     private var creatingWebProjects = Set<String>()
     private var creatingWebConversations = Set<String>()
     private var creatingSessions = Set<String>()
-    private var stopTasksBySession: [String: Task<Bool, Never>] = [:]
+    private var stopTasksBySession: [String: StopTaskEntry] = [:]
     private var commandSendsInFlight = Set<UUID>()
     private var metadataRefreshInFlight = false
     private var metadataRefreshQueued = false
@@ -184,6 +225,9 @@ final class WorkspaceStore: ObservableObject {
     private var projectConversationRevisions: [String: UInt64] = [:]
     private var projectConversationSnapshotIds: [String: String] = [:]
     private var sessionRevisions: [String: UInt64] = [:]
+    private var stopEventRevisionsBySession: [String: UInt64] = [:]
+    private var stopRunStartSequenceBySession: [String: Int64] = [:]
+    private var stopRunGenerationKeyBySession: [String: String] = [:]
     // Live events carry authoritative runtime/instance routing even when the mobile
     // catalog is still intentionally lazy. Keep that route so opening a conversation
     // can recover its history before the instance/session list has been expanded.
@@ -2052,6 +2096,11 @@ final class WorkspaceStore: ObservableObject {
         } catch is CancellationError {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             attachmentTransferBySession.removeValue(forKey: sessionId)
+            if messageCommandPersisted {
+                commandStates[commandId] = .unknown
+                errors[sessionId] = "发送确认已中断，送达状态未知。原命令已保留，核查前不会重发。"
+                return false
+            }
             commandStates[commandId] = .failed
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
@@ -2063,128 +2112,45 @@ final class WorkspaceStore: ObservableObject {
             commandStates[commandId] = .unknown
             DiagnosticsLog.shared.record("send_transport_interrupted", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "persisted": String(messageCommandPersisted)]), level: "WARN")
 
-            // Once the exact send command has been persisted locally, replaying that same
-            // commandId after a transport reconnect is safe: the Windows command registry
-            // is idempotent, so a frame that reached the Agent before the 1006 cannot
-            // create a duplicate provider turn. This also covers the opposite race where
-            // the WebSocket died before the encrypted frame ever reached the Relay.
+            // An interrupted acknowledgement does not prove delivery failed.
+            // Reconnect and inspect durable evidence; never automatically send again.
             if messageCommandPersisted,
-               let persisted = try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(commandId, machineId: activeMachineId)) {
-                for (attempt, backoff) in Self.sendRecoveryBackoffNanoseconds.enumerated() {
-                    if backoff > 0 { try? await Task.sleep(nanoseconds: backoff) }
-                    guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
-                    do {
-                        if !(await activeTransport.isConnected) { try await activeTransport.connect() }
-                        let authenticatedSequence = try await activeTransport.latestSequence(machineId: activeMachineId)
-                        guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
-                        machine.state = .online
-                        connectionPhase = .online
-                        errors["connection"] = nil
-                        await recoverDelta(freshLatestSequence: authenticatedSequence)
-                        commandStates[commandId] = .executing
-                        let replayedState = try await activeTransport.send(persisted)
-                        commandStates[commandId] = replayedState
-                        await recoverDelta()
-                        try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
-                        try? await cache.saveDraft("", sessionId: sessionId)
-                        errors[sessionId] = nil
-                        if messagesBySession[sessionId, default: []].last?.role == .user {
-                            let recoveredSendAt = Date()
-                            setSessionState(sessionId, .busy)
-                            markLiveRunActivity(sessionId: sessionId, at: recoveredSendAt)
-                            if runtimeId == "runtime.web" {
-                                promoteProjectConversationActivity(sessionId: sessionId, at: recoveredSendAt)
-                            }
-                            liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
-                                ? "连接已恢复，等待 ChatGPT 响应…"
-                                : "连接已恢复，等待远端响应…"
-                        }
-                        DiagnosticsLog.shared.record("send_recovered_after_disconnect", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)])
-                        return true
-                    } catch let retryError as TransportError where Self.isRecoverableCommandTransportError(retryError) {
-                        DiagnosticsLog.shared.record("send_reconnect_retry", fields: Self.diagnosticFields(for: retryError, adding: ["session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)]), level: "WARN")
-                        continue
-                    } catch {
-                        DiagnosticsLog.shared.record("send_reconnect_abort", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)]), level: "WARN")
-                        break
-                    }
-                }
+               await reconcileUnknownSend(commandId: commandId, runtimeId: runtimeId,
+                    instanceId: instanceId, sessionId: sessionId, generation: generation,
+                    activeTransport: activeTransport, machineId: activeMachineId) {
+                return true
             }
-
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, !isSuspended else { return false }
             errors[sessionId] = messageCommandPersisted
-                ? "Connection dropped while sending. RemoteAI retried the same operation safely, but delivery is still unknown; Retry continues to use the same command ID."
+                ? "Connection dropped while sending. Delivery is unknown; check delivery status before sending again."
                 : "Attachment transfer was interrupted before message delivery was attempted. Retry from the composer reuses the same operation ID."
-            DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "persisted": String(messageCommandPersisted)]), level: "WARN")
             return false
         } catch let error as TransportError {
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, !isSuspended else { return false }
             if Self.isUnknownWebSendOutcome(error, runtimeId: runtimeId) {
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
                 attachmentTransferBySession.removeValue(forKey: sessionId)
                 commandStates[commandId] = .unknown
-                errors[sessionId] = "Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."
+                errors[sessionId] = "Delivery is unknown after the ChatGPT page changed. Checking durable delivery evidence; no message will be sent again."
                 DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString]), level: "WARN")
-                // Unknown delivery must never be resolved by blindly sending again. First
-                // perform bounded read-only reconciliation: if the provider user turn is
-                // already visible, loadSession matches it to the persisted command payload
-                // and marks this exact command completed without another send side effect.
-                await recoverDelta()
-                for attempt in 0..<3 where commandStates[commandId] == .unknown {
-                    do {
-                        // The send path already knows the authoritative runtime/instance route.
-                        // Do not depend on lazy session-route hydration here: a fresh phone can
-                        // receive WEB_SEND_DELIVERY_UNKNOWN before that catalog has ever been
-                        // expanded, and loadSession() would then return without issuing a remote
-                        // history read. Read the exact session directly and reconcile only against
-                        // that authoritative page, so a local optimistic bubble still cannot prove
-                        // its own delivery.
-                        let page = try await activeTransport.loadRecent(
-                            machineId: activeMachineId,
-                            runtimeId: runtimeId,
-                            instanceId: instanceId,
-                            sessionId: sessionId,
-                            limit: 50
-                        )
-                        guard generation == lifecycleGeneration,
-                              transport === activeTransport,
-                              machine.id == activeMachineId,
-                              !isSuspended else { return false }
-                        await reconcilePendingUnknownCommands(with: page.items, sessionId: sessionId)
-                        for remoteUser in page.items where remoteUser.role == .user {
-                            await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
-                        }
-                        try? await cache.upsertMessages(page.items)
-                        merge(page.items, into: sessionId)
-                        ensureSessionDescriptorExists(sessionId: sessionId, instanceId: instanceId, updatedAt: page.items.last?.createdAt ?? Date())
-                        await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
-                        hasMoreBySession[sessionId] = page.hasMore
-                    } catch let reconcileError as TransportError where reconcileError == .disconnected || reconcileError == .timeout || reconcileError == .offline {
-                        DiagnosticsLog.shared.record("send_reconcile_retry", fields: Self.diagnosticFields(for: reconcileError, adding: ["session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)]), level: "WARN")
-                    } catch {
-                        DiagnosticsLog.shared.record("send_reconcile_abort", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId, "commandId": commandId.uuidString, "attempt": String(attempt + 1)]), level: "WARN")
-                        break
-                    }
-                    if commandStates[commandId] == .completed { break }
-                    if attempt < 2 { try? await Task.sleep(nanoseconds: 400_000_000) }
+                return await reconcileUnknownSend(commandId: commandId, runtimeId: runtimeId,
+                    instanceId: instanceId, sessionId: sessionId, generation: generation,
+                    activeTransport: activeTransport, machineId: activeMachineId)
+            }
+            if messageCommandPersisted {
+                // Only an explicit provider/Agent failure receipt can classify
+                // a dispatched send as failed. A malformed or rejected reply
+                // frame gives no evidence about the provider side effect.
+                if case .remote = error { /* handled as a definitive remote failure below */ }
+                else {
+                    commandStates[commandId] = .unknown
+                    attachmentTransferBySession.removeValue(forKey: sessionId)
+                    return await reconcileUnknownSend(commandId: commandId, runtimeId: runtimeId,
+                        instanceId: instanceId, sessionId: sessionId, generation: generation,
+                        activeTransport: activeTransport, machineId: activeMachineId)
                 }
-                if commandStates[commandId] == .completed {
-                    try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
-                    try? await cache.saveDraft("", sessionId: sessionId)
-                    errors[sessionId] = nil
-                    // If reconciliation found only the committed provider user turn,
-                    // keep the visible chat in active-poll mode until an authoritative
-                    // assistant final arrives. If loadSession already found that final,
-                    // its terminal state wins and must not be overwritten here.
-                    if messagesBySession[sessionId, default: []].last?.role == .user {
-                        setSessionState(sessionId, .busy)
-                        markLiveRunActivity(sessionId: sessionId, at: Date())
-                        liveRunStatusBySession[sessionId] = runtimeId == "runtime.web"
-                            ? "已确认发送，等待 ChatGPT 响应…"
-                            : "已确认发送，等待远端响应…"
-                    }
-                    DiagnosticsLog.shared.record("send_reconciled_delivery", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString])
-                    return true
-                }
-                return false
             }
             attachmentTransferBySession.removeValue(forKey: sessionId)
             commandStates[commandId] = .failed
@@ -2197,6 +2163,11 @@ final class WorkspaceStore: ObservableObject {
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             attachmentTransferBySession.removeValue(forKey: sessionId)
+            if messageCommandPersisted {
+                commandStates[commandId] = .unknown
+                errors[sessionId] = "发送回执无法确认：\(error.localizedDescription)。原命令已保留，不会自动重发。"
+                return false
+            }
             commandStates[commandId] = .failed
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
@@ -2207,68 +2178,182 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func retry(message: ChatMessage, runtimeId: String, instanceId: String, model: String = "") async {
-        guard let commandId = UUID(uuidString: message.id) else { return }
-        guard commandStates[commandId] == .unknown else { return }
-        guard commandSendsInFlight.insert(commandId).inserted else { return }
-        defer { commandSendsInFlight.remove(commandId) }
-        guard machine.state == .online else {
-            errors[message.sessionId] = "PC Offline — reconnect before retrying this unknown delivery."
-            return
+    // Both automatic reconnect and the user's status check reuse this read-only
+    // reconciliation. A cached ambiguous FAILED receipt is never delivery failure.
+    private func reconcileUnknownSend(commandId: UUID, runtimeId: String, instanceId: String,
+        sessionId: String, generation: UInt64, activeTransport: Transport, machineId: String) async -> Bool {
+        func current() -> Bool {
+            generation == lifecycleGeneration && transport === activeTransport
+                && machine.id == machineId && !isSuspended
         }
+        do {
+            guard current() else { return false }
+            if !(await activeTransport.isConnected) { try await activeTransport.connect() }
+            let head = try await activeTransport.latestSequence(machineId: machineId)
+            guard current() else { return false }
+            machine.state = .online
+            connectionPhase = .online
+            errors["connection"] = nil
+            await recoverDelta(freshLatestSequence: head)
+            for attempt in 0..<3 where commandStates[commandId] == .unknown {
+                guard current() else { return false }
+                let page = try await activeTransport.loadRecent(machineId: machineId,
+                    runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, limit: 50)
+                guard current() else { return false }
+                await reconcilePendingUnknownCommands(with: page.items, sessionId: sessionId)
+                for remoteUser in page.items where remoteUser.role == .user {
+                    await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+                }
+                try? await cache.upsertMessages(page.items)
+                guard current() else { return false }
+                merge(page.items, into: sessionId)
+                releaseRecoveryDisplaySnapshot(for: sessionId)
+                ensureSessionDescriptorExists(sessionId: sessionId, instanceId: instanceId,
+                    updatedAt: page.items.last?.createdAt ?? Date())
+                await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
+                hasMoreBySession[sessionId] = page.hasMore
+                if commandStates[commandId] == .completed { break }
+                if attempt < 2 { try await Task.sleep(nanoseconds: 400_000_000) }
+            }
+            guard current() else { return false }
+            if commandStates[commandId] == .completed {
+                try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: machineId))
+                try? await cache.saveDraft("", sessionId: sessionId)
+                guard current() else { return false }
+                errors[sessionId] = nil
+                if messagesBySession[sessionId, default: []].last?.role == .user {
+                    setSessionState(sessionId, .busy)
+                    markLiveRunActivity(sessionId: sessionId, at: Date())
+                    liveRunStatusBySession[sessionId] = "已确认发送，等待远端响应…"
+                }
+                return true
+            }
+        } catch {
+            guard current() else { return false }
+            DiagnosticsLog.shared.record("send_reconcile_unconfirmed",
+                fields: Self.diagnosticFields(for: error, adding: ["session": sessionId,
+                    "commandId": commandId.uuidString]), level: "WARN")
+        }
+        guard current() else { return false }
+        // Keep the exact payload for future evidence matching and manual diagnosis.
+        commandStates[commandId] = .unknown
+        errors[sessionId] = "送达状态仍未确认。已保留原 command ID；请核查电脑原会话，不会自动重发。"
+        return false
+    }
+
+    func retry(message: ChatMessage, runtimeId: String, instanceId: String, model: String = "") async {
+        guard let commandId = UUID(uuidString: message.id), commandStates[commandId] == .unknown,
+              commandSendsInFlight.insert(commandId).inserted else { return }
+        defer { commandSendsInFlight.remove(commandId) }
         let generation = lifecycleGeneration
         let activeTransport = transport
         let activeMachineId = machine.id
-        do {
-            let command: RemoteCommand
-            if let stored = try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(commandId, machineId: activeMachineId)) {
-                command = stored
-            } else {
-                guard !message.text.contains("[Attachments:") else {
-                    errors[message.sessionId] = "The saved attachment retry payload is unavailable. Refresh the conversation before sending anything again."
-                    return
-                }
-                command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: message.sessionId, action: "sendMessage", payload: ["text": .string(message.text)], commandId: commandId)
-            }
-            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
-            commandStates[commandId] = .executing
-            let finalState = try await activeTransport.send(command)
-            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
-            commandStates[commandId] = finalState
-            try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
-            errors[message.sessionId] = nil
-            // A replayed command response proves the side effect result, but the replay
-            // itself may not re-emit the original MESSAGE_ADDED event. Re-read the
-            // authoritative session so optimistic UI/cache state converges as well.
-            await loadSession(message.sessionId)
-        } catch let error as TransportError where Self.isRecoverableCommandTransportError(error) {
-            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
-            commandStates[commandId] = .unknown
-            errors[message.sessionId] = "Windows 已接收或连接刚发生切换，RemoteAI 会继续使用同一个 command ID 查询最终结果，不会重复发送到 ChatGPT。"
-        } catch {
-            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
-            commandStates[commandId] = .failed
-            try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
-            errors[message.sessionId] = error.localizedDescription
-        }
+        guard !isSuspended else { return }
+        _ = await reconcileUnknownSend(commandId: commandId, runtimeId: runtimeId,
+            instanceId: instanceId, sessionId: message.sessionId, generation: generation,
+            activeTransport: activeTransport, machineId: activeMachineId)
     }
 
     @discardableResult
     func stop(runtimeId: String, instanceId: String, sessionId: String) async -> Bool {
+        let requestedRun = stopRunIdentity(for: sessionId)
         if let inFlight = stopTasksBySession[sessionId] {
-            return await inFlight.value
+            if inFlight.runIdentity.canCoalesceStopTask(as: requestedRun) {
+                return await inFlight.task.value
+            }
+            _ = await inFlight.task.value
+            if let current = stopTasksBySession[sessionId], current.token != inFlight.token {
+                if current.runIdentity.canCoalesceStopTask(as: requestedRun) {
+                    return await current.task.value
+                }
+                return false
+            }
+            if stopTasksBySession[sessionId]?.token == inFlight.token {
+                stopTasksBySession.removeValue(forKey: sessionId)
+            }
+            // Do not let an old Stop task become a new Stop if the target changed
+            // again while this caller was waiting for it to settle.
+            guard stopRunIdentity(for: sessionId) == requestedRun else { return false }
         }
+        let token = UUID()
         let task = Task { @MainActor [weak self] in
             guard let self else { return false }
-            return await self.performStop(runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId)
+            return await self.performStop(runtimeId: runtimeId, instanceId: instanceId,
+                sessionId: sessionId, runIdentity: requestedRun)
         }
-        stopTasksBySession[sessionId] = task
+        stopTasksBySession[sessionId] = StopTaskEntry(token: token, runIdentity: requestedRun, task: task)
         let result = await task.value
-        stopTasksBySession.removeValue(forKey: sessionId)
+        if stopTasksBySession[sessionId]?.token == token {
+            stopTasksBySession.removeValue(forKey: sessionId)
+        }
         return result
     }
 
-    private func performStop(runtimeId: String, instanceId: String, sessionId: String) async -> Bool {
+    private func stopRunIdentity(for sessionId: String) -> StopRunIdentity {
+        let session = sessions.first(where: { $0.id == sessionId })
+        let activityAt = [
+            session?.lastActivityAt,
+            session?.lastProgressAt,
+            liveRunActivityAtBySession[sessionId],
+        ].compactMap { $0 }.max()
+        return StopRunIdentity(
+            eventRevision: stopEventRevisionsBySession[sessionId, default: 0],
+            generationSequence: stopRunStartSequenceBySession[sessionId],
+            generationKey: stopRunGenerationKeyBySession[sessionId],
+            activityAt: activityAt
+        )
+    }
+
+    private func laterStopActivity(_ first: Date?, _ second: Date?) -> Date? {
+        switch (first, second) {
+        case let (first?, second?): return max(first, second)
+        case let (first?, nil): return first
+        case let (nil, second?): return second
+        case (nil, nil): return nil
+        }
+    }
+
+    private func stopStatusHasFreshIdleEvidence(
+        _ snapshot: RemoteSessionStatusSnapshot,
+        requestStartedAt: Date,
+        sessionId: String
+    ) -> Bool {
+        guard snapshot.state == .idle else { return true }
+        let liveActivityAt = [
+            liveRunActivityAtBySession[sessionId],
+            sessions.first(where: { $0.id == sessionId })?.lastActivityAt,
+            sessions.first(where: { $0.id == sessionId })?.lastProgressAt,
+        ].compactMap { $0 }.max()
+        guard let liveActivityAt else { return true }
+        let remoteEvidenceAt = [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
+        return liveActivityAt <= requestStartedAt
+            && (remoteEvidenceAt.map { $0 >= liveActivityAt } ?? false)
+    }
+
+    private func stopOperationCacheKey(runtimeId: String, instanceId: String,
+        sessionId: String, machineId: String) -> String {
+        "pending.operation.\(machineId).stop.\(runtimeId).\(instanceId).\(sessionId)"
+    }
+
+    private func loadPendingStopOperation(cacheKey: String) async -> PendingStopOperation? {
+        if let record = try? await cache.get(PendingStopOperation.self, key: cacheKey) {
+            return record
+        }
+        // Read the previous UUID-only representation once so it cannot be replayed
+        // against a later run without first checking authoritative session status.
+        guard let raw = try? await cache.get(String.self, key: cacheKey),
+              let commandId = UUID(uuidString: raw) else { return nil }
+        return PendingStopOperation(commandId: commandId, runIdentity: nil)
+    }
+
+    private func finishPendingStopOperation(cacheKey: String, expectedCommandId: UUID) async {
+        guard let pending = await loadPendingStopOperation(cacheKey: cacheKey),
+              pending.commandId == expectedCommandId else { return }
+        try? await cache.remove(key: cacheKey)
+    }
+
+    private func performStop(runtimeId: String, instanceId: String, sessionId: String,
+        runIdentity: StopRunIdentity) async -> Bool {
         guard machine.state == .online else {
             errors[sessionId] = "PC Offline — stop will not be queued blindly."
             return false
@@ -2276,24 +2361,172 @@ final class WorkspaceStore: ObservableObject {
         let generation = lifecycleGeneration
         let activeTransport = transport
         let activeMachineId = machine.id
-        let operationKey = "stop.\(runtimeId).\(instanceId).\(sessionId)"
-        let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
-        guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+        let cacheKey = stopOperationCacheKey(runtimeId: runtimeId, instanceId: instanceId,
+            sessionId: sessionId, machineId: activeMachineId)
+        guard stopRunIdentity(for: sessionId) == runIdentity else { return false }
+
+        var commandId = UUID()
+        var reusedUnknownOperation = false
+        if let pending = await loadPendingStopOperation(cacheKey: cacheKey) {
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, !isSuspended,
+                  stopRunIdentity(for: sessionId) == runIdentity else { return false }
+            // A prior request may have stopped the old generation but lost its ACK.
+            // Before any explicit retry, read status and only replay its command ID
+            // when the same run is still active. An old cached ACK must never idle a
+            // newer generation.
+            let statusRequestStartedAt = Date()
+            do {
+                if !(await activeTransport.isConnected) { try await activeTransport.connect() }
+                let snapshot = try await activeTransport.sessionStatus(
+                    machineId: activeMachineId, runtimeId: runtimeId,
+                    instanceId: instanceId, sessionId: sessionId
+                )
+                guard generation == lifecycleGeneration, transport === activeTransport,
+                      machine.id == activeMachineId, !isSuspended,
+                      stopRunIdentity(for: sessionId) == runIdentity else { return false }
+                if !stopStatusHasFreshIdleEvidence(snapshot, requestStartedAt: statusRequestStartedAt,
+                    sessionId: sessionId) {
+                    errors[sessionId] = "Stop delivery is unknown and the status reply may be stale. No Stop was retried."
+                    return false
+                }
+                if snapshot.state == .idle || snapshot.state == .error {
+                    await finishPendingStopOperation(cacheKey: cacheKey, expectedCommandId: pending.commandId)
+                    guard generation == lifecycleGeneration, transport === activeTransport,
+                          machine.id == activeMachineId, !isSuspended,
+                          stopRunIdentity(for: sessionId) == runIdentity else { return false }
+                    if snapshot.state == .idle {
+                        setSessionState(sessionId, .idle)
+                        liveRunStatusBySession.removeValue(forKey: sessionId)
+                    } else {
+                        setSessionState(sessionId, .error)
+                    }
+                    errors[sessionId] = nil
+                    return true
+                }
+                guard snapshot.state == .busy || snapshot.state == .waiting else {
+                    errors[sessionId] = "Stop delivery is unknown; the current session state is not safe to retry."
+                    return false
+                }
+                let remoteEvidenceAt = [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
+                let statusEvidenceAt = remoteEvidenceAt
+                var statusBackedIdentity = runIdentity
+                if statusBackedIdentity.generationKey == nil,
+                   statusBackedIdentity.generationSequence == nil,
+                   let statusEvidenceAt {
+                    statusBackedIdentity = StopRunIdentity(
+                        eventRevision: runIdentity.eventRevision,
+                        generationSequence: nil,
+                        generationKey: nil,
+                        activityAt: max(runIdentity.activityAt ?? .distantPast, statusEvidenceAt)
+                    )
+                }
+                if let pendingIdentity = pending.runIdentity,
+                   pendingIdentity.identifiesSameRun(as: statusBackedIdentity) {
+                    commandId = pending.commandId
+                    reusedUnknownOperation = true
+                }
+                // UUID-only legacy records and records for a prior generation receive
+                // a new ID after this fresh status check.
+            } catch {
+                guard generation == lifecycleGeneration, transport === activeTransport,
+                      machine.id == activeMachineId, !isSuspended else { return false }
+                errors[sessionId] = "Stop delivery is unknown. Current status could not be confirmed, so no Stop was retried: \(error.localizedDescription)"
+                return false
+            }
+        }
+        guard generation == lifecycleGeneration, transport === activeTransport,
+              machine.id == activeMachineId, !isSuspended,
+              stopRunIdentity(for: sessionId) == runIdentity else { return false }
+        let statusEvidenceAt = [
+            sessions.first(where: { $0.id == sessionId })?.lastActivityAt,
+            sessions.first(where: { $0.id == sessionId })?.lastProgressAt,
+            liveRunActivityAtBySession[sessionId],
+        ].compactMap { $0 }.max()
+        let persistedIdentity = StopRunIdentity(
+            eventRevision: runIdentity.eventRevision,
+            generationSequence: runIdentity.generationSequence,
+            generationKey: runIdentity.generationKey,
+            activityAt: runIdentity.generationSequence == nil && runIdentity.generationKey == nil
+                ? laterStopActivity(runIdentity.activityAt, statusEvidenceAt)
+                : runIdentity.activityAt
+        )
+        try? await cache.put(PendingStopOperation(commandId: commandId, runIdentity: persistedIdentity), key: cacheKey)
+        guard generation == lifecycleGeneration, transport === activeTransport,
+              machine.id == activeMachineId, !isSuspended,
+              stopRunIdentity(for: sessionId) == runIdentity else {
+            if !reusedUnknownOperation { await finishPendingStopOperation(cacheKey: cacheKey, expectedCommandId: commandId) }
+            return false
+        }
         let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "stopGeneration", commandId: commandId)
         commandStates[command.commandId] = .pending
         do {
             let state = try await activeTransport.send(command)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             commandStates[command.commandId] = state
-            await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
-            setSessionState(sessionId, .idle)
-            errors[sessionId] = nil
+            await finishPendingStopOperation(cacheKey: cacheKey, expectedCommandId: commandId)
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, !isSuspended else { return false }
+            // Events delivered after the Stop was issued are authoritative. In
+            // particular a newer GENERATION_STARTED must not be rolled back by this
+            // request's cached/successful acknowledgement.
+            if reusedUnknownOperation {
+                let statusRequestStartedAt = Date()
+                do {
+                    let snapshot = try await activeTransport.sessionStatus(
+                        machineId: activeMachineId, runtimeId: runtimeId,
+                        instanceId: instanceId, sessionId: sessionId
+                    )
+                    guard generation == lifecycleGeneration, transport === activeTransport,
+                          machine.id == activeMachineId, !isSuspended else { return false }
+                    guard stopRunIdentity(for: sessionId) == runIdentity else { return true }
+                    guard stopStatusHasFreshIdleEvidence(snapshot,
+                        requestStartedAt: statusRequestStartedAt, sessionId: sessionId) else {
+                        errors[sessionId] = "Stop acknowledgement was replayed, but status evidence may be stale. The current run remains unchanged."
+                        return false
+                    }
+                    switch snapshot.state {
+                    case .idle:
+                        setSessionState(sessionId, .idle)
+                        liveRunStatusBySession.removeValue(forKey: sessionId)
+                        errors[sessionId] = nil
+                        return true
+                    case .error:
+                        setSessionState(sessionId, .error)
+                        errors[sessionId] = nil
+                        return true
+                    case .busy, .waiting:
+                        errors[sessionId] = "The Stop receipt is complete, but current status still shows this run as active. Tap Stop again to issue a new check."
+                        return false
+                    default:
+                        errors[sessionId] = "The Stop receipt is complete, but current status is not conclusive."
+                        return false
+                    }
+                } catch {
+                    guard generation == lifecycleGeneration, transport === activeTransport,
+                          machine.id == activeMachineId, !isSuspended else { return false }
+                    if stopRunIdentity(for: sessionId) == runIdentity {
+                        errors[sessionId] = "Stop acknowledgement could not be reconciled with current status: \(error.localizedDescription)"
+                    }
+                    return false
+                }
+            }
+            if stopRunIdentity(for: sessionId) == runIdentity {
+                setSessionState(sessionId, .idle)
+                errors[sessionId] = nil
+            }
             return true
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             commandStates[command.commandId] = isUnknownDelivery(error) ? .unknown : .failed
-            if !isUnknownDelivery(error) { await finishPendingOperation(key: operationKey, machineId: activeMachineId) }
-            errors[sessionId] = error.localizedDescription
+            if !isUnknownDelivery(error) {
+                await finishPendingStopOperation(cacheKey: cacheKey, expectedCommandId: commandId)
+                guard generation == lifecycleGeneration, transport === activeTransport,
+                      machine.id == activeMachineId, !isSuspended else { return false }
+            }
+            if stopRunIdentity(for: sessionId) == runIdentity {
+                errors[sessionId] = error.localizedDescription
+            }
             return false
         }
     }
@@ -2453,7 +2686,7 @@ final class WorkspaceStore: ObservableObject {
         creatingWebProjects.removeAll()
         creatingWebConversations.removeAll()
         creatingSessions.removeAll()
-        for task in stopTasksBySession.values { task.cancel() }
+        for entry in stopTasksBySession.values { entry.task.cancel() }
         stopTasksBySession.removeAll()
         commandSendsInFlight.removeAll()
         metadataRefreshInFlight = false
@@ -2461,6 +2694,9 @@ final class WorkspaceStore: ObservableObject {
         webProjectsRevision &+= 1
         projectConversationRevisions.removeAll()
         sessionRevisions.removeAll()
+        stopEventRevisionsBySession.removeAll()
+        stopRunStartSequenceBySession.removeAll()
+        stopRunGenerationKeyBySession.removeAll()
 
         let config = RemoteAIConfig(relayBaseURL: baseURL, machineId: result.machineId)
         config.saveMetadata()
@@ -3871,6 +4107,16 @@ final class WorkspaceStore: ObservableObject {
             // definition. Without bumping the revision, its late response can delete a
             // newly registered desktop Chat or roll Busy/lastActivityAt back to idle.
             sessionRevisions[event.instanceId, default: 0] &+= 1
+            stopEventRevisionsBySession[sessionId, default: 0] &+= 1
+            if event.type == "GENERATION_STARTED" {
+                stopRunStartSequenceBySession[sessionId] = event.sequence
+                if let generationKey = event.payload["generationKey"]?.stringValue,
+                   !generationKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    stopRunGenerationKeyBySession[sessionId] = generationKey
+                } else {
+                    stopRunGenerationKeyBySession.removeValue(forKey: sessionId)
+                }
+            }
         }
 
         sessionRouteHints[sessionId] = (event.machineId, event.runtimeId, event.instanceId)
@@ -3925,6 +4171,8 @@ final class WorkspaceStore: ObservableObject {
             sessions.removeAll { $0.id == sessionId }
             messagesBySession.removeValue(forKey: sessionId)
             liveRunStatusBySession.removeValue(forKey: sessionId)
+            stopRunStartSequenceBySession.removeValue(forKey: sessionId)
+            stopRunGenerationKeyBySession.removeValue(forKey: sessionId)
             await persistMetadata()
         case "MESSAGE_REMOVED":
             if let messageID = event.payload["messageId"]?.stringValue {
