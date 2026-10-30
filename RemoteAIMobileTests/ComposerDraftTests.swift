@@ -100,7 +100,7 @@ final class ComposerDraftTests: XCTestCase {
         try await waitUntil { draft.isLoadResolved }
 
         draft.text = "first"
-        try await waitUntil { await storage.isFirstSavePending }
+        try await waitUntil { await storage.isFirstSavePending() }
         draft.text = "latest"
         let flush = Task { @MainActor in await draft.flush() }
         try await Task.sleep(nanoseconds: 20_000_000)
