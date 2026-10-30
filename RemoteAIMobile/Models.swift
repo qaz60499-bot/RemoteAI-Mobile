@@ -62,6 +62,30 @@ struct InstanceDescriptor: Codable, Identifiable, Hashable {
 struct CodexModelOption: Codable, Identifiable, Hashable {
     let id: String
     let label: String
+    let reasoningLevels: [String]?
+
+    init(id: String, label: String, reasoningLevels: [String]? = nil) {
+        self.id = id
+        self.label = label
+        self.reasoningLevels = reasoningLevels
+    }
+
+    var supportedReasoningLevels: [String] {
+        let allowed = Set(["low", "medium", "high", "xhigh", "max", "ultra"])
+        return (reasoningLevels ?? []).filter { allowed.contains($0) }
+    }
+
+    static func reasoningLabel(_ level: String) -> String {
+        switch level {
+        case "low": return "低"
+        case "medium": return "中"
+        case "high": return "高"
+        case "xhigh": return "超高"
+        case "max": return "Max"
+        case "ultra": return "Ultra"
+        default: return level
+        }
+    }
 }
 
 struct CodexCatalog: Codable, Hashable {
