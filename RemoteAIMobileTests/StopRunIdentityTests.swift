@@ -99,6 +99,9 @@ final class StopRunIdentityTests: XCTestCase {
     private func prepare(_ store: WorkspaceStore) async throws {
         await store.start()
         let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        // MockTransport follows the production lazy-catalog flow: start loads runtimes,
+        // while instances are fetched only when their runtime is opened.
+        await store.refreshRuntime(runtime)
         let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "photo" }))
         await store.refreshSessions(runtime: runtime, instance: instance)
     }

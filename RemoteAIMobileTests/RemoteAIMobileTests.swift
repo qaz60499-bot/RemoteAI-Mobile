@@ -3185,7 +3185,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let serverUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "delivery-committed")
         XCTAssertEqual(serverUserCount, 1)
         XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "delivery-committed" }.count, 1)
-        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "已确认发送，等待 ChatGPT 响应…")
+        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "已确认发送，等待远端响应…")
         let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
         XCTAssertNil(pending)
         await store.suspend()
