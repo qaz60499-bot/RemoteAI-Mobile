@@ -22,6 +22,34 @@ final class RemoteAIMobileUITests: XCTestCase {
         XCTAssertGreaterThan(app.staticTexts["My PC"].frame.minY, 50)
     }
 
+    func testOpenWebChatByTappingStatusAreaOfExistingChromeTab() throws {
+        let app = makeMockApp()
+        app.launch()
+        app.staticTexts["Web"].tap()
+        XCTAssertTrue(app.staticTexts["ChatGPT"].waitForExistence(timeout: 5))
+        app.staticTexts["ChatGPT"].tap()
+        let row = app.buttons["open-web-tab-12"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        // Exercise the status/details area, not only the title.
+        row.coordinate(withNormalizedOffset: CGVector(dx: 0.40, dy: 0.70)).tap()
+        XCTAssertTrue(app.textViews["MessageComposer"].waitForExistence(timeout: 10),
+                      "Existing Chrome Chat should open the same mobile conversation")
+    }
+
+    func testOpenWebProjectFromExistingChromeTab() throws {
+        let app = makeMockApp()
+        app.launch()
+        app.staticTexts["Web"].tap()
+        XCTAssertTrue(app.staticTexts["ChatGPT"].waitForExistence(timeout: 5))
+        app.staticTexts["ChatGPT"].tap()
+        let row = app.buttons["open-web-tab-13"]
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        row.tap()
+        XCTAssertTrue(app.staticTexts["在此 Project 新建对话"].waitForExistence(timeout: 10),
+                      "A Project tab must navigate to its Project without creating a Chat")
+        XCTAssertTrue(app.staticTexts["Project smoke"].waitForExistence(timeout: 10))
+    }
+
     func testOpenCachedWebConversation() throws {
         let app = makeMockApp()
         app.launch()
