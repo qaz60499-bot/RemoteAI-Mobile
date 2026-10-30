@@ -22,6 +22,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var hasLoadedOpenWebTabs = false
     @Published private(set) var openWebTabsInventoryUnverified = true
     @Published private(set) var openWebTabsLastVerifiedAt: Date?
+    private var webTabsRefreshNeedsConnectivityRetry = false
     @Published private(set) var managingWebTabIds = Set<Int>()
     @Published var webTabDiagnosesById: [Int: WebTabDiagnosis] = [:]
     @Published var webTabActionNotesById: [Int: String] = [:]
@@ -375,6 +376,7 @@ final class WorkspaceStore: ObservableObject {
             errors["connection"] = nil
             endTransientConnectionPresentation()
             DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence)])
+            scheduleWebTabsRefreshAfterConnectivityRecovery(reason: "initial-online")
             startConnectionMonitor()
             scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "initial-online")
 
@@ -457,6 +459,7 @@ final class WorkspaceStore: ObservableObject {
 
     func refreshOpenWebTabs() async {
         guard machine.state == .online, !isSuspended else {
+            webTabsRefreshNeedsConnectivityRetry = true
             // A visible refresh control must not silently leave a stale spinner
             // when the phone is offline or the app's transport is suspended.
             openWebTabsInventoryUnverified = true
@@ -492,6 +495,7 @@ final class WorkspaceStore: ObservableObject {
             hasLoadedOpenWebTabs = true
             openWebTabsInventoryUnverified = false
             openWebTabsLastVerifiedAt = Date()
+            webTabsRefreshNeedsConnectivityRetry = false
             errors["web.tabs"] = nil
             DiagnosticsLog.shared.record("web_tabs_request_verified", fields: ["commandId": commandId.uuidString, "count": String(tabs.count)])
         } catch {
@@ -499,6 +503,14 @@ final class WorkspaceStore: ObservableObject {
                 // Keep the last verified inventory, but do not present its counts as current.
                 openWebTabsInventoryUnverified = true
                 errors["web.tabs"] = error.localizedDescription
+                if let transportError = error as? TransportError {
+                    switch transportError {
+                    case .offline, .disconnected, .timeout:
+                        webTabsRefreshNeedsConnectivityRetry = true
+                    default:
+                        break
+                    }
+                }
                 DiagnosticsLog.shared.record("web_tabs_request_failed", fields: Self.diagnosticFields(for: error, adding: ["commandId": commandId.uuidString]), level: "WARN")
             }
         }
@@ -4236,6 +4248,7 @@ final class WorkspaceStore: ObservableObject {
                 if recovered && !deferringTransientConnectionPresentation {
                     recentSystemNotice = "Windows Agent 已重新连上 Relay，正在补同步当前会话。"
                 }
+                scheduleWebTabsRefreshAfterConnectivityRecovery(reason: "agent-online")
             case .connecting, .reconnecting:
                 if machine.state != .online {
                     // During initial connection there is no previously authenticated
@@ -4264,6 +4277,23 @@ final class WorkspaceStore: ObservableObject {
                 errors["connection"] = "Windows Agent 离线 — 手机仍连接 Cloudflare Relay，将在电脑恢复后自动补同步。"
                 recentSystemNotice = "Windows Agent 已确认离线；Cloudflare Relay 连接仍会保持，电脑恢复后会自动继续。"
             }
+        }
+    }
+
+    private func scheduleWebTabsRefreshAfterConnectivityRecovery(reason: String) {
+        guard webTabsRefreshNeedsConnectivityRetry else { return }
+        let generation = lifecycleGeneration
+        Task { @MainActor [weak self] in
+            guard let self,
+                  generation == self.lifecycleGeneration,
+                  !self.isSuspended,
+                  self.machine.state == .online,
+                  self.webTabsRefreshNeedsConnectivityRetry else { return }
+            // Claim the one pending read-only recovery before suspending for network IO.
+            // Do not create a second polling loop or repeat any provider send.
+            self.webTabsRefreshNeedsConnectivityRetry = false
+            DiagnosticsLog.shared.record("web_tabs_connectivity_recovery", fields: ["reason": reason])
+            await self.refreshOpenWebTabs()
         }
     }
 
