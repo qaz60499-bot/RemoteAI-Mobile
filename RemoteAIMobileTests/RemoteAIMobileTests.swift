@@ -1612,9 +1612,13 @@ final class RemoteAIMobileTests: XCTestCase {
         // Reconciliation must drain the deferred request even if the 20s TTL
         // has not expired.
         await store.refreshSessions(runtime: web, instance: instance)
-        for _ in 0..<200 {
-            if await mock.actionAttemptCount("listProjects") > before { break }
-            try await Task.sleep(nanoseconds: 2_000_000)
+        // Counted dispatch is not completed reconciliation. A CI scheduler may
+        // resume this test immediately after MockTransport records the attempt,
+        // before the authoritative response has reached WorkspaceStore.
+        for _ in 0..<600 {
+            if await mock.actionAttemptCount("listProjects") > before,
+               store.webProjectsSnapshotState == .authoritativeLiveDOM { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
         }
         let afterReconciliation = await mock.actionAttemptCount("listProjects")
         XCTAssertEqual(afterReconciliation, before + 1)
