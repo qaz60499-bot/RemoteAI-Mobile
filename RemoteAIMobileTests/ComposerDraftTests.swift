@@ -33,6 +33,7 @@ final class ComposerDraftTests: XCTestCase {
         let save: ComposerDraft.Saver = { id, text in await storage.save(text, sessionId: id) }
         draft.bind(sessionId: "chat-a", load: load, save: save)
         try await waitUntil { await storage.isLoadPending("chat-a") }
+        draft.text = "A local draft"
 
         draft.bind(sessionId: "chat-b", load: load, save: save)
         try await waitUntil { draft.text == "B draft" }
@@ -44,7 +45,7 @@ final class ComposerDraftTests: XCTestCase {
         await draft.flush()
         let savedA = await storage.value(for: "chat-a")
         let savedB = await storage.value(for: "chat-b")
-        XCTAssertEqual(savedA, "A draft")
+        XCTAssertEqual(savedA, "A local draft")
         XCTAssertEqual(savedB, "B edited")
     }
 
@@ -121,8 +122,11 @@ final class ComposerDraftTests: XCTestCase {
         })
         try await waitUntil { draft.isLoadResolved }
 
+        draft.text = ""
         let sentRevision = draft.revision
+        await draft.flush()
         draft.text = "newer text"
+        await storage.save("", sessionId: "chat")
         await draft.clearAfterSend(ifRevision: sentRevision)
 
         XCTAssertEqual(draft.text, "newer text")

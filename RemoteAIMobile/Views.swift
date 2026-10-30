@@ -1521,6 +1521,7 @@ struct ChatView: View {
                         let correctingActiveRun = isGenerating
                         focused = false
                         input = ""
+                        let sentDraftRevision = draft.revision
                         pendingAttachments.removeAll()
                         sending = true
                         sendTask = Task {
@@ -1561,6 +1562,9 @@ struct ChatView: View {
                                 // message yet. Reusing this ID also reuses deterministic upload IDs.
                                 composerCommandId = state == .unknown ? commandId : nil
                             }
+                            // send() writes its own draft outcome. Reassert any
+                            // newer typing without clearing edits made in flight.
+                            await draft.clearAfterSend(ifRevision: sentDraftRevision)
                         }
                     }
                 )

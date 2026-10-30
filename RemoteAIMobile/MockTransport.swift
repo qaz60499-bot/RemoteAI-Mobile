@@ -448,10 +448,10 @@ actor MockTransport: Transport {
                 ]
             ]
             response = CommandResponseEnvelope(ok: true,
-                result: .array(rows.filter { !closedOpenWebTabIDs.contains($0["tabId"]?.intValue ?? -1) }.map { JSONValue.object($0) }),
+                result: .array(rows.filter { !closedOpenWebTabIDs.contains(Int($0["tabId"]?.intValue ?? -1)) }.map { JSONValue.object($0) }),
                 error: nil, idempotentReplay: nil)
         case "inspectOpenWebTab":
-            let tabId = command.payload["tabId"]?.intValue ?? -1
+            let tabId = Int(command.payload["tabId"]?.intValue ?? -1)
             let canonicalUrl = openWebTabCurrentURLOverrides[tabId] ?? command.payload["expectedUrl"]?.stringValue ?? ""
             response = success([
                 "tabId": .number(Double(tabId)),
@@ -462,7 +462,7 @@ actor MockTransport: Transport {
             ])
         case "manageOpenWebTab":
             let operation = command.payload["operation"]?.stringValue ?? ""
-            let tabId = command.payload["tabId"]?.intValue ?? -1
+            let tabId = Int(command.payload["tabId"]?.intValue ?? -1)
             let expectedUrl = command.payload["expectedUrl"]?.stringValue ?? ""
             if operation == "enter", let fixture = enteredOpenWebTabFixture {
                 response = success(fixture)
