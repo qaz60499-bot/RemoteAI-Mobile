@@ -4893,7 +4893,11 @@ final class WorkspaceStore: ObservableObject {
                 guard message.role == .user else { return false }
                 if message.id.caseInsensitiveCompare(id.uuidString) == .orderedSame { return true }
                 guard !text.isEmpty, message.text == text else { return false }
-                return abs(message.createdAt.timeIntervalSince(command.createdAt)) < 300
+                // Identical prompts can be sent in separate operations minutes apart.
+                // A provider turn older than this command is not evidence of this
+                // operation's delivery. Allow only a small cross-device clock skew.
+                let elapsed = message.createdAt.timeIntervalSince(command.createdAt)
+                return elapsed >= -5 && elapsed < 300
             }
             if delivered {
                 commandStates[id] = .completed
@@ -4911,7 +4915,13 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.deleteMessage(id: providerId)
         }
         guard let optimistic = messagesBySession[sessionId, default: []].last(where: {
-            $0.role == .user && $0.sequence == nil && UUID(uuidString: $0.id) != nil && $0.text == serverMessage.text && abs($0.createdAt.timeIntervalSince(serverMessage.createdAt)) < 180
+            guard $0.role == .user, $0.sequence == nil,
+                  UUID(uuidString: $0.id) != nil,
+                  $0.text == serverMessage.text else { return false }
+            // Never erase a newer optimistic Send because an older, identical
+            // provider turn appeared during history reconciliation.
+            let elapsed = serverMessage.createdAt.timeIntervalSince($0.createdAt)
+            return elapsed >= -5 && elapsed < 180
         }) else { return }
         messagesBySession[sessionId]?.removeAll { $0.id == optimistic.id }
         try? await cache.deleteMessage(id: optimistic.id)
