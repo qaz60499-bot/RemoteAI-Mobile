@@ -1986,12 +1986,12 @@ final class WorkspaceStore: ObservableObject {
             DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "persisted": String(messageCommandPersisted)]), level: "WARN")
             return false
         } catch let error as TransportError {
-            if case .remote(let code, _) = error, code == "WEB_SEND_DELIVERY_UNKNOWN" {
+            if Self.isUnknownWebSendOutcome(error, runtimeId: runtimeId) {
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
                 attachmentTransferBySession.removeValue(forKey: sessionId)
                 commandStates[commandId] = .unknown
                 errors[sessionId] = "Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."
-                DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "remoteCode": code]), level: "WARN")
+                DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString]), level: "WARN")
                 // Unknown delivery must never be resolved by blindly sending again. First
                 // perform bounded read-only reconciliation: if the provider user turn is
                 // already visible, loadSession matches it to the persisted command payload
@@ -2378,6 +2378,18 @@ final class WorkspaceStore: ObservableObject {
             guard raw?.caseInsensitiveCompare(expectedCommandId.uuidString) == .orderedSame else { return }
         }
         try? await cache.remove(key: cacheKey)
+    }
+
+    private static func isUnknownWebSendOutcome(_ error: TransportError, runtimeId: String) -> Bool {
+        guard case .remote(let code, let message) = error else { return false }
+        if code == "WEB_SEND_DELIVERY_UNKNOWN" { return true }
+        // Compatibility with the running pre-fix Windows Agent. Its Chrome async
+        // listener can close after the provider accepted Send. The exact Chrome
+        // signature is ambiguous, so read-only history reconciliation must win
+        // over treating it as a definite failure or automatically replaying Send.
+        guard runtimeId == "runtime.web", code == "WEB_SELECTOR_FAILED" else { return false }
+        return message.range(of: "A listener indicated an asynchronous response by returning true", options: .caseInsensitive) != nil
+            && message.range(of: "message channel closed before a response was received", options: .caseInsensitive) != nil
     }
 
     private func isUnknownDelivery(_ error: Error) -> Bool {
