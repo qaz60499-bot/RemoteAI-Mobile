@@ -79,7 +79,7 @@ enum WritingBlockFenceParser {
             }
 
             guard let opener = fenceOpener(in: line, from: source) else { continue }
-            if opener.fence.character == 96, let flags = writingFlags(from: opener.info) {
+            if opener.fence.character == 96, let flags = Self.writingFlags(from: opener.info) {
                 if flags.leadingNewline,
                    line.start == 0 || source.character(at: line.start - 1) != 10 {
                     ordinaryFence = opener.fence
