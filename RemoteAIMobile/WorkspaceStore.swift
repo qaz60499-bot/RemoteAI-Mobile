@@ -38,6 +38,9 @@ final class WorkspaceStore: ObservableObject {
     @Published var projectConversationLoadingByAlias: [String: Bool] = [:]
     @Published var liveRunStatusBySession: [String: String] = [:]
     @Published private(set) var deltaRecoveryDisplayMessagesBySession: [String: [ChatMessage]]? = nil
+    // A late delta page must never re-freeze a chat after a newer live reply
+    // has already been applied during the same catch-up pass.
+    private var recoveryLivePresentationSessions = Set<String>()
     private var liveRunActivityAtBySession: [String: Date] = [:]
     private var terminalWebRuns = Set<String>()
     @Published var hasLoadedWebProjects = false
@@ -3363,6 +3366,10 @@ final class WorkspaceStore: ObservableObject {
         }
         tracker.advanceMonotonically(to: event.sequence)
         await applyEvent(event)
+        if let sessionId = event.sessionId,
+           ["MESSAGE_ADDED", "MESSAGE_UPDATED", "MESSAGE_REMOVED", "SESSION_DELETED"].contains(event.type) {
+            releaseRecoveryDisplaySnapshot(for: sessionId)
+        }
         try? await cache.setLastSequence(event.sequence)
     }
 
@@ -3424,6 +3431,7 @@ final class WorkspaceStore: ObservableObject {
             return
         }
         deltaRecoveryInFlight = true
+        recoveryLivePresentationSessions.removeAll()
         let generation = lifecycleGeneration
         defer {
             deltaRecoveryInFlight = false
@@ -3439,6 +3447,7 @@ final class WorkspaceStore: ObservableObject {
                 if deltaRecoveryDisplayMessagesBySession != nil {
                     deltaRecoveryDisplayMessagesBySession = nil
                 }
+                recoveryLivePresentationSessions.removeAll()
                 if authoritativeResyncAfterDelta,
                    generation == lifecycleGeneration,
                    machine.state == .online,
@@ -3534,10 +3543,10 @@ final class WorkspaceStore: ObservableObject {
                     // loaded on the phone even though a delta burst usually belongs to
                     // one active conversation.
                     let affectedSessionIds = Set(result.events.compactMap { $0.sessionId })
-                    if !affectedSessionIds.isEmpty {
+                    if coalesceHistoricalPresentation && !affectedSessionIds.isEmpty {
                         var displaySnapshot = deltaRecoveryDisplayMessagesBySession ?? [:]
                         var snapshotChanged = deltaRecoveryDisplayMessagesBySession == nil
-                        for sessionId in affectedSessionIds where displaySnapshot[sessionId] == nil {
+                        for sessionId in affectedSessionIds where displaySnapshot[sessionId] == nil && !recoveryLivePresentationSessions.contains(sessionId) {
                             displaySnapshot[sessionId] = messagesBySession[sessionId, default: []]
                             snapshotChanged = true
                         }
@@ -3612,6 +3621,11 @@ final class WorkspaceStore: ObservableObject {
                     // the only authority allowed to mutate current transport presentation.
                     if event.type != "TRANSPORT_STATUS" {
                         await applyEvent(event, suppressTransientPresentation: suppressEventPresentation)
+                        if !suppressEventPresentation,
+                           let sessionId = event.sessionId,
+                           ["MESSAGE_ADDED", "MESSAGE_UPDATED", "MESSAGE_REMOVED", "SESSION_DELETED"].contains(event.type) {
+                            releaseRecoveryDisplaySnapshot(for: sessionId)
+                        }
                     }
                     cursor = event.sequence
                     try? await cache.setLastSequence(cursor)
@@ -3669,6 +3683,17 @@ final class WorkspaceStore: ObservableObject {
                 fields["retryAfterSeconds"] = String(Int(delay))
                 DiagnosticsLog.shared.record("delta_recovery_failed", fields: fields, level: "ERROR")
             }
+        }
+    }
+
+    private func releaseRecoveryDisplaySnapshot(for sessionId: String) {
+        guard deltaRecoveryInFlight else { return }
+        recoveryLivePresentationSessions.insert(sessionId)
+        // The canonical messagesBySession has already been updated by applyEvent.
+        // Leaving the earlier copy here hides a real reply until every other
+        // session's historical delta pages have completed.
+        if deltaRecoveryDisplayMessagesBySession?[sessionId] != nil {
+            deltaRecoveryDisplayMessagesBySession?.removeValue(forKey: sessionId)
         }
     }
 
