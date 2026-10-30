@@ -5268,26 +5268,98 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func reconcilePendingUnknownCommands(with remote: [ChatMessage], sessionId: String) async {
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let machineId = machine.id
+        func isCurrent() -> Bool {
+            generation == lifecycleGeneration
+                && transport === activeTransport
+                && machine.id == machineId
+                && machine.state == .online
+                && !isSuspended
+        }
+
+        guard isCurrent() else { return }
+        let remoteUsers = remote.filter { $0.role == .user && $0.sessionId == sessionId }
+        guard !remoteUsers.isEmpty else { return }
         let unknownIds = commandStates.compactMap { $0.value == .unknown ? $0.key : nil }
         guard !unknownIds.isEmpty else { return }
+
+        var candidates: [(id: UUID, text: String, createdAt: Date)] = []
         for id in unknownIds {
-            guard let command = try? await cache.get(RemoteCommand.self, key: Self.pendingCommandKey(id, machineId: machine.id)),
+            guard isCurrent() else { return }
+            let command = try? await cache.get(RemoteCommand.self,
+                key: Self.pendingCommandKey(id, machineId: machineId))
+            guard isCurrent() else { return }
+            guard let command,
+                  command.machineId == machineId,
+                  command.action == "sendMessage",
                   command.sessionId == sessionId else { continue }
-            let text = command.payload["text"]?.stringValue ?? ""
-            let delivered = remote.contains { message in
-                guard message.role == .user else { return false }
-                if message.id.caseInsensitiveCompare(id.uuidString) == .orderedSame { return true }
-                guard !text.isEmpty, message.text == text else { return false }
-                // Identical prompts can be sent in separate operations minutes apart.
-                // A provider turn older than this command is not evidence of this
-                // operation's delivery. Allow only a small cross-device clock skew.
-                let elapsed = message.createdAt.timeIntervalSince(command.createdAt)
-                return elapsed >= -5 && elapsed < 300
+            candidates.append((id: id, text: command.payload["text"]?.stringValue ?? "",
+                               createdAt: command.createdAt))
+        }
+
+        guard isCurrent(), !candidates.isEmpty else { return }
+
+        func identifies(_ value: String?, commandId: UUID) -> Bool {
+            value?.caseInsensitiveCompare(commandId.uuidString) == .orderedSame
+        }
+
+        // Exact provider/command identity is stronger evidence than matching prompt
+        // text. Treat both the local message ID and the historical providerMessageId
+        // alias as identity fields, and reserve every row that proves an exact match
+        // so it cannot also complete another same-text command.
+        var resolvedIds = Set<UUID>()
+        var exactMessageIndexes = Set<Int>()
+        var exactIndexesByCommand: [UUID: Set<Int>] = [:]
+        // Reserve exact rows for every known operation state, including commands
+        // already resolved on an earlier bounded history page. Otherwise a later
+        // retry could reuse that row as text-only evidence for another pending send.
+        for (index, message) in remoteUsers.enumerated() {
+            for commandId in commandStates.keys
+            where identifies(message.id, commandId: commandId)
+                || identifies(message.providerMessageId, commandId: commandId) {
+                exactMessageIndexes.insert(index)
+                exactIndexesByCommand[commandId, default: []].insert(index)
             }
-            if delivered {
-                commandStates[id] = .completed
-                try? await cache.remove(key: Self.pendingCommandKey(id, machineId: machine.id))
+        }
+        for candidate in candidates {
+            if let exactIndexes = exactIndexesByCommand[candidate.id], !exactIndexes.isEmpty {
+                resolvedIds.insert(candidate.id)
             }
+        }
+
+        // Text/time matching is only useful if the evidence is one-to-one across
+        // every pending command and provider user turn in this session. If a single
+        // provider turn could belong to two same-text sends, leave both unknown.
+        var candidateMessageIndexes: [UUID: Set<Int>] = [:]
+        var messageCandidateIds: [Int: Set<UUID>] = [:]
+        for candidate in candidates where !resolvedIds.contains(candidate.id) && !candidate.text.isEmpty {
+            for (index, message) in remoteUsers.enumerated() where !exactMessageIndexes.contains(index) {
+                guard message.text == candidate.text else { continue }
+                // Preserve protection against an earlier identical prompt while
+                // allowing a small cross-device clock skew for the current turn.
+                let elapsed = message.createdAt.timeIntervalSince(candidate.createdAt)
+                guard elapsed >= -5, elapsed < 300 else { continue }
+                candidateMessageIndexes[candidate.id, default: []].insert(index)
+                messageCandidateIds[index, default: []].insert(candidate.id)
+            }
+        }
+
+        for candidate in candidates where !resolvedIds.contains(candidate.id) {
+            guard let matches = candidateMessageIndexes[candidate.id],
+                  matches.count == 1,
+                  let messageIndex = matches.first,
+                  messageCandidateIds[messageIndex]?.count == 1 else { continue }
+            resolvedIds.insert(candidate.id)
+        }
+
+        for candidate in candidates where resolvedIds.contains(candidate.id) {
+            guard isCurrent() else { return }
+            guard commandStates[candidate.id] == .unknown else { continue }
+            commandStates[candidate.id] = .completed
+            try? await cache.remove(key: Self.pendingCommandKey(candidate.id, machineId: machineId))
+            guard isCurrent() else { return }
         }
     }
 

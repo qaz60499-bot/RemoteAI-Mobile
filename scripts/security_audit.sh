@@ -58,7 +58,16 @@ fi
 if grep -nE 'UserDefaults|SQLiteStore|sqlite3_' RemoteAIMobile/Security.swift; then
   fail "pairing key implementation references non-Keychain persistence"
 fi
-if grep -R -nE 'print\(|NSLog\(|os_log\(|Logger\(' RemoteAIMobile --exclude='DiagnosticsLog.swift'; then
+LOG_CALL_PATTERN='(^|[^[:alnum:]_])(print|debugPrint|NSLog|os_log|Logger)[[:space:]]*\('
+# Match logging identifiers, not the suffix of an unrelated name such as
+# attachmentUploadFingerprint(). Keep positive checks at the actual grep gate.
+for sample in 'print("private")' 'Swift.print ("private")' 'debugPrint("private")' 'NSLog("private")' 'os_log("private")' 'let logger = Logger()'; do
+  printf '%s\n' "$sample" | grep -qE "$LOG_CALL_PATTERN" || fail "logging audit missed a real logging call"
+done
+if printf '%s\n' 'func attachmentUploadFingerprint() {}' 'let id = attachmentUploadFingerprint(file)' | grep -qE "$LOG_CALL_PATTERN"; then
+  fail "logging audit matched an unrelated identifier suffix"
+fi
+if grep -R -nE "$LOG_CALL_PATTERN" RemoteAIMobile --exclude='DiagnosticsLog.swift'; then
   fail "runtime logging call detected outside the reviewed diagnostics mirror"
 fi
 "$PYTHON" - <<'PY'

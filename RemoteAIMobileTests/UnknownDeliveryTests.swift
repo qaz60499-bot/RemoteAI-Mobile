@@ -44,19 +44,13 @@ final class UnknownDeliveryTests: XCTestCase {
     @MainActor
     func testCancellationAfterDispatchKeepsUnknownPayloadAndBubble() async throws {
         let cache = try SQLiteStore.inMemory()
-        let mock = MockTransport(scenario: .deltaOnlySend, historyCount: 0)
+        let mock = MockTransport(scenario: .cancelledSendReplyAfterCommit, historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
         await store.start()
-        await mock.setResponseDelay(action: "sendMessage", nanoseconds: 5_000_000_000)
         let commandId = UUID()
-        let send = Task { await store.send(text: "cancelled-ack", runtimeId: "runtime.web",
-            instanceId: "photo", sessionId: "photo-upload", commandId: commandId) }
-        for _ in 0..<200 {
-            if await mock.actionAttemptCount("sendMessage") > 0 { break }
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
-        send.cancel()
-        _ = await send.value
+        let sent = await store.send(text: "cancelled-ack", runtimeId: "runtime.web",
+            instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
+        XCTAssertFalse(sent)
         XCTAssertEqual(store.commandStates[commandId], .unknown,
             "Cancelling a confirmation cannot prove an already-dispatched send failed")
         let pending: RemoteCommand? = try await cache.get(RemoteCommand.self,

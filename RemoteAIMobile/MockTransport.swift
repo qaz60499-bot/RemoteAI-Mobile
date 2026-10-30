@@ -8,6 +8,7 @@ enum MockScenario: String, CaseIterable {
     case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, staleThenFreshProjectConversations, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
     case malformedCreateReplyAfterCommit
     case malformedSendReplyAfterCommit
+    case cancelledSendReplyAfterCommit
 }
 
 enum MockProjectConversationPaginationFault: String, Equatable {
@@ -699,7 +700,9 @@ actor MockTransport: Transport {
             let sessionId = command.sessionId ?? ""
             let user = ServerMessage(messageId: command.commandId.uuidString, sessionId: sessionId, role: "user", content: text, externalId: nil, createdAt: Date())
             history[sessionId, default: []].append(user)
-            if scenario != .deltaOnlySend { Task { await self.simulateResponse(for: command, user: user) } }
+            if scenario != .deltaOnlySend && scenario != .cancelledSendReplyAfterCommit {
+                Task { await self.simulateResponse(for: command, user: user) }
+            }
             response = success(["accepted": .bool(true), "sessionId": .string(sessionId), "messageId": .string(user.messageId)])
         case "stopGeneration", "stopSession":
             await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: command.sessionId, type: "GENERATION_STOPPED", payload: ["ok": .bool(true)])
@@ -772,6 +775,9 @@ actor MockTransport: Transport {
         }
         if scenario == .malformedSendReplyAfterCommit, command.action == "sendMessage" {
             throw TransportError.malformedData
+        }
+        if scenario == .cancelledSendReplyAfterCommit, command.action == "sendMessage" {
+            throw CancellationError()
         }
         if scenario == .disconnectAfterAttachmentChunk, command.action == "uploadAttachmentChunk" {
             connected = false
