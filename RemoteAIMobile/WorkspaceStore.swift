@@ -3498,7 +3498,6 @@ final class WorkspaceStore: ObservableObject {
                     visibleSessionHistorySyncAt.removeAll()
                     visibleSessionHistoryRemoteRevision.removeAll()
                     metadataRefreshDeferredForDelta = true
-DEVSPACE_CONTINUITY_RISK: Approximately 1239467 DevSpace tool characters since the last acknowledged checkpoint. This is a secondary context-pressure signal, not an exact token-count or host context percentage, and not an automatic handoff trigger. Ordinary chat, other tools and host compaction are not measured. The host owns context management.
                     DiagnosticsLog.shared.record("delta_recovery_fast_forward", fields: [
                         "cursor": String(previousCursor),
                         "latestSequence": String(freshLatestSequence),
