@@ -19,5 +19,10 @@ final class RuntimeIssuesUITests: XCTestCase {
         XCTAssertTrue(refresh.exists)
         refresh.tap()
         XCTAssertTrue(app.navigationBars["运行异常"].exists)
+
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "runtime-issues-summary"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
     }
 }

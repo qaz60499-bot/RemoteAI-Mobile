@@ -166,6 +166,14 @@ final class RemoteAIMobileUITests: XCTestCase {
         XCTAssertTrue(final.waitForExistence(timeout: max(180, expectedFixtureSeconds + 90)),
                       "The actual final message must replace the streaming row")
         XCTAssertTrue(final.label.contains(marker), "The rendered final message must have the expected contents")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "streaming-tail-\(chars)"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+
+        let finalCopy = app.buttons["message-copy-stress-final-\(chars)"]
+        XCTAssertTrue(finalCopy.waitForExistence(timeout: 10), "The final message footer must be rendered")
+        XCTAssertTrue(finalCopy.isHittable, "The final message footer must be visible after returning to the latest reply")
         // The draft remains populated: "Send correction" changes to "Send"
         // only once the chat's authoritative generation state becomes idle.
         // Check a positive, exact accessibility target rather than repeatedly

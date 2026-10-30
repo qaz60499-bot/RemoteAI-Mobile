@@ -338,30 +338,8 @@ struct InstanceView: View {
             return store.webProjects
         }
         if isAntigravity {
-            if store.hasLoadedAntigravityProjects { return store.antigravityProjects }
-            var map: [String: (count: Int, lastOpened: Date?)] = [:]
-            for s in store.sessions where s.instanceId == instance.id {
-                if let alias = s.projectAlias, !alias.isEmpty {
-                    let current = map[alias] ?? (count: 0, lastOpened: nil)
-                    let date = s.orderingDate
-                    let maxDate = current.lastOpened.map { max($0, date) } ?? date
-                    map[alias] = (count: current.count + 1, lastOpened: maxDate)
-                }
-            }
-            if map["googleac"] == nil {
-                map["googleac"] = (count: 0, lastOpened: Date())
-            }
-            return map.map { (alias, info) in
-                WebProjectDescriptor(
-                    projectAlias: alias,
-                    projectId: alias,
-                    displayName: alias,
-                    canonicalUrl: "antigravity://project/\(alias)",
-                    lastSeenAt: info.lastOpened,
-                    lastOpenedAt: info.lastOpened,
-                    // active project
-                )
-            }.sorted { ($0.lastOpenedAt ?? .distantPast) > ($1.lastOpenedAt ?? .distantPast) }
+            if store.hasLoadedAntigravityProjects { return AntigravityProjectOrdering.sorted(store.antigravityProjects) }
+            return AntigravityProjectOrdering.fallbackProjects(from: store.sessions, instanceId: instance.id)
         }
         return []
     }
@@ -547,7 +525,11 @@ struct InstanceView: View {
                                     Text(project.displayName).font(.body.weight(.medium))
                                     HStack(spacing: 5) {
                                         Text("Project").font(.caption2.weight(.semibold))
-                                        if let date = project.lastOpenedAt ?? project.lastSeenAt { FixedTimestamp(date: date, prefix: "最近访问") }
+                                        if isAntigravity {
+                                            if let activity = project.lastActivityAt { FixedTimestamp(date: activity, prefix: "最近活动") }
+                                        } else if let date = project.lastOpenedAt ?? project.lastSeenAt {
+                                            FixedTimestamp(date: date, prefix: "最近访问")
+                                        }
                                     }
                                 }
                             }.padding(.vertical, 4)
@@ -1317,6 +1299,16 @@ struct ChatView: View {
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
+                        .background {
+                            ChatTranscriptTailFollower(
+                                isFollowing: didInitialScrollToBottom
+                                    && !userBrowsingHistory
+                                    && !loadingOlder
+                                    && !messages.isEmpty
+                            )
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                        }
                     }
                     .background(Color(.systemGroupedBackground))
                     .simultaneousGesture(
@@ -2520,6 +2512,7 @@ struct MessageRow: View, Equatable {
                                     copyLabel("复制全文", actionID: "message-full")
                                 }
                                 .buttonStyle(.borderless)
+                                .accessibilityIdentifier("message-copy-\(message.id)")
                                 Button {
                                     onSelectText?(MessageContentSegment.copyableText(selectionText), false)
                                 } label: {

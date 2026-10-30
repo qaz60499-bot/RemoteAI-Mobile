@@ -312,6 +312,52 @@ struct WebProjectDescriptor: Codable, Identifiable, Hashable {
     let canonicalUrl: String
     let lastSeenAt: Date?
     let lastOpenedAt: Date?
+    var lastActivityAt: Date? = nil
+}
+
+enum AntigravityProjectOrdering {
+    static let defaultWorkspaceAlias = "googleac"
+
+    static func fallbackProjects(from sessions: [SessionDescriptor], instanceId: String) -> [WebProjectDescriptor] {
+        var latestActivityByAlias: [String: Date] = [:]
+        for session in sessions where session.instanceId == instanceId {
+            guard let alias = session.projectAlias?.trimmingCharacters(in: .whitespacesAndNewlines), !alias.isEmpty else {
+                continue
+            }
+            let activity = session.orderingDate
+            latestActivityByAlias[alias] = max(latestActivityByAlias[alias] ?? activity, activity)
+        }
+
+        let aliases = Set(latestActivityByAlias.keys).union([defaultWorkspaceAlias]).sorted()
+        let projects = aliases.map { alias -> WebProjectDescriptor in
+            let activity = latestActivityByAlias[alias]
+            return WebProjectDescriptor(
+                projectAlias: alias,
+                projectId: alias,
+                displayName: alias,
+                canonicalUrl: "antigravity://project/\(alias)",
+                lastSeenAt: activity,
+                lastOpenedAt: activity,
+                lastActivityAt: activity
+            )
+        }
+        return sorted(projects)
+    }
+
+    static func sorted(_ projects: [WebProjectDescriptor]) -> [WebProjectDescriptor] {
+        projects.sorted { lhs, rhs in
+            switch (lhs.lastActivityAt, rhs.lastActivityAt) {
+            case let (left?, right?) where left != right:
+                return left > right
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                return lhs.projectAlias < rhs.projectAlias
+            }
+        }
+    }
 }
 
 struct WebConversationDescriptor: Codable, Identifiable, Hashable {
