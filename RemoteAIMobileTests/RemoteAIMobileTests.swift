@@ -559,6 +559,72 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testLiveReplyUnmasksFrozenHistoryBeforeRemainingDeltaPagesComplete() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let initialSequence = try await cache.lastSequence()
+        XCTAssertEqual(initialSequence, 1200)
+
+        let old = Date().addingTimeInterval(-45)
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1, eventId: UUID(), sequence: 1201, machineId: "my-pc",
+            runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload",
+            type: "GENERATION_STARTED", payload: [:], createdAt: old
+        ))
+        // The first delta page is long enough to coalesce history and freeze the
+        // visible transcript. The second page deliberately stays in flight.
+        for sequence in 1202...1700 {
+            await mock.injectEvent(RemoteEvent(
+                protocolVersion: 1, eventId: UUID(), sequence: Int64(sequence),
+                machineId: "my-pc", runtimeId: "runtime.system",
+                instanceId: "agent", sessionId: nil, type: "TRANSPORT_STATUS",
+                payload: ["channel": .string("relay"), "state": .string("online")],
+                createdAt: old
+            ))
+        }
+        let final = ServerMessage(
+            messageId: "live-during-recovery", sessionId: "photo-upload",
+            role: "assistant", content: "already arrived on the phone",
+            externalId: nil, createdAt: Date()
+        )
+        let finalEvent = RemoteEvent(
+            protocolVersion: 1, eventId: UUID(), sequence: 1701,
+            machineId: "my-pc", runtimeId: "runtime.web",
+            instanceId: "photo", sessionId: "photo-upload",
+            type: "MESSAGE_ADDED",
+            payload: try XCTUnwrap(try JSONValue.encode(final).objectValue),
+            createdAt: Date()
+        )
+        await mock.injectEvent(finalEvent)
+        await mock.setResponseDelay(action: "getChangesAfterCursor", nanoseconds: 400_000_000)
+
+        let recovery = Task { await store.verifyOnlineSyncHead() }
+        for _ in 0..<300 {
+            if await mock.actionAttemptCount("getChangesAfterCursor") >= 2 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let deltaCalls = await mock.actionAttemptCount("getChangesAfterCursor")
+        XCTAssertGreaterThanOrEqual(deltaCalls, 2)
+        XCTAssertNotNil(store.deltaRecoveryDisplayMessagesBySession?["photo-upload"])
+
+        // A websocket final is newer than the frozen historical transcript. The
+        // displayed snapshot must be released before page two returns.
+        await mock.injectEvent(finalEvent, deliverLive: true)
+        for _ in 0..<100 {
+            if store.messagesBySession["photo-upload", default: []].contains(where: { $0.id == "live-during-recovery" }) { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.id == "live-during-recovery" }.count, 1)
+        XCTAssertNil(store.deltaRecoveryDisplayMessagesBySession?["photo-upload"],
+            "A frozen catch-up snapshot must not conceal a delivered live reply")
+        await recovery.value
+        XCTAssertNil(store.deltaRecoveryDisplayMessagesBySession)
+        await store.suspend()
+    }
+
+    @MainActor
     func testLargeDeltaRecoveryCoalescesHistoricalProgressButPublishesLatestActiveTail() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
