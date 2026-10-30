@@ -31,6 +31,19 @@ final class CodexDirectoryTests: XCTestCase {
         XCTAssertNil(decoded.workingDirectory)
         XCTAssertEqual(decoded.id, legacy.id)
     }
+    func testCodexModelReasoningLevelsDecodeAndRespectActualCapabilities() throws {
+        let raw = Data(#"{"id":"gpt-5.6-sol","label":"GPT-5.6-Sol","reasoningLevels":["low","medium","high","xhigh","max","ultra"]}"#.utf8)
+        let rich = try JSONDecoder.remoteAI.decode(CodexModelOption.self, from: raw)
+        XCTAssertEqual(rich.supportedReasoningLevels, ["low", "medium", "high", "xhigh", "max", "ultra"])
+        XCTAssertEqual(CodexModelOption.reasoningLabel("xhigh"), "超高")
+        let luna = try JSONDecoder.remoteAI.decode(CodexModelOption.self, from:
+            Data(#"{"id":"gpt-5.6-luna","label":"Luna","reasoningLevels":["low","medium","high","xhigh","max"]}"#.utf8))
+        XCTAssertFalse(luna.supportedReasoningLevels.contains("ultra"))
+        let legacy = try JSONDecoder.remoteAI.decode(CodexModelOption.self, from:
+            Data(#"{"id":"old","label":"Old"}"#.utf8))
+        XCTAssertTrue(legacy.supportedReasoningLevels.isEmpty)
+    }
+
     func testNativeMessageAliasesAndUnknownStatePreserveTheirIdentity() throws {
         let row = ServerMessage(messageId: "original-client-id", sessionId: "original-thread", role: "user",
                                 content: "same prompt", externalId: "native-api-id", createdAt: Date(timeIntervalSince1970: 1))
