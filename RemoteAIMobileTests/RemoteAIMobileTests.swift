@@ -579,7 +579,9 @@ final class RemoteAIMobileTests: XCTestCase {
             await mock.injectEvent(RemoteEvent(
                 protocolVersion: 1, eventId: UUID(), sequence: Int64(sequence),
                 machineId: "my-pc", runtimeId: "runtime.system",
-                instanceId: "agent", sessionId: nil, type: "TRANSPORT_STATUS",
+                // MockTransport Codable omits nil sessionId, unlike production wire.
+                // Use a benign session identifier to keep the strict test fixture valid.
+                instanceId: "agent", sessionId: "photo-upload", type: "TRANSPORT_STATUS",
                 payload: ["channel": .string("relay"), "state": .string("online")],
                 createdAt: old
             ))
