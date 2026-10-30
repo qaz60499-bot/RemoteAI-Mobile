@@ -3112,6 +3112,51 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testLegacyChromeListenerClosedReconcilesCommittedSendWithoutDuplicate() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .webSendLegacyChromeChannelClosedAfterCommit, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let commandId = UUID()
+
+        let sent = await store.send(
+            text: "legacy-listener-channel-closed", runtimeId: "runtime.web",
+            instanceId: "photo", sessionId: "photo-upload", commandId: commandId
+        )
+
+        XCTAssertTrue(sent, "Old Agent channel-closure errors must reconcile a committed provider turn")
+        XCTAssertEqual(store.commandStates[commandId], .completed)
+        let sendCount = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sendCount, 1, "Never automatically resend a possibly committed provider turn")
+        let providerCount = await mock.userMessageCount(sessionId: "photo-upload", text: "legacy-listener-channel-closed")
+        XCTAssertEqual(providerCount, 1)
+        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "legacy-listener-channel-closed" }.count, 1)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testUnrelatedLegacySelectorErrorRemainsDefiniteFailure() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .webSendLegacyUnrelatedSelectorFailure, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let commandId = UUID()
+
+        let sent = await store.send(
+            text: "button-missing", runtimeId: "runtime.web",
+            instanceId: "photo", sessionId: "photo-upload", commandId: commandId
+        )
+
+        XCTAssertFalse(sent)
+        XCTAssertEqual(store.commandStates[commandId], .failed)
+        let sendCount = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sendCount, 1)
+        let restoredDraft = await store.draft(sessionId: "photo-upload")
+        XCTAssertEqual(restoredDraft, "button-missing")
+        await store.suspend()
+    }
+
+    @MainActor
     func testConfirmedSendImmediatelyRecoversDeltaAndDeduplicatesOptimisticUser() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .deltaOnlySend, historyCount: 0)
