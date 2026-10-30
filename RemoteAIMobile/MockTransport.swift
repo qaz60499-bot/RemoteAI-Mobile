@@ -3,7 +3,7 @@ import Foundation
 enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
-    case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, alreadyExecutedThenSuccess, deltaOnlySend
+    case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, webSendLegacyChromeChannelClosedAfterCommit, webSendLegacyUnrelatedSelectorFailure, alreadyExecutedThenSuccess, deltaOnlySend
     case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, staleThenFreshProjectConversations, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
     case malformedCreateReplyAfterCommit
 }
@@ -353,6 +353,20 @@ actor MockTransport: Transport {
         }
         if command.action == "sendMessage", scenario == .webSendDeliveryUnknown {
             let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SEND_DELIVERY_UNKNOWN", message: "Mock page changed without proof of delivery", retryable: false, details: nil), idempotentReplay: nil)
+            processedCommands[command.commandId] = response
+            return response
+        }
+        if command.action == "sendMessage", scenario == .webSendLegacyUnrelatedSelectorFailure {
+            let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SELECTOR_FAILED", message: "No visible Send control", retryable: false, details: nil), idempotentReplay: nil)
+            processedCommands[command.commandId] = response
+            return response
+        }
+        if command.action == "sendMessage", scenario == .webSendLegacyChromeChannelClosedAfterCommit {
+            let text = command.payload["text"]?.stringValue ?? ""
+            let sessionId = command.sessionId ?? ""
+            let user = ServerMessage(messageId: "legacy-provider-user-\(command.commandId.uuidString.lowercased())", sessionId: sessionId, role: "user", content: text, externalId: nil, createdAt: Date())
+            history[sessionId, default: []].append(user)
+            let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SELECTOR_FAILED", message: "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received", retryable: true, details: nil), idempotentReplay: nil)
             processedCommands[command.commandId] = response
             return response
         }
