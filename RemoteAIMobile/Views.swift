@@ -940,5 +940,2067 @@ struct WebProjectView: View {
                     }
                 }
                 if store.projectHasMoreByAlias[project.projectAlias] == true {
+                    Button(loadingMore ? "加载中…" : "加载更多") {
+                        guard !loadingMore else { return }
+                        loadingMore = true
+                        Task { await store.loadMoreProjectConversations(projectAlias: project.projectAlias); loadingMore = false }
+                    }.disabled(loadingMore)
+                }
+                }
+            }
+            if !isAntigravity, let error = store.errors["web.project.\(project.projectAlias)"] { Section { ErrorBanner(text: error) { store.clearError(sessionId: "web.project.\(project.projectAlias)") } } }
+        }
+        .remoteAITopBreathingRoom()
+        .sheet(isPresented: $newAntigravitySession) {
+            NewSessionView(runtime: runtime, instance: instance, projectAlias: project.projectAlias).environmentObject(store)
+        }
+        .alert("删除电脑和手机上的 Antigravity 对话？", isPresented: $showingDeleteConfirmation) {
+            Button("取消", role: .cancel) { deleteCandidate = nil }
+            Button("删除对话", role: .destructive) {
+                if let session = deleteCandidate { Task { _ = await store.deleteSession(runtime: runtime, instance: instance, session: session) } }
+                deleteCandidate = nil
+            }
+        } message: { Text("这将请求 Windows 上的 Antigravity 删除原始对话，操作不可撤销。") }
+        .navigationTitle(project.displayName)
+        .navigationBarTitleDisplayMode(.inline)
+        .background(
+            Group {
+                if let createdSession {
+                    NavigationLink(
+                        destination: ChatView(runtime: runtime, instance: instance, session: createdSession),
+                        isActive: $openCreatedSession
+                    ) { EmptyView() }
+                    .hidden()
+                }
+            }
+        )
+        .task {
+            // An automatic Project open should reuse the verified catalog and
+            // existing Web tab; only an explicit pull-to-refresh forces a DOM scan.
+            await refreshProjectContext(force: false)
+            // Websocket events are the fast path, but a phone can miss the start of a
+            // desktop run while backgrounded or reconnecting. Poll only the cheap Agent
+            // session catalog while this Project view is visible; never open a browser
+            // just to discover Busy/Waiting state.
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                } catch {
+                    break
+                }
+                guard !Task.isCancelled else { break }
+                if store.machine.state == .online {
+                    await store.refreshSessions(runtime: runtime, instance: instance)
+                }
+            }
+        }
+        .onChange(of: scenePhase) { phase in
+            guard phase == .active, store.machine.state == .online else { return }
+            Task { await refreshProjectContext(force: false) }
+        }
+        .onChange(of: store.machine.state) { state in
+            guard state == .online else { return }
+            Task { await refreshProjectContext(force: false) }
+        }
+        .refreshable { await refreshProjectContext(force: true) }
+    }
+}
 
-[Showing lines 1-942 of 3006 (50.0KB limit). Use offset=943 to continue.]
+struct ChatView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.scenePhase) private var scenePhase
+    let runtime: RuntimeDescriptor
+    let instance: InstanceDescriptor
+    let session: SessionDescriptor
+    // The composer alone observes keystrokes. ChatView keeps the reference but
+    // does not invalidate the history/scroll tree for every text edit.
+    @State private var draft = ComposerDraft()
+    private var input: String {
+        get { draft.text }
+        nonmutating set { draft.text = newValue }
+    }
+    @State private var loadingOlder = false
+    @State private var pendingAttachments: [PendingAttachment] = []
+    @State private var showPhotoPicker = false
+    @State private var showFilePicker = false
+    @State private var attachmentError: String?
+    @State private var sending = false
+    @State private var sendTask: Task<Void, Never>?
+    @State private var composerCommandId: UUID?
+    @State private var selectedModel = ""
+    @State private var selectedReasoningEffort = ""
+    @State private var voiceBaseText = ""
+    @State private var isAtBottom = true
+    @State private var didInitialScrollToBottom = false
+    @State private var userBrowsingHistory = false
+    @StateObject private var speechInput = SpeechInputController()
+    @State private var textSelectionRequest: TextSelectionRequest?
+    @FocusState private var focused: Bool
+
+    var messages: [ChatMessage] {
+        store.deltaRecoveryDisplayMessagesBySession?[session.id]
+            ?? store.messagesBySession[session.id, default: []]
+    }
+    private var supportsModelSelection: Bool { runtime.kind == .codex || runtime.kind == .antigravity }
+    private var modelOptions: [CodexModelOption] { instance.modelCatalog?.models ?? [] }
+    private var selectedReasoningLevels: [String] {
+        modelOptions.first(where: { $0.id == selectedModel })?.supportedReasoningLevels ?? []
+    }
+    private var currentSession: SessionDescriptor {
+        store.sessions.first(where: { $0.id == session.id }) ?? session
+    }
+    private var currentSessionState: SessionState { currentSession.state }
+    private var currentWebProviderIssue: RemoteProviderSurfaceIssue? {
+        runtime.kind == .web ? store.webProviderIssuesBySession[session.id] : nil
+    }
+    private var currentWebProviderSurfaceState: String? {
+        runtime.kind == .web ? store.webProviderSurfaceStateBySession[session.id] : nil
+    }
+    private var generationStatusText: String {
+        store.liveRunStatusBySession[session.id]
+            ?? currentSession.lastProgressStatus
+            ?? (runtime.kind == .web ? "电脑端 ChatGPT 正在处理…" : "电脑端任务正在处理…")
+    }
+    private var generationProgressAt: Date? {
+        currentSession.lastProgressAt ?? currentSession.lastActivityAt
+    }
+    private var relevantSystemNotice: String? {
+        guard let notice = store.recentSystemNotice else { return nil }
+        // A browser-specific diagnostic must not appear inside Codex or Antigravity Chats.
+        if runtime.kind != .web && (notice.contains("ChatGPT") || notice.contains("Browser Bridge")) {
+            return nil
+        }
+        return notice
+    }
+    private var isGenerating: Bool {
+        if currentSessionState == .error { return false }
+        return currentSessionState == .busy
+            || currentSessionState == .waiting
+            || store.liveRunStatusBySession[session.id] != nil
+    }
+    var body: some View {
+        VStack(spacing: 0) {
+            if store.shouldDisplayConnectionBanner {
+                StatusBanner(
+                    text: store.errors["connection"] ?? store.connectionPhase.displayName,
+                    systemImage: "wifi.exclamationmark"
+                )
+            }
+            if let syncError = store.errors["sync"] {
+                StatusBanner(text: "同步异常：\(syncError)", systemImage: "arrow.triangle.2.circlepath")
+            }
+            if let notice = relevantSystemNotice {
+                StatusBanner(
+                    text: notice,
+                    systemImage: "desktopcomputer.and.arrow.down",
+                    dismiss: { store.clearRecentSystemNotice() }
+                )
+            }
+            if let issue = currentWebProviderIssue {
+                WebProviderSurfaceIssueBanner(
+                    issue: issue,
+                    surfaceState: currentWebProviderSurfaceState ?? "degraded",
+                    surfaceObservedAt: store.webProviderSurfaceObservedAtBySession[session.id],
+                    sessionState: currentSessionState
+                )
+            } else if runtime.kind == .web, currentWebProviderSurfaceState == "unknown" {
+                WebProviderSurfaceUnknownBanner(
+                    observedAt: store.webProviderSurfaceObservedAtBySession[session.id],
+                    sessionState: currentSessionState
+                )
+            } else if runtime.kind == .web,
+                      let recoveredAt = store.webProviderRecoveryObservedAtBySession[session.id] {
+                WebProviderSurfaceRecoveryBanner(observedAt: recoveredAt, sessionState: currentSessionState)
+            }
+            if let error = store.errors[session.id], error != currentWebProviderIssue?.message {
+                ErrorBanner(text: error) { store.clearError(sessionId: session.id) }
+            }
+            if let attachmentError { ErrorBanner(text: attachmentError) { self.attachmentError = nil } }
+            if let voiceError = speechInput.errorMessage { ErrorBanner(text: voiceError) { speechInput.dismissError() } }
+            ScrollViewReader { proxy in
+                ZStack(alignment: .bottomTrailing) {
+                    ScrollView {
+                        LazyVStack(spacing: 12) {
+                            Color.clear.frame(height: 1).id("top").onAppear { guard didInitialScrollToBottom, userBrowsingHistory, !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
+                            if loadingOlder { ProgressView().padding(.vertical, 6) }
+                            ForEach(messages) { message in
+                                let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
+                                // Definite failures restore the composer and use a new operation.
+                                // Only unknown delivery is replayed with the original command ID.
+                                let retryable = commandState == .unknown && UUID(uuidString: message.id) != nil
+                                if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
+                                    AssistantStreamRow(stream: stream, message: message, followTail: {
+                                        guard !userBrowsingHistory else { return }
+                                        proxy.scrollTo("bottom", anchor: .bottom)
+                                    }, onSelectText: { text, monospaced in
+                                        textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
+                                    }).id(message.id)
+                                } else {
+                                    MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: supportsModelSelection ? selectedModel : "") } } : nil, retryContextKey: selectedModel, onSelectText: { text, monospaced in
+                                        textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
+                                    }).equatable().id(message.id)
+                                }
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id("bottom")
+                                .onAppear {
+                                    // LazyVStack may recycle/retain the bottom sentinel while a
+                                    // streaming row is changing height. Never let that lifecycle
+                                    // event cancel an explicit user intent to browse older history;
+                                    // otherwise tail-following can re-enable between two drag events
+                                    // and the "回到最新消息" affordance disappears intermittently.
+                                    guard !userBrowsingHistory else {
+                                        isAtBottom = false
+                                        return
+                                    }
+                                    isAtBottom = true
+                                }
+                                .onDisappear { isAtBottom = false }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                    .background(Color(.systemGroupedBackground))
+                    .simultaneousGesture(
+                        TapGesture().onEnded { focused = false }
+                    )
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 8)
+                            .onChanged { value in
+                                // A downward finger drag moves the transcript toward older
+                                // messages. Mark that intent immediately instead of relying
+                                // only on LazyVStack bottom-sentinel disappearance, which may
+                                // be delayed while the sentinel remains retained offscreen.
+                                // A deliberate vertical swipe owns history browsing in either direction.
+                                // Do not let live tool events or streaming updates steal scroll position.
+                                if abs(value.translation.height) > 8 {
+                                    focused = false
+                                    userBrowsingHistory = true
+                                    isAtBottom = false
+                                }
+                            }
+                    )
+                    .onAppear {
+                        guard !didInitialScrollToBottom, !messages.isEmpty else { return }
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("bottom", anchor: .bottom)
+                            didInitialScrollToBottom = true
+                        }
+                    }
+                    .onChange(of: messages.last?.id) { _ in
+                        guard !loadingOlder, !messages.isEmpty else { return }
+                        if !didInitialScrollToBottom {
+                            DispatchQueue.main.async {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                                didInitialScrollToBottom = true
+                            }
+                        } else if !userBrowsingHistory {
+                            userBrowsingHistory = false
+                            withAnimation(.easeOut(duration: 0.18)) {
+DEVSPACE_CONTINUITY_RISK: Approximately 906129 DevSpace tool characters since the last acknowledged checkpoint. This is a secondary context-pressure signal, not an exact token-count or host context percentage, and not an automatic handoff trigger. Ordinary chat, other tools and host compaction are not measured. The host owns context management.
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                            }
+                        }
+                    }
+                    .onChange(of: session.id) { _ in
+                        didInitialScrollToBottom = false
+                        userBrowsingHistory = false
+                        isAtBottom = true
+                    }
+
+                    if didInitialScrollToBottom, !isAtBottom, !messages.isEmpty {
+                        Button {
+                            userBrowsingHistory = false
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                            }
+                        } label: {
+                            Image(systemName: "arrow.down")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(width: 36, height: 36)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .shadow(radius: 2, y: 1)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("回到最新消息")
+                        .padding(.trailing, 16)
+                        .padding(.bottom, 12)
+                    }
+                }
+            }
+        }
+        .remoteAITopBreathingRoom()
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) { VStack(spacing: 1) { Text(instance.name).font(.subheadline.weight(.semibold)); Text(session.title).font(.caption2).foregroundColor(.secondary); Text(store.machine.state.rawValue).font(.caption2).foregroundColor(store.machine.state == .online ? .green : .secondary) } }
+            ToolbarItem(placement: .navigationBarTrailing) { if store.machine.state == .online && isGenerating { Button("Stop") { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } }.font(.caption) } }
+        }
+        .safeAreaInset(edge: .bottom) {
+            VStack(spacing: 0) {
+                if runtime.kind == .antigravity {
+                    BackgroundTaskStatusView(
+                        snapshot: currentSession.backgroundTaskStatus,
+                        receivedAt: currentSession.backgroundTaskStatusReceivedAt,
+                        machineOnline: store.machine.state == .online,
+                        sceneActive: scenePhase == .active
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.ultraThinMaterial)
+                }
+                if supportsModelSelection, !modelOptions.isEmpty {
+                    HStack(spacing: 8) {
+                        Label("Model", systemImage: "cpu")
+                            .font(.caption.weight(.medium))
+                        Spacer()
+                        Picker("Model", selection: $selectedModel) {
+                            ForEach(modelOptions) { option in Text(option.label).tag(option.id) }
+                        }
+                        .pickerStyle(.menu)
+                        .onChange(of: selectedModel) { _ in selectedReasoningEffort = "" }
+                        if runtime.kind == .codex, session.id.hasPrefix("codex-pending-"), !selectedReasoningLevels.isEmpty {
+                            Picker("推理强度", selection: $selectedReasoningEffort) {
+                                Text("默认").tag("")
+                                ForEach(selectedReasoningLevels, id: \.self) { level in
+                                    Text(CodexModelOption.reasoningLabel(level)).tag(level)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                        } else if runtime.kind == .codex, !session.id.hasPrefix("codex-pending-") {
+                            Text("Desktop 原生会话的推理强度由电脑端控制；新建 CLI Chat 可单独选择。")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.ultraThinMaterial)
+                }
+                if isGenerating {
+                    HStack(spacing: 9) {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(runtime.kind == .antigravity ? "对话处理中 · \(generationStatusText)" : generationStatusText)
+                                .font(.caption.weight(.medium))
+                                .lineLimit(2)
+                            if store.desktopAgentConnected == false {
+                                Text("Windows Agent 当前未在线；手机仍会保留 Relay 连接并等待电脑恢复。")
+                                    .font(.caption2)
+                                    .foregroundColor(.orange)
+                            } else if store.desktopBrowserConnected == false, runtime.kind == .web {
+                                Text("电脑端 Browser Bridge 已断开，正在等待恢复；当前进度可能暂停。")
+                                    .font(.caption2)
+                                    .foregroundColor(.orange)
+                            } else if let progressAt = generationProgressAt {
+                                Text(runtime.kind == .antigravity
+                                    ? "对话进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 等待完成，或手动点击 Stop；发送不会自动打断"
+                                    : runtime.kind == .codex
+                                        ? "Codex 进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 等待完成，或手动点击 Stop"
+                                        : "电脑端进度更新：\(progressAt.formatted(date: .omitted, time: .standard)) · 可直接发送新指令纠正方向")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text(runtime.kind == .antigravity
+                                    ? "电脑端对话正在处理；请等待完成，或手动点击 Stop。"
+                                    : runtime.kind == .codex ? "等待当前 Codex 任务完成，或手动点击 Stop。" : "可直接发送新指令纠正方向；也可以先停止。")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        Spacer()
+                        Button {
+                            Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) }
+                        } label: {
+                            Image(systemName: "stop.circle.fill").font(.title3)
+                        }
+                        .accessibilityLabel("Stop generation")
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(.ultraThinMaterial)
+                }
+                if let transfer = store.attachmentTransferBySession[session.id] {
+                    HStack(spacing: 10) {
+                        ProgressView(value: transfer.fraction)
+                            .frame(maxWidth: 110)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("上传附件 \(min(transfer.completed + 1, transfer.total))/\(transfer.total)")
+                                .font(.caption.weight(.medium))
+                            Text(transfer.name).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        Button("取消") { sendTask?.cancel() }
+                            .font(.caption)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(.ultraThinMaterial)
+                }
+                Composer(
+                    draft: draft,
+                    focused: $focused,
+                    attachments: $pendingAttachments,
+                    enabled: store.machine.state == .online && !sending,
+                    isGenerating: isGenerating,
+                    isRecording: speechInput.isRecording,
+                    addPhoto: { showPhotoPicker = true },
+                    addFile: { showFilePicker = true },
+                    toggleVoice: { toggleVoiceInput() },
+                    stop: { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } },
+                    send: {
+                        if runtime.kind == .antigravity && isGenerating {
+                            attachmentError = "Antigravity 电脑侧边栏仍在执行。为避免打乱任务顺序，本次未发送、草稿已保留。请等待完成，或先手动点击 Stop。"
+                            return
+                        }
+                        if speechInput.isRecording { speechInput.stop() }
+                        let text = input
+                        let attachments = pendingAttachments
+                        let commandId = composerCommandId ?? UUID()
+                        let correctingActiveRun = isGenerating
+                        focused = false
+                        input = ""
+                        pendingAttachments.removeAll()
+                        sending = true
+                        sendTask = Task {
+                            if correctingActiveRun {
+                                let stopped = await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id)
+                                if !stopped {
+                                    await MainActor.run {
+                                        sending = false
+                                        sendTask = nil
+                                        if input.isEmpty { input = text }
+                                        if pendingAttachments.isEmpty { pendingAttachments = attachments }
+                                    }
+                                    return
+                                }
+                            }
+                            let sent = await store.send(text: text, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, attachments: attachments, model: supportsModelSelection ? selectedModel : "", reasoningEffort: runtime.kind == .codex ? selectedReasoningEffort : "", commandId: commandId)
+                            await MainActor.run {
+                                sending = false
+                                sendTask = nil
+                                if sent {
+                                    composerCommandId = nil
+                                    return
+                                }
+                                let state = store.commandStates[commandId]
+                                let hasOptimisticMessage = store.messagesBySession[session.id, default: []].contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame }
+                                if state == .unknown && hasOptimisticMessage {
+                                    // The final send may already have happened remotely. Keep the
+                                    // composer empty; the message-row Retry replays exactly once.
+                                    composerCommandId = nil
+                                    return
+                                }
+                                if input.isEmpty { input = text }
+                                if pendingAttachments.isEmpty { pendingAttachments = attachments }
+                                // If only attachment transfer was interrupted, there is no remote
+                                // message yet. Reusing this ID also reuses deterministic upload IDs.
+                                composerCommandId = state == .unknown ? commandId : nil
+                            }
+                        }
+                    }
+                )
+            }
+        }
+        .sheet(isPresented: $showPhotoPicker) {
+            PhotoLibraryAttachmentPicker(maxSelection: max(1, 8 - pendingAttachments.count)) { result in
+                appendAttachments(result)
+                showPhotoPicker = false
+            }
+        }
+        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls): appendFileURLs(urls)
+            case .failure(let error): attachmentError = error.localizedDescription
+            }
+        }
+        .sheet(item: $textSelectionRequest) { request in
+            TextSelectionSheet(text: request.text, monospaced: request.monospaced)
+        }
+        .onDisappear { speechInput.stop() }
+        .onChange(of: scenePhase) { phase in
+            if phase != .active {
+                speechInput.stop()
+            } else {
+                Task { await store.synchronizeVisibleSession(session.id, force: true) }
+            }
+        }
+        .task {
+            if supportsModelSelection, selectedModel.isEmpty {
+                selectedModel = [session.modelId, instance.configuredModel,
+                    instance.modelCatalog?.defaultModel, modelOptions.first?.id]
+                    .compactMap { $0 }
+                    .first(where: { candidate in modelOptions.contains(where: { $0.id == candidate }) })
+                    ?? ""
+            }
+            await store.loadSession(session.id)
+            if let mock = store.transport as? MockTransport {
+                await mock.runStressIfRequested(sessionId: session.id)
+            }
+            if input.isEmpty { input = await store.draft(sessionId: session.id) }
+
+            // Push remains the primary path, but a logically-connected websocket can
+            // still miss one event around SPA/document replacement. Reconcile only the
+            // currently visible conversation at a bounded cadence so the final reply,
+            // process state, or provider failure appears without leaving/reopening it.
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                guard !Task.isCancelled else { break }
+                if scenePhase == .active {
+                    await store.synchronizeVisibleSession(session.id)
+                }
+            }
+        }
+    }
+
+    private func toggleVoiceInput() {
+        if speechInput.isRecording {
+            speechInput.stop()
+            return
+        }
+        let existing = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        voiceBaseText = existing
+        speechInput.toggle { transcript in
+            let spoken = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !spoken.isEmpty else { return }
+            input = voiceBaseText.isEmpty ? spoken : "\(voiceBaseText) \(spoken)"
+        }
+    }
+
+    private func appendAttachments(_ incoming: [PendingAttachment]) {
+        var merged = pendingAttachments
+        for attachment in incoming {
+            guard merged.count < 8 else { attachmentError = "一次最多添加 8 个附件。"; break }
+            guard attachment.sizeBytes > 0 && attachment.sizeBytes <= 20 * 1024 * 1024 else {
+                attachmentError = "附件 \(attachment.name) 超过 20MB，未添加。"
+                continue
+            }
+            merged.append(attachment)
+        }
+        pendingAttachments = merged
+    }
+
+    private func appendFileURLs(_ urls: [URL]) {
+        var loaded: [PendingAttachment] = []
+        for url in urls.prefix(max(0, 8 - pendingAttachments.count)) {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let values = try url.resourceValues(forKeys: [.fileSizeKey, .nameKey, .contentTypeKey])
+                if let size = values.fileSize, size > 20 * 1024 * 1024 {
+                    attachmentError = "附件 \(values.name ?? url.lastPathComponent) 超过 20MB，未添加。"
+                    continue
+                }
+                let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+                let type = values.contentType?.preferredMIMEType
+                    ?? UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+                    ?? "application/octet-stream"
+                loaded.append(PendingAttachment(name: values.name ?? url.lastPathComponent, contentType: type, data: data))
+            } catch {
+                attachmentError = "读取文件失败：\(url.lastPathComponent)"
+            }
+        }
+        appendAttachments(loaded)
+    }
+}
+
+final class ComposerDraft: ObservableObject {
+    @Published var text = ""
+}
+
+struct Composer: View {
+    @ObservedObject var draft: ComposerDraft
+    let focused: FocusState<Bool>.Binding
+    private var text: String { draft.text }
+    @Binding var attachments: [PendingAttachment]
+    let enabled: Bool
+    let isGenerating: Bool
+    let isRecording: Bool
+    let addPhoto: () -> Void
+    let addFile: () -> Void
+    let toggleVoice: () -> Void
+    let stop: () -> Void
+    let send: () -> Void
+
+    private var hasDraft: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+    }
+
+    private var shouldShowStop: Bool { isGenerating && !hasDraft }
+
+    private var canSend: Bool {
+        enabled && hasDraft
+    }
+
+    var body: some View {
+        VStack(spacing: 6) {
+            if !attachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(attachments) { attachment in
+                            HStack(spacing: 5) {
+                                Image(systemName: attachment.contentType.hasPrefix("image/") ? "photo" : "doc")
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(attachment.name).font(.caption).lineLimit(1)
+                                    Text(ByteCountFormatter.string(fromByteCount: Int64(attachment.sizeBytes), countStyle: .file))
+                                        .font(.caption2).foregroundColor(.secondary)
+                                }
+                                Button {
+                                    attachments.removeAll { $0.id == attachment.id }
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Remove \(attachment.name)")
+                            }
+                            .padding(.horizontal, 9).padding(.vertical, 6)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Color(.secondarySystemBackground)))
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                }
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                Menu {
+                    Button(action: addPhoto) { Label("从照片选择", systemImage: "photo.on.rectangle") }
+                    Button(action: addFile) { Label("选择文件", systemImage: "folder") }
+                } label: {
+                    Image(systemName: "plus.circle").font(.title2).frame(width: 44, height: 44)
+                }
+                .disabled(attachments.count >= 8)
+                .accessibilityLabel("Attachments")
+
+                Button(action: toggleVoice) {
+                    Image(systemName: isRecording ? "waveform.circle.fill" : "mic.circle")
+                        .font(.title2)
+                        .frame(width: 38, height: 44)
+                        .foregroundColor(isRecording ? .accentColor : .secondary)
+                }
+                .disabled(!enabled)
+                .accessibilityLabel(isRecording ? "Stop voice input" : "Voice input")
+
+                TextEditor(text: $draft.text)
+                    .focused(focused)
+                    .frame(minHeight: 36, maxHeight: 92)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground)))
+                    .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color(.separator), lineWidth: 0.5))
+                    .accessibilityIdentifier("MessageComposer")
+
+                Button(action: shouldShowStop ? stop : send) {
+                    Image(systemName: shouldShowStop ? "stop.circle.fill" : "arrow.up.circle.fill")
+                        .font(.title)
+                        .frame(width: 44, height: 44)
+                        .foregroundColor((shouldShowStop && enabled) || canSend ? .accentColor : .secondary)
+                }
+                .disabled(shouldShowStop ? !enabled : !canSend)
+                .accessibilityLabel(shouldShowStop ? "Stop generation" : (isGenerating ? "Send correction" : "Send"))
+            }
+            .padding(.horizontal, 10)
+        }
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial)
+    }
+}
+
+struct PhotoLibraryAttachmentPicker: UIViewControllerRepresentable {
+    let maxSelection: Int
+    let onComplete: ([PendingAttachment]) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onComplete: onComplete) }
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var configuration = PHPickerConfiguration(photoLibrary: .shared())
+        configuration.filter = .images
+        configuration.selectionLimit = max(1, min(maxSelection, 8))
+        let controller = PHPickerViewController(configuration: configuration)
+        controller.delegate = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let onComplete: ([PendingAttachment]) -> Void
+        init(onComplete: @escaping ([PendingAttachment]) -> Void) { self.onComplete = onComplete }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            guard !results.isEmpty else { onComplete([]); return }
+            let group = DispatchGroup()
+            let lock = NSLock()
+            var attachments: [PendingAttachment] = []
+            for result in results.prefix(8) {
+                let provider = result.itemProvider
+                let typeIdentifier = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true })
+                    ?? UTType.image.identifier
+                group.enter()
+                provider.loadDataRepresentation(forTypeIdentifier: typeIdentifier) { data, _ in
+                    defer { group.leave() }
+                    guard let data, !data.isEmpty else { return }
+                    let type = UTType(typeIdentifier)
+                    let name = provider.suggestedName
+                        ?? "Photo-\(UUID().uuidString.prefix(8)).\(type?.preferredFilenameExtension ?? "jpg")"
+                    let attachment = PendingAttachment(
+                        name: name,
+                        contentType: type?.preferredMIMEType ?? "image/jpeg",
+                        data: data
+                    )
+                    lock.lock(); attachments.append(attachment); lock.unlock()
+                }
+            }
+            group.notify(queue: .main) { self.onComplete(attachments) }
+        }
+    }
+}
+
+enum MessageRenderingPolicy {
+    static let inlineByteLimit = 12 * 1024
+    static let inlineCharacterLimit = 2_000
+
+    static func isLarge(_ value: String) -> Bool {
+        value.utf8.count > inlineByteLimit
+    }
+
+    static func inlineText(_ value: String) -> String {
+        guard isLarge(value) else { return value }
+        let preview = String(value.prefix(inlineCharacterLimit))
+        return preview + "\n\n…（长消息已折叠，点击下方“查看全文”读取完整内容）"
+    }
+}
+
+struct MessageContentSegment: Identifiable, Equatable {
+    private static let editBlockMarker = "__REMOTEAI_EDIT_BLOCK__"
+    private static let editRegex = try! NSRegularExpression(
+        pattern: #"(^|\r?\n[ \t]*\r?\n)[ \t]*Edit[ \t]*\r?\n(?:[ \t]*\r?\n)?"#,
+        options: [.caseInsensitive, .anchorsMatchLines]
+    )
+
+    let id: Int
+    let text: String
+    let isCode: Bool
+    let language: String?
+
+    var isEditBlock: Bool { !isCode && language == Self.editBlockMarker }
+
+    static func parse(_ value: String) -> [MessageContentSegment] {
+        if value.range(of: "Edit", options: .caseInsensitive) == nil,
+           let inferred = inferredContinuationPrompt(in: value) {
+            return [MessageContentSegment(id: 0, text: inferred, isCode: false, language: editBlockMarker)]
+        }
+        if !value.contains("```"), value.range(of: "Edit", options: .caseInsensitive) == nil {
+            return value.isEmpty ? [] : [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)]
+        }
+        var result: [MessageContentSegment] = []
+        let nsValue = value as NSString
+        let matches = editMatches(in: value, nsValue: nsValue)
+
+        if !matches.isEmpty {
+            var cursor = 0
+            for (index, match) in matches.enumerated() {
+                if match.range.location > cursor {
+                    appendMarkdownSegments(nsValue.substring(with: NSRange(location: cursor, length: match.range.location - cursor)), to: &result)
+                }
+                let bodyStart = NSMaxRange(match.range)
+                let bodyEnd = index + 1 < matches.count ? matches[index + 1].range.location : nsValue.length
+                if bodyEnd > bodyStart {
+                    let body = nsValue.substring(with: NSRange(location: bodyStart, length: bodyEnd - bodyStart))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !body.isEmpty {
+                        result.append(MessageContentSegment(id: result.count, text: body, isCode: false, language: editBlockMarker))
+                    }
+                }
+                cursor = bodyEnd
+            }
+            if cursor < nsValue.length {
+                appendMarkdownSegments(nsValue.substring(from: cursor), to: &result)
+            }
+            if !result.isEmpty { return result }
+        }
+
+        appendMarkdownSegments(value, to: &result)
+        return result.isEmpty ? [MessageContentSegment(id: 0, text: value, isCode: false, language: nil)] : result
+    }
+
+    static func editBlocks(in value: String) -> [MessageContentSegment] {
+        let inferredPrompt = inferredContinuationPrompt(in: value)
+        guard value.range(of: "Edit", options: .caseInsensitive) != nil else { return continuationPromptBlocks(inferredPrompt) }
+        let nsValue = value as NSString
+        let matches = editMatches(in: value, nsValue: nsValue)
+        guard !matches.isEmpty else { return [] }
+
+        var blocks: [MessageContentSegment] = []
+        for (index, match) in matches.enumerated() {
+            let bodyStart = NSMaxRange(match.range)
+            let bodyEnd = index + 1 < matches.count ? matches[index + 1].range.location : nsValue.length
+            guard bodyEnd > bodyStart else { continue }
+            let body = nsValue.substring(with: NSRange(location: bodyStart, length: bodyEnd - bodyStart))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !body.isEmpty {
+                blocks.append(MessageContentSegment(id: blocks.count, text: body, isCode: false, language: editBlockMarker))
+            }
+        }
+        return blocks
+    }
+
+    private static func inferredContinuationPrompt(in value: String) -> String? {
+        guard value.utf8.count >= 256 else { return nil }
+        var score = 0
+        if value.contains("继续实际接管") || value.contains("请继续实际接管") || value.contains("继续接管") { score += 2 }
+        if value.contains("不要重新") { score += 1 }
+        if value.contains("必须以") { score += 1 }
+        if value.contains("当前真实") || value.contains("真实状态") { score += 1 }
+        if value.localizedCaseInsensitiveContains("Codex") { score += 1 }
+        guard score >= 4 else { return nil }
+
+        let lines = value.components(separatedBy: .newlines)
+        guard let start = lines.firstIndex(where: { line in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.contains("继续实际接管")
+                || trimmed.contains("请继续实际接管")
+                || trimmed.contains("继续接管")
+        }) else { return nil }
+        let body = lines[start...].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return body.isEmpty ? nil : body
+    }
+
+    private static func continuationPromptBlocks(_ prompt: String?) -> [MessageContentSegment] {
+        guard let prompt, !prompt.isEmpty else { return [] }
+        return [MessageContentSegment(id: 0, text: prompt, isCode: false, language: editBlockMarker)]
+    }
+
+    private static func editMatches(in value: String, nsValue: NSString) -> [NSTextCheckingResult] {
+        let allMatches = editRegex.matches(in: value, range: NSRange(location: 0, length: nsValue.length))
+        var fenceCursor = 0
+        var insideFence = false
+        return allMatches.filter { match in
+            // Scan each interval once; rebuilding every preceding prefix made
+            // repeated Edit blocks quadratic in the size of the input.
+            while fenceCursor < match.range.location {
+                let fence = nsValue.range(of: "```", options: [], range: NSRange(location: fenceCursor, length: match.range.location - fenceCursor))
+                guard fence.location != NSNotFound else { break }
+                insideFence.toggle()
+                fenceCursor = NSMaxRange(fence)
+            }
+            fenceCursor = match.range.location
+            return !insideFence
+        }
+    }
+
+    private static func appendMarkdownSegments(_ value: String, to result: inout [MessageContentSegment]) {
+        let parts = value.components(separatedBy: "```")
+        if parts.count == 1 {
+            if !value.isEmpty {
+                result.append(MessageContentSegment(id: result.count, text: value, isCode: false, language: nil))
+            }
+            return
+        }
+        for (index, rawPart) in parts.enumerated() where !rawPart.isEmpty {
+            let isCode = index % 2 == 1
+            var text = rawPart
+            var language: String? = nil
+            if isCode, let newline = text.firstIndex(of: "\n") {
+                let firstLine = String(text[..<newline]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !firstLine.isEmpty,
+                   firstLine.count <= 24,
+                   firstLine.range(of: "^[A-Za-z0-9_+.-]+$", options: .regularExpression) != nil {
+                    language = firstLine
+                    text = String(text[text.index(after: newline)...])
+                }
+            }
+            let cleaned = isCode ? text.trimmingCharacters(in: .newlines) : text
+            if !cleaned.isEmpty {
+                result.append(MessageContentSegment(id: result.count, text: cleaned, isCode: isCode, language: language))
+            }
+        }
+    }
+}
+
+struct SelectableTextEditor: UIViewRepresentable {
+    let text: String
+    var monospaced = false
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.backgroundColor = .clear
+        view.isEditable = false
+        view.isSelectable = true
+        view.isScrollEnabled = true
+        view.alwaysBounceVertical = true
+        view.textContainerInset = UIEdgeInsets(top: 12, left: 8, bottom: 12, right: 8)
+        view.textContainer.lineFragmentPadding = 0
+        view.adjustsFontForContentSizeCategory = true
+        configure(view)
+        return view
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        configure(uiView)
+    }
+
+    private func configure(_ view: UITextView) {
+        if view.text != text { view.text = text }
+        if monospaced {
+            let size = UIFont.preferredFont(forTextStyle: .body).pointSize
+            view.font = UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        } else {
+            view.font = UIFont.preferredFont(forTextStyle: .body)
+        }
+        view.textColor = .label
+    }
+}
+
+private struct TextSelectionRequest: Identifiable {
+    let id = UUID()
+    let text: String
+    let monospaced: Bool
+}
+
+struct TextSelectionSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let text: String
+    let monospaced: Bool
+
+    var body: some View {
+        NavigationView {
+            SelectableTextEditor(text: text, monospaced: monospaced)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(.systemBackground))
+                .navigationTitle("选择文字")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("全部复制") { UIPasteboard.general.string = text }
+                    }
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("完成") { dismiss() }
+                    }
+                }
+        }
+    }
+}
+
+// Cache prepared content, not SwiftUI views or selection sheets. A streaming
+// replacement invalidates only its own entry; unrelated store publications do
+// not repeat attachment regexes, preview copies and segment parsing.
+final class MessageRenderContent: NSObject {
+    let sourceText: String
+    let sourceAttachments: [MessageAttachment]?
+    let sourceDetail: String?
+    let displayText: String
+    let attachments: [MessageAttachment]
+    let isLarge: Bool
+    let segments: [MessageContentSegment]
+    let preservedEditBlocks: [MessageContentSegment]
+    let inlineDetail: String?
+
+    init(message: ChatMessage) {
+        sourceText = message.text
+        sourceAttachments = message.attachments
+        sourceDetail = message.detail
+        displayText = message.displayText
+        attachments = message.resolvedAttachments
+        isLarge = MessageRenderingPolicy.isLarge(displayText)
+        let inlinePreview = MessageRenderingPolicy.inlineText(displayText)
+        // A collapsed long-history bubble is a preview, not a full Markdown view.
+        // Parsing thousands of repeated inline fences/styles into many Text nodes
+        // inflates SwiftUI layout and XCTest/VoiceOver accessibility snapshots.
+        // Preserve existing Edit-block extraction and short-message formatting.
+        if isLarge && displayText.range(of: "Edit", options: .caseInsensitive) == nil {
+            segments = [MessageContentSegment(id: 0, text: inlinePreview, isCode: false, language: nil)]
+        } else {
+            segments = MessageContentSegment.parse(inlinePreview)
+        }
+        preservedEditBlocks = isLarge ? MessageContentSegment.editBlocks(in: displayText) : []
+        inlineDetail = message.detail.map { MessageRenderingPolicy.inlineText($0) }
+    }
+
+    func matches(_ message: ChatMessage) -> Bool {
+        sourceText == message.text && sourceAttachments == message.attachments && sourceDetail == message.detail
+    }
+}
+
+final class MessageRenderCache {
+    static let shared = MessageRenderCache()
+    private let entries = NSCache<NSString, MessageRenderContent>()
+
+    init() {
+        entries.countLimit = 128
+        entries.totalCostLimit = 4 * 1024 * 1024
+    }
+
+    func content(for message: ChatMessage) -> MessageRenderContent {
+        let key = "\(message.sessionId.utf8.count):\(message.sessionId)\(message.id)" as NSString
+        if let cached = entries.object(forKey: key), cached.matches(message) { return cached }
+        let content = MessageRenderContent(message: message)
+        let sourceCost = message.text.utf8.count + content.displayText.utf8.count
+        let detailCost = message.detail?.utf8.count ?? 0
+        let segmentCost = content.segments.reduce(into: 0) { $0 += $1.text.utf8.count }
+        let editCost = content.preservedEditBlocks.reduce(into: 0) { $0 += $1.text.utf8.count }
+        let cost = sourceCost + detailCost + segmentCost + editCost
+        entries.setObject(content, forKey: key, cost: cost)
+        return content
+    }
+}
+
+struct AssistantStreamRow: View, Equatable {
+    @ObservedObject var stream: AssistantStream
+    @Environment(\.scenePhase) private var scenePhase
+    let message: ChatMessage
+    var followTail: () -> Void = {}
+    var onSelectText: ((String, Bool) -> Void)? = nil
+    @State private var followTask: Task<Void, Never>?
+
+    static func == (lhs: AssistantStreamRow, rhs: AssistantStreamRow) -> Bool {
+        lhs.stream === rhs.stream && lhs.message == rhs.message
+    }
+
+    var body: some View {
+        let began = StreamPerformance.now
+        let visibleText = stream.visibleText
+        let visibleBytes = stream.visibleBytes
+        let _ = stream.performance.rowUpdated(bytes: visibleBytes)
+        // Keep the live path deliberately cheap. Re-running the full Markdown/Edit/
+        // attachment renderer for every presentation tick can monopolize the main
+        // thread on 30k/50k+ answers and even starve accessibility snapshots. The
+        // durable final message still uses MessageRow, so formatting is restored once.
+        let _ = stream.performance.preparation.add((StreamPerformance.now - began) * 1000)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .bottom) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(visibleText)
+                        .accessibilityHidden(true)
+                    HStack(spacing: 12) {
+                        Button {
+                            UIPasteboard.general.string = stream.text
+                        } label: {
+                            Label("复制当前全文", systemImage: "doc.on.doc")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        Button("查看 / 选择当前全文") {
+                            onSelectText?(stream.text, false)
+                        }
+                        .font(.caption2)
+                        .buttonStyle(.borderless)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(RoundedRectangle(cornerRadius: 16).fill(Color(.secondarySystemGroupedBackground)))
+                Spacer(minLength: 44)
+            }
+            Text("已接收 \(visibleBytes) 字节 · 显示最新内容")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .accessibilityIdentifier("assistant-stream-progress")
+        }
+        .onAppear { stream.performance.startFrames() }
+        .onDisappear {
+            stream.performance.stopFrames()
+            followTask?.cancel()
+            followTask = nil
+        }
+        .onChange(of: stream.visibleBytes) { _ in
+            // Coalesce presentation ticks, without postponing indefinitely while
+            // deltas keep arriving. The callback rechecks browsing at execution.
+            guard followTask == nil else { return }
+            followTask = Task { @MainActor in
+                do { try await Task.sleep(nanoseconds: 250_000_000) }
+                catch { return }
+                followTail()
+                followTask = nil
+            }
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active { stream.performance.startFrames() }
+            else { stream.performance.stopFrames() }
+        }
+    }
+}
+
+struct MessageRow: View, Equatable {
+    let message: ChatMessage
+    let commandState: CommandState?
+    let retry: (() -> Void)?
+    var retryContextKey: String = ""
+    var fullStreamingText: (() -> String)? = nil
+    var onSelectText: ((String, Bool) -> Void)? = nil
+    var preparedRenderContent: MessageRenderContent? = nil
+
+    static func == (lhs: MessageRow, rhs: MessageRow) -> Bool {
+        lhs.message == rhs.message && lhs.commandState == rhs.commandState
+            && (lhs.retry == nil) == (rhs.retry == nil) && lhs.retryContextKey == rhs.retryContextKey
+    }
+    @State private var toolExpanded = true
+    private var renderContent: MessageRenderContent { preparedRenderContent ?? MessageRenderCache.shared.content(for: message) }
+    private var displayText: String { renderContent.displayText }
+    private var displayAttachments: [MessageAttachment] { renderContent.attachments }
+    private var isLargeDisplayText: Bool { renderContent.isLarge || (fullStreamingText != nil && message.text.count >= 2001) }
+    private var contentSegments: [MessageContentSegment] {
+        if renderContent.isLarge, fullStreamingText == nil {
+            return renderContent.segments.filter { !$0.isEditBlock }
+        }
+        return renderContent.segments
+    }
+    private var preservedEditBlocks: [MessageContentSegment] {
+        fullStreamingText == nil ? renderContent.preservedEditBlocks : []
+    }
+    private var selectionText: String { fullStreamingText?() ?? displayText }
+
+    var body: some View {
+        Group {
+            if message.kind == .toolEvent {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Button {
+                            withAnimation(.easeOut(duration: 0.12)) { toolExpanded.toggle() }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: message.toolStatus == "Completed" ? "checkmark.circle.fill" : "gearshape.2")
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(message.toolName ?? "Tool")
+                                        .font(.subheadline.weight(.semibold))
+                                        .lineLimit(1)
+                                    Text(message.toolStatus ?? "Running")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Image(systemName: toolExpanded ? "chevron.down" : "chevron.right")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundColor(.secondary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        Spacer(minLength: 8)
+                        Button {
+                            UIPasteboard.general.string = message.toolCardCopyText
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.subheadline.weight(.medium))
+                                .frame(width: 34, height: 34)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("复制整块")
+                        .accessibilityIdentifier("tool-card-copy-whole")
+                    }
+                    if let detail = message.detail, !detail.isEmpty {
+                        Text(renderContent.inlineDetail ?? detail)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.primary)
+                            .lineLimit(toolExpanded ? nil : 3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if toolExpanded, let detail = message.detail {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 12) {
+                                if MessageRenderingPolicy.isLarge(detail) {
+                                    Button("查看全文") {
+                                        onSelectText?(detail, true)
+                                    }
+                                }
+                                Button("选择部分") {
+                                    onSelectText?(detail, true)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            HStack(spacing: 12) {
+                                Button("复制整块") {
+                                    UIPasteboard.general.string = message.toolCardCopyText
+                                }
+                                Button("选择整块") {
+                                    onSelectText?(message.toolCardCopyText, true)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .accessibilityIdentifier("tool-card-copy-actions")
+                        }
+                        .font(.caption2)
+                        .buttonStyle(.borderless)
+                    }
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = message.toolCardCopyText
+                    } label: {
+                        Label("复制整块", systemImage: "doc.on.doc")
+                    }
+                    Button {
+                        onSelectText?(message.toolCardCopyText, true)
+                    } label: {
+                        Label("选择整块", systemImage: "text.cursor")
+                    }
+                }
+            } else {
+                HStack(alignment: .bottom) {
+                    if message.role == .user { Spacer(minLength: 44) }
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(contentSegments) { segment in
+                            if segment.isEditBlock {
+                                editBlockCard(segment)
+                            } else if segment.isCode {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack(spacing: 8) {
+                                        Text(segment.language?.isEmpty == false ? segment.language! : "EDIT / Code")
+                                            .font(.caption2.weight(.medium))
+                                            .foregroundColor(.secondary)
+                                        Spacer()
+                                        Button("选择部分") {
+                                            onSelectText?(segment.text, true)
+                                        }
+                                        .font(.caption2)
+                                        .buttonStyle(.borderless)
+                                        Button {
+                                            UIPasteboard.general.string = segment.text
+                                        } label: {
+                                            Label("复制", systemImage: "doc.on.doc")
+                                                .font(.caption2)
+                                        }
+                                        .buttonStyle(.borderless)
+                                    }
+                                    Text(segment.text)
+                                        .font(.system(.body, design: .monospaced))
+                                        .accessibilityIdentifier("message-content-\(message.id)-\(segment.id)")
+                                }
+                                .padding(9)
+                                .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
+                            } else {
+                                if fullStreamingText != nil {
+                                    // Live text changes continuously; native selection
+                                    // bookkeeping is reserved for the full-text sheet.
+                                    Text(segment.text)
+                                        .accessibilityIdentifier("message-content-\(message.id)-\(segment.id)")
+                                } else {
+                                    Text(segment.text)
+                                        .accessibilityIdentifier("message-content-\(message.id)-\(segment.id)")
+                                }
+                            }
+                        }
+                        ForEach(preservedEditBlocks) { segment in
+                            editBlockCard(segment)
+                        }
+                        if isLargeDisplayText {
+                            Button {
+                                onSelectText?(selectionText, false)
+                            } label: {
+                                Label(fullStreamingText != nil ? "查看全文（生成中）" : "查看全文（约 \(max(1, displayText.utf8.count / 1024)) KB）", systemImage: "doc.text.magnifyingglass")
+                                    .font(.caption.weight(.medium))
+                            }
+                            .buttonStyle(.borderless)
+                            Text(fullStreamingText != nil ? "正在显示最新生成的内容，可查看或复制当前全文。" : "长消息已折叠，可查看或复制全文。")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        if !displayAttachments.isEmpty {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(displayAttachments) { attachment in
+                                    MessageAttachmentView(sessionId: message.sessionId, attachment: attachment)
+                                }
+                            }
+                        }
+                        if !displayText.isEmpty {
+                            HStack(spacing: 12) {
+                                Button {
+                                    UIPasteboard.general.string = selectionText
+                                } label: {
+                                    Label("复制全文", systemImage: "doc.on.doc")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.borderless)
+                                Button {
+                                    onSelectText?(selectionText, false)
+                                } label: {
+                                    Label("选择部分", systemImage: "text.cursor")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                        if message.toolStatus == "Streaming" { ProgressView().scaleEffect(0.7) }
+                        if message.role == .user, let commandState {
+                            Text(commandState.rawValue).font(.caption2).foregroundColor(commandState == .failed || commandState == .unknown ? .red : .secondary)
+                        }
+                        if let retry { Button("恢复原命令（不新建消息）", action: retry).font(.caption) }
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 9)
+                    .background(RoundedRectangle(cornerRadius: 16).fill(message.role == .user ? Color.accentColor.opacity(0.18) : Color(.secondarySystemGroupedBackground)))
+                    if message.role != .user { Spacer(minLength: 44) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func editBlockCard(_ segment: MessageContentSegment) -> some View {
+        let isLargeEdit = MessageRenderingPolicy.isLarge(segment.text)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label("Edit", systemImage: "square.and.pencil")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondary)
+                Spacer(minLength: 8)
+            }
+            HStack(spacing: 12) {
+                Button {
+                    UIPasteboard.general.string = segment.text
+                } label: {
+                    Label("复制整块", systemImage: "doc.on.doc")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                Button(isLargeEdit ? "查看 / 选择全文" : "选择部分") {
+                    onSelectText?(segment.text, false)
+                }
+                .font(.caption2)
+                .buttonStyle(.borderless)
+                Spacer(minLength: 0)
+            }
+            if isLargeEdit {
+                Text(MessageRenderingPolicy.inlineText(segment.text))
+            } else {
+                Text(segment.text)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground)))
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = segment.text
+            } label: {
+                Label("复制整块", systemImage: "doc.on.doc")
+            }
+            Button {
+                onSelectText?(segment.text, false)
+            } label: {
+                Label("选择部分", systemImage: "text.cursor")
+            }
+        }
+    }
+}
+
+private struct AttachmentPreviewItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+private struct SystemActivitySheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+private struct DocumentExportPicker: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        UIDocumentPickerViewController(forExporting: [url], asCopy: true)
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+}
+
+enum AttachmentPreviewPolicy {
+    static func shouldDismiss(translation: CGSize, predictedEndTranslation: CGSize) -> Bool {
+        let vertical = translation.height
+        let horizontal = abs(translation.width)
+        return vertical > 110
+            && vertical > horizontal * 1.35
+            && predictedEndTranslation.height > 150
+    }
+}
+
+private struct AttachmentPreviewSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let item: AttachmentPreviewItem
+    @State private var showingShare = false
+    @State private var showingExport = false
+
+    var body: some View {
+        NavigationView {
+            QuickLookPreview(url: item.url)
+                .navigationTitle(item.url.lastPathComponent)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button { dismiss() } label: {
+                            Image(systemName: "xmark")
+                        }
+                        .accessibilityLabel("关闭预览")
+                    }
+                    ToolbarItemGroup(placement: .navigationBarTrailing) {
+                        Button { showingExport = true } label: {
+                            Image(systemName: "arrow.down.to.line")
+                        }
+                        .accessibilityLabel("下载到文件")
+                        Button { showingShare = true } label: {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                        .accessibilityLabel("分享附件")
+                    }
+                }
+        }
+        .contentShape(Rectangle())
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 24)
+                .onEnded { value in
+                    if AttachmentPreviewPolicy.shouldDismiss(
+                        translation: value.translation,
+                        predictedEndTranslation: value.predictedEndTranslation
+                    ) {
+                        dismiss()
+                    }
+                }
+        )
+        .interactiveDismissDisabled(false)
+        .sheet(isPresented: $showingExport) {
+            DocumentExportPicker(url: item.url)
+        }
+        .sheet(isPresented: $showingShare) {
+            SystemActivitySheet(url: item.url)
+        }
+    }
+}
+
+private struct QuickLookPreview: UIViewControllerRepresentable {
+    let url: URL
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        var url: URL
+        init(url: URL) { self.url = url }
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem { url as NSURL }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(url: url) }
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+    func updateUIViewController(_ uiViewController: QLPreviewController, context: Context) {
+        context.coordinator.url = url
+        uiViewController.reloadData()
+    }
+}
+
+private struct MessageAttachmentView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    let sessionId: String
+    let attachment: MessageAttachment
+    @State private var cachedImage: UIImage?
+    @State private var cacheLoadFinished = false
+    @State private var previewItem: AttachmentPreviewItem?
+    @State private var exportItem: AttachmentPreviewItem?
+    @State private var previewError: String?
+    @State private var isOpeningPreview = false
+
+    private var canOpenFromAgent: Bool {
+        attachment.attachmentId?.hasPrefix("webasset-") == true
+    }
+
+    private var prefersFileExport: Bool {
+        let lower = attachment.name.lowercased()
+        return [".zip", ".ipa", ".apk", ".7z", ".rar"].contains { lower.hasSuffix($0) }
+    }
+
+    private var targetURL: URL? {
+        if let downloadURL = attachment.downloadURL, let url = URL(string: downloadURL) { return url }
+        if let previewURL = attachment.previewURL, let url = URL(string: previewURL) { return url }
+        return nil
+    }
+
+    private var metadataText: String {
+        var parts: [String] = []
+        if let contentType = attachment.contentType, !contentType.isEmpty { parts.append(contentType) }
+        if let sizeBytes = attachment.sizeBytes {
+            parts.append(ByteCountFormatter.string(fromByteCount: Int64(sizeBytes), countStyle: .file))
+        }
+        return parts.isEmpty ? (attachment.isImage ? "图片" : "文件") : parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        Group {
+            if canOpenFromAgent {
+                VStack(alignment: .leading, spacing: 6) {
+                    Button(action: openFromAgent) { cardContent }
+                        .buttonStyle(.plain)
+                        .disabled(isOpeningPreview)
+                    HStack(spacing: 12) {
+                        Button {
+                            saveFromAgent()
+                        } label: {
+                            Label("保存到文件", systemImage: "arrow.down.to.line")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(isOpeningPreview)
+                        if !attachment.isImage {
+                            Text("无需预览支持，也可直接保存 ZIP / IPA / APK 等文件")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .lineLimit(2)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 8)
+                }
+            } else if let targetURL {
+                Link(destination: targetURL) { cardContent }
+                    .buttonStyle(.plain)
+            } else {
+                cardContent
+            }
+        }
+        .sheet(item: $previewItem) { item in
+            AttachmentPreviewSheet(item: item)
+        }
+        .sheet(item: $exportItem) { item in
+            DocumentExportPicker(url: item.url)
+        }
+        .alert("无法打开附件", isPresented: Binding(
+            get: { previewError != nil },
+            set: { if !$0 { previewError = nil } }
+        )) {
+            Button("确定", role: .cancel) { previewError = nil }
+        } message: {
+            Text(previewError ?? "附件暂时不可用。")
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("附件 \(attachment.name)")
+        .accessibilityHint(canOpenFromAgent ? "双击预览附件" : "")
+    }
+
+    private var cardContent: some View {
+        HStack(spacing: 10) {
+            if shouldAutoLoadAgentImage {
+                Group {
+                    if let cachedImage {
+                        Image(uiImage: cachedImage).resizable().scaledToFill()
+                    } else if cacheLoadFinished {
+                        Image(systemName: "photo").font(.title3).foregroundColor(.secondary)
+                    } else {
+                        ProgressView().scaleEffect(0.75)
+                    }
+                }
+                .frame(width: 58, height: 58)
+                .background(Color(.tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+                .task(id: attachment.id) {
+                    guard cachedImage == nil, !cacheLoadFinished else { return }
+                    if let data = await store.loadMessageAttachmentData(sessionId: sessionId, attachment: attachment) {
+                        cachedImage = UIImage(data: data)
+                    }
+                    cacheLoadFinished = true
+                }
+            } else if attachment.isImage, let previewURL = attachment.previewURL, let url = URL(string: previewURL) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let image): image.resizable().scaledToFill()
+                    case .empty: ProgressView().scaleEffect(0.75)
+                    default: Image(systemName: "photo").font(.title3).foregroundColor(.secondary)
+                    }
+                }
+                .frame(width: 58, height: 58)
+                .background(Color(.tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+            } else {
+                Image(systemName: attachment.isImage ? "photo" : "doc.fill")
+                    .font(.title3)
+                    .frame(width: 34, height: 34)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color(.tertiarySystemGroupedBackground)))
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(attachment.name)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(2)
+                Text(metadataText)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            Spacer(minLength: 4)
+            if isOpeningPreview {
+                ProgressView().scaleEffect(0.7)
+            } else if canOpenFromAgent {
+                Image(systemName: "doc.text.magnifyingglass").font(.caption).foregroundColor(.secondary)
+            } else if targetURL != nil {
+                Image(systemName: "arrow.up.right.square").font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .padding(8)
+        .contentShape(Rectangle())
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color(.tertiarySystemGroupedBackground).opacity(0.7)))
+    }
+
+    private var shouldAutoLoadAgentImage: Bool {
+        guard attachment.isImage, attachment.attachmentId?.hasPrefix("webasset-") == true else { return false }
+        guard let sizeBytes = attachment.sizeBytes else { return false }
+        return sizeBytes <= 4 * 1024 * 1024
+    }
+
+    private func openFromAgent() {
+        materializeFromAgent(forExport: prefersFileExport)
+    }
+
+    private func saveFromAgent() {
+        materializeFromAgent(forExport: true)
+    }
+
+    private func materializeFromAgent(forExport: Bool) {
+        guard !isOpeningPreview else { return }
+        isOpeningPreview = true
+        Task {
+            guard let url = await store.downloadMessageAttachmentFile(sessionId: sessionId, attachment: attachment) else {
+                await MainActor.run {
+                    isOpeningPreview = false
+                    previewError = "无法从当前网页会话下载这个附件。请确认电脑端 ChatGPT 页面仍能访问该文件。"
+                }
+                return
+            }
+            await MainActor.run {
+                isOpeningPreview = false
+                let item = AttachmentPreviewItem(url: url)
+                if forExport { exportItem = item }
+                else { previewItem = item }
+            }
+        }
+    }
+
+    private func preferredPreviewFilename(data: Data) -> String {
+        let raw = URL(fileURLWithPath: attachment.name).lastPathComponent
+        let forbidden = CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/\\:"))
+        let sanitized = raw
+            .components(separatedBy: forbidden)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+        var name = sanitized.isEmpty ? "attachment" : String(sanitized.prefix(180))
+        guard (name as NSString).pathExtension.isEmpty else { return name }
+
+        let sourceExtension = [attachment.downloadURL, attachment.previewURL]
+            .compactMap { $0 }
+            .compactMap { URL(string: $0) }
+            .map { $0.pathExtension }
+            .first { !$0.isEmpty }
+        if let sourceExtension {
+            return name + "." + sourceExtension
+        }
+
+        if let contentType = attachment.contentType,
+           !contentType.contains("*"),
+           let type = UTType(mimeType: contentType),
+           let fileExtension = type.preferredFilenameExtension,
+           !fileExtension.isEmpty {
+            return name + "." + fileExtension
+        }
+
+        let bytes = [UInt8](data.prefix(12))
+        let inferred: String?
+        if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+            inferred = "png"
+        } else if bytes.starts(with: [0xFF, 0xD8, 0xFF]) {
+            inferred = "jpg"
+        } else if bytes.starts(with: Array("GIF8".utf8)) {
+            inferred = "gif"
+        } else if bytes.count >= 12,
+                  Array(bytes[0..<4]) == Array("RIFF".utf8),
+                  Array(bytes[8..<12]) == Array("WEBP".utf8) {
+            inferred = "webp"
+        } else if bytes.starts(with: Array("%PDF".utf8)) {
+            inferred = "pdf"
+        } else if bytes.starts(with: [0x50, 0x4B, 0x03, 0x04]) {
+            inferred = "zip"
+        } else {
+            inferred = nil
+        }
+        if let inferred { name += "." + inferred }
+        return name
+    }
+}
+
+struct ErrorBanner: View { let text: String; let dismiss: () -> Void; var body: some View { HStack { Image(systemName: "exclamationmark.triangle"); Text(text).font(.caption); Spacer(); Button(action: dismiss) { Image(systemName: "xmark") } }.padding(10).background(Color.red.opacity(0.12)) } }
+struct WebProviderSurfaceIssueBanner: View {
+    let issue: RemoteProviderSurfaceIssue
+    let surfaceState: String
+    let surfaceObservedAt: Date?
+    let sessionState: SessionState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("ChatGPT 网页异常", systemImage: "exclamationmark.triangle")
+                .font(.caption.weight(.semibold))
+            let currentStatus = surfaceState == "unknown" ? "当前网页状态无法确认" : "网页当前异常"
+            Text("问题类别：\(issue.chineseStateName) · \(currentStatus) · 会话状态：\(sessionState.chineseStatusName)")
+                .font(.caption)
+            if let originalMessage = issue.originalMessage, !originalMessage.isEmpty {
+                Text("网页原始错误短文本：\(originalMessage)")
+                    .font(.caption)
+                    .textSelection(.enabled)
+            }
+            Text("说明：\(issue.message)")
+                .font(.caption)
+            Text("错误代码：\(issue.code)")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            if let observedAt = issue.at {
+                FixedTimestamp(date: observedAt, prefix: "异常观测时间")
+            } else {
+                Text("异常观测时间未知").font(.caption2).foregroundColor(.secondary)
+            }
+            if surfaceState == "unknown", let surfaceObservedAt {
+                FixedTimestamp(date: surfaceObservedAt, prefix: "网页状态最后核对")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.red.opacity(0.12))
+    }
+}
+
+struct WebProviderSurfaceUnknownBanner: View {
+    let observedAt: Date?
+    let sessionState: SessionState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("ChatGPT 网页状态无法确认", systemImage: "questionmark.circle")
+                .font(.caption.weight(.semibold))
+            Text("当前会话状态：\(sessionState.chineseStatusName)")
+                .font(.caption)
+            if let observedAt {
+                FixedTimestamp(date: observedAt, prefix: "网页状态最后核对")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.orange.opacity(0.12))
+    }
+}
+
+struct WebProviderSurfaceRecoveryBanner: View {
+    let observedAt: Date
+    let sessionState: SessionState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("ChatGPT 网页已恢复", systemImage: "checkmark.circle")
+                .font(.caption.weight(.semibold))
+            Text("当前会话状态：\(sessionState.chineseStatusName)")
+                .font(.caption)
+            FixedTimestamp(date: observedAt, prefix: "最近确认恢复")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.green.opacity(0.12))
+    }
+}
+
+struct StatusBanner: View {
+    let text: String
+    let systemImage: String
+    var dismiss: (() -> Void)? = nil
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+            Text(text).font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+            if let dismiss {
+                Button(action: dismiss) { Image(systemName: "xmark") }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
+    }
+}
+struct StatusLabel: View { let text: String; let active: Bool; var body: some View { HStack(spacing: 5) { Circle().fill(active ? Color.green : Color.secondary).frame(width: 7, height: 7); Text(text).font(.caption).foregroundColor(.secondary) } } }
+
+struct NewWebProjectView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var creating = false
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("ChatGPT Project") {
+                    TextField("Project 名称", text: $name)
+                    Text("Windows 会在你当前已登录的 ChatGPT 页面里真实创建 Project。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                if let error = store.errors["web.projects"] {
+                    Section {
+                        ErrorBanner(text: error) { store.clearError(sessionId: "web.projects") }
+                    }
+                }
+            }
+            .remoteAITopBreathingRoom()
+            .navigationTitle("新建 Project")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(creating ? "Creating…" : "Create") {
+                        creating = true
+                        Task {
+                            let created = await store.createWebProject(name: name)
+                            creating = false
+                            if created != nil { dismiss() }
+                        }
+                    }
+                    .disabled(creating || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
+}
+
+struct NewSessionView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.dismiss) private var dismiss
+    let runtime: RuntimeDescriptor
+    let instance: InstanceDescriptor
+    var projectAlias: String? = nil
+    var codexProjectPath: String? = nil
+
+    @State private var title = ""
+    @State private var model = ""
+    @State private var reasoningEffort = ""
+    @State private var creating = false
+
+    private var supportsModelSelection: Bool { runtime.kind == .codex || runtime.kind == .antigravity }
+    private var modelCatalog: CodexCatalog {
+        instance.modelCatalog ?? CodexCatalog(models: [], defaultModel: instance.configuredModel)
+    }
+    private var selectedReasoningLevels: [String] {
+        modelCatalog.models.first(where: { $0.id == model })?.supportedReasoningLevels ?? []
+    }
+
+    private var canCreate: Bool {
+        if runtime.kind == .codex {
+            // A CLI draft consumes no model tokens. It can be created before
+            // the optional model catalog arrives; Windows chooses its configured
+            // default when no explicit model was selected.
+            return model.isEmpty || modelCatalog.models.contains(where: { $0.id == model })
+        }
+        if supportsModelSelection {
+            return !model.isEmpty && modelCatalog.models.contains(where: { $0.id == model })
+        }
+        return true
+    }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("工作区") {
+                    Text(instance.name).font(.headline)
+                    if let subtitle = instance.subtitle, !subtitle.isEmpty {
+                        Text(subtitle).font(.caption).foregroundColor(.secondary).textSelection(.enabled)
+                    }
+                    TextField("会话名称", text: $title)
+                    if runtime.kind == .codex {
+                        Text("CLI 草稿：创建时不启动模型、不消耗回复 Token；首条发送后才建立真正的 Codex Thread。不会冒充 Desktop 原生 Chat。")
+                            .font(.caption).foregroundColor(.secondary)
+                        if let codexProjectPath { Text(codexProjectPath).font(.caption2).foregroundColor(.secondary) }
+                    }
+                }
+
+                if let error = store.errors[instance.id] {
+                    Section { ErrorBanner(text: error) { store.clearError(sessionId: instance.id) } }
+                }
+
+                if supportsModelSelection {
+                    Section("模型") {
+                        if modelCatalog.models.isEmpty {
+                            Text(runtime.kind == .codex
+                                ? "模型目录暂不可用；仍可创建不耗 Token 的 CLI 草稿。发送时使用 Windows 配置的默认模型。"
+                                : "Windows 尚未提供此实例的模型目录。")
+                                .font(.caption).foregroundColor(.orange)
+                        } else {
+                            Picker("Model", selection: $model) {
+                                ForEach(modelCatalog.models) { option in
+                                    Text(option.label).tag(option.id)
+                                }
+                            }
+                            .onChange(of: model) { _ in reasoningEffort = "" }
+                            if runtime.kind == .codex, !selectedReasoningLevels.isEmpty {
+                                Picker("推理强度", selection: $reasoningEffort) {
+                                    Text("默认").tag("")
+                                    ForEach(selectedReasoningLevels, id: \.self) { level in
+                                        Text(CodexModelOption.reasoningLabel(level)).tag(level)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .remoteAITopBreathingRoom()
+            .navigationTitle(runtime.kind == .web || runtime.kind == .antigravity ? "New Chat" : "New Session")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear {
+                if supportsModelSelection {
+                    let preferred = instance.configuredModel ?? modelCatalog.defaultModel
+                    model = modelCatalog.models.first(where: { $0.id == preferred })?.id
+                        ?? modelCatalog.models.first?.id
+                        ?? ""
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(creating ? "Creating…" : "Create") {
+                        creating = true
+                        Task {
+                            let created = await store.createSession(
+                                runtime: runtime,
+                                instance: instance,
+                                title: title,
+                                model: model,
+                                reasoningEffort: runtime.kind == .codex ? reasoningEffort : "",
+                                projectAlias: projectAlias,
+                                codexProjectPath: codexProjectPath
+                            )
+                            creating = false
+                            if created { dismiss() }
+                        }
+                    }
+                    .disabled(creating || !canCreate)
+                }
+            }
+        }
+    }
+}
+
+struct PairingView: View {
+    @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var relay = RemoteAIConfig.loadMetadata().relayBaseURL.absoluteString
+    @State private var machineId = RemoteAIConfig.loadMetadata().machineId
+    @State private var code = ""
+    @State private var scanner = false
+    @State private var error: String?
+    @State private var pairing = false
+
+    var body: some View {
+        NavigationView { Form {
+            Section("Windows Relay") {
+                TextField("https://relay.example.com", text: $relay).textInputAutocapitalization(.never).autocorrectionDisabled(true)
+                TextField("Machine ID", text: $machineId).textInputAutocapitalization(.never).autocorrectionDisabled(true)
+                TextField("8-digit pairing code", text: $code).keyboardType(.numberPad).textInputAutocapitalization(.never).autocorrectionDisabled(true)
+                Button { scanner = true } label: { Label("Scan QR Code", systemImage: "qrcode.viewfinder") }
+            }
+            Section {
+                Text("Pairing uses X25519 + HKDF-SHA256. Device private/shared keys are ThisDeviceOnly Keychain items; Cloudflare only routes AES-256-GCM encrypted payloads.").font(.caption).foregroundColor(.secondary)
+            }
+            if pairing {
+                Section {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(store.pairingStage?.title ?? "Preparing secure pairing…").font(.subheadline.weight(.medium))
+                            Text(pairingDetail).font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+            if let error { Section("Pairing error") { Text(error).foregroundColor(.red).font(.caption) } }
+        }
+        .remoteAITopBreathingRoom()
+        .navigationTitle("Pair Device")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() }.disabled(pairing) }
+            ToolbarItem(placement: .confirmationAction) {
+                Button(pairing ? "Pairing…" : "Pair") {
+                    beginPairing()
+                }
+                .disabled(pairing)
+            }
+        }
+        .sheet(isPresented: $scanner) {
+            QRScannerView { value in
+                let complete = applyScannedPairing(value)
+                scanner = false
+                if complete { beginPairing() }
+            }
+        } }
+    }
+
+    private var pairingDetail: String {
+        switch store.pairingStage {
+        case .connectingRelay: return "Opening the secure Cloudflare Relay connection."
+        case .relayConnected: return "Relay accepted this iPhone and Windows is online."
+        case .sendingRequest: return "Sending this iPhone's ephemeral public key to Windows."
+        case .waitingChallenge: return "Waiting for the Windows pairing challenge."
+        case .challengeReceived, .verifyingWindowsKey: return "Validating the Windows X25519 identity before proving the code."
+        case .sendingProof, .waitingApproval: return "Completing the code proof with Windows."
+        case .secureKeySaved: return "The derived shared key is stored in ThisDeviceOnly Keychain."
+        case .connectingRemoteAI: return "Reconnecting with the newly paired key."
+        case .loadingRuntimes: return "Loading Web, Codex, and Antigravity from Windows."
+        case .completed: return "Pairing completed successfully."
+        default: return "Every network step is time-limited; the Pair button will recover on failure."
+        }
+    }
+
+    private func beginPairing() {
+        guard !pairing else { return }
+        guard let url = URL(string: relay), !machineId.isEmpty, ProtocolSecurity.validatePairingCode(code) else {
+            error = "Enter an HTTPS relay URL, Machine ID, and 8-digit code."
+            return
+        }
+        pairing = true
+        store.pairingStage = .preparing
+        error = nil
+        Task {
+            do {
+                try await store.savePairing(baseURL: url, machineId: machineId, code: code)
+                pairing = false
+                dismiss()
+            } catch {
+                pairing = false
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
+    @discardableResult
+    private func applyScannedPairing(_ value: String) -> Bool {
+        guard let payload = PairingScanPayload.parse(value) else {
+            error = "The QR code does not contain RemoteAI pairing information."
+            return false
+        }
+        if let url = payload.relayBaseURL { relay = url.absoluteString }
+        if let value = payload.machineId { machineId = value }
+        if let value = payload.pairingCode { code = value }
+        error = payload.isComplete ? nil : "QR read successfully. Complete any missing pairing fields, then tap Pair."
+        return payload.isComplete
+    }
+}
+
+struct QRScannerView: UIViewControllerRepresentable {
+    let onCode: (String) -> Void
+    func makeUIViewController(context: Context) -> QRScannerController { let vc = QRScannerController(); vc.onCode = onCode; return vc }
+    func updateUIViewController(_ uiViewController: QRScannerController, context: Context) {}
+}
+
+final class QRScannerController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
+    var onCode: ((String) -> Void)?
+    private let session = AVCaptureSession()
+    override func viewDidLoad() {
+        super.viewDidLoad(); view.backgroundColor = .black
+        guard let device = AVCaptureDevice.default(for: .video), let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else { return }
+        session.addInput(input); let output = AVCaptureMetadataOutput(); guard session.canAddOutput(output) else { return }; session.addOutput(output); output.setMetadataObjectsDelegate(self, queue: .main); output.metadataObjectTypes = [.qr]
+        let preview = AVCaptureVideoPreviewLayer(session: session); preview.videoGravity = .resizeAspectFill; preview.frame = view.bounds; view.layer.addSublayer(preview); session.startRunning()
+    }
+    override func viewDidLayoutSubviews() { super.viewDidLayoutSubviews(); (view.layer.sublayers?.first as? AVCaptureVideoPreviewLayer)?.frame = view.bounds }
+    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) { guard let value = (metadataObjects.first as? AVMetadataMachineReadableCodeObject)?.stringValue else { return }; session.stopRunning(); onCode?(value) }
+}
