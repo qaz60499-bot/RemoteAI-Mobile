@@ -36,6 +36,7 @@ actor MockTransport: Transport {
     private var executionDelayNanoseconds: UInt64 = 0
     private var requestDelayNanoseconds: [String: UInt64] = [:]
     private var responseDelayNanoseconds: [String: UInt64] = [:]
+    private var deltaPageLimitForTests: Int? = nil
     private var finishedAttachmentData: [String: Data] = [:]
     private var activeMessageAttachmentReads = 0
     private var peakMessageAttachmentReads = 0
@@ -188,6 +189,7 @@ actor MockTransport: Transport {
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
     func setRequestDelay(action: String, nanoseconds: UInt64) { requestDelayNanoseconds[action] = nanoseconds }
     func setResponseDelay(action: String, nanoseconds: UInt64) { responseDelayNanoseconds[action] = nanoseconds }
+    func setDeltaPageLimitForTests(_ value: Int) { deltaPageLimitForTests = max(1, value) }
     func failNextAction(_ action: String, count: Int = 1) { actionFailureCounts[action] = max(0, count) }
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
     func lastPreferCacheValue(_ action: String) -> Bool? { lastPreferCacheByAction[action] }
@@ -547,7 +549,7 @@ actor MockTransport: Transport {
         case "getChangesAfterCursor":
             let cursor = command.payload["cursor"]?.intValue ?? 0
             let limit = Int(command.payload["limit"]?.intValue ?? 500)
-            let events = Array(eventLog.filter { $0.sequence > cursor }.sorted { $0.sequence < $1.sequence }.prefix(max(1, min(limit, 1000))))
+            let events = Array(eventLog.filter { $0.sequence > cursor }.sorted { $0.sequence < $1.sequence }.prefix(max(1, min(limit, 1000, deltaPageLimitForTests ?? 1000))))
             response = try success(DeltaSyncResult(events: events, nextCursor: events.last?.sequence ?? cursor, hasMore: eventLog.filter { $0.sequence > (events.last?.sequence ?? cursor) }.isEmpty == false))
         case "createSession":
             if command.runtimeId == "runtime.web" {
