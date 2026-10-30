@@ -89,6 +89,19 @@ final class ProtocolSecurityTests: XCTestCase {
         }
     }
 
+    func testWebTabCommandsPassOutboundProtocolValidation() throws {
+        // Regression: three schema actions missing from the iOS outbound allowlist
+        // caused immediate malformedData before Windows saw the command.
+        for action in ["listOpenWebTabs", "inspectOpenWebTab", "manageOpenWebTab"] {
+            var object = validCommandObject()
+            object["instanceId"] = "web.chatgpt"
+            object["sessionId"] = NSNull()
+            object["action"] = action
+            let command = try ProtocolSecurity.decodeCommand(json(object))
+            XCTAssertNoThrow(try ProtocolSecurity.validate(command, expectedMachineId: "my-pc"), action)
+        }
+    }
+
     func testProtocolNegativeMatrix() throws {
         var passed = 0
         var total = 0
