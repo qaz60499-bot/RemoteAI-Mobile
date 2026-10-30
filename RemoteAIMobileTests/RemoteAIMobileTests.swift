@@ -3090,6 +3090,39 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testUnknownDeliveryNeverClaimsPreviousIdenticalPromptAsNewSend() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .webSendDeliveryUnknown, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        // The previous 1 was sent on the desktop well before the new command.
+        // The new command never reaches the provider, and history only shows 1.
+        await mock.appendHistoryMessage(ServerMessage(
+            messageId: "earlier-provider-turn", sessionId: "photo-upload",
+            role: "user", content: "1", externalId: nil,
+            createdAt: Date().addingTimeInterval(-45)
+        ))
+        let commandId = UUID()
+        let sent = await store.send(text: "1", runtimeId: "runtime.web",
+                                    instanceId: "photo", sessionId: "photo-upload",
+                                    commandId: commandId)
+
+        XCTAssertFalse(sent, "The old identical provider turn must not confirm a later unknown Send")
+        XCTAssertEqual(store.commandStates[commandId], .unknown)
+        XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains {
+            $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame
+        }, "The newer optimistic user bubble must not be erased by an older duplicate prompt")
+        let pending: RemoteCommand? = try await cache.get(
+            RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())"
+        )
+        XCTAssertEqual(pending?.commandId, commandId)
+        let sends = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sends, 1)
+        await store.suspend()
+    }
+
+    @MainActor
     func testWebSendDeliveryUnknownAutoReconcilesCommittedProviderTurnWithoutSecondSend() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .webSendDeliveryUnknownAfterCommit, historyCount: 0)
