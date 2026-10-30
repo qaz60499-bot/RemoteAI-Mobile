@@ -367,69 +367,75 @@ struct InstanceView: View {
                     }
                     ForEach(store.openWebTabs) { tab in
                         HStack(spacing: 10) {
-                            Image(systemName: tab.isChat ? "bubble.left.and.bubble.right" : "folder")
-                                .foregroundColor(.secondary)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Button {
-                                    guard enteringWebTabId == nil else { return }
-                                    enteringWebTabId = tab.id
-                                    Task {
-                                        let destination = await store.enterOpenWebTab(tab)
-                                        enteringWebTabId = nil
-                                        if let destination {
-                                            switch destination {
-                                            case .chat(let session):
-                                                enteredWebTabSession = session
-                                                openEnteredWebTabSession = true
-                                            case .project(let project):
-                                                enteredWebTabProject = project
-                                                openEnteredWebTabProject = true
-                                            }
+                            Button {
+                                guard enteringWebTabId == nil else { return }
+                                enteringWebTabId = tab.id
+                                Task {
+                                    let destination = await store.enterOpenWebTab(tab)
+                                    enteringWebTabId = nil
+                                    if let destination {
+                                        switch destination {
+                                        case .chat(let session):
+                                            enteredWebTabSession = session
+                                            openEnteredWebTabSession = true
+                                        case .project(let project):
+                                            enteredWebTabProject = project
+                                            openEnteredWebTabProject = true
                                         }
                                     }
-                                } label: {
-                                    HStack(spacing: 5) {
-                                        Text(tab.title).font(.subheadline).lineLimit(2)
-                                        Image(systemName: "chevron.right").font(.caption2)
+                                }
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: tab.isChat ? "bubble.left.and.bubble.right" : "folder")
+                                        .foregroundColor(.secondary)
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack(spacing: 5) {
+                                            Text(tab.title).font(.subheadline).lineLimit(2)
+                                            Image(systemName: "chevron.right").font(.caption2)
+                                        }
+                                        Text(tab.busy ? "正在生成 · 不可关闭/刷新" : (tab.loading ? "网页加载中" : (tab.active ? "电脑当前标签页" : "后台标签页")))
+                                            .font(.caption2).foregroundColor(.secondary)
+                                        Text(webTabStatus(tab))
+                                            .font(.caption2).foregroundColor(.secondary)
+                                        Text("执行：\(tab.executionState ?? "Unknown") · Agent 最近记录")
+                                            .font(.caption2).foregroundColor(.secondary)
+                                        if let value = tab.lastActivityAt, let date = RemoteAIDate.parse(value) {
+                                            FixedTimestamp(date: date, prefix: "最后活动")
+                                        }
+                                        if let value = tab.lastProgressAt, let date = RemoteAIDate.parse(value) {
+                                            FixedTimestamp(date: date, prefix: "最近实际进展")
+                                        }
+                                        if let action = tab.lastProgressSummary {
+                                            Text("最近事件：\(action)").font(.caption2).foregroundColor(.secondary)
+                                        }
+                                        if let diagnosis = store.webTabDiagnosesById[tab.id],
+                                           diagnosis.draftPresent == true || diagnosis.pendingUploads == true {
+                                            Text("Blocked · 草稿或上传尚未完成，禁止关闭与刷新")
+                                                .font(.caption2).foregroundColor(.orange)
+                                        }
+                                        if let diagnosis = store.webTabDiagnosesById[tab.id] {
+                                            if let issue = diagnosis.issueMessage, !issue.isEmpty {
+                                                Text("原因：\(issue)").font(.caption2).foregroundColor(.secondary)
+                                            }
+                                            if let code = diagnosis.issueCode, !code.isEmpty {
+                                                Text("错误代码：\(code)").font(.caption2).foregroundColor(.secondary)
+                                            }
+                                            if let observed = diagnosis.observedAt.flatMap(RemoteAIDate.parse) {
+                                                FixedTimestamp(date: observed, prefix: "最后检测")
+                                            }
+                                        }
+                                        if let note = store.webTabActionNotesById[tab.id] {
+                                            Text("最近操作：\(note)").font(.caption2).foregroundColor(.secondary)
+                                        }
                                     }
+                                    Spacer(minLength: 4)
                                 }
-                                .disabled(enteringWebTabId != nil || store.machine.state != .online)
-                                Text(tab.busy ? "正在生成 · 不可关闭/刷新" : (tab.loading ? "网页加载中" : (tab.active ? "电脑当前标签页" : "后台标签页")))
-                                    .font(.caption2).foregroundColor(.secondary)
-                                Text(webTabStatus(tab))
-                                    .font(.caption2).foregroundColor(.secondary)
-                                Text("执行：\(tab.executionState ?? "Unknown") · Agent 最近记录")
-                                    .font(.caption2).foregroundColor(.secondary)
-                                if let value = tab.lastActivityAt, let date = RemoteAIDate.parse(value) {
-                                    FixedTimestamp(date: date, prefix: "最后活动")
-                                }
-                                if let value = tab.lastProgressAt, let date = RemoteAIDate.parse(value) {
-                                    FixedTimestamp(date: date, prefix: "最近实际进展")
-                                }
-                                if let action = tab.lastProgressSummary {
-                                    Text("最近事件：\(action)").font(.caption2).foregroundColor(.secondary)
-                                }
-                                if let diagnosis = store.webTabDiagnosesById[tab.id],
-                                   diagnosis.draftPresent == true || diagnosis.pendingUploads == true {
-                                    Text("Blocked · 草稿或上传尚未完成，禁止关闭与刷新")
-                                        .font(.caption2).foregroundColor(.orange)
-                                }
-                                if let diagnosis = store.webTabDiagnosesById[tab.id] {
-                                    if let issue = diagnosis.issueMessage, !issue.isEmpty {
-                                        Text("原因：\(issue)").font(.caption2).foregroundColor(.secondary)
-                                    }
-                                    if let code = diagnosis.issueCode, !code.isEmpty {
-                                        Text("错误代码：\(code)").font(.caption2).foregroundColor(.secondary)
-                                    }
-                                    if let observed = diagnosis.observedAt.flatMap(RemoteAIDate.parse) {
-                                        FixedTimestamp(date: observed, prefix: "最后检测")
-                                    }
-                                }
-                                if let note = store.webTabActionNotesById[tab.id] {
-                                    Text("最近操作：\(note)").font(.caption2).foregroundColor(.secondary)
-                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                             }
-                            Spacer(minLength: 4)
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("open-web-tab-\(tab.id)")
+                            .disabled(enteringWebTabId != nil || store.machine.state != .online)
                             Menu {
                                 Button {
                                     Task { await store.inspectOpenWebTab(tab) }
