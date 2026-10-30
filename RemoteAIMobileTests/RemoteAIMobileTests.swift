@@ -575,7 +575,7 @@ final class RemoteAIMobileTests: XCTestCase {
         ))
         // The first delta page is long enough to coalesce history and freeze the
         // visible transcript. The second page deliberately stays in flight.
-        for sequence in 1202...1700 {
+        for sequence in 1202...1212 {
             await mock.injectEvent(RemoteEvent(
                 protocolVersion: 1, eventId: UUID(), sequence: Int64(sequence),
                 machineId: "my-pc", runtimeId: "runtime.system",
@@ -590,7 +590,7 @@ final class RemoteAIMobileTests: XCTestCase {
             externalId: nil, createdAt: Date()
         )
         let finalEvent = RemoteEvent(
-            protocolVersion: 1, eventId: UUID(), sequence: 1701,
+            protocolVersion: 1, eventId: UUID(), sequence: 1213,
             machineId: "my-pc", runtimeId: "runtime.web",
             instanceId: "photo", sessionId: "photo-upload",
             type: "MESSAGE_ADDED",
@@ -598,6 +598,7 @@ final class RemoteAIMobileTests: XCTestCase {
             createdAt: Date()
         )
         await mock.injectEvent(finalEvent)
+        await mock.setDeltaPageLimitForTests(12)
         await mock.setResponseDelay(action: "getChangesAfterCursor", nanoseconds: 400_000_000)
 
         let recovery = Task { await store.verifyOnlineSyncHead() }
