@@ -1409,8 +1409,8 @@ struct ChatView: View {
                     .disabled(store.stopRequestsPending.contains(session.id))
                 }
             }
-            if runtime.kind == .web {
-                ToolbarItem(placement: .navigationBarTrailing) {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                if runtime.kind == .web {
                     Menu {
                         Button("重新同步消息") { Task { await store.recoverWebChat(session.id, operation: "resync") } }
                         Button("检测网页运行状态") { Task { await store.recoverWebChat(session.id, operation: "inspect") } }
