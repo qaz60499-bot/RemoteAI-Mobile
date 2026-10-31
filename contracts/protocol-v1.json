@@ -10,7 +10,7 @@
     "action": {
       "type": "string",
       "enum": [
-        "getStatus", "getDiagnostics", "listRuntimes", "listInstances", "listSessions",
+        "getStatus", "getDiagnostics", "getCommandOutcome", "listRuntimes", "listInstances", "listSessions",
         "createSession", "resumeSession", "stopSession", "getSessionStatus",
         "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore", "readMessageAttachmentChunk",
         "getChangesAfterCursor",
