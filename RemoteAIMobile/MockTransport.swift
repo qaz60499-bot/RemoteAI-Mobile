@@ -423,6 +423,21 @@ actor MockTransport: Transport {
         switch command.action {
         case "getStatus":
             response = success(["machineId": .string(machineId), "latestSequence": .number(Double(sequence))])
+        case "getCommandOutcome":
+            let targetIdText = command.payload["targetCommandId"]?.stringValue ?? ""
+            let saved = UUID(uuidString: targetIdText).flatMap { processedCommands[$0] }
+            let status: String
+            if let saved {
+                status = saved.ok ? "COMPLETED"
+                    : (saved.error?.code == "WEB_SEND_DELIVERY_UNKNOWN" ? "UNKNOWN_DELIVERY" : "FAILED")
+            } else {
+                status = "NOT_FOUND"
+            }
+            response = success([
+                "targetCommandId": .string(targetIdText),
+                "status": .string(status),
+                "outcome": saved.map { .object(["ok": .bool($0.ok)]) } ?? .null
+            ])
         case "getDiagnostics":
             response = success([
                 "schemaVersion": .number(1),
