@@ -701,6 +701,88 @@ final class WorkspaceStore: ObservableObject {
             && !isSuspended
     }
 
+    // Chat-level manual recovery is opt-in and never guesses a tab from Chrome focus.
+    // Cached history remains untouched when the Browser/Relay is unavailable.
+    func recoverWebChat(_ sessionId: String, operation: String) async {
+        guard machine.state == .online, !isSuspended else {
+            errors[sessionId] = "Windows 未连接；已保留本地历史，等待重连。"
+            return
+        }
+        if operation == "resync" {
+            webChatRecoveryNotesBySession[sessionId] = "正在补同步消息；不会刷新网页。"
+            await synchronizeVisibleSession(sessionId, force: true)
+            webChatRecoveryNotesBySession[sessionId] = "已请求最新消息；若仍缺失，请检测网页状态。"
+            return
+        }
+        if operation == "connection" {
+            do {
+                let status = try await transport.agentStatusSnapshot(machineId: machine.id)
+                if status.browserConnected == false {
+                    webChatRecoveryNotesBySession[sessionId] = "Agent 在线，但 Browser Bridge 未连接；等待桌面端恢复。"
+                } else {
+                    webChatRecoveryNotesBySession[sessionId] = "已收到 Agent 连接回执，正在补同步原 Chat。"
+                    await synchronizeVisibleSession(sessionId, force: true)
+                }
+            } catch {
+                errors[sessionId] = "连接状态无法确认：\(error.localizedDescription)"
+            }
+            return
+        }
+        guard ["inspect", "reload", "hardReload"].contains(operation) else { return }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        webChatRecoveryNotesBySession[sessionId] = "正在核验当前 Chat 的网页身份…"
+        await refreshOpenWebTabs()
+        guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId),
+              !openWebTabsInventoryUnverified else {
+            errors[sessionId] = "无法确认 Chrome 标签身份；未执行网页操作。"
+            return
+        }
+        let matches = openWebTabs.filter { $0.sessionId == sessionId && $0.isChat }
+        guard matches.count == 1, let tab = matches.first else {
+            errors[sessionId] = "原 Chat 未绑定唯一标签页；不会刷新其他网页。请先重新同步。"
+            return
+        }
+        if operation == "inspect" {
+            await inspectOpenWebTab(tab)
+            guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
+            if let diagnosis = webTabDiagnosesById[tab.id] {
+                webChatRecoveryNotesBySession[sessionId] = "网页状态：\(diagnosis.state)" +
+                    (diagnosis.issueMessage.map { " · \($0)" } ?? "")
+            } else {
+                errors[sessionId] = errors["web.tabs"] ?? "网页状态尚未确认。"
+            }
+            return
+        }
+        guard managingWebTabIds.insert(tab.id).inserted else {
+            errors[sessionId] = "此网页已有管理操作正在运行，未发送重复刷新。"
+            return
+        }
+        defer { managingWebTabIds.remove(tab.id) }
+        do {
+            webChatRecoveryNotesBySession[sessionId] = "用户已确认风险，正在刷新选中的 Chat 网页…"
+            try await activeTransport.manageOpenWebTab(machineId: activeMachineId, tab: tab,
+                operation: operation, userConfirmedDisruptive: true)
+            guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
+            webChatRecoveryNotesBySession[sessionId] = "Chrome 已接受刷新；尚未证明页面恢复。"
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            await refreshOpenWebTabs()
+            guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
+            await synchronizeVisibleSession(sessionId, force: true)
+            if let after = openWebTabs.first(where: { $0.tabId == tab.id && $0.sessionId == sessionId }) {
+                await inspectOpenWebTab(after)
+                let diagnosis = webTabDiagnosesById[tab.id]
+                webChatRecoveryNotesBySession[sessionId] = "已重新同步原 Chat · 网页状态：\(diagnosis?.state ?? "待验证")"
+            } else {
+                webChatRecoveryNotesBySession[sessionId] = "刷新后尚未核实原会话绑定；已保留历史。"
+            }
+        } catch {
+            guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
+            errors[sessionId] = "网页操作未确认：\(error.localizedDescription)；未操作其他 Chat。"
+        }
+    }
+
     private var hasActiveChatGPTWebRun: Bool {
         sessions.contains { $0.instanceId == "web.chatgpt" && ($0.state == .busy || $0.state == .waiting) }
             || liveRunStatusBySession.keys.contains { id in
