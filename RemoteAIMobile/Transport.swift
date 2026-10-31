@@ -348,7 +348,29 @@ private func sameChatGPTConversation(_ conversation: WebConversationDescriptor, 
     return tab.sessionId != nil || sameChatGPTTarget(conversation.canonicalUrl, tab.canonicalUrl)
 }
 
+struct StopExecutionReceipt: Equatable {
+    let stopped: Bool
+    let alreadyIdle: Bool
+    let settled: Bool
+    let staleGeneration: Bool
+    var confirmed: Bool { settled && !staleGeneration && (stopped || alreadyIdle) }
+}
+
 extension Transport {
+    // A successful command envelope means delivery, not that the executor stopped.
+    func requestStop(_ command: RemoteCommand) async throws -> StopExecutionReceipt {
+        let result = try await requireSuccess(execute(command))
+        guard let object = result.objectValue else { throw TransportError.malformedData }
+        let stopped = object["stopped"]?.boolValue == true
+        let alreadyIdle = object["alreadyIdle"]?.boolValue == true
+        return StopExecutionReceipt(
+            stopped: stopped,
+            alreadyIdle: alreadyIdle,
+            settled: object["settled"]?.boolValue ?? (command.runtimeId != "runtime.web" && stopped),
+            staleGeneration: object["staleGeneration"]?.boolValue == true
+        )
+    }
+
     func healthStream() async -> AsyncStream<TransportHealthEvent> {
         AsyncStream { _ in }
     }
@@ -545,12 +567,13 @@ extension Transport {
         _ = try await requireSuccess(execute(command))
     }
 
-    func manageOpenWebTab(machineId: String, tab: OpenWebTab, operation: String, commandId: UUID = UUID()) async throws {
+    func manageOpenWebTab(machineId: String, tab: OpenWebTab, operation: String, userConfirmedDisruptive: Bool = false, commandId: UUID = UUID()) async throws {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "manageOpenWebTab", payload: [
             "tabId": .number(Double(tab.tabId)),
             "expectedUrl": .string(tab.canonicalUrl),
             "operation": .string(operation),
-            "sessionId": tab.sessionId.map(JSONValue.string) ?? .null
+            "sessionId": tab.sessionId.map(JSONValue.string) ?? .null,
+            "userConfirmedDisruptive": .bool(userConfirmedDisruptive)
         ], commandId: commandId)
         _ = try await requireSuccess(execute(command))
     }
