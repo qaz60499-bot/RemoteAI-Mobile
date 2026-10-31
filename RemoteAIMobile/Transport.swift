@@ -620,7 +620,8 @@ extension Transport {
         var payload: [String: JSONValue] = [
             "projectAlias": .string(projectAlias),
             "limit": .number(Double(safeLimit)),
-            "preferCache": .bool(!forceRefresh)
+            "preferCache": .bool(!forceRefresh),
+            "forceRefresh": .bool(forceRefresh)
         ]
         if let cursor, !cursor.isEmpty { payload["cursor"] = .string(cursor) }
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "web.chatgpt", action: "listProjectConversations", payload: payload)
