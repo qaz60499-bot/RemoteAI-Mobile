@@ -6,7 +6,7 @@ enum MockScenario: String, CaseIterable {
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
     case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, webSendLegacyChromeChannelClosedAfterCommit, webSendLegacyUnrelatedSelectorFailure, alreadyExecutedThenSuccess, deltaOnlySend
     case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, staleThenFreshProjectConversations, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
-    case malformedCreateReplyAfterCommit
+    case malformedCreateReplyAfterCommit, stopUnconfirmed, stopConfirmedWithoutEvent
     case malformedSendReplyAfterCommit
     case cancelledSendReplyAfterCommit
 }
@@ -705,8 +705,18 @@ actor MockTransport: Transport {
             }
             response = success(["accepted": .bool(true), "sessionId": .string(sessionId), "messageId": .string(user.messageId)])
         case "stopGeneration", "stopSession":
-            await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: command.sessionId, type: "GENERATION_STOPPED", payload: ["ok": .bool(true)])
-            response = success(["stopped": .bool(true)])
+            if scenario == .stopUnconfirmed {
+                // A command was received, but the executor did not settle.
+                response = success(["stopped": .bool(true), "settled": .bool(false)])
+            } else {
+                if scenario == .stopConfirmedWithoutEvent, let sessionId = command.sessionId {
+                    sessionStatusOverrides[sessionId] = "idle"
+                }
+                if scenario != .stopConfirmedWithoutEvent {
+                    await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: command.sessionId, type: "GENERATION_STOPPED", payload: ["ok": .bool(true)])
+                }
+                response = success(["stopped": .bool(true), "settled": .bool(true)])
+            }
         case "createConversation":
             let alias = command.payload["projectAlias"]?.stringValue
             let now = Date()
