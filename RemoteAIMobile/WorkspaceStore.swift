@@ -184,6 +184,7 @@ final class WorkspaceStore: ObservableObject {
     private var runtimeRefreshes = Set<String>()
     private var sessionRefreshes = Set<String>()
     private var sessionLoads = Set<String>()
+    private var reopeningWebConversations = Set<String>()
     private var visibleSessionSyncAt: [String: Date] = [:]
     private var visibleSessionHistorySyncAt: [String: Date] = [:]
     private var visibleSessionHistoryRemoteRevision: [String: Date] = [:]
@@ -644,14 +645,50 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func reopenClosedWebConversation(sessionId: String) async {
-        guard machine.state == .online, !isSuspended else { return }
+        guard machine.state == .online, !isSuspended else {
+            errors[sessionId] = "Windows 未连接，无法重开原 Chat；历史已保留。"
+            return
+        }
+        // A second tap must not allocate another renderer while the first open is
+        // awaiting an uncertain browser response. Never guess a target from title/focus.
+        guard reopeningWebConversations.insert(sessionId).inserted else { return }
+        defer { reopeningWebConversations.remove(sessionId) }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        webChatRecoveryNotesBySession[sessionId] = "正在按原会话身份重新打开网页…"
         do {
-            try await transport.reopenVerifiedWebConversation(machineId: machine.id, sessionId: sessionId)
-            recentWebTabNotices.insert("已请求重新打开原 Chat（不是新建 Chat）；请检查 Chrome 页面是否恢复。", at: 0)
-            recentWebTabNotices = Array(recentWebTabNotices.prefix(5))
+            try await activeTransport.reopenVerifiedWebConversation(machineId: activeMachineId, sessionId: sessionId)
+            guard isCurrentWebTabOperation(generation: generation,
+                    transport: activeTransport, machineId: activeMachineId) else { return }
             await refreshOpenWebTabs()
+            guard isCurrentWebTabOperation(generation: generation,
+                    transport: activeTransport, machineId: activeMachineId) else { return }
+            let matches = openWebTabsInventoryUnverified ? [] :
+                openWebTabs.filter { $0.sessionId == sessionId && $0.isChat }
+            guard matches.count == 1, let tab = matches.first else {
+                webChatRecoveryNotesBySession[sessionId] = "网页打开请求已返回，但原 Chat 标签身份未核实；不会自动重试。"
+                errors[sessionId] = "未能唯一确认原 Chat 的 Chrome 标签；历史保持不变。"
+                return
+            }
+            webTabDiagnosesById.removeValue(forKey: tab.id)
+            await performInspectOpenWebTab(tab, generation: generation,
+                transport: activeTransport, machineId: activeMachineId)
+            guard isCurrentWebTabOperation(generation: generation,
+                    transport: activeTransport, machineId: activeMachineId) else { return }
+            guard let diagnosis = webTabDiagnosesById[tab.id],
+                  ["ready", "generating", "retry-visible"].contains(diagnosis.state) else {
+                webChatRecoveryNotesBySession[sessionId] = "已找到原 Chat，但网页状态仍未确认；未刷新其他标签。"
+                return
+            }
+            webChatRecoveryNotesBySession[sessionId] = "已验证原 Chat 标签与网页状态，正在同步消息。"
+            errors[sessionId] = nil
+            await synchronizeVisibleSession(sessionId, force: true)
         } catch {
-            errors["web.tabs"] = "重新打开失败：\(error.localizedDescription)"
+            guard isCurrentWebTabOperation(generation: generation,
+                    transport: activeTransport, machineId: activeMachineId) else { return }
+            errors[sessionId] = "重新打开原 Chat 未确认：\(error.localizedDescription)"
+            webChatRecoveryNotesBySession[sessionId] = "当前操作未确认；不会自动重开或重发消息。"
         }
     }
 

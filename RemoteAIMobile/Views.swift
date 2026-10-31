@@ -1415,6 +1415,7 @@ struct ChatView: View {
                         Button("重新同步消息") { Task { await store.recoverWebChat(session.id, operation: "resync") } }
                         Button("检测网页运行状态") { Task { await store.recoverWebChat(session.id, operation: "inspect") } }
                         Button("检查连接并补同步") { Task { await store.recoverWebChat(session.id, operation: "connection") } }
+                        Button("重开原 Chat 网页") { Task { await store.reopenClosedWebConversation(sessionId: session.id) } }
                         Button("刷新当前网页…", role: .destructive) { showingWebReloadConfirmation = true }
                     } label: {
                         Image(systemName: "arrow.clockwise.circle")
