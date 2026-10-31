@@ -1508,6 +1508,49 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testCodexCLICreateFirstSendReplyAndSessionCatalog() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.codex" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "codex.6" }))
+
+        let createdSuccessfully = await store.createSession(
+            runtime: runtime, instance: instance, title: "Build78 CLI first-send",
+            codexProjectPath: "D:\\wendangcodex\\RemoteAI"
+        )
+        XCTAssertTrue(createdSuccessfully)
+        let created = try XCTUnwrap(store.sessions.first(where: {
+            $0.instanceId == instance.id && $0.title == "Build78 CLI first-send"
+        }))
+        XCTAssertTrue(created.id.hasPrefix("session-"))
+        let commandId = UUID()
+        let sent = await store.send(
+            text: "Build78 CLI reply probe", runtimeId: runtime.id,
+            instanceId: instance.id, sessionId: created.id, commandId: commandId
+        )
+        XCTAssertTrue(sent)
+        let userMessageCount = await mock.userMessageCount(
+            sessionId: created.id, text: "Build78 CLI reply probe"
+        )
+        XCTAssertEqual(userMessageCount, 1)
+        try await Task.sleep(nanoseconds: 800_000_000)
+        XCTAssertTrue(store.messagesBySession[created.id, default: []].contains(where: {
+            $0.role == .assistant && $0.text.contains("mock streaming response.")
+        }), "The first CLI Send must produce an assistant reply in the same Chat")
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        XCTAssertTrue(store.sessions.contains(where: { $0.id == created.id }),
+                      "The CLI Chat must remain visible after refreshing its instance")
+        let createAttempts = await mock.actionAttemptCount("createSession")
+        let sendAttempts = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(createAttempts, 1)
+        XCTAssertEqual(sendAttempts, 1)
+        await store.suspend()
+    }
+
+    @MainActor
     func testCreateSessionCannotBeErasedByConcurrentOlderRefresh() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 1)
