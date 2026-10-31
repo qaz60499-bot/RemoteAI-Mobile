@@ -45,6 +45,7 @@ actor MockTransport: Transport {
     private var disconnectAfterActionCounts: [String: Int] = [:]
     private var actionFailureCounts: [String: Int] = [:]
     private var lastPreferCacheByAction: [String: Bool] = [:]
+    private var lastForceRefreshByAction: [String: Bool] = [:]
     private var connectAttempts = 0
     private var executionDelayNanoseconds: UInt64 = 0
     private var requestDelayNanoseconds: [String: UInt64] = [:]
@@ -227,6 +228,7 @@ actor MockTransport: Transport {
         eventLog.filter { $0.type == type && $0.sessionId == sessionId }.count
     }
     func lastPreferCacheValue(_ action: String) -> Bool? { lastPreferCacheByAction[action] }
+    func lastForceRefreshValue(_ action: String) -> Bool? { lastForceRefreshByAction[action] }
     func preferCacheValues(_ action: String) -> [Bool] { preferCacheHistoryByAction[action, default: []] }
     func connectionAttemptCount() -> Int { connectAttempts }
     func projectCount() -> Int { webProjects.count }
@@ -353,6 +355,9 @@ actor MockTransport: Transport {
         try ProtocolSecurity.validate(command, expectedMachineId: machineId)
         commandAttempts[command.action, default: 0] += 1
         commandIdsByAction[command.action, default: []].append(command.commandId)
+        if command.action == "listProjectConversations" {
+            lastForceRefreshByAction[command.action] = command.payload["forceRefresh"]?.boolValue ?? false
+        }
         if let preferCache = command.payload["preferCache"]?.boolValue {
             lastPreferCacheByAction[command.action] = preferCache
             preferCacheHistoryByAction[command.action, default: []].append(preferCache)
