@@ -6,7 +6,7 @@ enum MockScenario: String, CaseIterable {
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
     case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, webSendLegacyChromeChannelClosedAfterCommit, webSendLegacyUnrelatedSelectorFailure, alreadyExecutedThenSuccess, deltaOnlySend
     case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, staleThenFreshProjectConversations, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
-    case malformedCreateReplyAfterCommit, stopUnconfirmed, stopConfirmedWithoutEvent
+    case malformedCreateReplyAfterCommit, stopUnconfirmed, stopPageIdleButAgentUnconfirmed, stopConfirmedWithoutEvent
     case malformedSendReplyAfterCommit
     case cancelledSendReplyAfterCommit
 }
@@ -705,9 +705,11 @@ actor MockTransport: Transport {
             }
             response = success(["accepted": .bool(true), "sessionId": .string(sessionId), "messageId": .string(user.messageId)])
         case "stopGeneration", "stopSession":
-            if scenario == .stopUnconfirmed {
-                // A command was received, but the executor did not settle.
-                response = success(["stopped": .bool(true), "settled": .bool(false)])
+            if scenario == .stopUnconfirmed || scenario == .stopPageIdleButAgentUnconfirmed {
+                // A bare DOM idle ACK is not evidence of Agent registry reconciliation.
+                response = scenario == .stopPageIdleButAgentUnconfirmed
+                    ? success(["stopped": .bool(false), "alreadyIdle": .bool(true), "settled": .bool(true), "confirmedIdle": .bool(false)])
+                    : success(["stopped": .bool(true), "settled": .bool(false), "confirmedIdle": .bool(false)])
             } else {
                 if scenario == .stopConfirmedWithoutEvent, let sessionId = command.sessionId {
                     sessionStatusOverrides[sessionId] = "idle"
@@ -715,7 +717,7 @@ actor MockTransport: Transport {
                 if scenario != .stopConfirmedWithoutEvent {
                     await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: command.sessionId, type: "GENERATION_STOPPED", payload: ["ok": .bool(true)])
                 }
-                response = success(["stopped": .bool(true), "settled": .bool(true)])
+                response = success(["stopped": .bool(true), "settled": .bool(true), "confirmedIdle": .bool(true)])
             }
         case "createConversation":
             let alias = command.payload["projectAlias"]?.stringValue
