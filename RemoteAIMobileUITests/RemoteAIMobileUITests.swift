@@ -170,10 +170,11 @@ final class RemoteAIMobileUITests: XCTestCase {
         let composer = app.textViews["MessageComposer"]
         let typingBegan = ProcessInfo.processInfo.systemUptime
         composer.tap()
-        // Type through the already-focused app instead of resolving TextEditor
-        // again on every key while the transcript is continuously streaming.
-        // Retains actual keyboard input and the exact draft-content assertion.
-        app.typeText("still responsive")
+        // The app-root typeText request snapshots the entire continuously
+        // changing transcript before dispatching keys; at 50K this blocked
+        // XCTest accessibility for minutes. Type on the already-focused
+        // composer instead, preserving a real keyboard input and exact draft.
+        composer.typeText("still responsive")
         XCTAssertEqual(composer.value as? String, "still responsive")
         XCTAssertTrue(progress.exists, "Typing must finish while the stream is still live")
         print("STREAM_UI chars=\(chars) composerInteractionMs=\((ProcessInfo.processInfo.systemUptime - typingBegan) * 1000)")
