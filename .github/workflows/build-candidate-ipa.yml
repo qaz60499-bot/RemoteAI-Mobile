@@ -200,6 +200,8 @@ jobs:
               --only testMachineRuntimeHierarchyOnIPhone \
               --only testOpenCachedWebConversation \
               --only testConversationOpensAtLatestAndOffersReturnToBottomAfterBrowsingHistory \
+              --only testOpenWebChatByTappingStatusAreaOfExistingChromeTab \
+              --only testOpenWebProjectFromExistingChromeTab \
               | tee build/ui-tests.log
           else
             python3 scripts/run_candidate_ui_tests.py \
