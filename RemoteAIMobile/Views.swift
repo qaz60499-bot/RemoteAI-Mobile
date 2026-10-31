@@ -1169,6 +1169,7 @@ struct ChatView: View {
     @State private var showPhotoPicker = false
     @State private var showFilePicker = false
     @State private var attachmentError: String?
+    @State private var showingWebReloadConfirmation = false
     @State private var sending = false
     @State private var sendTask: Task<Void, Never>?
     @State private var composerCommandId: UUID?
@@ -1202,7 +1203,10 @@ struct ChatView: View {
         runtime.kind == .web ? store.webProviderSurfaceStateBySession[session.id] : nil
     }
     private var generationStatusText: String {
-        store.liveRunStatusBySession[session.id]
+        if store.stopRequestsPending.contains(session.id) {
+            return "正在请求停止 · 等待执行端确认…"
+        }
+        return store.liveRunStatusBySession[session.id]
             ?? currentSession.lastProgressStatus
             ?? (runtime.kind == .web ? "电脑端 ChatGPT 正在处理…" : "电脑端任务正在处理…")
     }
@@ -1256,6 +1260,14 @@ struct ChatView: View {
             } else if runtime.kind == .web,
                       let recoveredAt = store.webProviderRecoveryObservedAtBySession[session.id] {
                 WebProviderSurfaceRecoveryBanner(observedAt: recoveredAt, sessionState: currentSessionState)
+            }
+            if runtime.kind == .web, let recovery = store.webChatRecoveryNotesBySession[session.id] {
+                Text(recovery)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 5)
             }
             if let error = store.errors[session.id], error != currentWebProviderIssue?.message {
                 ErrorBanner(text: error) { store.clearError(sessionId: session.id) }
@@ -1388,7 +1400,40 @@ struct ChatView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) { VStack(spacing: 1) { Text(instance.name).font(.subheadline.weight(.semibold)); Text(session.title).font(.caption2).foregroundColor(.secondary); Text(store.machine.state.rawValue).font(.caption2).foregroundColor(store.machine.state == .online ? .green : .secondary) } }
-            ToolbarItem(placement: .navigationBarTrailing) { if store.machine.state == .online && isGenerating { Button("Stop") { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } }.font(.caption) } }
+            ToolbarItem(placement: .navigationBarTrailing) {
+                if store.machine.state == .online && isGenerating {
+                    Button("Stop") {
+                        Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) }
+                    }
+                    .font(.caption)
+                    .disabled(store.stopRequestsPending.contains(session.id))
+                }
+            }
+            if runtime.kind == .web {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button("重新同步消息") { Task { await store.recoverWebChat(session.id, operation: "resync") } }
+                        Button("检测网页运行状态") { Task { await store.recoverWebChat(session.id, operation: "inspect") } }
+                        Button("检查连接并补同步") { Task { await store.recoverWebChat(session.id, operation: "connection") } }
+                        Button("刷新当前网页…", role: .destructive) { showingWebReloadConfirmation = true }
+                    } label: {
+                        Image(systemName: "arrow.clockwise.circle")
+                    }
+                    .accessibilityLabel("当前 Chat 恢复操作")
+                    .disabled(store.machine.state != .online)
+                }
+            }
+        }
+        .confirmationDialog("刷新当前 ChatGPT 网页", isPresented: $showingWebReloadConfirmation, titleVisibility: .visible) {
+            Button("刷新当前网页", role: .destructive) {
+                Task { await store.recoverWebChat(session.id, operation: "reload") }
+            }
+            Button("强制刷新（绕过缓存）", role: .destructive) {
+                Task { await store.recoverWebChat(session.id, operation: "hardReload") }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将刷新当前 Chat 的电脑 Chrome 标签页。若正在生成、存在网页草稿或附件上传，可能中断并丢失未保存内容。不会删除手机本地历史或主动刷新其他 Chat。请确认该 Chat 未被其他任务使用。")
         }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {
@@ -1473,7 +1518,8 @@ struct ChatView: View {
                         } label: {
                             Image(systemName: "stop.circle.fill").font(.title3)
                         }
-                        .accessibilityLabel("Stop generation")
+                        .accessibilityLabel(store.stopRequestsPending.contains(session.id) ? "正在确认停止" : "Stop generation")
+                        .disabled(store.stopRequestsPending.contains(session.id))
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
