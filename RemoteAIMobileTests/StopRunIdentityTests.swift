@@ -59,7 +59,8 @@ final class StopRunIdentityTests: XCTestCase {
         let nextRunAt = Date()
         await mock.setSessionStatus(sessionId, status: "generating", lastActivityAt: nextRunAt, updatedAt: nextRunAt)
         await mock.injectEvent(generationStarted(sequence: 1203, key: "observer:2", at: nextRunAt), deliverLive: true)
-        let nextRunVisible = await waitForSessionState(.busy, in: store)
+        // Wait for the *new* run's event to be applied, not a leftover busy state.
+        let nextRunVisible = await waitForSessionActivity(atOrAfter: nextRunAt, in: store)
         XCTAssertTrue(nextRunVisible)
 
         let statusReadsBeforeRetry = await mock.actionAttemptCount("getSessionStatus")
