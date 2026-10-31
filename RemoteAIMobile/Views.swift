@@ -309,6 +309,9 @@ struct InstanceView: View {
     @State private var showingDeleteConfirmation = false
     @State private var closingWebTab: OpenWebTab?
     @State private var showingCloseWebTabConfirmation = false
+    @State private var refreshingWebTab: OpenWebTab?
+    @State private var refreshingWebTabOperation = "reload"
+    @State private var showingWebTabReloadConfirmation = false
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
     private var isAntigravity: Bool { runtime.id == "runtime.antigravity" }
     private var supportsProjects: Bool { isChatGPTWeb || isAntigravity }
@@ -427,6 +430,14 @@ struct InstanceView: View {
                                         if let note = store.webTabActionNotesById[tab.id] {
                                             Text("最近操作：\(note)").font(.caption2).foregroundColor(.secondary)
                                         }
+                                        if let sessionId = tab.sessionId,
+                                           let recovery = store.webChatRecoveryNotesBySession[sessionId] {
+                                            Text("网页恢复：\(recovery)").font(.caption2).foregroundColor(.secondary)
+                                        }
+                                        if let sessionId = tab.sessionId,
+                                           let problem = store.errors[sessionId], !problem.isEmpty {
+                                            Text("最近失败：\(problem)").font(.caption2).foregroundColor(.orange)
+                                        }
                                     }
                                     Spacer(minLength: 4)
                                 }
@@ -443,9 +454,11 @@ struct InstanceView: View {
                                     Label("检测网页实际状态", systemImage: "stethoscope")
                                 }
                                 Button {
-                                    Task { await store.manageOpenWebTab(tab, operation: "hardReload") }
+                                    refreshingWebTab = tab
+                                    refreshingWebTabOperation = "hardReload"
+                                    showingWebTabReloadConfirmation = true
                                 } label: {
-                                    Label("强制重载（绕过缓存）", systemImage: "arrow.triangle.2.circlepath")
+                                    Label("强制重载（绕过缓存）…", systemImage: "arrow.triangle.2.circlepath")
                                 }
                                 Button {
                                     Task { await store.manageOpenWebTab(tab, operation: "reopen") }
@@ -453,9 +466,11 @@ struct InstanceView: View {
                                     Label("重新打开此网页（复用标签）", systemImage: "arrow.up.forward.app")
                                 }
                                 Button {
-                                    Task { await store.manageOpenWebTab(tab, operation: "reload") }
+                                    refreshingWebTab = tab
+                                    refreshingWebTabOperation = "reload"
+                                    showingWebTabReloadConfirmation = true
                                 } label: {
-                                    Label("刷新此标签页", systemImage: "arrow.clockwise")
+                                    Label("刷新此标签页…", systemImage: "arrow.clockwise")
                                 }
                                 Button(role: .destructive) {
                                     closingWebTab = tab
@@ -688,6 +703,28 @@ struct InstanceView: View {
             Text(runtime.kind == .codex
                 ? "将使用 Codex 原生归档接口，使此 Chat 从电脑和手机的活动会话列表移除；可在 Codex 归档中恢复。"
                 : "这将请求 Windows 上的 Antigravity 删除原始对话，操作不可撤销。")
+        }
+        .confirmationDialog("确定刷新选中的 ChatGPT 网页？", isPresented: $showingWebTabReloadConfirmation) {
+            Button("取消", role: .cancel) { refreshingWebTab = nil }
+            Button(refreshingWebTabOperation == "hardReload" ? "确认绕过缓存刷新" : "确认刷新", role: .destructive) {
+                guard let tab = refreshingWebTab else { return }
+                let operation = refreshingWebTabOperation
+                refreshingWebTab = nil
+                Task {
+                    if tab.isChat, let sessionId = tab.sessionId {
+                        // Recover only this durable Chat. The store re-reads the live tab
+                        // inventory and requires a unique matching session before the
+                        // explicit disruptive confirmation can reach Chrome.
+                        await store.recoverWebChat(sessionId, operation: operation, expectedTabId: tab.tabId)
+                    } else {
+                        // Project homes or unbound tabs cannot authorize a disruptive
+                        // Chat reload. Keep the ordinary idle-only browser guard.
+                        await store.manageOpenWebTab(tab, operation: operation)
+                    }
+                }
+            }
+        } message: {
+            Text("只针对选中标签页。网页异常时，普通刷新必须获得这次确认才能绕过未知草稿状态的保护。刷新可能中断生成、丢失未发送草稿或附件；不会删除手机历史、关闭其他 Chat 或重复发送消息。")
         }
         .confirmationDialog("关闭这个 Chrome 标签页？", isPresented: $showingCloseWebTabConfirmation) {
             Button("取消", role: .cancel) { closingWebTab = nil }

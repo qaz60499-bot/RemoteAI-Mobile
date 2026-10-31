@@ -3,6 +3,36 @@ import XCTest
 
 final class WebTabEntryTests: XCTestCase {
     @MainActor
+    func testConfirmedWebTabRecoveryUsesExactTabAndDisruptiveConsent() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        let tabs = try await mock.listOpenWebTabs(machineId: "my-pc")
+        let tab = try XCTUnwrap(tabs.first(where: { $0.isChat && $0.sessionId != nil }))
+        await store.recoverWebChat(try XCTUnwrap(tab.sessionId),
+            operation: "hardReload", expectedTabId: tab.tabId)
+        let attempts = await mock.actionAttemptCount("manageOpenWebTab")
+        let consent = await mock.lastManagedWebTabConsent()
+        XCTAssertEqual(attempts, 1, "Explicit user confirmation must be delivered only once")
+        XCTAssertEqual(consent, true, "Chrome needs explicit permission to reload an errored document")
+    }
+
+    @MainActor
+    func testStaleSelectedWebTabDoesNotReloadAnotherMatchingChat() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        let tabs = try await mock.listOpenWebTabs(machineId: "my-pc")
+        let tab = try XCTUnwrap(tabs.first(where: { $0.isChat && $0.sessionId != nil }))
+        await store.recoverWebChat(try XCTUnwrap(tab.sessionId),
+            operation: "reload", expectedTabId: tab.tabId + 1000)
+        let attempts = await mock.actionAttemptCount("manageOpenWebTab")
+        XCTAssertEqual(attempts, 0, "Changed tab identities must never receive a reload")
+    }
+
+    @MainActor
     func testEnterKeepsDiagnosisAndAllowsViewingBusyTab() async throws {
         let mock = MockTransport(historyCount: 0)
         try await mock.connect()

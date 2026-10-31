@@ -42,6 +42,7 @@ actor MockTransport: Transport {
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
     private var commandAttempts: [String: Int] = [:]
     private var commandIdsByAction: [String: [UUID]] = [:]
+    private var latestManagedWebTabExplicitConsent: Bool?
     private var disconnectAfterActionCounts: [String: Int] = [:]
     private var actionFailureCounts: [String: Int] = [:]
     private var lastPreferCacheByAction: [String: Bool] = [:]
@@ -224,6 +225,7 @@ actor MockTransport: Transport {
     }
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
     func commandIds(action: String) -> [UUID] { commandIdsByAction[action, default: []] }
+    func lastManagedWebTabConsent() -> Bool? { latestManagedWebTabExplicitConsent }
     func eventCount(type: String, sessionId: String) -> Int {
         eventLog.filter { $0.type == type && $0.sessionId == sessionId }.count
     }
@@ -494,6 +496,7 @@ actor MockTransport: Transport {
                 "draftPresent": .bool(false), "pendingUploads": .bool(false), "busy": .bool(false)
             ])
         case "manageOpenWebTab":
+            latestManagedWebTabExplicitConsent = command.payload["userConfirmedDisruptive"]?.boolValue
             let operation = command.payload["operation"]?.stringValue ?? ""
             let tabId = Int(command.payload["tabId"]?.intValue ?? -1)
             let expectedUrl = command.payload["expectedUrl"]?.stringValue ?? ""

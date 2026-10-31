@@ -740,7 +740,7 @@ final class WorkspaceStore: ObservableObject {
 
     // Chat-level manual recovery is opt-in and never guesses a tab from Chrome focus.
     // Cached history remains untouched when the Browser/Relay is unavailable.
-    func recoverWebChat(_ sessionId: String, operation: String) async {
+    func recoverWebChat(_ sessionId: String, operation: String, expectedTabId: Int? = nil) async {
         guard machine.state == .online, !isSuspended else {
             errors[sessionId] = "Windows 未连接；已保留本地历史，等待重连。"
             return
@@ -779,6 +779,10 @@ final class WorkspaceStore: ObservableObject {
         let matches = openWebTabs.filter { $0.sessionId == sessionId && $0.isChat }
         guard matches.count == 1, let tab = matches.first else {
             errors[sessionId] = "原 Chat 未绑定唯一标签页；不会刷新其他网页。请先重新同步。"
+            return
+        }
+        if let expectedTabId, tab.tabId != expectedTabId {
+            errors[sessionId] = "选中的 Chrome 标签页已改变；未刷新其他标签页或重复发送。"
             return
         }
         if operation == "inspect" {
