@@ -1073,8 +1073,15 @@ final class WorkspaceStore: ObservableObject {
                revision == projectConversationRevisions[projectAlias, default: 0],
                projectConversationsByAlias[projectAlias] == nil,
                !isSuspended {
-                projectConversationsByAlias[projectAlias] = cached
+                let uniqueCached = Self.uniqueProjectConversations(cached)
+                projectConversationsByAlias[projectAlias] = uniqueCached
                 projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
+                // Historical builds could persist the same Chat twice. Fix only
+                // duplicate identities here; never interpret a cache repair as
+                // provider deletion or as authority to reorder the remaining rows.
+                if uniqueCached.count != cached.count {
+                    try? await cache.put(uniqueCached, key: "web.project.\(projectAlias).conversations")
+                }
             }
         }
         guard refresh else { return }
@@ -1125,7 +1132,7 @@ final class WorkspaceStore: ObservableObject {
                    let staleSnapshotId = page.snapshotId,
                    !staleSnapshotId.isEmpty,
                    !page.items.isEmpty {
-                    var staleItems = page.items
+                    var staleItems = Self.uniqueProjectConversations(page.items)
                     var seenIds = Set(staleItems.map(\.id))
                     var nextCursor = page.nextCursor
                     var hasMore = page.hasMore
@@ -1239,11 +1246,12 @@ final class WorkspaceStore: ObservableObject {
                     // partially mounted. Show those verified rows immediately instead
                     // of presenting an empty/error screen, but keep the state non-
                     // authoritative so a later live DOM pass can replace it.
-                    projectConversationsByAlias[projectAlias] = page.items
+                    let uniqueItems = Self.uniqueProjectConversations(page.items)
+                    projectConversationsByAlias[projectAlias] = uniqueItems
                     projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .staleCache
                     projectNextCursorByAlias[projectAlias] = page.nextCursor
                     projectHasMoreByAlias[projectAlias] = page.hasMore
-                    mergeProjectSessions(page.items)
+                    mergeProjectSessions(uniqueItems)
                     errors["web.project.\(projectAlias)"] = nil
                     DiagnosticsLog.shared.record("project_load_stale", fields: ["project": projectAlias, "count": String(page.items.count), "source": page.source ?? "unknown"], level: "WARN")
                     return
@@ -1294,7 +1302,7 @@ final class WorkspaceStore: ObservableObject {
             // A Project refresh mirrors the complete ChatGPT left-sidebar list,
             // not only its first lazy page. Follow a stable authoritative snapshot until
             // exhausted; never mix pages from different sidebar revisions.
-            var authoritativeItems = page.items
+            var authoritativeItems = Self.uniqueProjectConversations(page.items)
             var nextCursor = page.nextCursor
             var hasMore = page.hasMore
             let authoritativeSnapshotId = page.snapshotId
@@ -1390,6 +1398,7 @@ final class WorkspaceStore: ObservableObject {
             errors["web.project.\(projectAlias)"] = nil
             let catalogDigests = DiagnosticsLog.catalogDigests(authoritativeItems.map(\.localConversationId))
             DiagnosticsLog.shared.record("project_load_ok", fields: [
+DEVSPACE_CONTINUITY_CHECK: Approximately 573185 DevSpace tool characters since the last acknowledged checkpoint. This is a secondary context-pressure signal, not an exact token-count or host context percentage, and not an automatic handoff trigger. Ordinary chat, other tools and host compaction are not measured. The host owns context management.
                 "project": projectAlias,
                 "count": String(authoritativeItems.count),
                 "hasMore": String(hasMore),
@@ -3331,6 +3340,21 @@ final class WorkspaceStore: ObservableObject {
         ]
     }
 
+    // Deduplicate only repeated stable identities. This is not a provider
+    // membership snapshot: stale/partial pages must never delete distinct
+    // conversations or claim a new ordering.
+    static func uniqueProjectConversations(_ items: [WebConversationDescriptor]) -> [WebConversationDescriptor] {
+        var seenIds = Set<String>()
+        var seenAliases = Set<String>()
+        return items.filter { row in
+            if seenIds.contains(row.id) { return false }
+            if let alias = row.conversationAlias, seenAliases.contains(alias) { return false }
+            seenIds.insert(row.id)
+            if let alias = row.conversationAlias { seenAliases.insert(alias) }
+            return true
+        }
+    }
+
     private func isSyntheticConversationTitle(_ title: String, conversationAlias: String?) -> Bool {
         let value = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if value.isEmpty || value.caseInsensitiveCompare("ChatGPT Conversation") == .orderedSame { return true }
@@ -3450,10 +3474,14 @@ final class WorkspaceStore: ObservableObject {
     @discardableResult
     private func mergeConversationTitleHints(_ hints: [WebConversationDescriptor], projectAlias: String) -> Bool {
         guard var current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
-        let byAlias = Dictionary(uniqueKeysWithValues: hints.compactMap { hint -> (String, WebConversationDescriptor)? in
-            guard let alias = hint.conversationAlias, sameWebProjectAlias(hint.projectAlias, projectAlias) else { return nil }
-            return (alias, hint)
-        })
+        // Duplicate aliases can arrive in stale provider snapshots. The old
+        // uniqueKeysWithValues initializer traps on duplicates instead of
+        // repairing titles; retain the newest safe hint for each identity.
+        let byAlias = hints.reduce(into: [String: WebConversationDescriptor]()) { result, hint in
+            guard let alias = hint.conversationAlias, sameWebProjectAlias(hint.projectAlias, projectAlias) else { return }
+            if let existing = result[alias], existing.updatedAt > hint.updatedAt { return }
+            result[alias] = hint
+        }
         var changed = false
         for index in current.indices {
             guard let alias = current[index].conversationAlias,
