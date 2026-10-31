@@ -4,6 +4,39 @@ import Combine
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
+    func testReadOnlyDurableCommandLookupNeverReplaysOriginalSend() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let id = UUID()
+        let missing = try await mock.commandOutcome(machineId: "my-pc", targetCommandId: id)
+        XCTAssertEqual(missing.status, "NOT_FOUND")
+        XCTAssertFalse(missing.accepted)
+
+        let send = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.web",
+            instanceId: "photo", sessionId: "photo-upload", action: "sendMessage",
+            payload: ["text": .string("durable-lookup-check")], commandId: id)
+        let sent = try await mock.execute(send)
+        XCTAssertTrue(sent.ok)
+        let recorded = try await mock.commandOutcome(machineId: "my-pc", targetCommandId: id)
+        XCTAssertEqual(recorded.status, "COMPLETED")
+        XCTAssertTrue(recorded.accepted)
+        let sends = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sends, 1)
+
+        let ambiguous = MockTransport(scenario: .webSendDeliveryUnknown, historyCount: 0)
+        try await ambiguous.connect()
+        let ambiguousId = UUID()
+        let uncertain = try await ambiguous.execute(RemoteCommand.make(machineId: "my-pc",
+            runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload",
+            action: "sendMessage", payload: ["text": .string("uncertain")], commandId: ambiguousId))
+        XCTAssertFalse(uncertain.ok)
+        let status = try await ambiguous.commandOutcome(machineId: "my-pc", targetCommandId: ambiguousId)
+        XCTAssertEqual(status.status, "UNKNOWN_DELIVERY")
+        XCTAssertFalse(status.accepted)
+        let uncertainSends = await ambiguous.actionAttemptCount("sendMessage")
+        XCTAssertEqual(uncertainSends, 1)
+    }
+
     func testExistingWebTabEnterRestoresChatAndProjectWithoutCreatingAnything() async throws {
         let mock = MockTransport(historyCount: 0)
         try await mock.connect()
