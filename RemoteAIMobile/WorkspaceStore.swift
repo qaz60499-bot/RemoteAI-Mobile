@@ -2316,6 +2316,20 @@ final class WorkspaceStore: ObservableObject {
             connectionPhase = .online
             errors["connection"] = nil
             await recoverDelta(freshLatestSequence: head)
+            guard current() else { return false }
+            // A successful durable Agent receipt proves the original dispatch was
+            // confirmed, even when the websocket reply was lost during reconnect.
+            // Older Windows releases lack this query; keep Unknown instead of
+            // repeating an uncertain Send or inventing a terminal failure.
+            if commandStates[commandId] == .unknown,
+               let receipt = try? await activeTransport.commandOutcome(
+                   machineId: machineId, targetCommandId: commandId),
+               receipt.accepted {
+                guard current() else { return false }
+                commandStates[commandId] = .completed
+                DiagnosticsLog.shared.record("send_durable_receipt_recovered",
+                    fields: ["session": sessionId, "commandId": commandId.uuidString])
+            }
             for attempt in 0..<3 where commandStates[commandId] == .unknown {
                 guard current() else { return false }
                 let page = try await activeTransport.loadRecent(machineId: machineId,
