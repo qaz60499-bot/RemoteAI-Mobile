@@ -1288,7 +1288,11 @@ struct ChatView: View {
                                 let retryable = commandState == .unknown && UUID(uuidString: message.id) != nil
                                 if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
                                     AssistantStreamRow(stream: stream, message: message, followTail: {
-                                        guard !userBrowsingHistory else { return }
+                                        // While the composer owns keyboard focus, each incoming
+                                        // streaming delta must not scroll/re-layout its parent.
+                                        // Keep the active input responsive and the draft intact;
+                                        // follow-tail resumes once focus is released.
+                                        guard !userBrowsingHistory, !focused else { return }
                                         proxy.scrollTo("bottom", anchor: .bottom)
                                     }, onSelectText: { text, monospaced in
                                         textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
