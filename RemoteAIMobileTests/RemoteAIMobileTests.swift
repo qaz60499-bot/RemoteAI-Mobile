@@ -3311,6 +3311,31 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testAlreadyIdleStopWithoutAgentConfirmationKeepsRunning() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(scenario: .stopPageIdleButAgentUnconfirmed, historyCount: 0)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await mock.setSessionStatus("photo-upload", status: "generating")
+        await mock.injectEvent(RemoteEvent(
+            protocolVersion: 1, eventId: UUID(), sequence: 1201,
+            machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo",
+            sessionId: "photo-upload", type: "GENERATION_STARTED", payload: [:], createdAt: Date()
+        ), deliverLive: true)
+        for _ in 0..<80 {
+            if store.liveRunStatusBySession["photo-upload"] != nil { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
+        let stopped = await store.stop(runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload")
+        XCTAssertFalse(stopped, "A DOM idle response is not an Agent-confirmed terminal state")
+        XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
+        XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
+        XCTAssertTrue(store.errors["photo-upload"]?.contains("尚未确认停止") == true)
+        await store.suspend()
+    }
+
+    @MainActor
     func testConfirmedStopClearsRunningWhenTerminalPushWasLost() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .stopConfirmedWithoutEvent, historyCount: 0)
