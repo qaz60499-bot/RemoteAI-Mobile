@@ -1113,12 +1113,11 @@ struct WebProjectView: View {
             // An automatic Project open should reuse the verified catalog and
             // existing Web tab; only an explicit pull-to-refresh forces a DOM scan.
             await refreshProjectContext(force: false)
-            // Session status is cheap and can change while the user stays on this
-            // screen. Project membership is separate: without a periodic catalog
-            // read, desktop-created/deleted chats never appear until a manual pull.
-            // Read the Project catalog only every sixth status tick (30 seconds),
-            // and only while foregrounded. Keep the store's snapshot protections:
-            // partial/failed DOM reads must never erase verified conversations.
+            // Session status is cheap and changes while this Project stays open.
+            // Retain the 30-second steady-state cadence for an authoritative DOM
+            // snapshot, but retry the non-destructive catalog read after 15 seconds
+            // while showing stale or partial membership. A non-forced read reuses
+            // the store's deduplication and never authorizes deletion from a cache.
             var statusTicks = 0
             while !Task.isCancelled {
                 do {
@@ -1131,7 +1130,9 @@ struct WebProjectView: View {
                     await store.refreshSessions(runtime: runtime, instance: instance)
                     if !isAntigravity {
                         statusTicks += 1
-                        if statusTicks >= 6 {
+                        let hasAuthoritativeSnapshot =
+                            store.projectConversationSnapshotStateByAlias[project.projectAlias] == .authoritativeLiveDOM
+                        if statusTicks >= (hasAuthoritativeSnapshot ? 6 : 3) {
                             statusTicks = 0
                             await store.loadProjectConversations(projectAlias: project.projectAlias, force: false)
                         }
