@@ -698,6 +698,7 @@ final class RemoteAIMobileTests: XCTestCase {
             if await mock.actionAttemptCount("getChangesAfterCursor") >= 2 { break }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
+DEVSPACE_CONTINUITY_RISK: Approximately 868692 DevSpace tool characters since the last acknowledged checkpoint. This is a secondary context-pressure signal, not an exact token-count or host context percentage, and not an automatic handoff trigger. Ordinary chat, other tools and host compaction are not measured. The host owns context management.
         let deltaCalls = await mock.actionAttemptCount("getChangesAfterCursor")
         XCTAssertGreaterThanOrEqual(deltaCalls, 2)
         XCTAssertNotNil(store.deltaRecoveryDisplayMessagesBySession?["photo-upload"])
@@ -2305,6 +2306,71 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.map(\.conversationAlias), ["seed-0", "seed-1"])
         XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .authoritativeLiveDOM)
         XCTAssertNil(store.errors["web.project.g-p-remoteai"])
+        await store.suspend()
+    }
+
+    @MainActor
+    func testProjectConversationIdentityDedupPreservesFirstSeenOrder() {
+        let now = Date()
+        func row(_ id: String, _ alias: String) -> WebConversationDescriptor {
+            WebConversationDescriptor(
+                localConversationId: id,
+                canonicalUrl: "https://chatgpt.com/g/g-p-remoteai/c/\(alias)",
+                projectId: nil,
+                displayTitle: alias,
+                projectAlias: "g-p-remoteai",
+                conversationAlias: alias,
+                lastVisited: nil,
+                updatedAt: now
+            )
+        }
+        let distinct = WorkspaceStore.uniqueProjectConversations([
+            row("webconv-first", "first"),
+            row("webconv-second", "second"),
+            row("webconv-second", "second"),
+            row("webconv-third-alias-copy", "first"),
+            row("webconv-third", "third")
+        ])
+        XCTAssertEqual(distinct.map(\.localConversationId), [
+            "webconv-first", "webconv-second", "webconv-third"
+        ])
+    }
+
+    @MainActor
+    func testColdProjectCacheRepairsDuplicateRowsWithoutTreatingCacheAsDeletionAuthority() async throws {
+        let alias = "g-p-remoteai"
+        let now = Date()
+        func row(_ id: String, _ chat: String) -> WebConversationDescriptor {
+            WebConversationDescriptor(
+                localConversationId: id,
+                canonicalUrl: "https://chatgpt.com/g/\(alias)/c/\(chat)",
+                projectId: nil,
+                displayTitle: chat,
+                projectAlias: alias,
+                conversationAlias: chat,
+                lastVisited: nil,
+                updatedAt: now
+            )
+        }
+        let cache = try SQLiteStore.inMemory()
+        let key = "web.project.\(alias).conversations"
+        try await cache.put([
+            row("webconv-1", "one"),
+            row("webconv-2", "two"),
+            row("webconv-2", "two"),
+            row("webconv-3", "three")
+        ], key: key)
+        let store = WorkspaceStore(transport: MockTransport(historyCount: 1), cache: cache)
+        await store.start()
+        await store.loadProjectConversations(projectAlias: alias, refresh: false)
+
+        XCTAssertEqual(
+            store.projectConversationsByAlias[alias]?.map(\.localConversationId),
+            ["webconv-1", "webconv-2", "webconv-3"]
+        )
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias[alias], .staleCache)
+        let repaired: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: key)
+        XCTAssertEqual(repaired?.map(\.localConversationId), ["webconv-1", "webconv-2", "webconv-3"])
         await store.suspend()
     }
 
