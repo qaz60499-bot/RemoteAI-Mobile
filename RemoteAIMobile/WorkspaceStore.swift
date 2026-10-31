@@ -73,6 +73,7 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var managingWebTabIds = Set<Int>()
     @Published var webTabDiagnosesById: [Int: WebTabDiagnosis] = [:]
     @Published var webTabActionNotesById: [Int: String] = [:]
+    @Published private(set) var webChatRecoveryNotesBySession: [String: String] = [:]
     @Published var recentWebTabNotices: [String] = []
     private var explicitlyClosedWebTabIDs = Set<Int>()
     @Published var antigravityProjects: [WebProjectDescriptor] = []
@@ -206,6 +207,7 @@ final class WorkspaceStore: ObservableObject {
     private var creatingWebConversations = Set<String>()
     private var creatingSessions = Set<String>()
     private var stopTasksBySession: [String: StopTaskEntry] = [:]
+    @Published private(set) var stopRequestsPending = Set<String>()
     private var commandSendsInFlight = Set<UUID>()
     private var metadataRefreshInFlight = false
     private var metadataRefreshQueued = false
@@ -2364,6 +2366,8 @@ final class WorkspaceStore: ObservableObject {
         let cacheKey = stopOperationCacheKey(runtimeId: runtimeId, instanceId: instanceId,
             sessionId: sessionId, machineId: activeMachineId)
         guard stopRunIdentity(for: sessionId) == runIdentity else { return false }
+        stopRequestsPending.insert(sessionId)
+        defer { stopRequestsPending.remove(sessionId) }
 
         var commandId = UUID()
         var reusedUnknownOperation = false
@@ -2461,12 +2465,27 @@ final class WorkspaceStore: ObservableObject {
         let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "stopGeneration", commandId: commandId)
         commandStates[command.commandId] = .pending
         do {
-            let state = try await activeTransport.send(command)
+            let receipt = try await activeTransport.requestStop(command)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
-            commandStates[command.commandId] = state
+            commandStates[command.commandId] = receipt.confirmed ? .completed : .acknowledged
             await finishPendingStopOperation(cacheKey: cacheKey, expectedCommandId: commandId)
             guard generation == lifecycleGeneration, transport === activeTransport,
                   machine.id == activeMachineId, !isSuspended else { return false }
+            // A successful Relay/Router ACK cannot synthesize a terminal boundary.
+            // Never stop a newer generation or clear Running on unconfirmed Stop.
+            if !receipt.confirmed {
+                if stopRunIdentity(for: sessionId) == runIdentity {
+                    errors[sessionId] = receipt.staleGeneration
+                        ? "停止命令针对的生成已变化；没有停止新的生成。"
+                        : "停止请求已到达执行端，但尚未确认停止；当前状态仍需重新核验。"
+                }
+                DiagnosticsLog.shared.record("stop_unconfirmed", fields: [
+                    "session": sessionId, "settled": String(receipt.settled),
+                    "stopped": String(receipt.stopped),
+                    "staleGeneration": String(receipt.staleGeneration)
+                ], level: "WARN")
+                return false
+            }
             // Events delivered after the Stop was issued are authoritative. In
             // particular a newer GENERATION_STARTED must not be rolled back by this
             // request's cached/successful acknowledgement.
@@ -2512,7 +2531,10 @@ final class WorkspaceStore: ObservableObject {
                 }
             }
             if stopRunIdentity(for: sessionId) == runIdentity {
+                if runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
                 setSessionState(sessionId, .idle)
+                liveRunStatusBySession.removeValue(forKey: sessionId)
+                clearLiveRunActivity(sessionId: sessionId)
                 errors[sessionId] = nil
             }
             return true
