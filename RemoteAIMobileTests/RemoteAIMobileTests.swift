@@ -4,6 +4,23 @@ import Combine
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
+    func testProjectForcedRefreshReachesWindowsProviderFlag() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        _ = try await mock.listProjectConversations(machineId: "my-pc",
+            projectAlias: "g-p-remoteai", limit: 30, forceRefresh: true)
+        let forced = await mock.lastForceRefreshValue("listProjectConversations")
+        let forcedPreferCache = await mock.lastPreferCacheValue("listProjectConversations")
+        XCTAssertEqual(forced, true)
+        XCTAssertEqual(forcedPreferCache, false)
+        _ = try await mock.listProjectConversations(machineId: "my-pc",
+            projectAlias: "g-p-remoteai", limit: 30, forceRefresh: false)
+        let normal = await mock.lastForceRefreshValue("listProjectConversations")
+        let normalPreferCache = await mock.lastPreferCacheValue("listProjectConversations")
+        XCTAssertEqual(normal, false)
+        XCTAssertEqual(normalPreferCache, true)
+    }
+
     func testReadOnlyDurableCommandLookupNeverReplaysOriginalSend() async throws {
         let mock = MockTransport(historyCount: 0)
         try await mock.connect()
