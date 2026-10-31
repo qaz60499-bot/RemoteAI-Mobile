@@ -353,7 +353,8 @@ struct StopExecutionReceipt: Equatable {
     let alreadyIdle: Bool
     let settled: Bool
     let staleGeneration: Bool
-    var confirmed: Bool { settled && !staleGeneration && (stopped || alreadyIdle) }
+    let agentConfirmedIdle: Bool
+    var confirmed: Bool { settled && !staleGeneration && (stopped || alreadyIdle) && agentConfirmedIdle }
 }
 
 extension Transport {
@@ -367,7 +368,10 @@ extension Transport {
             stopped: stopped,
             alreadyIdle: alreadyIdle,
             settled: object["settled"]?.boolValue ?? (command.runtimeId != "runtime.web" && stopped),
-            staleGeneration: object["staleGeneration"]?.boolValue == true
+            staleGeneration: object["staleGeneration"]?.boolValue == true,
+            // Only the Agent's registry reconciliation may clear a Web run.
+            agentConfirmedIdle: command.runtimeId != "runtime.web"
+                || object["confirmedIdle"]?.boolValue == true
         )
     }
 
