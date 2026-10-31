@@ -386,6 +386,23 @@ extension Transport {
         return .failed
     }
 
+    // Query the Windows durable receipt without re-dispatching the original Send.
+    // A missing/running/uncertain result is never proof of failed delivery.
+    func commandOutcome(machineId: String, targetCommandId: UUID) async throws -> (status: String, accepted: Bool) {
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web",
+            instanceId: "agent", action: "getCommandOutcome",
+            payload: ["targetCommandId": .string(targetCommandId.uuidString)])
+        let response = try await requireSuccess(execute(command))
+        guard let object = response.objectValue,
+              object["targetCommandId"]?.stringValue?.lowercased() == targetCommandId.uuidString.lowercased(),
+              let status = object["status"]?.stringValue,
+              ["NOT_FOUND", "RUNNING", "COMPLETED", "FAILED", "UNKNOWN_DELIVERY"].contains(status) else {
+            throw TransportError.malformedData
+        }
+        let accepted = status == "COMPLETED" && object["outcome"]?.objectValue?["ok"]?.boolValue == true
+        return (status, accepted)
+    }
+
     func agentStatusSnapshot(machineId: String) async throws -> AgentStatusSnapshot {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "getStatus", payload: ["assistantDeltaVersion": .number(1)])
         let response = try await requireSuccess(execute(command))
