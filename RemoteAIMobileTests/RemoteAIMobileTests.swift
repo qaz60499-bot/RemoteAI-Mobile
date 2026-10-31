@@ -698,7 +698,6 @@ final class RemoteAIMobileTests: XCTestCase {
             if await mock.actionAttemptCount("getChangesAfterCursor") >= 2 { break }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
-DEVSPACE_CONTINUITY_RISK: Approximately 868692 DevSpace tool characters since the last acknowledged checkpoint. This is a secondary context-pressure signal, not an exact token-count or host context percentage, and not an automatic handoff trigger. Ordinary chat, other tools and host compaction are not measured. The host owns context management.
         let deltaCalls = await mock.actionAttemptCount("getChangesAfterCursor")
         XCTAssertGreaterThanOrEqual(deltaCalls, 2)
         XCTAssertNotNil(store.deltaRecoveryDisplayMessagesBySession?["photo-upload"])
