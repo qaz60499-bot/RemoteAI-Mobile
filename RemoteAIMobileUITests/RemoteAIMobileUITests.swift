@@ -178,10 +178,16 @@ final class RemoteAIMobileUITests: XCTestCase {
         // No mock state injection, paused stream, or skipped draft assertion.
         let keyboard = app.keyboards.firstMatch
         XCTAssertTrue(keyboard.waitForExistence(timeout: 8), "The stream must not block keyboard presentation")
-        let key = keyboard.keys["s"]
-        XCTAssertTrue(key.waitForExistence(timeout: 8), "The software keyboard must be interactive")
+        // iOS enables sentence auto-capitalization on a new composer. The
+        // accessibility hierarchy then exposes an uppercase "S" key, not "s".
+        // Match the *real* visible key case-insensitively rather than relying
+        // on keyboard shift state (verified from the failed 50K xcresult AX tree).
+        let key = keyboard.keys.matching(NSPredicate(format: "label ==[c] %@", "s")).firstMatch
+        XCTAssertTrue(key.waitForExistence(timeout: 8), "A letter key must be interactive during streaming")
+        XCTAssertEqual(key.label.lowercased(), "s")
         key.tap()
-        XCTAssertEqual(composer.value as? String, "s", "A real keyboard tap must update the draft during streaming")
+        let typedDraft = try XCTUnwrap(composer.value as? String)
+        XCTAssertEqual(typedDraft.lowercased(), "s", "A real keyboard tap must update the draft during streaming")
         XCTAssertTrue(progress.exists, "Typing must finish while the stream is still live")
         print("STREAM_UI chars=\(chars) composerInteractionMs=\((ProcessInfo.processInfo.systemUptime - typingBegan) * 1000)")
         let scrollingBegan = ProcessInfo.processInfo.systemUptime
@@ -218,6 +224,6 @@ final class RemoteAIMobileUITests: XCTestCase {
         // searching for a vanished progress label across a huge XCUI tree.
         XCTAssertTrue(app.buttons["Send"].waitForExistence(timeout: 15),
                       "Final delivery must clear active generation and restore normal sending")
-        XCTAssertEqual(composer.value as? String, "s", "Final must preserve the real unsent keyboard draft")
+        XCTAssertEqual(composer.value as? String, typedDraft, "Final must preserve the exact unsent keyboard draft")
     }
 }
