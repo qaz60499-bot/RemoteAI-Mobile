@@ -32,6 +32,32 @@ final class ProjectConvergenceTests: XCTestCase {
     }
 
     @MainActor
+    func testCompletedWebProgressLabelDoesNotBlockProjectRefresh() async throws {
+        let mock = MockTransport(historyCount: 1)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        await store.refreshWebProjects(force: true)
+        let before = await mock.actionAttemptCount("listProjects")
+
+        // A delayed tool-status update can leave a finished banner visible
+        // after the provider reports the Chat idle. This is not proof of an
+        // active generation and must not indefinitely defer Project discovery.
+        let idleId = "completed-web-label"
+        store.sessions.append(SessionDescriptor(
+            id: idleId, instanceId: "web.chatgpt",
+            title: "Already finished", state: .idle, updatedAt: Date()
+        ))
+        store.liveRunStatusBySession[idleId] = "回答已生成，正在确认同步…"
+        store.webProjectsSnapshotState = .staleCache
+        await store.refreshWebProjects(force: false)
+
+        let after = await mock.actionAttemptCount("listProjects")
+        XCTAssertGreaterThan(after, before,
+            "An idle Chat with only a stale progress label must not indefinitely suppress Project refresh")
+        await store.suspend()
+    }
+
+    @MainActor
     func testProjectRefreshLoadsMoreThanTwoHundredRowsAcrossStablePages() async throws {
         let mock = MockTransport(historyCount: 1)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 225)

@@ -839,10 +839,19 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private var hasActiveChatGPTWebRun: Bool {
-        sessions.contains { $0.instanceId == "web.chatgpt" && ($0.state == .busy || $0.state == .waiting) }
-            || liveRunStatusBySession.keys.contains { id in
-                sessions.contains { $0.id == id && $0.instanceId == "web.chatgpt" }
-            }
+        // A presentation label alone is not an active run: a completed tool or
+        // delayed status update may leave a banner behind after the Chat is idle.
+        // Treat only a nonterminal busy/waiting session or one with independent
+        // live-activity evidence as an active browser task. Otherwise Project
+        // refreshes can be deferred forever by a stale "completed" banner.
+        sessions.contains { session in
+            guard session.instanceId == "web.chatgpt",
+                  !terminalWebRuns.contains(session.id) else { return false }
+            let stateActive = session.state == .busy || session.state == .waiting
+            let independentlyLive = liveRunStatusBySession[session.id] != nil
+                && liveRunActivityAtBySession[session.id] != nil
+            return stateActive || independentlyLive
+        }
     }
 
     private func resumeDeferredWebProjectsRefreshIfIdle() {
