@@ -6,7 +6,14 @@ final class WebTabEntryTests: XCTestCase {
     func testOrdinaryWebHistoryKeepsRouteThroughCatalogRaceWithoutOpeningChrome() async throws {
         let mock = MockTransport(historyCount: 0, includeOrdinaryWebHistoryFixture: true)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
-        await store.start()
+        let started = await store.start()
+        XCTAssertTrue(started)
+        // start() loads runtime metadata but intentionally leaves session catalogs
+        // lazy. Entering Web > ChatGPT triggers this exact two-stage catalog read.
+        let runtime = try XCTUnwrap(store.runtimes.first(where: { $0.id == "runtime.web" }))
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first(where: { $0.id == "web.chatgpt" }))
+        await store.refreshSessions(runtime: runtime, instance: instance)
         let session = try XCTUnwrap(store.sessions.first(where: { $0.id == "webconv-root-history-mock" }))
         store.prepareHistoricalWebChat(session)
 
