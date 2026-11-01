@@ -31,7 +31,10 @@ jobs:
     name: Candidate Test + Device IPA
     if: github.event_name == 'workflow_dispatch'
     runs-on: macos-15
-    timeout-minutes: 45
+    # A real 11-case isolated-simulator UI suite plus protocol/unit and stream-performance
+    # checks exhausted the previous 45-minute job limit before iphoneos packaging.
+    # All test assertions remain mandatory; do not skip any gate for a green build.
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
