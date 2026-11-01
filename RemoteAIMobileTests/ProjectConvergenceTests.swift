@@ -80,8 +80,40 @@ final class ProjectConvergenceTests: XCTestCase {
                 "Malformed \(fault.rawValue) pagination must not replace or truncate the last accepted list"
             )
             XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .partialDOM)
+            XCTAssertNotNil(store.errors["web.project.g-p-remoteai"], "Incomplete pagination must remain visibly retryable, not falsely display success")
             await store.suspend()
         }
+    }
+
+    @MainActor
+    func testLoadMoreCannotCommitHalfPagedProjectAsComplete() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 125)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await store.loadProjectConversations(projectAlias: "g-p-remoteai", refresh: true, force: true)
+        let fullyAccepted = store.projectConversationsByAlias["g-p-remoteai"] ?? []
+        XCTAssertEqual(fullyAccepted.count, 125)
+
+        // Reproduce a session that has displayed only the first 50 of a known
+        // generation, while the last complete durable catalog still has 125 rows.
+        store.projectConversationsByAlias["g-p-remoteai"] = Array(fullyAccepted.prefix(50))
+        store.projectNextCursorByAlias["g-p-remoteai"] = "offset:50"
+        store.projectHasMoreByAlias["g-p-remoteai"] = true
+        await store.loadMoreProjectConversations(projectAlias: "g-p-remoteai")
+
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 100)
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .partialDOM)
+        XCTAssertNotNil(store.errors["web.project.g-p-remoteai"])
+        let unchangedCache: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
+        XCTAssertEqual(unchangedCache?.count, 125, "Page 2 must not replace the prior complete durable catalog")
+
+        await store.loadMoreProjectConversations(projectAlias: "g-p-remoteai")
+        XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 125)
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .authoritativeLiveDOM)
+        XCTAssertNil(store.errors["web.project.g-p-remoteai"])
+        await store.suspend()
     }
 
     @MainActor

@@ -1204,7 +1204,9 @@ final class WorkspaceStore: ObservableObject {
                             try? await cache.put(preservedItems, key: "web.project.\(projectAlias).conversations")
                         }
                         mergeProjectSessions(preservedItems)
-                        errors["web.project.\(projectAlias)"] = nil
+                        errors["web.project.\(projectAlias)"] = pagingStoppedEarly
+                            ? "Windows 缓存分页中断；已保留原有 Project 对话，可重新刷新。"
+                            : nil
                         DiagnosticsLog.shared.record("project_load_stale_preserved", fields: [
                             "project": projectAlias,
                             "acceptedCount": String(previouslyAcceptedItems.count),
@@ -1228,7 +1230,9 @@ final class WorkspaceStore: ObservableObject {
                     else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
                     projectHasMoreByAlias[projectAlias] = hasMore
                     mergeProjectSessions(staleItems)
-                    errors["web.project.\(projectAlias)"] = nil
+                    errors["web.project.\(projectAlias)"] = pagingStoppedEarly
+                        ? "Windows 缓存分页中断；当前只显示已读取部分，刷新可重试。"
+                        : nil
                     DiagnosticsLog.shared.record("project_load_stale", fields: [
                         "project": projectAlias,
                         "count": String(staleItems.count),
@@ -1378,7 +1382,11 @@ final class WorkspaceStore: ObservableObject {
                 } else {
                     projectConversationSnapshotStateByAlias[projectAlias] = .partialDOM
                 }
-                errors["web.project.\(projectAlias)"] = nil
+                // A half-paged response is not successful synchronization. Keep
+                // the accepted catalog visible, but expose a recoverable warning
+                // until a complete authoritative snapshot has been verified.
+                errors["web.project.\(projectAlias)"] =
+                    "Project 对话尚未完全同步；已保留上次确认的 \(previouslyAcceptedItems.count) 条记录，刷新可重试。"
                 DiagnosticsLog.shared.record("project_load_paging_incomplete", fields: [
                     "project": projectAlias,
                     "acceptedCount": String(previouslyAcceptedItems.count),
@@ -1469,14 +1477,20 @@ final class WorkspaceStore: ObservableObject {
             // Preserve the authoritative newest-first order supplied by ChatGPT.
             // Registry update timestamps reflect our scan time, not conversation age.
             projectConversationsByAlias[projectAlias] = merged
-            projectConversationSnapshotStateByAlias[projectAlias] = .authoritativeLiveDOM
+            // A load-more page alone cannot establish a complete snapshot. Keep it
+            // provisional until the terminal page of the same generation arrives.
+            projectConversationSnapshotStateByAlias[projectAlias] = page.hasMore ? .partialDOM : .authoritativeLiveDOM
             if let next = page.nextCursor { projectNextCursorByAlias[projectAlias] = next }
             else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
             projectHasMoreByAlias[projectAlias] = page.hasMore
-            try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+            if !page.hasMore {
+                try? await cache.put(merged, key: "web.project.\(projectAlias).conversations")
+            }
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended else { return }
             mergeProjectSessions(page.items)
-            errors["web.project.\(projectAlias)"] = nil
+            errors["web.project.\(projectAlias)"] = page.hasMore
+                ? "Project 对话仍在分页读取；尚未完成全量同步。"
+                : nil
         } catch {
             if generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended {
                 projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
