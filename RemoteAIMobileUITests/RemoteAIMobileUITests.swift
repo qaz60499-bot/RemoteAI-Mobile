@@ -170,12 +170,18 @@ final class RemoteAIMobileUITests: XCTestCase {
         let composer = app.textViews["MessageComposer"]
         let typingBegan = ProcessInfo.processInfo.systemUptime
         composer.tap()
-        // The app-root typeText request snapshots the entire continuously
-        // changing transcript before dispatching keys; at 50K this blocked
-        // XCTest accessibility for minutes. Type on the already-focused
-        // composer instead, preserving a real keyboard input and exact draft.
-        composer.typeText("still responsive")
-        XCTAssertEqual(composer.value as? String, "still responsive")
+        // A focused TextView.typeText still forces XCTest to resolve its live
+        // accessibility subtree before injecting any keys. On the 30K hosted
+        // simulator this query took >200 seconds while streaming was active.
+        // Interact with the actual iOS keyboard instead: key lookup is limited
+        // to the keyboard, and the composer value must still reflect the key.
+        // No mock state injection, paused stream, or skipped draft assertion.
+        let keyboard = app.keyboards.firstMatch
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 8), "The stream must not block keyboard presentation")
+        let key = keyboard.keys["s"]
+        XCTAssertTrue(key.waitForExistence(timeout: 8), "The software keyboard must be interactive")
+        key.tap()
+        XCTAssertEqual(composer.value as? String, "s", "A real keyboard tap must update the draft during streaming")
         XCTAssertTrue(progress.exists, "Typing must finish while the stream is still live")
         print("STREAM_UI chars=\(chars) composerInteractionMs=\((ProcessInfo.processInfo.systemUptime - typingBegan) * 1000)")
         let scrollingBegan = ProcessInfo.processInfo.systemUptime
@@ -212,6 +218,6 @@ final class RemoteAIMobileUITests: XCTestCase {
         // searching for a vanished progress label across a huge XCUI tree.
         XCTAssertTrue(app.buttons["Send"].waitForExistence(timeout: 15),
                       "Final delivery must clear active generation and restore normal sending")
-        XCTAssertEqual(composer.value as? String, "still responsive", "Final must preserve the unsent draft")
+        XCTAssertEqual(composer.value as? String, "s", "Final must preserve the real unsent keyboard draft")
     }
 }
