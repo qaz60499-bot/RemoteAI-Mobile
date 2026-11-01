@@ -812,9 +812,23 @@ final class WorkspaceStore: ObservableObject {
             guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
             await synchronizeVisibleSession(sessionId, force: true)
             if let after = openWebTabs.first(where: { $0.tabId == tab.id && $0.sessionId == sessionId }) {
-                await inspectOpenWebTab(after)
-                let diagnosis = webTabDiagnosesById[tab.id]
-                webChatRecoveryNotesBySession[sessionId] = "已重新同步原 Chat · 网页状态：\(diagnosis?.state ?? "待验证")"
+                // This method already holds the selected tab's management lock.
+                // inspectOpenWebTab would reject that second lock acquisition
+                // and silently skip every post-reload check. Inspect under this lock.
+                webTabDiagnosesById.removeValue(forKey: tab.id)
+                await performInspectOpenWebTab(after, generation: generation,
+                    transport: activeTransport, machineId: activeMachineId)
+                guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
+                if let diagnosis = webTabDiagnosesById[tab.id] {
+                    let healthy = ["ready", "generating"].contains(diagnosis.state)
+                    if healthy && errors[sessionId] == nil {
+                        webChatRecoveryNotesBySession[sessionId] = "Chrome 已刷新；原 Chat 网页状态：\(diagnosis.state)。消息同步结果以实际历史为准。"
+                    } else {
+                        webChatRecoveryNotesBySession[sessionId] = "Chrome 已接受刷新，但原 Chat 尚未恢复（\(diagnosis.state)）；历史已保留。"
+                    }
+                } else {
+                    webChatRecoveryNotesBySession[sessionId] = "Chrome 已接受刷新，但刷新后的页面检查失败；无法确认网页恢复。"
+                }
             } else {
                 webChatRecoveryNotesBySession[sessionId] = "刷新后尚未核实原会话绑定；已保留历史。"
             }

@@ -19,6 +19,51 @@ final class WebTabEntryTests: XCTestCase {
     }
 
     @MainActor
+    func testConfirmedReloadInspectsTheSameTabAfterDispatch() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        let tabs = try await mock.listOpenWebTabs(machineId: "my-pc")
+        let tab = try XCTUnwrap(tabs.first(where: { $0.isChat && $0.sessionId != nil }))
+        let sessionId = try XCTUnwrap(tab.sessionId)
+
+        await store.recoverWebChat(sessionId, operation: "reload", expectedTabId: tab.tabId)
+
+        let reloadAttempts = await mock.actionAttemptCount("manageOpenWebTab")
+        let inspectionAttempts = await mock.actionAttemptCount("inspectOpenWebTab")
+        XCTAssertEqual(reloadAttempts, 1)
+        XCTAssertEqual(inspectionAttempts, 1,
+            "The post-reload probe must run even while recoverWebChat owns the tab lock")
+        XCTAssertEqual(store.webTabDiagnosesById[tab.id]?.tabId, tab.id)
+        XCTAssertEqual(store.webTabDiagnosesById[tab.id]?.state, "ready")
+        XCTAssertTrue(store.webChatRecoveryNotesBySession[sessionId]?.contains("ready") == true,
+            "The UI must report the newly probed state even when history recovery is incomplete")
+    }
+
+    @MainActor
+    func testReloadDoesNotClaimPageRecoveredWhenPostReloadProbeFails() async throws {
+        let mock = MockTransport(historyCount: 0)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        let tabs = try await mock.listOpenWebTabs(machineId: "my-pc")
+        let tab = try XCTUnwrap(tabs.first(where: { $0.isChat && $0.sessionId != nil }))
+        let sessionId = try XCTUnwrap(tab.sessionId)
+        await mock.failNextAction("inspectOpenWebTab")
+
+        await store.recoverWebChat(sessionId, operation: "hardReload", expectedTabId: tab.tabId)
+
+        let reloadAttempts = await mock.actionAttemptCount("manageOpenWebTab")
+        let inspectionAttempts = await mock.actionAttemptCount("inspectOpenWebTab")
+        XCTAssertEqual(reloadAttempts, 1)
+        XCTAssertEqual(inspectionAttempts, 1)
+        XCTAssertNil(store.webTabDiagnosesById[tab.id],
+            "A pre-refresh diagnosis must never be reused as proof of page recovery")
+        XCTAssertTrue(store.webChatRecoveryNotesBySession[sessionId]?.contains("检查失败") == true)
+    }
+
+    @MainActor
     func testStaleSelectedWebTabDoesNotReloadAnotherMatchingChat() async throws {
         let mock = MockTransport(historyCount: 0)
         try await mock.connect()
