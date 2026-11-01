@@ -1927,6 +1927,14 @@ enum MessageRenderingPolicy {
         let preview = String(value.prefix(inlineCharacterLimit))
         return preview + "\n\n…（长消息已折叠，点击下方“查看全文”读取完整内容）"
     }
+
+    // Give VoiceOver and UI automation a bounded proof of the canonical full
+    // message without asking accessibility to snapshot the entire long body.
+    // This is generated from the real final text, not a mock completion flag.
+    static func copyAccessibilitySummary(_ value: String) -> String {
+        let head = String(value.prefix(40)).replacingOccurrences(of: "\n", with: " ")
+        return "字符数=\(value.count)；开头=\(head)"
+    }
 }
 
 struct MessageContentSegment: Identifiable, Equatable {
@@ -2608,6 +2616,7 @@ struct MessageRow: View, Equatable {
                                 }
                                 .buttonStyle(.borderless)
                                 .accessibilityIdentifier("message-copy-\(message.id)")
+                                .accessibilityValue(isLargeDisplayText ? MessageRenderingPolicy.copyAccessibilitySummary(displayText) : "")
                                 Button {
                                     onSelectText?(MessageContentSegment.copyableText(selectionText), false)
                                 } label: {

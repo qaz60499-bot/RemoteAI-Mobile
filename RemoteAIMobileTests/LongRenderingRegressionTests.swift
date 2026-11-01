@@ -2,6 +2,16 @@ import XCTest
 @testable import RemoteAIMobile
 
 final class LongRenderingRegressionTests: XCTestCase {
+    func testLongFinalCopyAccessibilitySummaryReflectsCanonicalFullText() {
+        let marker = "STRESS_BEGIN_50000\n"
+        let actual = marker + String(repeating: "中文🙂 e\u{301} ", count: 5_000)
+        let summary = MessageRenderingPolicy.copyAccessibilitySummary(actual)
+        XCTAssertTrue(summary.contains("字符数=\(actual.count)"))
+        XCTAssertTrue(summary.contains("STRESS_BEGIN_50000"))
+        XCTAssertLessThan(summary.count, 95, "Accessibility must never enumerate the full long answer")
+        XCTAssertEqual(MessageRenderingPolicy.inlineText(actual).count > 2_000, true)
+    }
+
     func testLargeMessagePreservesEditBlockBeyondInlinePreview() {
         let prefix = String(repeating: "普通说明文字。\n", count: 2_500)
         let editBody = "@DevSpace\n\n请继续执行真实项目，并复制这一整块内容。"

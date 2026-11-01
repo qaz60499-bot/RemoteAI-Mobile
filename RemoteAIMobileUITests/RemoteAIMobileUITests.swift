@@ -198,26 +198,24 @@ final class RemoteAIMobileUITests: XCTestCase {
         latest.tap()
         print("STREAM_UI chars=\(chars) historyAndReturnInteractionMs=\((ProcessInfo.processInfo.systemUptime - scrollingBegan) * 1000)")
         let marker = "STRESS_BEGIN_\(chars)"
-        // The final message has a unique, stable text identifier. A global
-        // staticTexts.containing(label CONTAINS ...) scan can stall XCTest's
-        // accessibility snapshot for 30 seconds under a long transcript.
-        // The final is emitted only after every delta is appended by MockTransport.
-        let final = app.staticTexts["message-content-stress-final-\(chars)-0"]
-        // The UI-only fixture emits 100 characters at the configured chunk interval.
-        // Budget its complete duration plus runner/accessibility slack instead of retaining the
-        // old 40-second timeout that predates the deterministic slow fixture.
+        // After a 50K stream, a global StaticText query makes XCTest request
+        // a full accessibility hierarchy and can time out before the normal
+        // waitForExistence timeout. The final MessageRow has an exact ID-bound
+        // copy button that *cannot* exist in the transient streaming row.
+        // Its bounded accessibility value is computed from the canonical full
+        // answer; require both the actual character count and opening marker.
+        let finalCopy = app.buttons["message-copy-stress-final-\(chars)"]
         let expectedFixtureSeconds = (Double(chars) / 100.0) * (Double(fixtureChunkMilliseconds) / 1000.0)
-        XCTAssertTrue(final.waitForExistence(timeout: max(180, expectedFixtureSeconds + 90)),
-                      "The actual final message must replace the streaming row")
-        XCTAssertTrue(final.label.contains(marker), "The rendered final message must have the expected contents")
+        XCTAssertTrue(finalCopy.waitForExistence(timeout: max(180, expectedFixtureSeconds + 90)),
+                      "The actual final message and copy footer must replace the streaming row")
+        let finalSummary = try XCTUnwrap(finalCopy.value as? String)
+        XCTAssertTrue(finalSummary.contains("字符数=\(chars)"), "The real final must contain every expected character")
+        XCTAssertTrue(finalSummary.contains(marker), "The canonical final must begin with the expected marker")
+        XCTAssertTrue(finalCopy.isHittable, "The final message footer must be visible after returning to the latest reply")
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "streaming-tail-\(chars)"
         screenshot.lifetime = .keepAlways
         add(screenshot)
-
-        let finalCopy = app.buttons["message-copy-stress-final-\(chars)"]
-        XCTAssertTrue(finalCopy.waitForExistence(timeout: 10), "The final message footer must be rendered")
-        XCTAssertTrue(finalCopy.isHittable, "The final message footer must be visible after returning to the latest reply")
         // The draft remains populated: "Send correction" changes to "Send"
         // only once the chat's authoritative generation state becomes idle.
         // Check a positive, exact accessibility target rather than repeatedly
