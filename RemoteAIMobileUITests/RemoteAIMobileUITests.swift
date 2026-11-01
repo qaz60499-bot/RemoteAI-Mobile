@@ -60,7 +60,19 @@ final class RemoteAIMobileUITests: XCTestCase {
         // Fixture exists only in the ordinary Chats catalog, never in the
         // current Chrome tab inventory. Opening it must not trigger tab entry.
         let history = app.buttons["open-web-history-webconv-root-history-mock"]
-        XCTAssertTrue(history.waitForExistence(timeout: 5))
+        let list = app.collectionViews.firstMatch
+        XCTAssertTrue(list.waitForExistence(timeout: 5), "The Web ChatGPT catalog must render")
+        // Chrome tabs and Projects precede ordinary Chats in the List. iOS uses
+        // lazy CollectionView cells, so a history row below the initial viewport
+        // is not in the accessibility tree until the user scrolls to it.
+        // Exercise that real navigation path without weakening the reply check.
+        for _ in 0..<8 {
+            if history.exists && history.isHittable { break }
+            list.swipeUp()
+        }
+        XCTAssertTrue(history.waitForExistence(timeout: 5),
+            "Ordinary Web Chat must be present after scrolling past Chrome tabs and Projects")
+        XCTAssertTrue(history.isHittable, "History row must be tappable")
         history.tap()
         XCTAssertTrue(app.textViews["MessageComposer"].waitForExistence(timeout: 8),
             "A historical Web Chat should navigate without an open Chrome tab")
