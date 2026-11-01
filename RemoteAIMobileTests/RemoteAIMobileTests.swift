@@ -2093,7 +2093,7 @@ final class RemoteAIMobileTests: XCTestCase {
 
         XCTAssertEqual(store.projectConversationsByAlias["g-p-remoteai"]?.count, 65, "A changed page-2 snapshot must preserve the last fully accepted Project list")
         XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .partialDOM)
-        XCTAssertNil(store.errors["web.project.g-p-remoteai"])
+        XCTAssertNotNil(store.errors["web.project.g-p-remoteai"], "An interrupted multi-page refresh must visibly report incomplete sync while retaining the 65 verified rows")
         await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 0)
         await store.suspend()
     }
