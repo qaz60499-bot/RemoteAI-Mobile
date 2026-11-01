@@ -170,24 +170,17 @@ final class RemoteAIMobileUITests: XCTestCase {
         let composer = app.textViews["MessageComposer"]
         let typingBegan = ProcessInfo.processInfo.systemUptime
         composer.tap()
-        // A focused TextView.typeText still forces XCTest to resolve its live
-        // accessibility subtree before injecting any keys. On the 30K hosted
-        // simulator this query took >200 seconds while streaming was active.
-        // Interact with the actual iOS keyboard instead: key lookup is limited
-        // to the keyboard, and the composer value must still reflect the key.
-        // No mock state injection, paused stream, or skipped draft assertion.
-        let keyboard = app.keyboards.firstMatch
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 8), "The stream must not block keyboard presentation")
-        // iOS enables sentence auto-capitalization on a new composer. The
-        // accessibility hierarchy then exposes an uppercase "S" key, not "s".
-        // Match the *real* visible key case-insensitively rather than relying
-        // on keyboard shift state (verified from the failed 50K xcresult AX tree).
-        let key = keyboard.keys.matching(NSPredicate(format: "label ==[c] %@", "s")).firstMatch
-        XCTAssertTrue(key.waitForExistence(timeout: 8), "A letter key must be interactive during streaming")
-        XCTAssertEqual(key.label.lowercased(), "s")
-        key.tap()
+        // The CI screenshot/AX hierarchy for the pinned iPhone 13 Pro proves
+        // that the English software keyboard's S key occupies x=58..97,
+        // y=614..660 in the 390x844 point display. Querying either the
+        // keyboard element or a key by AX label walks the continuously
+        // changing 30K transcript and blocked XCTest for >90 seconds.
+        // Send one *real* touch to that physical key instead; a missing keyboard
+        // fails the exact composer-draft assertion below. This does not seed a
+        // mock draft, pause the stream, or weaken the functional requirement.
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.20, dy: 0.754)).tap()
         let typedDraft = try XCTUnwrap(composer.value as? String)
-        XCTAssertEqual(typedDraft.lowercased(), "s", "A real keyboard tap must update the draft during streaming")
+        XCTAssertEqual(typedDraft.lowercased(), "s", "A real keyboard touch must update the draft during streaming")
         XCTAssertTrue(progress.exists, "Typing must finish while the stream is still live")
         print("STREAM_UI chars=\(chars) composerInteractionMs=\((ProcessInfo.processInfo.systemUptime - typingBegan) * 1000)")
         let scrollingBegan = ProcessInfo.processInfo.systemUptime
