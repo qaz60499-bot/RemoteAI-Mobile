@@ -69,7 +69,7 @@ actor MockTransport: Transport {
     private let runtimes: [ServerRuntime]
     private let instances: [ServerInstance]
 
-    init(scenario: MockScenario = .normal, historyCount: Int = 1200, stressChars: Int = 0, stressChunkDelayMilliseconds: Int = 50) {
+    init(scenario: MockScenario = .normal, historyCount: Int = 1200, stressChars: Int = 0, stressChunkDelayMilliseconds: Int = 50, includeOrdinaryWebHistoryFixture: Bool = false) {
         self.scenario = scenario
         let eventPipe = AsyncStream<RemoteEvent>.makeStream()
         self.continuation = eventPipe.continuation
@@ -104,12 +104,17 @@ actor MockTransport: Transport {
         ]
 
         sessions = [
+            // This ordinary Web history belongs to no Project and no live Chrome
+            // tab. A single tap must open its cached user and assistant transcript.
             ServerSession(sessionId: "photo-upload", runtimeId: "runtime.web", instanceId: "photo", externalId: nil, title: "上传性能优化", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
             ServerSession(sessionId: "photo-ios", runtimeId: "runtime.web", instanceId: "photo", externalId: nil, title: "手机 APP", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
             ServerSession(sessionId: "excel-permission", runtimeId: "runtime.web", instanceId: "excel", externalId: nil, title: "权限测试", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now),
             ServerSession(sessionId: "codex6-a", runtimeId: "runtime.codex", instanceId: "codex.6", externalId: nil, title: "Session A", canonicalUrl: nil, status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now)
         ]
 
+        if includeOrdinaryWebHistoryFixture {
+            sessions.append(ServerSession(sessionId: "webconv-root-history-mock", runtimeId: "runtime.web", instanceId: "web.chatgpt", externalId: nil, title: "普通历史对话", canonicalUrl: "https://chatgpt.com/c/mock-root-history", status: "idle", metadata: [:], createdAt: now, updatedAt: now, lastVisited: now))
+        }
         var messages: [ServerMessage] = []
         if historyCount > 0 {
             for i in 1...historyCount {
@@ -127,6 +132,12 @@ actor MockTransport: Transport {
             }
         }
         history["photo-upload"] = messages
+        if includeOrdinaryWebHistoryFixture {
+            history["webconv-root-history-mock"] = [
+                ServerMessage(messageId: "root-user", sessionId: "webconv-root-history-mock", role: "user", content: "普通历史消息", externalId: nil, createdAt: now.addingTimeInterval(-30)),
+                ServerMessage(messageId: "root-assistant", sessionId: "webconv-root-history-mock", role: "assistant", content: "普通历史助手回复", externalId: nil, createdAt: now)
+            ]
+        }
         history["photo-ios"] = Array(messages.suffix(80)).map { ServerMessage(messageId: "ios-\($0.messageId)", sessionId: "photo-ios", role: $0.role, content: $0.content, externalId: nil, createdAt: $0.createdAt) }
         history["codex6-a"] = Array(messages.suffix(60)).map { ServerMessage(messageId: "codex-\($0.messageId)", sessionId: "codex6-a", role: $0.role, content: $0.content, externalId: nil, createdAt: $0.createdAt) }
     }

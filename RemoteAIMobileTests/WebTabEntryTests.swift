@@ -3,6 +3,27 @@ import XCTest
 
 final class WebTabEntryTests: XCTestCase {
     @MainActor
+    func testOrdinaryWebHistoryKeepsRouteThroughCatalogRaceWithoutOpeningChrome() async throws {
+        let mock = MockTransport(historyCount: 0, includeOrdinaryWebHistoryFixture: true)
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        await store.start()
+        let session = try XCTUnwrap(store.sessions.first(where: { $0.id == "webconv-root-history-mock" }))
+        store.prepareHistoricalWebChat(session)
+
+        // The historical row was tapped, but an incomplete listSessions refresh
+        // evicted it before ChatView's asynchronous first read could start.
+        store.sessions.removeAll { $0.id == session.id }
+        await store.loadSession(session.id)
+        let messages = store.messagesBySession[session.id] ?? []
+        XCTAssertEqual(messages.map(\.text), ["普通历史消息", "普通历史助手回复"])
+        let tabEntryAttempts = await mock.actionAttemptCount("manageOpenWebTab")
+        let reopenAttempts = await mock.actionAttemptCount("reopenVerifiedWebConversation")
+        XCTAssertEqual(tabEntryAttempts, 0)
+        XCTAssertEqual(reopenAttempts, 0)
+        await store.suspend()
+    }
+
+    @MainActor
     func testConfirmedWebTabRecoveryUsesExactTabAndDisruptiveConsent() async throws {
         let mock = MockTransport(historyCount: 0)
         try await mock.connect()

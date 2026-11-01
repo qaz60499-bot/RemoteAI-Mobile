@@ -50,6 +50,24 @@ final class RemoteAIMobileUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Project smoke"].waitForExistence(timeout: 10))
     }
 
+    func testOpenOrdinaryWebHistoryWithoutChromeTabAndReadAssistantReply() throws {
+        let app = makeMockApp()
+        app.launch()
+        app.staticTexts["Web"].tap()
+        XCTAssertTrue(app.staticTexts["ChatGPT"].waitForExistence(timeout: 5))
+        app.staticTexts["ChatGPT"].tap()
+
+        // Fixture exists only in the ordinary Chats catalog, never in the
+        // current Chrome tab inventory. Opening it must not trigger tab entry.
+        let history = app.buttons["open-web-history-webconv-root-history-mock"]
+        XCTAssertTrue(history.waitForExistence(timeout: 5))
+        history.tap()
+        XCTAssertTrue(app.textViews["MessageComposer"].waitForExistence(timeout: 8),
+            "A historical Web Chat should navigate without an open Chrome tab")
+        XCTAssertTrue(app.staticTexts["普通历史助手回复"].waitForExistence(timeout: 8),
+            "The cached historical assistant reply should appear on first open")
+    }
+
     func testOpenCachedWebConversation() throws {
         let app = makeMockApp()
         app.launch()

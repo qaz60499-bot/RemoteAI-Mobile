@@ -304,6 +304,10 @@ struct InstanceView: View {
     @State private var enteredWebTabProject: WebProjectDescriptor?
     @State private var openEnteredWebTabSession = false
     @State private var openEnteredWebTabProject = false
+    // Preserve the tapped historical session while its live catalog refreshes or
+    // reorders. Unlike Chrome tab entry, this navigation never requires an open tab.
+    @State private var selectedHistoricalWebSession: SessionDescriptor?
+    @State private var openHistoricalWebSession = false
     @State private var enteringWebTabId: Int?
     @State private var deleteCandidate: SessionDescriptor?
     @State private var showingDeleteConfirmation = false
@@ -584,7 +588,27 @@ struct InstanceView: View {
                     }
                     .disabled(creatingWebChat || store.machine.state != .online) } else { Button { newSession = true } label: { Label("新建普通 Antigravity 对话", systemImage: "plus.circle.fill") } }
                     ForEach(store.sessions.filter { $0.instanceId == instance.id && $0.projectAlias == nil }.sorted { $0.orderingDate > $1.orderingDate }) { session in
-                        NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) { SessionRow(session: session) }
+                        Group {
+                            if isChatGPTWeb {
+                                Button {
+                                    store.prepareHistoricalWebChat(session)
+                                    selectedHistoricalWebSession = session
+                                    openHistoricalWebSession = true
+                                } label: {
+                                    HStack {
+                                        SessionRow(session: session)
+                                        Image(systemName: "chevron.right").font(.caption2).foregroundColor(.secondary)
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("open-web-history-\(session.id)")
+                            } else {
+                                NavigationLink(destination: ChatView(runtime: runtime, instance: instance, session: session)) {
+                                    SessionRow(session: session)
+                                }
+                            }
+                        }
                             .swipeActions(edge: .leading, allowsFullSwipe: false) {
                                 if isChatGPTWeb {
                                     Button("重开网页") {
@@ -673,6 +697,13 @@ struct InstanceView: View {
                     NavigationLink(
                         destination: ChatView(runtime: runtime, instance: instance, session: createdWebSession),
                         isActive: $openCreatedWebSession
+                    ) { EmptyView() }
+                    .hidden()
+                }
+                if let selectedHistoricalWebSession {
+                    NavigationLink(
+                        destination: ChatView(runtime: runtime, instance: instance, session: selectedHistoricalWebSession),
+                        isActive: $openHistoricalWebSession
                     ) { EmptyView() }
                     .hidden()
                 }

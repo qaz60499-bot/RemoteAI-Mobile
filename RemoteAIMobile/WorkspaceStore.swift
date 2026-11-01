@@ -335,7 +335,7 @@ final class WorkspaceStore: ObservableObject {
         let stressChars = Int(process.environment["REMOTEAI_UI_STRESS_CHARS"] ?? "") ?? 0
         let stressChunkDelayMilliseconds = Int(process.environment["REMOTEAI_UI_STRESS_CHUNK_MS"] ?? "") ?? 50
         let transport: Transport = useMock
-            ? MockTransport(stressChars: stressChars, stressChunkDelayMilliseconds: stressChunkDelayMilliseconds)
+            ? MockTransport(stressChars: stressChars, stressChunkDelayMilliseconds: stressChunkDelayMilliseconds, includeOrdinaryWebHistoryFixture: true)
             : CloudflareTransport(config: config)
         let store = WorkspaceStore(transport: transport, cache: cache)
         store.machine = MachineMetadata(id: useMock ? "my-pc" : config.machineId, name: "My PC", state: .connecting)
@@ -3202,6 +3202,16 @@ final class WorkspaceStore: ObservableObject {
               let instance = instances.first(where: { $0.id == session.instanceId }),
               let runtime = runtimes.first(where: { $0.id == instance.runtimeId }) else { return nil }
         return (runtime, instance)
+    }
+
+    // Ordinary Web Chats are durable history entries, not current Chrome tabs.
+    // Preserve their exact runtime route when a row is tapped so a concurrent
+    // catalog refresh cannot strand ChatView with an empty cache and no route.
+    // This operation is local-only: no browser navigation, Send, or tab creation.
+    func prepareHistoricalWebChat(_ session: SessionDescriptor) {
+        guard session.instanceId == "web.chatgpt",
+              instances.contains(where: { $0.id == session.instanceId && $0.runtimeId == "runtime.web" }) else { return }
+        sessionRouteHints[session.id] = (machine.id, "runtime.web", session.instanceId)
     }
 
     private func routeForSession(_ sessionId: String) -> (runtimeId: String, instanceId: String)? {
