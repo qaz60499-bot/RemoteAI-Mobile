@@ -2745,26 +2745,29 @@ final class WorkspaceStore: ObservableObject {
                 sessionId: sessionId
             )
             guard machine.state == .online, !isSuspended else { return nil }
-            if route.runtimeId == "runtime.web", snapshot.canonicalUrl == nil {
-                // Windows Agent v146 omitted the canonicalUrl field entirely from
-                // getSessionStatus. Absence of protocol evidence is not proof that
-                // this newly created Chat changed identity or was deleted. Do not
-                // invent a verified identity or overwrite any transcript; the next
-                // full-status response from a compatible Agent can verify it.
-                if errors[sessionId] == "ChatGPT 会话身份暂未验证；已保留当前消息、草稿和会话绑定。" {
-                    errors.removeValue(forKey: sessionId)
-                }
-                DiagnosticsLog.shared.record("web_status_identity_field_missing",
-                    fields: ["session": sessionId], level: "WARN")
-                return nil
-            }
-            if route.runtimeId == "runtime.web", !isWebSessionIdentityVerified(snapshot, sessionId: sessionId) {
-                errors[sessionId] = "ChatGPT 会话身份暂未验证；已保留当前消息、草稿和会话绑定。"
-                DiagnosticsLog.shared.record("session_identity_unverified", fields: ["session": sessionId], level: "WARN")
-                return nil
-            }
             if route.runtimeId == "runtime.web" {
-                await backfillVerifiedWebSessionIdentity(snapshot, sessionId: sessionId)
+                let hasIdentityEvidence = snapshot.canonicalUrl != nil
+                    || snapshot.projectId != nil || snapshot.projectAlias != nil
+                if hasIdentityEvidence {
+                    // Verify every supplied identity field before changing the
+                    // binding; a partial or mismatched identity cannot authorize
+                    // another Chat's status or transcript.
+                    guard isWebSessionIdentityVerified(snapshot, sessionId: sessionId) else {
+                        errors[sessionId] = "ChatGPT 会话身份暂未验证；已保留当前消息、草稿和会话绑定。"
+                        DiagnosticsLog.shared.record("session_identity_unverified",
+                            fields: ["session": sessionId], level: "WARN")
+                        return nil
+                    }
+                    await backfillVerifiedWebSessionIdentity(snapshot, sessionId: sessionId)
+                } else {
+                    // Windows Agent v146 omitted all identity fields. Still consume
+                    // its exact session-scoped busy/idle, terminal and background
+                    // status, otherwise existing refresh/Stop recovery regresses.
+                    // Never promote or rebind identity on this legacy evidence.
+                    guard snapshot.sessionId == sessionId else { return nil }
+                    DiagnosticsLog.shared.record("web_status_identity_field_missing",
+                        fields: ["session": sessionId], level: "WARN")
+                }
             }
             if errors[sessionId] == "ChatGPT 会话身份暂未验证；已保留当前消息、草稿和会话绑定。" {
                 errors.removeValue(forKey: sessionId)
