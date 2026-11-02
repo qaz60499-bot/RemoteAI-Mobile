@@ -217,6 +217,7 @@ jobs:
         if: inputs.gate != 'streaming'
         run: |
           set -euo pipefail
+          python3 scripts/test_sample_streaming_performance.py
           python3 scripts/sample_streaming_performance.py --udid '${{ steps.simulator.outputs.udid }}' | tee build/stream-performance.log
 
       - name: Build unsigned iphoneos arm64 app
