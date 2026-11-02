@@ -1265,6 +1265,9 @@ struct ChatView: View {
         store.sessions.first(where: { $0.id == session.id }) ?? session
     }
     private var currentSessionState: SessionState { currentSession.state }
+    private var currentWebSessionUnavailable: Bool {
+        runtime.kind == .web && store.isWebSessionUnavailable(currentSession)
+    }
     private var currentWebProviderIssue: RemoteProviderSurfaceIssue? {
         runtime.kind == .web ? store.webProviderIssuesBySession[session.id] : nil
     }
@@ -1306,6 +1309,12 @@ struct ChatView: View {
             }
             if let syncError = store.errors["sync"] {
                 StatusBanner(text: "同步异常：\(syncError)", systemImage: "arrow.triangle.2.circlepath")
+            }
+            if currentWebSessionUnavailable {
+                StatusBanner(
+                    text: "此 Chat 已删除、归档或所属 Project 已删除。手机仍保留本地消息和草稿，远端操作已停用。",
+                    systemImage: "archivebox"
+                )
             }
             if let notice = relevantSystemNotice {
                 StatusBanner(
@@ -1353,7 +1362,9 @@ struct ChatView: View {
                                 let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
                                 // Definite failures restore the composer and use a new operation.
                                 // Only unknown delivery is replayed with the original command ID.
-                                let retryable = commandState == .unknown && UUID(uuidString: message.id) != nil
+                                let retryable = !currentWebSessionUnavailable
+                                    && commandState == .unknown
+                                    && UUID(uuidString: message.id) != nil
                                 if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
                                     AssistantStreamRow(stream: stream, message: message, followTail: {
                                         // While the composer owns keyboard focus, each incoming
@@ -1479,7 +1490,7 @@ struct ChatView: View {
                         Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) }
                     }
                     .font(.caption)
-                    .disabled(store.stopRequestsPending.contains(session.id))
+                    .disabled(currentWebSessionUnavailable || store.stopRequestsPending.contains(session.id))
                 }
             }
             ToolbarItem(placement: .navigationBarTrailing) {
@@ -1494,7 +1505,7 @@ struct ChatView: View {
                         Image(systemName: "arrow.clockwise.circle")
                     }
                     .accessibilityLabel("当前 Chat 恢复操作")
-                    .disabled(store.machine.state != .online)
+                    .disabled(store.machine.state != .online || currentWebSessionUnavailable)
                 }
             }
         }
@@ -1620,7 +1631,7 @@ struct ChatView: View {
                     draft: draft,
                     focused: $focused,
                     attachments: $pendingAttachments,
-                    enabled: store.machine.state == .online && !sending,
+                    enabled: store.machine.state == .online && !sending && !currentWebSessionUnavailable,
                     isGenerating: isGenerating,
                     isRecording: speechInput.isRecording,
                     addPhoto: { showPhotoPicker = true },
@@ -1730,7 +1741,13 @@ struct ChatView: View {
                     selectedReasoningEffort = effort
                 }
             }
-            await store.loadSession(session.id)
+            await store.loadSession(session.id, localOnly: runtime.kind == .web)
+            if runtime.kind == .web && !currentWebSessionUnavailable {
+                // A newly opened/switching Chat gets one exact status + recent-history
+                // reconciliation before it can be treated as current. The existing
+                // push and bounded visible-session loop remain the ongoing path.
+                await store.synchronizeVisibleSession(session.id, force: true)
+            }
             if let mock = store.transport as? MockTransport {
                 await mock.runStressIfRequested(sessionId: session.id)
             }

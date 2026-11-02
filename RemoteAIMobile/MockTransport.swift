@@ -5,7 +5,7 @@ enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
     case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, webSendLegacyChromeChannelClosedAfterCommit, webSendLegacyUnrelatedSelectorFailure, alreadyExecutedThenSuccess, deltaOnlySend
-    case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, staleThenFreshProjectConversations, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
+    case duplicateEvent, sequenceGap, partialWebCatalog, emptyPartialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, staleThenFreshProjectConversations, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
     case malformedCreateReplyAfterCommit, stopUnconfirmed, stopPageIdleButAgentUnconfirmed, stopConfirmedWithoutEvent
     case malformedSendReplyAfterCommit
     case cancelledSendReplyAfterCommit
@@ -34,6 +34,8 @@ actor MockTransport: Transport {
     private var sessionStatusOverrides: [String: String] = [:]
     private var sessionStatusActivityOverrides: [String: Date] = [:]
     private var sessionStatusRevisionOverrides: [String: Date] = [:]
+    private var sessionStatusIdentityOverrides: [String: (canonicalUrl: String?, projectId: String?, projectAlias: String?)] = [:]
+    private var recentMessageSessionIdOverrides: [String: String] = [:]
     private var sessionsWithoutStatusRevision = Set<String>()
     private var sessionBackgroundTaskStatusOverrides: [String: JSONValue] = [:]
     private var providerSurfaceStatusOverrides: [String: [String: JSONValue]] = [:]
@@ -188,6 +190,12 @@ actor MockTransport: Transport {
             sessionStatusRevisionOverrides.removeValue(forKey: sessionId)
         }
     }
+    func setSessionStatusIdentityOverride(_ sessionId: String, canonicalUrl: String?, projectId: String?, projectAlias: String?) {
+        sessionStatusIdentityOverrides[sessionId] = (canonicalUrl, projectId, projectAlias)
+    }
+    func setRecentMessageSessionIdOverride(requestedSessionId: String, responseSessionId: String?) {
+        recentMessageSessionIdOverrides[requestedSessionId] = responseSessionId
+    }
     func omitSessionStatusRevision(_ sessionId: String) { sessionsWithoutStatusRevision.insert(sessionId) }
     func setBackgroundTaskStatus(_ sessionId: String, snapshot: BackgroundTaskStatusSnapshot?) {
         guard let snapshot, let value = try? JSONValue.encode(snapshot) else {
@@ -262,6 +270,7 @@ actor MockTransport: Transport {
         )
         webProjectConversations[alias] = rows
     }
+    func seedHistory(sessionId: String, messages: [ServerMessage]) { history[sessionId] = messages }
     func seedProjectConversations(alias: String, count: Int) {
         let now = Date()
         webProjectConversations[alias] = (0..<max(0, count)).map { index in
@@ -276,6 +285,11 @@ actor MockTransport: Transport {
                 updatedAt: now.addingTimeInterval(Double(-index))
             )
         }
+    }
+    func removeWebProject(alias: String) { webProjects.removeAll { $0.projectAlias == alias } }
+    func emitSessionDeleted(sessionId: String, runtimeId: String = "runtime.web", instanceId: String = "web.chatgpt") async {
+        sessions.removeAll { $0.sessionId == sessionId }
+        await emit(runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, type: "SESSION_DELETED", payload: [:])
     }
     func prependProjectConversation(alias: String, conversationAlias: String, title: String) {
         let now = Date()
@@ -553,7 +567,21 @@ actor MockTransport: Transport {
             }
         case "loadRecentMessages":
             let limit = Int(command.payload["limit"]?.intValue ?? 40)
-            response = try success(Array(history[command.sessionId ?? "", default: []].suffix(max(1, min(limit, 100)))))
+            let requestedSessionId = command.sessionId ?? ""
+            let rows = Array(history[requestedSessionId, default: []].suffix(max(1, min(limit, 100))))
+            let responseSessionId = recentMessageSessionIdOverrides[requestedSessionId]
+            let responseRows = rows.map { row in
+                ServerMessage(
+                    messageId: row.messageId,
+                    sessionId: responseSessionId ?? row.sessionId,
+                    role: row.role,
+                    content: row.content,
+                    externalId: row.externalId,
+                    attachments: row.attachments,
+                    createdAt: row.createdAt
+                )
+            }
+            response = try success(responseRows)
         case "loadMessagesBefore":
             let limit = Int(command.payload["limit"]?.intValue ?? 40)
             let before = command.payload["before"]?.objectValue
@@ -570,6 +598,8 @@ actor MockTransport: Transport {
                 response = try success(WebProjectListResponse(items: webProjects, observedAt: Date(), source: "windows-verified-cache", stale: true, state: .staleCache, snapshotId: "mock-projects-verified-cache-\(webProjects.count)"))
             } else if scenario == .partialWebCatalog {
                 response = try success(WebProjectListResponse(items: Array(webProjects.prefix(1)), observedAt: Date(), source: "browser-dom", stale: true, state: .partialDOM, snapshotId: "mock-projects-partial-1"))
+            } else if scenario == .emptyPartialWebCatalog {
+                response = try success(WebProjectListResponse(items: [], observedAt: Date(), source: "browser-dom", stale: true, state: .partialDOM, snapshotId: "mock-projects-partial-empty"))
             } else if scenario == .staleWebCatalog {
                 response = try success(WebProjectListResponse(items: webProjects, observedAt: Date(), source: "windows-last-known-good", stale: true, state: .staleCache, snapshotId: "mock-projects-stale-\(webProjects.count)"))
             } else if scenario == .unclassifiedWebCatalog {
@@ -774,9 +804,14 @@ actor MockTransport: Transport {
         case "getSessionStatus":
             let sessionId = command.sessionId ?? ""
             let stored = sessions.first(where: { $0.sessionId == sessionId })
+            let projectConversation = webProjectConversations.values.lazy.flatMap { $0 }.first { $0.localConversationId == sessionId }
             let last = history[sessionId, default: []].last
             let active = last?.role == "user"
             var metadata = stored?.metadata ?? [:]
+            if let projectConversation {
+                metadata["projectId"] = projectConversation.projectId.map(JSONValue.string) ?? .null
+                metadata["projectAlias"] = projectConversation.projectAlias.map(JSONValue.string) ?? .null
+            }
             if let statusActivityAt = sessionStatusActivityOverrides[sessionId] {
                 metadata["lastActivityAt"] = .string(RemoteAIDate.string(statusActivityAt))
             } else if active {
@@ -797,6 +832,17 @@ actor MockTransport: Transport {
                 "browserConnected": .bool(true),
                 "metadata": .object(metadata)
             ]
+            let identityOverride = sessionStatusIdentityOverrides[sessionId]
+            if let canonicalUrl = identityOverride?.canonicalUrl ?? stored?.canonicalUrl ?? projectConversation?.canonicalUrl {
+                statusResponse["canonicalUrl"] = .string(canonicalUrl)
+            }
+            if let identityOverride {
+                if let projectId = identityOverride.projectId { metadata["projectId"] = .string(projectId) }
+                else { metadata.removeValue(forKey: "projectId") }
+                if let projectAlias = identityOverride.projectAlias { metadata["projectAlias"] = .string(projectAlias) }
+                else { metadata.removeValue(forKey: "projectAlias") }
+                statusResponse["metadata"] = .object(metadata)
+            }
             if !sessionsWithoutStatusRevision.contains(sessionId),
                let updatedAt = sessionStatusRevisionOverrides[sessionId] ?? stored?.updatedAt {
                 statusResponse["updatedAt"] = .string(RemoteAIDate.string(updatedAt))

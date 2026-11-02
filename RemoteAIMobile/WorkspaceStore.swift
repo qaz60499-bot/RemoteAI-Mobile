@@ -65,6 +65,7 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var codexSessionsMayHaveMore: [String: Bool] = [:]
     @Published var messagesBySession: [String: [ChatMessage]] = [:]
     @Published var webProjects: [WebProjectDescriptor] = []
+    @Published private(set) var deletedWebSessionIds = Set<String>()
     @Published var openWebTabs: [OpenWebTab] = []
     @Published var hasLoadedOpenWebTabs = false
     @Published private(set) var openWebTabsInventoryUnverified = true
@@ -225,6 +226,7 @@ final class WorkspaceStore: ObservableObject {
     private static let maxHistoricalDeltaReplayEvents: Int64 = 2_000
     private var webProjectsRevision: UInt64 = 0
     private var webProjectsSnapshotId: String?
+    private var webProjectDirectoryAuthoritative = false
     private var projectConversationRevisions: [String: UInt64] = [:]
     private var projectConversationSnapshotIds: [String: String] = [:]
     private var sessionRevisions: [String: UInt64] = [:]
@@ -250,9 +252,189 @@ final class WorkspaceStore: ObservableObject {
             || (remoteStatusIsTerminal && remoteRevision != nil && remoteRevision != lastSuccessfulRemoteRevision)
     }
 
+    func isWebSessionUnavailable(_ session: SessionDescriptor) -> Bool {
+        guard session.instanceId == "web.chatgpt" else { return false }
+        if deletedWebSessionIds.contains(session.id) { return true }
+        guard webProjectDirectoryAuthoritative,
+              let projectAlias = session.projectAlias ?? webProjectAlias(from: session.canonicalUrl) else { return false }
+        return !webProjects.contains { sameWebProjectAlias($0.projectAlias, projectAlias) }
+    }
+
+    private func isWebSessionUnavailable(_ sessionId: String) -> Bool {
+        if deletedWebSessionIds.contains(sessionId) { return true }
+        guard let session = sessions.first(where: { $0.id == sessionId }) else { return false }
+        return isWebSessionUnavailable(session)
+    }
+
+    private func isWebProjectKnownAbsent(_ projectAlias: String) -> Bool {
+        webProjectDirectoryAuthoritative
+            && !webProjects.contains { sameWebProjectAlias($0.projectAlias, projectAlias) }
+    }
+
+    private func persistDeletedWebSessionIds() async {
+        try? await cache.put(
+            WebCatalogDeletionState(deletedSessionIds: deletedWebSessionIds),
+            key: Self.deletedWebSessionsCacheKey
+        )
+    }
+
+    private func removeWebSessionFromProjectProjections(_ sessionId: String) async {
+        let aliases = Set(projectConversationsByAlias.keys).union(webProjects.map(\.projectAlias))
+        for alias in aliases {
+            let cached: [WebConversationDescriptor]? = try? await cache.get(
+                [WebConversationDescriptor].self,
+                key: "web.project.\(alias).conversations"
+            )
+            let current = projectConversationsByAlias[alias] ?? cached ?? []
+            let filtered = current.filter { $0.localConversationId != sessionId }
+            guard filtered.count != current.count else { continue }
+            projectConversationsByAlias[alias] = filtered
+            try? await cache.put(filtered, key: "web.project.\(alias).conversations")
+        }
+    }
+
+    private func applyAuthoritativeWebSessionDeletion(_ sessionId: String) async {
+        var deleted = deletedWebSessionIds
+        deleted.insert(sessionId)
+        deletedWebSessionIds = deleted
+        sessions.removeAll { $0.id == sessionId }
+        sessionRouteHints.removeValue(forKey: sessionId)
+        visibleSessionSyncAt.removeValue(forKey: sessionId)
+        visibleSessionHistorySyncAt.removeValue(forKey: sessionId)
+        visibleSessionHistoryRemoteRevision.removeValue(forKey: sessionId)
+        await removeWebSessionFromProjectProjections(sessionId)
+        // Message rows, drafts, and pending command IDs are intentionally retained.
+        errors[sessionId] = "此 Chat 已在 ChatGPT 中删除或归档。手机仍保留本地消息和草稿。"
+        await persistDeletedWebSessionIds()
+        await persistMetadata()
+    }
+
+    private func applyAuthoritativeWebProjectDeletions(_ removedProjects: [WebProjectDescriptor]) async {
+        guard !removedProjects.isEmpty else { return }
+        var childSessionIds = Set<String>()
+        for project in removedProjects {
+            childSessionIds.formUnion(projectConversationsByAlias[project.projectAlias, default: []].map(\.localConversationId))
+            let cachedRows: [WebConversationDescriptor] = (try? await cache.get(
+                [WebConversationDescriptor].self,
+                key: "web.project.\(project.projectAlias).conversations"
+            )) ?? []
+            childSessionIds.formUnion(cachedRows.map(\.localConversationId))
+            childSessionIds.formUnion(sessions.filter {
+                let alias = $0.projectAlias ?? webProjectAlias(from: $0.canonicalUrl)
+                return alias.map { sameWebProjectAlias($0, project.projectAlias) } == true
+            }.map(\.id))
+            projectConversationsByAlias.removeValue(forKey: project.projectAlias)
+            projectNextCursorByAlias.removeValue(forKey: project.projectAlias)
+            projectHasMoreByAlias.removeValue(forKey: project.projectAlias)
+            projectConversationSnapshotIds.removeValue(forKey: project.projectAlias)
+            projectConversationSnapshotStateByAlias.removeValue(forKey: project.projectAlias)
+            projectConversationRevisions[project.projectAlias, default: 0] &+= 1
+            try? await cache.remove(key: "web.project.\(project.projectAlias).conversations")
+        }
+        if !childSessionIds.isEmpty {
+            var deleted = deletedWebSessionIds
+            deleted.formUnion(childSessionIds)
+            deletedWebSessionIds = deleted
+            sessions.removeAll { childSessionIds.contains($0.id) }
+            for sessionId in childSessionIds {
+                sessionRouteHints.removeValue(forKey: sessionId)
+                visibleSessionSyncAt.removeValue(forKey: sessionId)
+                visibleSessionHistorySyncAt.removeValue(forKey: sessionId)
+                visibleSessionHistoryRemoteRevision.removeValue(forKey: sessionId)
+                errors[sessionId] = "所属的 ChatGPT Project 已删除或归档。手机仍保留本地消息和草稿。"
+            }
+            await persistDeletedWebSessionIds()
+            await persistMetadata()
+        }
+    }
+
+    private func clearReappearedWebSessionDeletions(_ items: [WebConversationDescriptor]) async {
+        let reappeared = Set(items.map(\.localConversationId)).intersection(deletedWebSessionIds)
+        guard !reappeared.isEmpty else { return }
+        var deleted = deletedWebSessionIds
+        deleted.subtract(reappeared)
+        deletedWebSessionIds = deleted
+        for sessionId in reappeared { errors.removeValue(forKey: sessionId) }
+        await persistDeletedWebSessionIds()
+    }
+
+    private func isWebSessionIdentityVerified(_ snapshot: RemoteSessionStatusSnapshot, sessionId: String) -> Bool {
+        guard snapshot.sessionId == sessionId else { return false }
+        guard let expected = sessions.first(where: { $0.id == sessionId }) else { return false }
+        guard expected.instanceId == "web.chatgpt" else { return true }
+        if let expectedProjectId = expected.projectId, expectedProjectId != snapshot.projectId { return false }
+
+        let expectedURL = normalizedWebCanonicalURL(expected.canonicalUrl)
+        let observedURL = normalizedWebCanonicalURL(snapshot.canonicalUrl)
+        guard let expectedURL, let observedURL,
+              webCanonicalOrigin(expected.canonicalUrl) == webCanonicalOrigin(snapshot.canonicalUrl) else { return false }
+        let expectedConversation = webConversationAlias(from: expected.canonicalUrl)
+        let observedConversation = webConversationAlias(from: snapshot.canonicalUrl)
+        if expectedConversation != nil || observedConversation != nil {
+            guard expectedConversation != nil, expectedConversation == observedConversation else { return false }
+        } else if expectedURL != observedURL {
+            return false
+        }
+
+        let expectedProjectAlias = expected.projectAlias ?? webProjectAlias(from: expected.canonicalUrl)
+        let observedProjectAlias = snapshot.projectAlias ?? webProjectAlias(from: snapshot.canonicalUrl)
+        guard (expectedProjectAlias == nil) == (observedProjectAlias == nil) else { return false }
+        if let expectedProjectAlias {
+            guard let observedProjectAlias,
+                  sameWebProjectAlias(expectedProjectAlias, observedProjectAlias) else { return false }
+        } else if snapshot.projectId != nil, observedProjectAlias == nil {
+            // A legacy row with unknown Project identity can be enriched only when
+            // exact canonical URL evidence and stable Project metadata agree.
+            guard expectedURL == observedURL, observedProjectAlias != nil else { return false }
+        } else if snapshot.projectAlias != nil, observedProjectAlias == nil {
+            return false
+        }
+        return true
+    }
+
+    private func normalizedWebCanonicalURL(_ raw: String?) -> String? {
+        guard let raw, let components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased() else { return nil }
+        var path = components.percentEncodedPath
+        while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+        return "\(scheme)://\(host)\(path)"
+    }
+
+    private func webCanonicalOrigin(_ raw: String?) -> String? {
+        guard let raw, let components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased() else { return nil }
+        return "\(scheme)://\(host)"
+    }
+
+    private func backfillVerifiedWebSessionIdentity(_ snapshot: RemoteSessionStatusSnapshot, sessionId: String) async {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionId }),
+              sessions[index].instanceId == "web.chatgpt" else { return }
+        var updated = sessions[index]
+        if updated.projectAlias == nil {
+            updated.projectAlias = snapshot.projectAlias ?? webProjectAlias(from: snapshot.canonicalUrl)
+        }
+        if updated.projectId == nil { updated.projectId = snapshot.projectId }
+        if updated.canonicalUrl == nil { updated.canonicalUrl = snapshot.canonicalUrl }
+        guard updated != sessions[index] else { return }
+        sessions[index] = updated
+        await persistMetadata()
+    }
+
+    private func webProjectAlias(from canonicalURL: String?) -> String? {
+        guard let canonicalURL, let url = URL(string: canonicalURL) else { return nil }
+        let parts = url.path.split(separator: "/").map(String.init)
+        guard parts.count >= 2, parts[0] == "g", parts[1].hasPrefix("g-") else { return nil }
+        return parts[1]
+    }
+
     private static func pendingCommandPrefix(machineId: String) -> String {
         "pending.command.\(machineId)."
     }
+
+    private static let deletedWebSessionsCacheKey = "web.catalog.deleted-sessions"
+    private static let webProjectDirectoryAuthorityCacheKey = "web.projects.authoritative"
 
     private static func pendingCommandKey(_ id: UUID, machineId: String) -> String {
         pendingCommandPrefix(machineId: machineId) + id.uuidString.lowercased()
@@ -377,6 +559,7 @@ final class WorkspaceStore: ObservableObject {
             sessions.removeAll()
             messagesBySession.removeAll()
             webProjects.removeAll()
+            deletedWebSessionIds.removeAll()
             projectConversationsByAlias.removeAll()
             projectNextCursorByAlias.removeAll()
             projectHasMoreByAlias.removeAll()
@@ -588,6 +771,9 @@ final class WorkspaceStore: ObservableObject {
             webTabDiagnosesById[tab.id] = entered.diagnosis
             errors["web.tabs"] = nil
             if let conversation = entered.conversation {
+                // This is one of the few live paths that returns a fully checked
+                // provider identity for a root Chat without a Project sidebar snapshot.
+                await clearReappearedWebSessionDeletions([conversation])
                 // Enter returns a verified existing provider identity, not a
                 // new chat. Keep the live Agent status when already available.
                 let session = sessions.first(where: { $0.id == conversation.localConversationId })
@@ -926,7 +1112,7 @@ final class WorkspaceStore: ObservableObject {
             }
         }
         guard machine.state == .online else {
-            hasLoadedWebProjects = !webProjects.isEmpty
+            hasLoadedWebProjects = webProjectDirectoryAuthoritative || !webProjects.isEmpty
             webProjectsRefreshNeedsConnectivityRetry = true
             DiagnosticsLog.shared.record("projects_refresh_skipped_offline", fields: ["cachedCount": String(webProjects.count)], level: "WARN")
             return
@@ -937,11 +1123,11 @@ final class WorkspaceStore: ObservableObject {
             guard response.isAuthoritativeLiveDOM else {
                 if response.state == .staleCache,
                    response.source == "windows-verified-cache" {
-                    if webProjects.isEmpty, !response.items.isEmpty {
+                    if webProjects.isEmpty, !response.items.isEmpty, !webProjectDirectoryAuthoritative {
                         webProjects = response.items
                     }
                     webProjectsSnapshotState = .staleCache
-                    hasLoadedWebProjects = !webProjects.isEmpty
+                    hasLoadedWebProjects = webProjectDirectoryAuthoritative || !webProjects.isEmpty
                     errors["web.projects"] = nil
                     DiagnosticsLog.shared.record("projects_refresh_cache_fast", fields: ["count": String(response.items.count), "durationMs": Self.durationMilliseconds(since: refreshStartedAt)])
                     if !force {
@@ -954,6 +1140,7 @@ final class WorkspaceStore: ObservableObject {
                 }
                 if response.state == .staleCache,
                    webProjects.isEmpty,
+                   !webProjectDirectoryAuthoritative,
                    !response.items.isEmpty {
                     // A fresh install may have no iOS-side cache even though Windows has
                     // a previously verified live-DOM Project snapshot. Bootstrap from
@@ -967,27 +1154,37 @@ final class WorkspaceStore: ObservableObject {
                     return
                 }
                 webProjectsSnapshotState = response.state ?? .providerUnavailable
-                hasLoadedWebProjects = !webProjects.isEmpty
+                hasLoadedWebProjects = webProjectDirectoryAuthoritative || !webProjects.isEmpty
                 errors["web.projects"] = "ChatGPT Projects are temporarily incomplete; keeping the last verified Project list."
                 DiagnosticsLog.shared.record("projects_refresh_incomplete", fields: ["cachedCount": String(webProjects.count), "state": String(describing: response.state)], level: "WARN")
                 return
             }
             // Preserve the authoritative DOM order from Windows. Sorting by cached
             // timestamps can make a complete Project list look random or incomplete.
+            let previouslyCompleteDirectory = webProjectDirectoryAuthoritative
+            if previouslyCompleteDirectory {
+                let removedProjects = webProjects.filter { old in
+                    !response.items.contains { sameWebProjectAlias($0.projectAlias, old.projectAlias) }
+                }
+                await applyAuthoritativeWebProjectDeletions(removedProjects)
+                guard generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended else { return }
+            }
             webProjects = response.items
             webProjectsSnapshotState = .authoritativeLiveDOM
             webProjectsSnapshotId = response.snapshotId
+            webProjectDirectoryAuthoritative = true
             webProjectsRefreshNeedsConnectivityRetry = false
             lastWebProjectsRefreshAt = Date()
             hasLoadedWebProjects = true
             try? await cache.put(webProjects, key: "web.projects")
+            try? await cache.put(true, key: Self.webProjectDirectoryAuthorityCacheKey)
             guard generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended else { return }
             errors["web.projects"] = nil
             DiagnosticsLog.shared.record("projects_refresh_ok", fields: ["count": String(webProjects.count), "durationMs": Self.durationMilliseconds(since: refreshStartedAt)])
         } catch {
             if generation == lifecycleGeneration, revision == webProjectsRevision, !isSuspended {
                 webProjectsSnapshotState = .providerUnavailable
-                hasLoadedWebProjects = !webProjects.isEmpty
+                hasLoadedWebProjects = webProjectDirectoryAuthoritative || !webProjects.isEmpty
                 webProjectsRefreshNeedsConnectivityRetry = Self.shouldRetryWebProjectsAfterConnectivityRecovery(error)
                 errors["web.projects"] = error.localizedDescription
                 DiagnosticsLog.shared.record("projects_refresh_failed", fields: Self.diagnosticFields(for: error, adding: ["durationMs": Self.durationMilliseconds(since: refreshStartedAt)]), level: "ERROR")
@@ -1063,6 +1260,11 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func loadProjectConversations(projectAlias: String, refresh: Bool = true, force: Bool = true) async {
+        guard !isWebProjectKnownAbsent(projectAlias) else {
+            errors["web.project.\(projectAlias)"] = "此 ChatGPT Project 已不在最近一次确认的项目目录中。"
+            DiagnosticsLog.shared.record("project_load_deleted_project_blocked", fields: ["project": projectAlias], level: "WARN")
+            return
+        }
         if refresh {
             if !force,
                !projectConversationsByAlias[projectAlias, default: []].isEmpty,
@@ -1159,7 +1361,7 @@ final class WorkspaceStore: ObservableObject {
                    let staleSnapshotId = page.snapshotId,
                    !staleSnapshotId.isEmpty,
                    !page.items.isEmpty {
-                    var staleItems = Self.uniqueProjectConversations(page.items)
+                    var staleItems = Self.uniqueProjectConversations(page.items.filter { !deletedWebSessionIds.contains($0.localConversationId) })
                     var seenIds = Set(staleItems.map(\.id))
                     var nextCursor = page.nextCursor
                     var hasMore = page.hasMore
@@ -1277,7 +1479,7 @@ final class WorkspaceStore: ObservableObject {
                     // partially mounted. Show those verified rows immediately instead
                     // of presenting an empty/error screen, but keep the state non-
                     // authoritative so a later live DOM pass can replace it.
-                    let uniqueItems = Self.uniqueProjectConversations(page.items)
+                    let uniqueItems = Self.uniqueProjectConversations(page.items.filter { !deletedWebSessionIds.contains($0.localConversationId) })
                     projectConversationsByAlias[projectAlias] = uniqueItems
                     projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .staleCache
                     projectNextCursorByAlias[projectAlias] = page.nextCursor
@@ -1304,13 +1506,10 @@ final class WorkspaceStore: ObservableObject {
                     && mergeConversationVerifiedStaleHead(page.items, projectAlias: projectAlias)
                 let repairedTitles = mergeConversationTitleHints(page.items, projectAlias: projectAlias)
                 if mergedHead || mergedVerifiedStaleHead || repairedTitles {
-                    if mergedHead || repairedTitles {
-                        // Preserve the existing title-repair persistence contract and
-                        // persist monotonic partial live-DOM head proof. A stale Windows
-                        // identity-only head merge remains in-memory and will be re-proved
-                        // on the next refresh before it can replace cache truth.
-                        try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
-                    }
+                    // Persist monotonic partial live-DOM head proof. A stale Windows
+                    // identity-only head is positive membership evidence; it cannot
+                    // delete/reorder the accepted tail and is safe to retain offline.
+                    try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
                     mergeProjectSessions(projectConversationsByAlias[projectAlias] ?? [])
                 }
                 if mergedHead {
@@ -1396,14 +1595,32 @@ final class WorkspaceStore: ObservableObject {
                 // on first load show the verified prefix only as partial, without caching
                 // it as a final Project catalog.
                 if previouslyAcceptedItems.isEmpty {
-                    projectConversationsByAlias[projectAlias] = authoritativeItems
+                    let visiblePrefix = authoritativeItems.filter { !deletedWebSessionIds.contains($0.localConversationId) }
+                    projectConversationsByAlias[projectAlias] = visiblePrefix
                     projectConversationSnapshotStateByAlias[projectAlias] = .partialDOM
                     if let cursor = nextCursor { projectNextCursorByAlias[projectAlias] = cursor }
                     else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
                     projectHasMoreByAlias[projectAlias] = hasMore
-                    mergeProjectSessions(authoritativeItems)
+                    mergeProjectSessions(visiblePrefix)
                 } else {
                     projectConversationSnapshotStateByAlias[projectAlias] = .partialDOM
+                    // A failed later page still proves this exact first-page head. Merge
+                    // only its monotonic unknown prefix before an accepted identity; the
+                    // old verified tail and its relative ordering stay intact.
+                    let mergedHead = mergeConversationPartialHead(authoritativeItems, projectAlias: projectAlias)
+                    let repairedTitles = mergeConversationTitleHints(authoritativeItems, projectAlias: projectAlias)
+                    if mergedHead || repairedTitles {
+                        let visibleRows = projectConversationsByAlias[projectAlias, default: previouslyAcceptedItems]
+                        try? await cache.put(visibleRows, key: "web.project.\(projectAlias).conversations")
+                        mergeProjectSessions(visibleRows)
+                        DiagnosticsLog.shared.record("project_load_paging_head_merged", fields: [
+                            "project": projectAlias,
+                            "acceptedCount": String(previouslyAcceptedItems.count),
+                            "visibleCount": String(visibleRows.count),
+                            "addedHead": String(mergedHead),
+                            "repairedTitles": String(repairedTitles),
+                        ])
+                    }
                 }
                 // A half-paged response is not successful synchronization. Keep
                 // the accepted catalog visible, but expose a recoverable warning
@@ -1420,6 +1637,7 @@ final class WorkspaceStore: ObservableObject {
                 return
             }
 
+            await clearReappearedWebSessionDeletions(authoritativeItems)
             projectConversationsByAlias[projectAlias] = authoritativeItems
             projectConversationSnapshotStateByAlias[projectAlias] = .authoritativeLiveDOM
             if let snapshotId = authoritativeSnapshotId { projectConversationSnapshotIds[projectAlias] = snapshotId }
@@ -1507,6 +1725,7 @@ final class WorkspaceStore: ObservableObject {
             else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
             projectHasMoreByAlias[projectAlias] = page.hasMore
             if !page.hasMore {
+                await clearReappearedWebSessionDeletions(merged)
                 try? await cache.put(merged, key: "web.project.\(projectAlias).conversations")
             }
             guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended else { return }
@@ -1632,7 +1851,10 @@ final class WorkspaceStore: ObservableObject {
             // must never overwrite a newer session created by a live event.
             let currentRows = sessions.filter { $0.instanceId == instance.id }
             let currentById = Dictionary(uniqueKeysWithValues: currentRows.map { ($0.id, $0) })
-            let remoteRows = remote.map { row in
+            let eligibleRemote = runtime.kind == .web
+                ? remote.filter { !isWebSessionUnavailable($0) }
+                : remote
+            let remoteRows = eligibleRemote.map { row in
                 var updated = row
                 if let current = currentById[row.id],
                    let known = current.backgroundTaskStatus,
@@ -1654,7 +1876,7 @@ final class WorkspaceStore: ObservableObject {
             // Repair safe metadata in already-loaded rows without reordering them.
             // Busy rows missing from ChatGPT's lazy sidebar are overlaid only at render
             // time by displayedProjectConversations.
-            let reconciledProjects = reconcileProjectConversationActivityFromSessions(remote)
+            let reconciledProjects = reconcileProjectConversationActivityFromSessions(eligibleRemote)
             for alias in reconciledProjects {
                 try? await cache.put(
                     projectConversationsByAlias[alias] ?? [],
@@ -1669,7 +1891,7 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func loadSession(_ sessionId: String, remoteRevision: Date? = nil) async {
+    func loadSession(_ sessionId: String, remoteRevision: Date? = nil, localOnly: Bool = false) async {
         guard sessionLoads.insert(sessionId).inserted else { return }
         defer { sessionLoads.remove(sessionId) }
         let generation = lifecycleGeneration
@@ -1727,12 +1949,25 @@ final class WorkspaceStore: ObservableObject {
         // stale .error/.busy navigation snapshot immediately. Do not make the user
         // wait for the network read just to discover that the conversation already
         // completed successfully on the PC.
+        if localOnly {
+            if isWebSessionUnavailable(sessionId) {
+                errors[sessionId] = "此 Chat 已删除、归档或所属 Project 已删除。手机仍保留本地消息和草稿。"
+            }
+            return
+        }
         await settleRunStateIfAuthoritativeFinalExists(cachedMessages, sessionId: sessionId)
+        if isWebSessionUnavailable(sessionId) {
+            errors[sessionId] = "此 Chat 已删除、归档或所属 Project 已删除。手机仍保留本地消息和草稿。"
+            return
+        }
         guard machine.state == .online, let route = routeForSession(sessionId) else { return }
         await hydrateSessionDescriptorIfNeeded(sessionId: sessionId, route: route, generation: generation)
         do {
             let page = try await transport.loadRecent(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, limit: 50)
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+            guard page.items.allSatisfy({ $0.sessionId == sessionId }) else {
+                throw TransportError.malformedData
+            }
             let authoritativeItems = route.runtimeId == "runtime.web"
                 ? page.items.map(Self.normalizedWebAssistantMessage)
                 : page.items
@@ -1811,6 +2046,17 @@ final class WorkspaceStore: ObservableObject {
                 sessionId: sessionId
             )
             guard machine.state == .online, !isSuspended else { return nil }
+            if route.runtimeId == "runtime.web", !isWebSessionIdentityVerified(snapshot, sessionId: sessionId) {
+                errors[sessionId] = "ChatGPT 会话身份暂未验证；已保留当前消息、草稿和会话绑定。"
+                DiagnosticsLog.shared.record("session_identity_unverified", fields: ["session": sessionId], level: "WARN")
+                return nil
+            }
+            if route.runtimeId == "runtime.web" {
+                await backfillVerifiedWebSessionIdentity(snapshot, sessionId: sessionId)
+            }
+            if errors[sessionId] == "ChatGPT 会话身份暂未验证；已保留当前消息、草稿和会话绑定。" {
+                errors.removeValue(forKey: sessionId)
+            }
             let liveActivityAt = liveRunActivityAtBySession[sessionId]
             let remoteEvidenceAt = [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
             let staleIdleSnapshot: Bool
@@ -1952,6 +2198,10 @@ final class WorkspaceStore: ObservableObject {
     func synchronizeVisibleSession(_ sessionId: String, force: Bool = false) async {
         guard machine.state == .online, !isSuspended else { return }
         guard !sessionLoads.contains(sessionId) else { return }
+        if isWebSessionUnavailable(sessionId) {
+            errors[sessionId] = "此 Chat 已删除、归档或所属 Project 已删除。手机仍保留本地消息和草稿。"
+            return
+        }
 
         let sessionBeforeStatus = sessions.first(where: { $0.id == sessionId })
         let active = sessionBeforeStatus.map { $0.state == .busy || $0.state == .waiting } == true
@@ -1990,6 +2240,7 @@ final class WorkspaceStore: ObservableObject {
 
         let remoteStatus = await refreshVisibleSessionStatus(sessionId, rejectEvidencePoorIdle: recoveredLiveActivityDuringSync)
         guard machine.state == .online, !isSuspended else { return }
+        if errors[sessionId] == "ChatGPT 会话身份暂未验证；已保留当前消息、草稿和会话绑定。" { return }
 
         let terminalTransition = active
             && remoteStatus.map { $0.state == .idle || $0.state == .error } == true
@@ -2133,6 +2384,12 @@ final class WorkspaceStore: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         DiagnosticsLog.shared.record("send_begin", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "hasInput": String(!trimmed.isEmpty), "attachments": String(attachments.count), "commandId": commandId.uuidString])
         guard !trimmed.isEmpty || !attachments.isEmpty else { return false }
+        if runtimeId == "runtime.web", isWebSessionUnavailable(sessionId) {
+            if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
+            errors[sessionId] = "此 Chat 已删除、归档或所属 Project 已删除。草稿已保留，未发送。"
+            DiagnosticsLog.shared.record("send_blocked_deleted_web_session", fields: ["session": sessionId, "commandId": commandId.uuidString], level: "WARN")
+            return false
+        }
         guard attachments.count <= 8, attachments.allSatisfy({ $0.sizeBytes > 0 && $0.sizeBytes <= 20 * 1024 * 1024 }) else {
             errors[sessionId] = "最多一次发送 8 个附件，每个附件不能超过 20MB。"
             return false
@@ -2427,6 +2684,7 @@ final class WorkspaceStore: ObservableObject {
 
     func retry(message: ChatMessage, runtimeId: String, instanceId: String, model: String = "") async {
         guard let commandId = UUID(uuidString: message.id), commandStates[commandId] == .unknown,
+              !isWebSessionUnavailable(message.sessionId),
               commandSendsInFlight.insert(commandId).inserted else { return }
         defer { commandSendsInFlight.remove(commandId) }
         let generation = lifecycleGeneration
@@ -2853,6 +3111,8 @@ final class WorkspaceStore: ObservableObject {
         syncState = "unknown"
         lastOnlineHeadProbe = .distantPast
         webProjects.removeAll()
+        deletedWebSessionIds.removeAll()
+        webProjectDirectoryAuthoritative = false
         projectConversationsByAlias.removeAll()
         projectNextCursorByAlias.removeAll()
         projectHasMoreByAlias.removeAll()
@@ -3215,6 +3475,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func routeForSession(_ sessionId: String) -> (runtimeId: String, instanceId: String)? {
+        if isWebSessionUnavailable(sessionId) { return nil }
         if let context = contextForSession(sessionId) {
             return (context.runtime.id, context.instance.id)
         }
@@ -3227,7 +3488,8 @@ final class WorkspaceStore: ObservableObject {
         route: (runtimeId: String, instanceId: String),
         generation: UInt64
     ) async {
-        guard !sessions.contains(where: { $0.id == sessionId }),
+        guard !isWebSessionUnavailable(sessionId),
+              !sessions.contains(where: { $0.id == sessionId }),
               machine.state == .online,
               generation == lifecycleGeneration,
               !isSuspended else { return }
@@ -3293,6 +3555,12 @@ final class WorkspaceStore: ObservableObject {
         if let value: [RuntimeDescriptor] = try? await cache.get([RuntimeDescriptor].self, key: "runtimes") { runtimes = value }
         if let value: [InstanceDescriptor] = try? await cache.get([InstanceDescriptor].self, key: "instances") { instances = value }
         if let value: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") { sessions = value }
+        if let value: Bool = try? await cache.get(Bool.self, key: Self.webProjectDirectoryAuthorityCacheKey) {
+            webProjectDirectoryAuthoritative = value
+        }
+        if let deletionState: WebCatalogDeletionState = try? await cache.get(WebCatalogDeletionState.self, key: Self.deletedWebSessionsCacheKey) {
+            deletedWebSessionIds = deletionState.deletedSessionIds
+        }
         if webProjects.isEmpty,
            let value: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
             webProjects = value
@@ -3301,7 +3569,7 @@ final class WorkspaceStore: ObservableObject {
             // DOM truth, but the user should never stare at an empty Projects surface
             // while Relay/Browser connectivity is being restored.
             webProjectsSnapshotState = .staleCache
-            hasLoadedWebProjects = !value.isEmpty
+            hasLoadedWebProjects = true
         }
         tracker = SequenceTracker(lastSequence: (try? await cache.lastSequence()) ?? 0)
         let process = ProcessInfo.processInfo
@@ -3418,7 +3686,11 @@ final class WorkspaceStore: ObservableObject {
         guard let current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
         let currentAliases = Set(current.compactMap(\.conversationAlias))
         guard !currentAliases.isEmpty else { return false }
-        let validIncoming = incoming.filter { sameWebProjectAlias($0.projectAlias, projectAlias) && $0.conversationAlias != nil }
+        let validIncoming = incoming.filter {
+            sameWebProjectAlias($0.projectAlias, projectAlias)
+                && $0.conversationAlias != nil
+                && !deletedWebSessionIds.contains($0.localConversationId)
+        }
         guard let firstKnownIndex = validIncoming.firstIndex(where: { row in
             row.conversationAlias.map(currentAliases.contains) ?? false
         }), firstKnownIndex > 0 else { return false }
@@ -3446,7 +3718,11 @@ final class WorkspaceStore: ObservableObject {
         guard let current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return false }
         let currentAliases = Set(current.compactMap(\.conversationAlias))
         guard !currentAliases.isEmpty else { return false }
-        let validIncoming = incoming.filter { sameWebProjectAlias($0.projectAlias, projectAlias) && $0.conversationAlias != nil }
+        let validIncoming = incoming.filter {
+            sameWebProjectAlias($0.projectAlias, projectAlias)
+                && $0.conversationAlias != nil
+                && !deletedWebSessionIds.contains($0.localConversationId)
+        }
         guard let firstKnownIndex = validIncoming.firstIndex(where: { row in
             row.conversationAlias.map(currentAliases.contains) ?? false
         }), firstKnownIndex > 0 else { return false }
@@ -3476,7 +3752,11 @@ final class WorkspaceStore: ObservableObject {
     @discardableResult
     private func mergeConversationVerifiedStaleCatalog(_ incoming: [WebConversationDescriptor], projectAlias: String) -> Int {
         guard var current = projectConversationsByAlias[projectAlias], !current.isEmpty else { return 0 }
-        let validIncoming = incoming.filter { sameWebProjectAlias($0.projectAlias, projectAlias) && $0.conversationAlias != nil }
+        let validIncoming = incoming.filter {
+            sameWebProjectAlias($0.projectAlias, projectAlias)
+                && $0.conversationAlias != nil
+                && !deletedWebSessionIds.contains($0.localConversationId)
+        }
         guard !validIncoming.isEmpty else { return 0 }
 
         var knownAliases = Set(current.compactMap(\.conversationAlias))
@@ -3528,7 +3808,9 @@ final class WorkspaceStore: ObservableObject {
         // uniqueKeysWithValues initializer traps on duplicates instead of
         // repairing titles; retain the newest safe hint for each identity.
         let byAlias = hints.reduce(into: [String: WebConversationDescriptor]()) { result, hint in
-            guard let alias = hint.conversationAlias, sameWebProjectAlias(hint.projectAlias, projectAlias) else { return }
+            guard let alias = hint.conversationAlias,
+                  sameWebProjectAlias(hint.projectAlias, projectAlias),
+                  !deletedWebSessionIds.contains(hint.localConversationId) else { return }
             if let existing = result[alias], existing.updatedAt > hint.updatedAt { return }
             result[alias] = hint
         }
@@ -3565,6 +3847,8 @@ final class WorkspaceStore: ObservableObject {
 
     private func mergeProjectSessions(_ items: [WebConversationDescriptor]) {
         for item in items {
+            guard !deletedWebSessionIds.contains(item.localConversationId) else { continue }
+            if let projectAlias = item.projectAlias, isWebProjectKnownAbsent(projectAlias) { continue }
             var session = item.session
             // Project discovery itself proves that this conversation belongs to the
             // ChatGPT Web runtime. Instance catalog loading is intentionally lazy, so
@@ -3664,7 +3948,9 @@ final class WorkspaceStore: ObservableObject {
     /// durable Windows/phone activity owns the visible recent-activity head. Keep those
     /// authorities separate so reordering never truncates a large Project.
     func displayedProjectConversations(projectAlias: String) -> [WebConversationDescriptor] {
+        guard !isWebProjectKnownAbsent(projectAlias) else { return [] }
         let providerRows = projectConversationsByAlias[projectAlias, default: []].filter { row in
+            guard !deletedWebSessionIds.contains(row.localConversationId) else { return false }
             let provisional = isProvisionalWebConversationAlias(row.conversationAlias)
                 || isProvisionalWebConversationAlias(webConversationAlias(from: row.canonicalUrl))
             guard provisional else { return true }
@@ -4401,12 +4687,19 @@ final class WorkspaceStore: ObservableObject {
 
         switch event.type {
         case "SESSION_DELETED":
-            sessions.removeAll { $0.id == sessionId }
-            messagesBySession.removeValue(forKey: sessionId)
-            liveRunStatusBySession.removeValue(forKey: sessionId)
-            stopRunStartSequenceBySession.removeValue(forKey: sessionId)
-            stopRunGenerationKeyBySession.removeValue(forKey: sessionId)
-            await persistMetadata()
+            if event.runtimeId == "runtime.web" {
+                liveRunStatusBySession.removeValue(forKey: sessionId)
+                stopRunStartSequenceBySession.removeValue(forKey: sessionId)
+                stopRunGenerationKeyBySession.removeValue(forKey: sessionId)
+                await applyAuthoritativeWebSessionDeletion(sessionId)
+            } else {
+                sessions.removeAll { $0.id == sessionId }
+                messagesBySession.removeValue(forKey: sessionId)
+                liveRunStatusBySession.removeValue(forKey: sessionId)
+                stopRunStartSequenceBySession.removeValue(forKey: sessionId)
+                stopRunGenerationKeyBySession.removeValue(forKey: sessionId)
+                await persistMetadata()
+            }
         case "MESSAGE_REMOVED":
             if let messageID = event.payload["messageId"]?.stringValue {
                 messagesBySession[sessionId]?.removeAll { $0.id == messageID }

@@ -116,6 +116,7 @@ struct SessionDescriptor: Codable, Identifiable, Hashable {
     var state: SessionState
     var updatedAt: Date
     var projectAlias: String? = nil
+    var projectId: String? = nil
     var canonicalUrl: String? = nil
     var lastActivityAt: Date? = nil
     var lastProgressStatus: String? = nil
@@ -379,6 +380,7 @@ struct WebConversationDescriptor: Codable, Identifiable, Hashable {
             state: .idle,
             updatedAt: updatedAt,
             projectAlias: projectAlias,
+            projectId: projectId,
             canonicalUrl: canonicalUrl,
             // lastVisited is discovery/navigation metadata, not conversation activity.
             // Treating a sidebar scan as activity silently reorders Project chats.
@@ -447,6 +449,13 @@ struct WebProjectConversationPage: Codable {
     var isAuthoritativeLiveDOM: Bool {
         state == .authoritativeLiveDOM && stale != true
     }
+}
+
+/// Minimal durable guard against an old Project snapshot reintroducing a Web Chat
+/// after an explicit SESSION_DELETED event or confirmed Project removal. Transcript
+/// rows and drafts remain in their separate stores.
+struct WebCatalogDeletionState: Codable, Equatable {
+    var deletedSessionIds: Set<String> = []
 }
 
 struct MessageCursor: Codable, Hashable {
@@ -810,6 +819,7 @@ extension ServerSession {
             state: .server(status),
             updatedAt: updatedAt,
             projectAlias: metadata["projectAlias"]?.stringValue,
+            projectId: metadata["projectId"]?.stringValue,
             canonicalUrl: canonicalUrl,
             // Only semantic activity published by the Agent may drive recent-chat
             // ordering. lastVisited can be refreshed by DOM discovery alone.

@@ -162,6 +162,40 @@ final class ProjectConvergenceTests: XCTestCase {
         await store.suspend()
     }
 
+    @MainActor
+    func testFailedFullRefreshPersistsVerifiedNewestHeadWithoutTruncatingAcceptedTail() async throws {
+        let alias = "g-p-remoteai"
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: alias, count: 230)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+
+        await store.loadProjectConversations(projectAlias: alias, refresh: true, force: true)
+        let accepted = try XCTUnwrap(store.projectConversationsByAlias[alias])
+        XCTAssertEqual(accepted.count, 230)
+        XCTAssertEqual(accepted.first?.conversationAlias, "seed-0")
+
+        // The live first page proves one newly created head row followed by an
+        // accepted identity. A later page failure must not hide that new chat or
+        // replace the existing full catalog with the incomplete prefix.
+        await mock.prependProjectConversation(alias: alias, conversationAlias: "newest-head", title: "Newest head")
+        await mock.setProjectConversationPaginationFault(.emptyNonterminalPage)
+
+        await store.loadProjectConversations(projectAlias: alias, refresh: true, force: true)
+
+        let rows = try XCTUnwrap(store.projectConversationsByAlias[alias])
+        XCTAssertEqual(rows.first?.conversationAlias, "newest-head")
+        XCTAssertEqual(rows.count, 231)
+        XCTAssertEqual(Set(rows.compactMap(\.conversationAlias)), Set(["newest-head"] + (0..<230).map { "seed-\($0)" }))
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias[alias], .partialDOM)
+        XCTAssertNotNil(store.errors["web.project.\(alias)"], "A failed full scan remains visibly incomplete")
+
+        let cached: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.\(alias).conversations")
+        XCTAssertEqual(cached?.map(\.conversationAlias), rows.map(\.conversationAlias), "The safe head merge must persist so a relaunch can show the latest Chat")
+        await store.suspend()
+    }
+
     private func conversation(alias: String, title: String, age: TimeInterval) -> WebConversationDescriptor {
         let updatedAt = Date().addingTimeInterval(-age)
         return WebConversationDescriptor(
