@@ -2,6 +2,35 @@ import XCTest
 @testable import RemoteAIMobile
 
 final class WebTabEntryTests: XCTestCase {
+    func testWebFirstSendCanReachConnectedTransportRecoveryWhenDisplayIsStaleOffline() {
+        XCTAssertTrue(ChatComposerSendAvailability.enabled(machineOnline: false, isWeb: true,
+            sending: false, sessionUnavailable: false, readOnly: false),
+            "Web first Send must reach the existing authenticated recovery or draft-preserving failure path")
+        XCTAssertTrue(ChatComposerSendAvailability.enabled(machineOnline: true, isWeb: true,
+            sending: false, sessionUnavailable: false, readOnly: false))
+        XCTAssertFalse(ChatComposerSendAvailability.enabled(machineOnline: false, isWeb: false,
+            sending: false, sessionUnavailable: false, readOnly: false))
+        XCTAssertFalse(ChatComposerSendAvailability.enabled(machineOnline: false, isWeb: true,
+            sending: true, sessionUnavailable: false, readOnly: false))
+        XCTAssertFalse(ChatComposerSendAvailability.enabled(machineOnline: false, isWeb: true,
+            sending: false, sessionUnavailable: true, readOnly: false))
+        XCTAssertFalse(ChatComposerSendAvailability.enabled(machineOnline: false, isWeb: true,
+            sending: false, sessionUnavailable: false, readOnly: true))
+    }
+
+    func testClosedTabNoticeCannotLeakIntoNewlyCreatedChat() {
+        let closed = "电脑端对应的 ChatGPT 标签页已关闭；RemoteAI 会在需要时重新打开并绑定该会话。"
+        let rebound = "电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。"
+        XCTAssertTrue(WebChatNoticeVisibility.shouldDisplay(closed,
+            sessionId: "webconv-old", sourceSessionId: "webconv-old"))
+        XCTAssertFalse(WebChatNoticeVisibility.shouldDisplay(closed,
+            sessionId: "webconv-new", sourceSessionId: "webconv-old"))
+        XCTAssertFalse(WebChatNoticeVisibility.shouldDisplay(rebound,
+            sessionId: "webconv-new", sourceSessionId: nil))
+        XCTAssertTrue(WebChatNoticeVisibility.shouldDisplay("Relay 已恢复",
+            sessionId: "webconv-new", sourceSessionId: "webconv-old"))
+    }
+
     func testStaleWebTabRowRefreshesInventoryInsteadOfDisablingTheTap() {
         let stale = WebTabEntryStatus(isLoading: false,
             code: "BROWSER_BINDING_MISSING", diagnosisCode: nil,

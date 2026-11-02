@@ -187,6 +187,9 @@ final class WorkspaceStore: ObservableObject {
     @Published var pairingStage: PairingStage?
     @Published var connectionPhase: ConnectionDiagnosticPhase = .relayConnecting
     @Published var recentSystemNotice: String?
+    // Browser-binding notices belong to one exact Web session; never show a
+    // previous Chat's closed-tab warning on a newly created draft.
+    private(set) var recentWebBindingNoticeSessionId: String?
     @Published var desktopBrowserConnected: Bool?
     @Published var desktopRelayConnected: Bool?
     @Published var desktopAgentConnected: Bool?
@@ -2689,6 +2692,7 @@ final class WorkspaceStore: ObservableObject {
                 if webBindingDetachedSessions.remove(sessionId) != nil,
                    (recentSystemNotice?.contains("ChatGPT 标签页") == true
                        || recentSystemNotice?.contains("标签页绑定") == true) {
+                    recentWebBindingNoticeSessionId = sessionId
                     recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机已补同步最新状态。"
                 }
             }
@@ -2741,6 +2745,19 @@ final class WorkspaceStore: ObservableObject {
                 sessionId: sessionId
             )
             guard machine.state == .online, !isSuspended else { return nil }
+            if route.runtimeId == "runtime.web", snapshot.canonicalUrl == nil {
+                // Windows Agent v146 omitted the canonicalUrl field entirely from
+                // getSessionStatus. Absence of protocol evidence is not proof that
+                // this newly created Chat changed identity or was deleted. Do not
+                // invent a verified identity or overwrite any transcript; the next
+                // full-status response from a compatible Agent can verify it.
+                if errors[sessionId] == "ChatGPT 会话身份暂未验证；已保留当前消息、草稿和会话绑定。" {
+                    errors.removeValue(forKey: sessionId)
+                }
+                DiagnosticsLog.shared.record("web_status_identity_field_missing",
+                    fields: ["session": sessionId], level: "WARN")
+                return nil
+            }
             if route.runtimeId == "runtime.web", !isWebSessionIdentityVerified(snapshot, sessionId: sessionId) {
                 errors[sessionId] = "ChatGPT 会话身份暂未验证；已保留当前消息、草稿和会话绑定。"
                 DiagnosticsLog.shared.record("session_identity_unverified", fields: ["session": sessionId], level: "WARN")
@@ -6312,6 +6329,7 @@ final class WorkspaceStore: ObservableObject {
             }
             await requestMetadataRefresh()
         case "WEB_BINDING_CHANGED":
+            recentWebBindingNoticeSessionId = sessionId
             let reason = event.payload["reason"]?.stringValue ?? "unknown"
             let activeTabId = event.payload["activeTabId"]?.intValue
             if activeTabId == nil && ["tabClosed", "conversationContextChanged", "projectContextChanged", "tabReassignedToRegisteredConversation"].contains(reason) {
@@ -6339,6 +6357,7 @@ final class WorkspaceStore: ObservableObject {
             await applyWebPageRegistrationEvent(event, sessionId: sessionId, suppressPresentation: suppressTransientPresentation)
             if event.payload["activeTabId"]?.intValue != nil,
                webBindingDetachedSessions.remove(sessionId) != nil {
+                recentWebBindingNoticeSessionId = sessionId
                 recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。"
             }
             await requestMetadataRefresh()

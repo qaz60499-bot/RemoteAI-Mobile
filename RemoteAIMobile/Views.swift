@@ -298,6 +298,27 @@ enum WebTabRowIntent: Equatable {
     }
 }
 
+// Browser-binding events are global UI notifications, but a ChatView is scoped
+// to one immutable session. Never display another Chat's closed-tab event here.
+enum WebChatNoticeVisibility {
+    static func shouldDisplay(_ notice: String, sessionId: String, sourceSessionId: String?) -> Bool {
+        let bindingNotice = notice.contains("ChatGPT 标签页")
+            || notice.contains("ChatGPT 会话已重新绑定")
+            || notice.contains("标签页绑定")
+        return !bindingNotice || sourceSessionId == sessionId
+    }
+}
+
+// The send path can recover an authenticated socket when machine.state still
+// displays Offline. Do not disable Web's very first Send before it reaches
+// that path; if the socket is truly down, send() preserves the draft safely.
+enum ChatComposerSendAvailability {
+    static func enabled(machineOnline: Bool, isWeb: Bool, sending: Bool,
+        sessionUnavailable: Bool, readOnly: Bool) -> Bool {
+        !sending && !sessionUnavailable && !readOnly && (machineOnline || isWeb)
+    }
+}
+
 struct InstanceView: View {
     @EnvironmentObject var store: WorkspaceStore
     @Environment(\.scenePhase) private var scenePhase
@@ -343,6 +364,19 @@ struct InstanceView: View {
         enteringWebTabId = tab.id
         Task { @MainActor in
             let destination = await store.enterOpenWebTab(tab)
+            if destination == nil {
+                // A translated or temporarily unverified Chrome page must not make a
+                // durable historical Chat entirely inaccessible. The existing
+                // cache-only route proves exact tab ID, canonical URL and session ID
+                // before showing history; it never imports untranslated DOM or sends.
+                let cached = await store.openCachedWebTabHistory(tab)
+                if enteringWebTabId == tab.id { enteringWebTabId = nil }
+                if let cached {
+                    selectedHistoricalWebSession = cached
+                    openHistoricalWebSession = true
+                }
+                return
+            }
             if enteringWebTabId == tab.id { enteringWebTabId = nil }
             guard let destination else { return }
             switch destination {
@@ -1397,6 +1431,13 @@ struct ChatView: View {
         if runtime.kind != .web && (notice.contains("ChatGPT") || notice.contains("Browser Bridge")) {
             return nil
         }
+        // The last Web binding event is global state. A previously closed Chat
+        // must not show its warning inside a different, newly created Chat.
+        if runtime.kind == .web,
+           !WebChatNoticeVisibility.shouldDisplay(notice, sessionId: session.id,
+               sourceSessionId: store.recentWebBindingNoticeSessionId) {
+            return nil
+        }
         return notice
     }
     private var isGenerating: Bool {
@@ -1754,7 +1795,11 @@ struct ChatView: View {
                     draft: draft,
                     focused: $focused,
                     attachments: $pendingAttachments,
-                    enabled: store.machine.state == .online && !sending && !currentWebSessionUnavailable && !currentWebSessionReadOnly,
+                    enabled: ChatComposerSendAvailability.enabled(
+                        machineOnline: store.machine.state == .online,
+                        isWeb: runtime.kind == .web, sending: sending,
+                        sessionUnavailable: currentWebSessionUnavailable,
+                        readOnly: currentWebSessionReadOnly),
                     isGenerating: isGenerating,
                     isRecording: speechInput.isRecording,
                     addPhoto: { showPhotoPicker = true },
