@@ -30,7 +30,7 @@ jobs:
   build:
     name: Candidate Test + Device IPA
     if: github.event_name == 'workflow_dispatch'
-    runs-on: macos-15
+    runs-on: macos-15-intel
     # A real 11-case isolated-simulator UI suite plus protocol/unit and stream-performance
     # checks exhausted the previous 45-minute job limit before iphoneos packaging.
     # All test assertions remain mandatory; do not skip any gate for a green build.
