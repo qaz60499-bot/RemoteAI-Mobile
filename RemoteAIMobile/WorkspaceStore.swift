@@ -1400,7 +1400,7 @@ final class WorkspaceStore: ObservableObject {
             code: prior.code ?? code,
             diagnosisCode: diagnosis.issueCode ?? (code == prior.code ? nil : code),
             message: message,
-            observedAt: RemoteAIDate.parse(diagnosis.observedAt) ?? Date(),
+            observedAt: diagnosis.observedAt.flatMap(RemoteAIDate.parse) ?? Date(),
             rawMessage: diagnosis.issueMessage.map { String($0.prefix(180)) } ?? prior.rawMessage,
             retryable: retryable,
             requiresInventoryRefresh: requiresInventoryRefresh,
@@ -3095,7 +3095,9 @@ final class WorkspaceStore: ObservableObject {
             }
             guard page.items.allSatisfy({ $0.sessionId == sessionId }),
                   generation == lifecycleGeneration, transport === activeTransport,
-                  machine.id == activeMachineId, !isSuspended else { return }
+                  machine.id == activeMachineId, !isSuspended,
+                  !(loadedRemotely && sessionRoute?.runtimeId == "runtime.web"
+                      && readOnlyCachedWebSessionIds.contains(sessionId)) else { return }
             try? await cache.upsertMessages(page.items)
             guard generation == lifecycleGeneration, transport === activeTransport,
                   machine.id == activeMachineId, !isSuspended,
