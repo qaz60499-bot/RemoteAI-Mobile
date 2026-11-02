@@ -6853,6 +6853,13 @@ final class WorkspaceStore: ObservableObject {
     private func bufferStreaming(sessionId: String, id: String, content: String, attachments: [MessageAttachment], sequence: Int64, deferPresentation: Bool = false) {
         streamingBuffers[sessionId] = (id, content, sequence, attachments)
         if deferPresentation { return }
+        // Image-only assistant updates otherwise have no text to render until a
+        // later global stream flush. Publish the attachment row immediately so
+        // its metadata remains visible even on a busy device or simulator.
+        if content.isEmpty && !attachments.isEmpty {
+            flushStreaming(sessionId: sessionId)
+            return
+        }
         if flushTask == nil {
             let byteCount = assistantStreams[sessionId]?.utf8Count ?? content.utf8.count
             let delay = Self.streamingFlushDelayNanoseconds(forByteCount: byteCount)

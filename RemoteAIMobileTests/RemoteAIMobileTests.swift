@@ -3837,7 +3837,12 @@ final class RemoteAIMobileTests: XCTestCase {
             ],
             createdAt: Date()
         ), deliverLive: true)
-        try await Task.sleep(nanoseconds: 180_000_000)
+        // Event delivery and MainActor presentation can be delayed under CI
+        // simulator load. Wait for the exact streamed row, not a fixed 180 ms.
+        for _ in 0..<120 {
+            if store.messagesBySession["photo-upload", default: []].contains(where: { $0.id == "stream-image" }) { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
         let streaming = try XCTUnwrap(store.messagesBySession["photo-upload", default: []].first(where: { $0.id == "stream-image" }))
         XCTAssertEqual(streaming.attachments, [attachment])
         XCTAssertEqual(streaming.toolStatus, "Streaming")
