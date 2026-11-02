@@ -2547,6 +2547,8 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(store.projectConversationSnapshotStateByAlias["g-p-remoteai"], .staleCache)
         XCTAssertNil(store.errors["web.project.g-p-remoteai"])
         XCTAssertTrue(store.sessions.contains(where: { $0.id == "webconv-stale-new-head" }), "The merged newest Project chat must also enter the session catalog so it can be opened immediately")
+        let cached: [WebConversationDescriptor]? = try await cache.get([WebConversationDescriptor].self, key: "web.project.g-p-remoteai.conversations")
+        XCTAssertEqual(cached?.map(\.conversationAlias), ["stale-new-head", "mock-1"], "The verified new head must remain visible after a cold launch even when the full live scan is incomplete")
         await store.suspend()
     }
 
