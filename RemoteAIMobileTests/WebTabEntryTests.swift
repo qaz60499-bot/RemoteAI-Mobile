@@ -2,6 +2,22 @@ import XCTest
 @testable import RemoteAIMobile
 
 final class WebTabEntryTests: XCTestCase {
+    func testStaleWebTabRowRefreshesInventoryInsteadOfDisablingTheTap() {
+        let stale = WebTabEntryStatus(isLoading: false,
+            code: "BROWSER_BINDING_MISSING", diagnosisCode: nil,
+            message: "Tab identity changed", observedAt: Date(),
+            rawMessage: nil, retryable: false,
+            requiresInventoryRefresh: true, cachedSession: nil)
+        let recoverableWarning = WebTabEntryStatus(isLoading: false,
+            code: "PROVIDER_UNAVAILABLE", diagnosisCode: nil,
+            message: "Page unavailable", observedAt: Date(),
+            rawMessage: nil, retryable: true,
+            requiresInventoryRefresh: false, cachedSession: nil)
+        XCTAssertEqual(WebTabRowIntent.resolve(stale), .refreshInventory)
+        XCTAssertEqual(WebTabRowIntent.resolve(recoverableWarning), .enter)
+        XCTAssertEqual(WebTabRowIntent.resolve(nil), .enter)
+    }
+
     @MainActor
     func testOrdinaryWebHistoryKeepsRouteThroughCatalogRaceWithoutOpeningChrome() async throws {
         let mock = MockTransport(historyCount: 0, includeOrdinaryWebHistoryFixture: true)

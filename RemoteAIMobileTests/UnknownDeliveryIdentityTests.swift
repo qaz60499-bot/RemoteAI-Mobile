@@ -7,7 +7,7 @@ final class UnknownDeliveryIdentityTests: XCTestCase {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .webSendDeliveryUnknown, historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
-        await store.start()
+        await startStore(store)
         let commandId = UUID()
         let priorMessageId = "prior-same-text-provider-turn"
         await mock.appendHistoryMessage(ServerMessage(
@@ -40,7 +40,7 @@ final class UnknownDeliveryIdentityTests: XCTestCase {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
-        await store.start()
+        await startStore(store)
 
         let firstId = UUID()
         let secondId = UUID()
@@ -76,7 +76,7 @@ final class UnknownDeliveryIdentityTests: XCTestCase {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
-        await store.start()
+        await startStore(store)
 
         let exactId = UUID()
         let ambiguousId = UUID()
@@ -113,7 +113,7 @@ final class UnknownDeliveryIdentityTests: XCTestCase {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
-        await store.start()
+        await startStore(store)
         let firstId = UUID()
         let secondId = UUID()
         let firstBubble = try await seedUnknownSend(id: firstId, text: "conflicting aliases", cache: cache, store: store)
@@ -149,7 +149,7 @@ final class UnknownDeliveryIdentityTests: XCTestCase {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .webSendDeliveryUnknown, historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
-        await store.start()
+        await startStore(store)
         let commandId = UUID()
 
         let sent = await store.send(text: "confirm exact identity", runtimeId: "runtime.web",
@@ -183,7 +183,7 @@ final class UnknownDeliveryIdentityTests: XCTestCase {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
-        await store.start()
+        await startStore(store)
         let commandId = UUID()
         let bubble = try await seedUnknownSend(id: commandId, text: "lifecycle pending", cache: cache, store: store)
         await mock.appendHistoryMessage(ServerMessage(
@@ -247,5 +247,24 @@ final class UnknownDeliveryIdentityTests: XCTestCase {
             detail: nil,
             createdAt: command.createdAt
         )
+    }
+
+    @MainActor
+    private func startStore(_ store: WorkspaceStore) async {
+        let started = await store.start()
+        XCTAssertTrue(started, "WorkspaceStore.start() must pass its native MockTransport startup path")
+        guard started else { return }
+        guard let webRuntime = store.runtimes.first(where: { $0.id == "runtime.web" }) else {
+            XCTFail("The Web runtime must be loaded before these history tests run")
+            return
+        }
+        await store.refreshRuntime(webRuntime)
+        guard let photoInstance = store.instances.first(where: { $0.id == "photo" }) else {
+            XCTFail("The Web test route must include the Photo instance")
+            return
+        }
+        await store.refreshSessions(runtime: webRuntime, instance: photoInstance)
+        XCTAssertTrue(store.sessions.contains(where: { $0.id == "photo-upload" }),
+            "The Web session must be loaded to provide a route for loadSession and retry")
     }
 }

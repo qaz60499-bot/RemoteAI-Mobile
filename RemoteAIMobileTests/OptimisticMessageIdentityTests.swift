@@ -374,6 +374,19 @@ final class OptimisticMessageIdentityTests: XCTestCase {
     private func startStore(_ store: WorkspaceStore) async {
         let started = await store.start()
         XCTAssertTrue(started, "WorkspaceStore.start() must pass its native MockTransport startup path")
+        guard started else { return }
+        guard let webRuntime = store.runtimes.first(where: { $0.id == "runtime.web" }) else {
+            XCTFail("The Web runtime must be loaded before these history tests run")
+            return
+        }
+        await store.refreshRuntime(webRuntime)
+        guard let photoInstance = store.instances.first(where: { $0.id == "photo" }) else {
+            XCTFail("The Web test route must include the Photo instance")
+            return
+        }
+        await store.refreshSessions(runtime: webRuntime, instance: photoInstance)
+        XCTAssertTrue(store.sessions.contains(where: { $0.id == "photo-upload" }),
+            "The Web session must be loaded to provide a route for loadSession and retry")
     }
 
     @MainActor

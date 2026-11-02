@@ -6,12 +6,20 @@ final class WebErrorExplanationTests: XCTestCase {
     func testRepeatedProviderIssueKeepsOneVisibleIssueAndFreshRecoveryWins() async throws {
         let mock = MockTransport(historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
-        await store.start()
+        let started = await store.start()
+        XCTAssertTrue(started)
+        let runtime = try XCTUnwrap(store.runtimes.first { $0.id == "runtime.web" })
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first { $0.id == "photo" })
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        // These are live observations for an opened Chat, not an empty-install
+        // cursor bootstrap. Use the next real sequence instead of a synthetic gap.
+        let firstSequence = try await mock.latestSequence(machineId: store.machine.id) + 1
         let at = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
         for index in 0..<12 {
             let observed = at.addingTimeInterval(Double(index))
             await mock.injectEvent(RemoteEvent(
-                protocolVersion: 1, eventId: UUID(), sequence: Int64(1501 + index),
+                protocolVersion: 1, eventId: UUID(), sequence: firstSequence + Int64(index),
                 machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo",
                 sessionId: "photo-upload", type: "SESSION_STATUS",
                 payload: ["providerSurface": .bool(true), "state": .string("degraded"),
@@ -31,7 +39,7 @@ final class WebErrorExplanationTests: XCTestCase {
 
         let recovered = at.addingTimeInterval(20)
         await mock.injectEvent(RemoteEvent(
-            protocolVersion: 1, eventId: UUID(), sequence: 1513,
+            protocolVersion: 1, eventId: UUID(), sequence: firstSequence + 12,
             machineId: "my-pc", runtimeId: "runtime.web", instanceId: "photo",
             sessionId: "photo-upload", type: "SESSION_STATUS",
             payload: ["providerSurface": .bool(true), "state": .string("online"),

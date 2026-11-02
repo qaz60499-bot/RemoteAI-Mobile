@@ -1886,12 +1886,13 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func isCurrentProjectLoadEpoch(generation: UInt64, revision: UInt64,
-        projectAlias: String, machineId: String, transport activeTransport: Transport) -> Bool {
+        projectAlias: String, machineId: String, transport activeTransport: Transport,
+        allowSuspended: Bool = false) -> Bool {
         generation == lifecycleGeneration
             && revision == projectConversationRevisions[projectAlias, default: 0]
             && machine.id == machineId
             && transport === activeTransport
-            && !isSuspended
+            && (allowSuspended || !isSuspended)
     }
 
     func loadProjectConversations(projectAlias: String, refresh: Bool = true, force: Bool = true) async {
@@ -1935,12 +1936,15 @@ final class WorkspaceStore: ObservableObject {
         if projectConversationsByAlias[projectAlias] == nil {
             cached = try? await cache.get([WebConversationDescriptor].self, key: "web.project.\(projectAlias).conversations")
             guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
-                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport) else { return }
+                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport,
+                allowSuspended: true) else { return }
         }
         if projectConversationsByAlias[projectAlias] == nil, let cached {
             // This cache contains only previously accepted authoritative snapshots.
-            // Check the epoch after the await so a create/refresh cannot be erased.
-            if projectConversationsByAlias[projectAlias] == nil, !isSuspended {
+            // A suspended view may still use this local snapshot to distinguish an
+            // unseen Project (show an offline explanation) from an offline cached one.
+            // The generation/revision checks above reject work that crossed suspension.
+            if projectConversationsByAlias[projectAlias] == nil {
                 let uniqueCached = Self.uniqueProjectConversations(cached)
                 projectConversationsByAlias[projectAlias] = uniqueCached
                 projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
@@ -1950,7 +1954,8 @@ final class WorkspaceStore: ObservableObject {
                 if uniqueCached.count != cached.count {
                     try? await cache.put(uniqueCached, key: "web.project.\(projectAlias).conversations")
                     guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
-                        projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport) else { return }
+                        projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport,
+                        allowSuspended: true) else { return }
                 }
             }
         }
@@ -2659,11 +2664,11 @@ final class WorkspaceStore: ObservableObject {
                 : page.items
             await reconcilePendingUnknownCommands(with: authoritativeItems, sessionId: sessionId)
             for remoteUser in authoritativeItems where remoteUser.role == .user {
-                await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+                await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId, runtimeId: route.runtimeId)
             }
             if route.runtimeId == "runtime.web" {
                 await reconcileLegacyWebOptimisticEchoes(with: authoritativeItems, sessionId: sessionId,
-                    forceRecheck: retryUnresolvedWebReceipts)
+                    runtimeId: route.runtimeId, forceRecheck: retryUnresolvedWebReceipts)
             }
             if route.runtimeId == "runtime.antigravity",
                sessions.first(where: { $0.id == sessionId })?.state != .busy {
@@ -3077,12 +3082,13 @@ final class WorkspaceStore: ObservableObject {
                           machine.id == activeMachineId, machine.state == .online, !isSuspended,
                           !readOnlyCachedWebSessionIds.contains(sessionId) else { return }
                     for remoteUser in authoritativeItems where remoteUser.role == .user {
-                        await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+                        await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId, runtimeId: route.runtimeId)
                         guard generation == lifecycleGeneration, transport === activeTransport,
                               machine.id == activeMachineId, machine.state == .online, !isSuspended,
                               !readOnlyCachedWebSessionIds.contains(sessionId) else { return }
                     }
-                    await reconcileLegacyWebOptimisticEchoes(with: authoritativeItems, sessionId: sessionId)
+                    await reconcileLegacyWebOptimisticEchoes(with: authoritativeItems, sessionId: sessionId,
+                        runtimeId: route.runtimeId)
                     guard generation == lifecycleGeneration, transport === activeTransport,
                           machine.id == activeMachineId, machine.state == .online, !isSuspended,
                           !readOnlyCachedWebSessionIds.contains(sessionId) else { return }
@@ -3406,9 +3412,10 @@ final class WorkspaceStore: ObservableObject {
                         }
                         await reconcilePendingUnknownCommands(with: page.items, sessionId: sessionId)
                         for remoteUser in page.items where remoteUser.role == .user {
-                            await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+                            await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId, runtimeId: runtimeId)
                         }
-                        await reconcileLegacyWebOptimisticEchoes(with: page.items, sessionId: sessionId)
+                        await reconcileLegacyWebOptimisticEchoes(with: page.items, sessionId: sessionId,
+                            runtimeId: runtimeId)
                         try? await cache.upsertMessages(page.items)
                         guard current() else { return false }
                         merge(page.items, into: sessionId)
@@ -3434,10 +3441,11 @@ final class WorkspaceStore: ObservableObject {
                 guard current() else { return false }
                 await reconcilePendingUnknownCommands(with: page.items, sessionId: sessionId)
                 for remoteUser in page.items where remoteUser.role == .user {
-                    await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+                    await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId, runtimeId: runtimeId)
                 }
                 if runtimeId == "runtime.web" {
-                    await reconcileLegacyWebOptimisticEchoes(with: page.items, sessionId: sessionId)
+                    await reconcileLegacyWebOptimisticEchoes(with: page.items, sessionId: sessionId,
+                        runtimeId: runtimeId)
                 }
                 try? await cache.upsertMessages(page.items)
                 guard current() else { return false }
@@ -5892,16 +5900,41 @@ final class WorkspaceStore: ObservableObject {
             "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "SESSION_DELETED",
             "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED", "MESSAGE_REMOVED",
         ])
+        let stopRunBoundaryEventTypes: Set<String> = [
+            "GENERATION_STARTED", "GENERATION_STOPPED", "MESSAGE_ADDED",
+            "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "SESSION_DELETED",
+            "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED", "MESSAGE_REMOVED",
+        ]
+        let eventGenerationKey = event.type == "GENERATION_STARTED"
+            ? event.payload["generationKey"]?.stringValue
+            : nil
+        let eventGenerationKeyIsNonempty = eventGenerationKey.map {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        } ?? false
+        // The Agent may reannounce the exact run key after a verified Web preflight
+        // adopts it. That does not create a new Stop boundary or replace the known
+        // start sequence; a different or missing key still invalidates the preflight.
+        let repeatedVerifiedGenerationStart = event.type == "GENERATION_STARTED"
+            && eventGenerationKeyIsNonempty
+            && stopRunGenerationKeyBySession[sessionId] == eventGenerationKey
+        let stopRunBoundaryEvent = (stopRunBoundaryEventTypes.contains(event.type)
+            && !repeatedVerifiedGenerationStart)
+            || (event.type == "MESSAGE_UPDATED" && event.payload["partial"]?.boolValue == false)
         if sessionCatalogMutatingEventTypes.contains(event.type) {
             // A listSessions request that started before this live event is stale by
             // definition. Without bumping the revision, its late response can delete a
             // newly registered desktop Chat or roll Busy/lastActivityAt back to idle.
             sessionRevisions[event.instanceId, default: 0] &+= 1
-            stopEventRevisionsBySession[sessionId, default: 0] &+= 1
-            if event.type == "GENERATION_STARTED" {
+            // StopRunIdentity's revision represents run/session identity boundaries.
+            // Tool and partial message progress are frequent within one generation;
+            // they still invalidate listSessions above but must not invalidate a
+            // same-run Stop preflight while its read-only page inspection is in flight.
+            if stopRunBoundaryEvent {
+                stopEventRevisionsBySession[sessionId, default: 0] &+= 1
+            }
+            if event.type == "GENERATION_STARTED", !repeatedVerifiedGenerationStart {
                 stopRunStartSequenceBySession[sessionId] = event.sequence
-                if let generationKey = event.payload["generationKey"]?.stringValue,
-                   !generationKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if let generationKey = eventGenerationKey, eventGenerationKeyIsNonempty {
                     stopRunGenerationKeyBySession[sessionId] = generationKey
                 } else {
                     stopRunGenerationKeyBySession.removeValue(forKey: sessionId)
@@ -6076,7 +6109,9 @@ final class WorkspaceStore: ObservableObject {
                     liveRunStatusBySession.removeValue(forKey: sessionId)
                     clearLiveRunActivity(sessionId: sessionId)
                 }
-                if base.role == .user { await reconcileOptimisticUserEcho(base, sessionId: sessionId) }
+                if base.role == .user {
+                    await reconcileOptimisticUserEcho(base, sessionId: sessionId, runtimeId: event.runtimeId)
+                }
                 let message = ChatMessage(id: base.id, sessionId: base.sessionId, sequence: event.sequence, role: base.role, kind: base.kind, text: base.text, toolName: nil, toolStatus: nil, detail: nil, attachments: base.attachments, createdAt: base.createdAt)
                 merge([message], into: sessionId)
                 // The durable reply is already merged. Unfreeze the visible transcript
@@ -7181,11 +7216,12 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func reconcileOptimisticUserEcho(_ serverMessage: ChatMessage, sessionId: String) async {
+    private func reconcileOptimisticUserEcho(_ serverMessage: ChatMessage, sessionId: String,
+        runtimeId: String? = nil) async {
         guard serverMessage.sessionId == sessionId, serverMessage.role == .user else { return }
-        if routeForSession(sessionId)?.runtimeId == "runtime.web",
-           readOnlyCachedWebSessionIds.contains(sessionId) { return }
-        if routeForSession(sessionId)?.runtimeId == "runtime.codex",
+        let identityRuntimeId = runtimeId ?? routeForSession(sessionId)?.runtimeId
+        if identityRuntimeId == "runtime.web", readOnlyCachedWebSessionIds.contains(sessionId) { return }
+        if identityRuntimeId == "runtime.codex",
            let providerId = serverMessage.providerMessageId, providerId != serverMessage.id {
             // An authoritative native turn maps the old API ID to the original
             // client ID. Remove only that exact alias, never another equal prompt.
@@ -7215,7 +7251,9 @@ final class WorkspaceStore: ObservableObject {
         // Web history and a mobile Send command have independent clocks and provider
         // IDs. A matching body/time window cannot establish that those rows are the
         // same operation, so Web reconciliation is identity-only.
-        if routeForSession(sessionId)?.runtimeId == "runtime.web" { return }
+        // Body/time matching is allowed only when a non-Web runtime is explicit.
+        // A missing lazy catalog entry is not evidence that a Web Chat is native.
+        guard let identityRuntimeId, identityRuntimeId != "runtime.web" else { return }
         guard let optimistic = messagesBySession[sessionId, default: []].last(where: {
             guard $0.role == .user, $0.sequence == nil,
                   UUID(uuidString: $0.id) != nil,
@@ -7300,8 +7338,9 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func reconcileLegacyWebOptimisticEchoes(with remote: [ChatMessage], sessionId: String,
+        runtimeId: String,
         forceRecheck: Bool = false) async {
-        guard routeForSession(sessionId)?.runtimeId == "runtime.web",
+        guard runtimeId == "runtime.web",
               remote.allSatisfy({ $0.sessionId == sessionId }) else { return }
         let generation = lifecycleGeneration
         let activeTransport = transport

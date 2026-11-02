@@ -32,7 +32,7 @@ final class ConnectionRecoveryLifecycleTests: XCTestCase {
         // Model an agent-online presence frame lost on the retained socket. The fresh
         // bounded handshake observes the real Agent state and resumes authentication.
         await transport.setAgentOnlineWithoutHealthEvent(true)
-        let recovered = await waitForMachineOnline(store, timeout: 8)
+        let recovered = await waitForAuthenticatedDeltaRecovery(store, transport: transport, timeout: 8)
         XCTAssertTrue(recovered)
         let presenceRefreshes = await transport.presenceRefreshCount()
         let authenticatedStatusCalls = await transport.statusCallCount()
@@ -92,7 +92,7 @@ final class ConnectionRecoveryLifecycleTests: XCTestCase {
         await transport.setAgentOnlineWithoutHealthEvent(true)
         await transport.injectHealth(TransportHealthEvent(channel: .agent, state: .online, at: Date(), detail: nil))
 
-        let recovered = await waitForMachineOnline(store, timeout: 2)
+        let recovered = await waitForAuthenticatedDeltaRecovery(store, transport: transport, timeout: 2)
         XCTAssertTrue(recovered)
         let statusCalls = await transport.statusCallCount()
         let deltaCalls = await transport.deltaCallCount()
@@ -106,13 +106,27 @@ final class ConnectionRecoveryLifecycleTests: XCTestCase {
         await store.suspend()
     }
 
-    private func waitForMachineOnline(_ store: WorkspaceStore, timeout: TimeInterval) async -> Bool {
+    private func waitForAuthenticatedDeltaRecovery(
+        _ store: WorkspaceStore,
+        transport: AgentPresenceTransport,
+        timeout: TimeInterval
+    ) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if store.machine.state == .online && store.connectionPhase == .online { return true }
+            let statusCalls = await transport.statusCallCount()
+            let deltaCalls = await transport.deltaCallCount()
+            if store.machine.state == .online,
+               store.connectionPhase == .online,
+               statusCalls >= 2,
+               deltaCalls >= 1 { return true }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
-        return store.machine.state == .online && store.connectionPhase == .online
+        let statusCalls = await transport.statusCallCount()
+        let deltaCalls = await transport.deltaCallCount()
+        return store.machine.state == .online
+            && store.connectionPhase == .online
+            && statusCalls >= 2
+            && deltaCalls >= 1
     }
 
     private func waitForPresenceRefreshCount(

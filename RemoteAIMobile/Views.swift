@@ -289,6 +289,15 @@ struct RuntimeView: View {
     }
 }
 
+enum WebTabRowIntent: Equatable {
+    case enter
+    case refreshInventory
+
+    static func resolve(_ status: WebTabEntryStatus?) -> WebTabRowIntent {
+        status?.requiresInventoryRefresh == true ? .refreshInventory : .enter
+    }
+}
+
 struct InstanceView: View {
     @EnvironmentObject var store: WorkspaceStore
     @Environment(\.scenePhase) private var scenePhase
@@ -321,6 +330,16 @@ struct InstanceView: View {
     private var supportsProjects: Bool { isChatGPTWeb || isAntigravity }
     private func enterWebTab(_ tab: OpenWebTab) {
         guard enteringWebTabId == nil else { return }
+        if WebTabRowIntent.resolve(store.webTabEntryStatusById[tab.id]) == .refreshInventory {
+            // Expired tab identity: refresh the inventory first; never navigate using
+            // an old tab ID or send a message during this recovery path.
+            enteringWebTabId = tab.id
+            Task { @MainActor in
+                await store.refreshOpenWebTabs()
+                if enteringWebTabId == tab.id { enteringWebTabId = nil }
+            }
+            return
+        }
         enteringWebTabId = tab.id
         Task { @MainActor in
             let destination = await store.enterOpenWebTab(tab)
@@ -463,7 +482,8 @@ struct InstanceView: View {
                                             }
                                             if let sessionId = tab.sessionId,
                                                let problem = store.errors[sessionId], !problem.isEmpty {
-                                                Text("最近失败：\(problem)").font(.caption2).foregroundColor(.orange)
+                                                Text("会话故障记录（不代表当前网页无法打开）：\(problem)")
+                                                    .font(.caption2).foregroundColor(.orange)
                                             }
                                         }
                                         Spacer(minLength: 4)
@@ -473,8 +493,7 @@ struct InstanceView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .accessibilityIdentifier("open-web-tab-\(tab.id)")
-                                .disabled(enteringWebTabId != nil || store.machine.state != .online
-                                    || store.webTabEntryStatusById[tab.id]?.requiresInventoryRefresh == true)
+                                .disabled(enteringWebTabId != nil || store.machine.state != .online)
                                 Menu {
                                     Button { inspectWebTab(tab) } label: {
                                         Label("检测网页实际状态", systemImage: "stethoscope")
@@ -520,6 +539,10 @@ struct InstanceView: View {
                                         Text(entry.message)
                                             .font(.caption)
                                             .foregroundColor(entry.isLoading ? .secondary : .orange)
+                                    }
+                                    if entry.requiresInventoryRefresh {
+                                        Text("此标签身份已变化：点击上方 Chat 行先更新网页列表；核验身份后再进入。")
+                                            .font(.caption2).foregroundColor(.orange)
                                     }
                                     if let code = entry.code {
                                         Text("错误代码：\(code)").font(.caption2).foregroundColor(.secondary)
