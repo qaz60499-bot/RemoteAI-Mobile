@@ -45,6 +45,7 @@ actor MockTransport: Transport {
     private var commandAttempts: [String: Int] = [:]
     private var commandIdsByAction: [String: [UUID]] = [:]
     private var commandPayloadsByAction: [String: [[String: JSONValue]]] = [:]
+    private var commandOutcomeOverrides: [UUID: (status: String, accepted: Bool?, sessionId: String?, messageId: String?)] = [:]
     private var latestManagedWebTabExplicitConsent: Bool?
     private var disconnectAfterActionCounts: [String: Int] = [:]
     private var actionFailureCounts: [String: Int] = [:]
@@ -254,6 +255,10 @@ actor MockTransport: Transport {
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
     func commandIds(action: String) -> [UUID] { commandIdsByAction[action, default: []] }
     func commandPayloads(action: String) -> [[String: JSONValue]] { commandPayloadsByAction[action, default: []] }
+    func setCommandOutcomeOverride(for commandId: UUID, status: String, accepted: Bool? = nil,
+        sessionId: String? = nil, messageId: String? = nil) {
+        commandOutcomeOverrides[commandId] = (status, accepted, sessionId, messageId)
+    }
     func lastManagedWebTabConsent() -> Bool? { latestManagedWebTabExplicitConsent }
     func eventCount(type: String, sessionId: String) -> Int {
         eventLog.filter { $0.type == type && $0.sessionId == sessionId }.count
@@ -494,19 +499,41 @@ actor MockTransport: Transport {
             response = success(["machineId": .string(machineId), "latestSequence": .number(Double(sequence))])
         case "getCommandOutcome":
             let targetIdText = command.payload["targetCommandId"]?.stringValue ?? ""
-            let saved = UUID(uuidString: targetIdText).flatMap { processedCommands[$0] }
-            let status: String
-            if let saved {
-                status = saved.ok ? "COMPLETED"
-                    : (saved.error?.code == "WEB_SEND_DELIVERY_UNKNOWN" ? "UNKNOWN_DELIVERY" : "FAILED")
+            let targetCommandId = UUID(uuidString: targetIdText)
+            if let override = targetCommandId.flatMap({ commandOutcomeOverrides[$0] }) {
+                var result: [String: JSONValue] = [:]
+                if let accepted = override.accepted { result["accepted"] = .bool(accepted) }
+                if let sessionId = override.sessionId { result["sessionId"] = .string(sessionId) }
+                if let messageId = override.messageId { result["messageId"] = .string(messageId) }
+                let outcome = JSONValue.object([
+                    "ok": .bool(true),
+                    "result": .object(result),
+                ])
+                response = success([
+                    "targetCommandId": .string(targetIdText),
+                    "status": .string(override.status),
+                    "outcome": outcome,
+                ])
             } else {
-                status = "NOT_FOUND"
+                let saved = targetCommandId.flatMap { processedCommands[$0] }
+                let status: String
+                if let saved {
+                    status = saved.ok ? "COMPLETED"
+                        : (saved.error?.code == "WEB_SEND_DELIVERY_UNKNOWN" ? "UNKNOWN_DELIVERY" : "FAILED")
+                } else {
+                    status = "NOT_FOUND"
+                }
+                let outcome: JSONValue? = saved.map { saved in
+                    var fields: [String: JSONValue] = ["ok": .bool(saved.ok)]
+                    if let result = saved.result { fields["result"] = result }
+                    return .object(fields)
+                }
+                response = success([
+                    "targetCommandId": .string(targetIdText),
+                    "status": .string(status),
+                    "outcome": outcome ?? .null,
+                ])
             }
-            response = success([
-                "targetCommandId": .string(targetIdText),
-                "status": .string(status),
-                "outcome": saved.map { .object(["ok": .bool($0.ok)]) } ?? .null
-            ])
         case "getDiagnostics":
             response = success([
                 "schemaVersion": .number(1),

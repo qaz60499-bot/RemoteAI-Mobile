@@ -1,56 +1,17 @@
 import XCTest
 @testable import RemoteAIMobile
 
-private struct CommandOutcomeFixture {
+private struct CommandOutcomeFixture: Sendable {
     let status: String
     let accepted: Bool?
     let sessionId: String?
     let messageId: String?
 }
 
-private actor CommandOutcomeFixtureTransport: Transport {
-    private let base: MockTransport
-    private var outcomes: [UUID: CommandOutcomeFixture] = [:]
-    private var outcomeLookups = 0
-
-    init(base: MockTransport) {
-        self.base = base
-    }
-
-    var isConnected: Bool { get async { await base.isConnected } }
-
-    func connect() async throws { try await base.connect() }
-    func disconnect() async { await base.disconnect() }
-    func eventStream() async -> AsyncStream<RemoteEvent> { await base.eventStream() }
-    func healthStream() async -> AsyncStream<TransportHealthEvent> { await base.healthStream() }
-
+private extension MockTransport {
     func setOutcome(_ fixture: CommandOutcomeFixture, for commandId: UUID) {
-        outcomes[commandId] = fixture
-    }
-
-    func outcomeLookupCount() -> Int { outcomeLookups }
-
-    func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
-        guard command.action == "getCommandOutcome" else { return try await base.execute(command) }
-        outcomeLookups += 1
-        let targetText = command.payload["targetCommandId"]?.stringValue ?? ""
-        let targetId = UUID(uuidString: targetText)
-        let fixture = targetId.flatMap { outcomes[$0] }
-            ?? CommandOutcomeFixture(status: "NOT_FOUND", accepted: false, sessionId: nil, messageId: nil)
-        var result: [String: JSONValue] = [:]
-        if let accepted = fixture.accepted { result["accepted"] = .bool(accepted) }
-        if let sessionId = fixture.sessionId { result["sessionId"] = .string(sessionId) }
-        if let messageId = fixture.messageId { result["messageId"] = .string(messageId) }
-        let outcome = JSONValue.object([
-            "ok": .bool(true),
-            "result": .object(result),
-        ])
-        let response = JSONValue.object([
-            "targetCommandId": .string(targetText),
-            "status": .string(fixture.status),
-            "outcome": outcome,
-        ])
-        return CommandResponseEnvelope(ok: true, result: response, error: nil, idempotentReplay: nil)
+        setCommandOutcomeOverride(for: commandId, status: fixture.status,
+            accepted: fixture.accepted, sessionId: fixture.sessionId, messageId: fixture.messageId)
     }
 }
 
@@ -59,9 +20,9 @@ final class OptimisticMessageIdentityTests: XCTestCase {
     func testWebCommandIdentityRemovesOptimisticBubbleDespiteOlderProviderTimestamp() async throws {
         let cache = try SQLiteStore.inMemory()
         let base = MockTransport(historyCount: 0)
-        let transport = CommandOutcomeFixtureTransport(base: base)
+        let transport = base
         let store = WorkspaceStore(transport: transport, cache: cache)
-        await store.start()
+        await startStore(store)
 
         let commandId = UUID()
         let now = Date()
@@ -80,7 +41,7 @@ final class OptimisticMessageIdentityTests: XCTestCase {
         let users = store.messagesBySession["photo-upload", default: []].filter { $0.role == .user }
         XCTAssertEqual(users.count, 1)
         XCTAssertEqual(users.first?.id, commandId.uuidString)
-        let lookupCount = await transport.outcomeLookupCount()
+        let lookupCount = await base.actionAttemptCount("getCommandOutcome")
         XCTAssertEqual(lookupCount, 0,
             "An exact command/message identity should reconcile without querying the receipt bridge")
         await store.suspend()
@@ -90,9 +51,9 @@ final class OptimisticMessageIdentityTests: XCTestCase {
     func testSameTextTrueSendsRemainSeparateWhenOnlyOneExactCommandEchoExists() async throws {
         let cache = try SQLiteStore.inMemory()
         let base = MockTransport(historyCount: 0)
-        let transport = CommandOutcomeFixtureTransport(base: base)
+        let transport = base
         let store = WorkspaceStore(transport: transport, cache: cache)
-        await store.start()
+        await startStore(store)
 
         let firstId = UUID()
         let secondId = UUID()
@@ -117,7 +78,7 @@ final class OptimisticMessageIdentityTests: XCTestCase {
         let users = store.messagesBySession["photo-upload", default: []].filter { $0.role == .user }
         XCTAssertEqual(Set(users.map(\.id)), Set([firstId.uuidString, secondId.uuidString]))
         let sendAttempts = await base.actionAttemptCount("sendMessage")
-        let outcomeLookups = await transport.outcomeLookupCount()
+        let outcomeLookups = await base.actionAttemptCount("getCommandOutcome")
         XCTAssertEqual(sendAttempts, 0,
             "An unknown status lookup must never resend either command")
         XCTAssertEqual(outcomeLookups, 1,
@@ -129,9 +90,9 @@ final class OptimisticMessageIdentityTests: XCTestCase {
     func testLegacyBuild84ReceiptUsesExactSameSessionServerMessageAndSurvivesRestart() async throws {
         let cache = try SQLiteStore.inMemory()
         let base = MockTransport(historyCount: 0)
-        let transport = CommandOutcomeFixtureTransport(base: base)
+        let transport = base
         let store = WorkspaceStore(transport: transport, cache: cache)
-        await store.start()
+        await startStore(store)
 
         let commandId = UUID()
         let serverMessageId = "legacy-web-message-42"
@@ -142,7 +103,7 @@ final class OptimisticMessageIdentityTests: XCTestCase {
         await store.loadSession("photo-upload")
         XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains(where: { $0.id == commandId.uuidString }),
             "A receipt without its named page row cannot remove the legacy bubble")
-        let firstLookupCount = await transport.outcomeLookupCount()
+        let firstLookupCount = await base.actionAttemptCount("getCommandOutcome")
         XCTAssertEqual(firstLookupCount, 1)
         await store.suspend()
 
@@ -155,13 +116,13 @@ final class OptimisticMessageIdentityTests: XCTestCase {
             createdAt: Date().addingTimeInterval(-11)
         ))
         let restarted = WorkspaceStore(transport: transport, cache: cache)
-        await restarted.start()
+        await startStore(restarted)
         await restarted.loadSession("photo-upload")
 
         let users = restarted.messagesBySession["photo-upload", default: []].filter { $0.role == .user }
         XCTAssertEqual(users.map(\.id), [serverMessageId],
             "The persisted receipt's exact server ID, not text or time, resolves the Build84 optimistic row")
-        let restartedLookupCount = await transport.outcomeLookupCount()
+        let restartedLookupCount = await base.actionAttemptCount("getCommandOutcome")
         XCTAssertEqual(restartedLookupCount, 1,
             "A cached accepted receipt is reused after restart without an extra outcome request")
         await restarted.suspend()
@@ -189,9 +150,9 @@ final class OptimisticMessageIdentityTests: XCTestCase {
         for (name, receipt, serverRow) in cases {
             let cache = try SQLiteStore.inMemory()
             let base = MockTransport(historyCount: 0)
-            let transport = CommandOutcomeFixtureTransport(base: base)
+            let transport = base
             let store = WorkspaceStore(transport: transport, cache: cache)
-            await store.start()
+            await startStore(store)
             let commandId = UUID()
             try await cache.upsertMessages([optimistic(commandId, text: "same prompt", at: Date())])
             await transport.setOutcome(receipt, for: commandId)
@@ -212,9 +173,9 @@ final class OptimisticMessageIdentityTests: XCTestCase {
     func testOneLegacyProviderRowCannotConsumeTwoCommandReceiptsAcrossRestart() async throws {
         let cache = try SQLiteStore.inMemory()
         let base = MockTransport(historyCount: 0)
-        let transport = CommandOutcomeFixtureTransport(base: base)
+        let transport = base
         let store = WorkspaceStore(transport: transport, cache: cache)
-        await store.start()
+        await startStore(store)
         let firstId = UUID()
         let secondId = UUID()
         let rowId = "legacy-shared-provider-row"
@@ -234,17 +195,17 @@ final class OptimisticMessageIdentityTests: XCTestCase {
         let firstPassUsers = store.messagesBySession["photo-upload", default: []].filter { $0.role == .user }
         XCTAssertEqual(Set(firstPassUsers.map(\.id)), Set([firstId.uuidString, secondId.uuidString, rowId]),
             "Conflicting durable receipts must leave both optimistic commands visible")
-        let firstPassLookups = await transport.outcomeLookupCount()
+        let firstPassLookups = await base.actionAttemptCount("getCommandOutcome")
         XCTAssertEqual(firstPassLookups, 2)
         await store.suspend()
 
         let restarted = WorkspaceStore(transport: transport, cache: cache)
-        await restarted.start()
+        await startStore(restarted)
         await restarted.loadSession("photo-upload")
         let restartedUsers = restarted.messagesBySession["photo-upload", default: []].filter { $0.role == .user }
         XCTAssertEqual(Set(restartedUsers.map(\.id)), Set([firstId.uuidString, secondId.uuidString, rowId]),
             "The persisted conflict marker prevents one row consuming a second bubble after restart")
-        let restartLookups = await transport.outcomeLookupCount()
+        let restartLookups = await base.actionAttemptCount("getCommandOutcome")
         XCTAssertEqual(restartLookups, firstPassLookups,
             "Accepted receipts and the conflict decision are reused across restart")
         await restarted.suspend()
@@ -254,9 +215,9 @@ final class OptimisticMessageIdentityTests: XCTestCase {
     func testManualRetryKeepsUnknownWhenAcceptedReceiptNamesMissingHistoryRow() async throws {
         let cache = try SQLiteStore.inMemory()
         let base = MockTransport(historyCount: 0)
-        let transport = CommandOutcomeFixtureTransport(base: base)
+        let transport = base
         let store = WorkspaceStore(transport: transport, cache: cache)
-        await store.start()
+        await startStore(store)
         let commandId = UUID()
         let bubble = try await seedPendingUnknown(commandId, text: "accepted but row missing", cache: cache, store: store)
         await transport.setOutcome(CommandOutcomeFixture(status: "COMPLETED", accepted: true,
@@ -280,9 +241,9 @@ final class OptimisticMessageIdentityTests: XCTestCase {
     func testManualRetryDoesNotCompleteTwoUnknownCommandsFromOneConflictingReceiptRow() async throws {
         let cache = try SQLiteStore.inMemory()
         let base = MockTransport(historyCount: 0)
-        let transport = CommandOutcomeFixtureTransport(base: base)
+        let transport = base
         let store = WorkspaceStore(transport: transport, cache: cache)
-        await store.start()
+        await startStore(store)
         let firstId = UUID()
         let secondId = UUID()
         let firstBubble = try await seedPendingUnknown(firstId, text: "same prompt", cache: cache, store: store)
@@ -318,9 +279,9 @@ final class OptimisticMessageIdentityTests: XCTestCase {
     func testLoadOlderReconcilesExactReceiptFromHistoryOutsideRecentWindow() async throws {
         let cache = try SQLiteStore.inMemory()
         let base = MockTransport(historyCount: 0)
-        let transport = CommandOutcomeFixtureTransport(base: base)
+        let transport = base
         let store = WorkspaceStore(transport: transport, cache: cache)
-        await store.start()
+        await startStore(store)
         let commandId = UUID()
         let oldRowId = "older-named-provider-row"
         let anchor = Date().addingTimeInterval(-1_000)
@@ -348,7 +309,7 @@ final class OptimisticMessageIdentityTests: XCTestCase {
             "The accepted receipt cannot map its older row until that history page is loaded")
         XCTAssertTrue(store.hasMoreBySession["photo-upload"] == true)
         XCTAssertTrue(store.messagesBySession["photo-upload", default: []].contains { $0.id == commandId.uuidString })
-        let receiptLookupsBeforeOlderPage = await transport.outcomeLookupCount()
+        let receiptLookupsBeforeOlderPage = await base.actionAttemptCount("getCommandOutcome")
         XCTAssertEqual(receiptLookupsBeforeOlderPage, 1)
 
         await store.loadOlder("photo-upload")
@@ -362,7 +323,7 @@ final class OptimisticMessageIdentityTests: XCTestCase {
         XCTAssertNil(pendingAfterOlderPage)
         let loadBeforeAttempts = await base.actionAttemptCount("loadMessagesBefore")
         XCTAssertEqual(loadBeforeAttempts, 1, "One explicit older-page request is sufficient")
-        let receiptLookupsAfterOlderPage = await transport.outcomeLookupCount()
+        let receiptLookupsAfterOlderPage = await base.actionAttemptCount("getCommandOutcome")
         XCTAssertEqual(receiptLookupsAfterOlderPage, receiptLookupsBeforeOlderPage,
             "The persisted exact receipt is reused without a polling loop")
         let sendAttempts = await base.actionAttemptCount("sendMessage")
@@ -374,9 +335,9 @@ final class OptimisticMessageIdentityTests: XCTestCase {
     func testManualResyncRechecksPersistedUnknownReceiptWithoutResending() async throws {
         let cache = try SQLiteStore.inMemory()
         let base = MockTransport(historyCount: 0)
-        let transport = CommandOutcomeFixtureTransport(base: base)
+        let transport = base
         let store = WorkspaceStore(transport: transport, cache: cache)
-        await store.start()
+        await startStore(store)
         let commandId = UUID()
         let serverMessageId = "late-legacy-web-row"
         try await cache.upsertMessages([optimistic(commandId, text: "manual check", at: Date())])
@@ -384,7 +345,7 @@ final class OptimisticMessageIdentityTests: XCTestCase {
             sessionId: "photo-upload", messageId: nil), for: commandId)
         await store.loadSession("photo-upload")
         await store.loadSession("photo-upload")
-        let automaticLookupCount = await transport.outcomeLookupCount()
+        let automaticLookupCount = await base.actionAttemptCount("getCommandOutcome")
         XCTAssertEqual(automaticLookupCount, 1,
             "Repeated automatic history loads are throttled by the persisted unresolved receipt")
 
@@ -401,12 +362,18 @@ final class OptimisticMessageIdentityTests: XCTestCase {
         XCTAssertFalse(store.messagesBySession["photo-upload", default: []].contains(where: { $0.id == commandId.uuidString }))
         XCTAssertNil(store.sendDeliveryDiagnosticsByCommand[commandId],
             "The exact accepted receipt clears only the matching unknown delivery notice")
-        let manualLookupCount = await transport.outcomeLookupCount()
+        let manualLookupCount = await base.actionAttemptCount("getCommandOutcome")
         let sendAttempts = await base.actionAttemptCount("sendMessage")
         XCTAssertEqual(manualLookupCount, 2,
             "An explicit manual resync can query the existing durable receipt path after an unknown result")
         XCTAssertEqual(sendAttempts, 0)
         await store.suspend()
+    }
+
+    @MainActor
+    private func startStore(_ store: WorkspaceStore) async {
+        let started = await store.start()
+        XCTAssertTrue(started, "WorkspaceStore.start() must pass its native MockTransport startup path")
     }
 
     @MainActor
