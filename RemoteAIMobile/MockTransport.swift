@@ -44,6 +44,7 @@ actor MockTransport: Transport {
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
     private var commandAttempts: [String: Int] = [:]
     private var commandIdsByAction: [String: [UUID]] = [:]
+    private var commandPayloadsByAction: [String: [[String: JSONValue]]] = [:]
     private var latestManagedWebTabExplicitConsent: Bool?
     private var disconnectAfterActionCounts: [String: Int] = [:]
     private var actionFailureCounts: [String: Int] = [:]
@@ -58,6 +59,8 @@ actor MockTransport: Transport {
     private var enteredOpenWebTabFixture: [String: JSONValue]?
     private var openWebTabCurrentURLOverrides: [Int: String] = [:]
     private var openWebTabCurrentSessionOverrides: [Int: String] = [:]
+    private var openWebTabInspectionOverrides: [Int: [String: JSONValue]] = [:]
+    private var queuedStopReceipts: [JSONValue] = []
     private var closedOpenWebTabIDs = Set<Int>()
     private var deltaPageLimitForTests: Int? = nil
     private var finishedAttachmentData: [String: Data] = [:]
@@ -237,6 +240,12 @@ actor MockTransport: Transport {
     func setOpenWebTabCurrentSessionOverride(tabId: Int, sessionId: String?) {
         openWebTabCurrentSessionOverrides[tabId] = sessionId
     }
+    func setOpenWebTabInspectionOverrides(tabId: Int, fields: [String: JSONValue]?) {
+        openWebTabInspectionOverrides[tabId] = fields
+    }
+    func enqueueStopReceipt(_ fields: [String: JSONValue]) {
+        queuedStopReceipts.append(.object(fields))
+    }
     func setDeltaPageLimitForTests(_ value: Int) { deltaPageLimitForTests = max(1, value) }
     func failNextAction(_ action: String, count: Int = 1) { actionFailureCounts[action] = max(0, count) }
     func disconnectAfterNextAction(_ action: String, count: Int = 1) {
@@ -244,6 +253,7 @@ actor MockTransport: Transport {
     }
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
     func commandIds(action: String) -> [UUID] { commandIdsByAction[action, default: []] }
+    func commandPayloads(action: String) -> [[String: JSONValue]] { commandPayloadsByAction[action, default: []] }
     func lastManagedWebTabConsent() -> Bool? { latestManagedWebTabExplicitConsent }
     func eventCount(type: String, sessionId: String) -> Int {
         eventLog.filter { $0.type == type && $0.sessionId == sessionId }.count
@@ -335,6 +345,32 @@ actor MockTransport: Transport {
             lastVisited: now
         ))
     }
+    func seedWebChatSession(
+        sessionId: String,
+        canonicalUrl: String,
+        status: String = "idle",
+        projectAlias: String? = nil,
+        lastActivityAt: Date? = nil
+    ) {
+        let now = Date()
+        var metadata: [String: JSONValue] = [:]
+        if let projectAlias { metadata["projectAlias"] = .string(projectAlias) }
+        if let lastActivityAt { metadata["lastActivityAt"] = .string(RemoteAIDate.string(lastActivityAt)) }
+        sessions.removeAll { $0.sessionId == sessionId }
+        sessions.append(ServerSession(
+            sessionId: sessionId,
+            runtimeId: "runtime.web",
+            instanceId: "web.chatgpt",
+            externalId: nil,
+            title: "Web Chat stop fixture",
+            canonicalUrl: canonicalUrl,
+            status: status,
+            metadata: metadata,
+            createdAt: now.addingTimeInterval(-60),
+            updatedAt: lastActivityAt ?? now,
+            lastVisited: now
+        ))
+    }
     func userMessageCount(sessionId: String, text: String) -> Int {
         history[sessionId, default: []].filter { $0.role == "user" && $0.content == text }.count
     }
@@ -382,6 +418,7 @@ actor MockTransport: Transport {
         try ProtocolSecurity.validate(command, expectedMachineId: machineId)
         commandAttempts[command.action, default: 0] += 1
         commandIdsByAction[command.action, default: []].append(command.commandId)
+        commandPayloadsByAction[command.action, default: []].append(command.payload)
         if command.action == "listProjectConversations" {
             lastForceRefreshByAction[command.action] = command.payload["forceRefresh"]?.boolValue ?? false
         }
@@ -513,13 +550,17 @@ actor MockTransport: Transport {
         case "inspectOpenWebTab":
             let tabId = Int(command.payload["tabId"]?.intValue ?? -1)
             let canonicalUrl = openWebTabCurrentURLOverrides[tabId] ?? command.payload["expectedUrl"]?.stringValue ?? ""
-            response = success([
+            var diagnosis: [String: JSONValue] = [
                 "tabId": .number(Double(tabId)),
                 "state": .string("ready"),
                 "canonicalUrl": .string(canonicalUrl),
                 "generating": .bool(false), "composerReady": .bool(true),
                 "draftPresent": .bool(false), "pendingUploads": .bool(false), "busy": .bool(false)
-            ])
+            ]
+            for (key, value) in openWebTabInspectionOverrides[tabId] ?? [:] {
+                diagnosis[key] = value
+            }
+            response = success(diagnosis)
         case "manageOpenWebTab":
             latestManagedWebTabExplicitConsent = command.payload["userConfirmedDisruptive"]?.boolValue
             let operation = command.payload["operation"]?.stringValue ?? ""
@@ -769,7 +810,9 @@ actor MockTransport: Transport {
             }
             response = success(["accepted": .bool(true), "sessionId": .string(sessionId), "messageId": .string(user.messageId)])
         case "stopGeneration", "stopSession":
-            if scenario == .stopUnconfirmed || scenario == .stopPageIdleButAgentUnconfirmed {
+            if !queuedStopReceipts.isEmpty {
+                response = success(queuedStopReceipts.removeFirst().objectValue ?? [:])
+            } else if scenario == .stopUnconfirmed || scenario == .stopPageIdleButAgentUnconfirmed {
                 // A bare DOM idle ACK is not evidence of Agent registry reconciliation.
                 response = scenario == .stopPageIdleButAgentUnconfirmed
                     ? success(["stopped": .bool(false), "alreadyIdle": .bool(true), "settled": .bool(true), "confirmedIdle": .bool(false)])
@@ -781,7 +824,10 @@ actor MockTransport: Transport {
                 if scenario != .stopConfirmedWithoutEvent {
                     await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: command.sessionId, type: "GENERATION_STOPPED", payload: ["ok": .bool(true)])
                 }
-                response = success(["stopped": .bool(true), "settled": .bool(true), "confirmedIdle": .bool(true)])
+                response = success([
+                    "stopped": .bool(true), "settled": .bool(true), "confirmedIdle": .bool(true),
+                    "stopIdentity": defaultStopIdentity(for: command)
+                ])
             }
         case "createConversation":
             let alias = command.payload["projectAlias"]?.stringValue
@@ -931,6 +977,20 @@ actor MockTransport: Transport {
 
     private func success(_ result: [String: JSONValue]) -> CommandResponseEnvelope {
         CommandResponseEnvelope(ok: true, result: .object(result), error: nil, idempotentReplay: nil)
+    }
+
+    private func defaultStopIdentity(for command: RemoteCommand) -> JSONValue {
+        let key = command.payload["expectedGenerationKey"]?.stringValue ?? "mock-current-generation"
+        return .object([
+            "expectedGenerationKey": command.payload["expectedGenerationKey"] ?? .null,
+            "observedGenerationKey": .string(key),
+            "currentGenerationKey": .string(key),
+            "state": .string("matched"),
+            "source": .string("chatgpt-extension-observer"),
+            "observedAt": .string(RemoteAIDate.string(Date())),
+            "pageVerified": .bool(true),
+            "generating": .bool(false),
+        ])
     }
 
     private func success<T: Encodable>(_ result: T) throws -> CommandResponseEnvelope {

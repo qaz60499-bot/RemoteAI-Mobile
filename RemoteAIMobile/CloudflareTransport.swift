@@ -150,6 +150,22 @@ actor CloudflareTransport: Transport {
         failAllPending(with: TransportError.disconnected)
     }
 
+    func refreshAgentPresence() async throws -> Bool {
+        // A forced handshake is only needed after a confirmed offline episode has
+        // outlived its expected health signal. Do not recycle the Relay socket while
+        // any command is awaiting a receipt; that could turn a known operation into
+        // an avoidable unknown-delivery result.
+        guard pending.isEmpty else {
+            await recordDiagnostic("relay_presence_refresh_deferred", fields: [
+                "pendingCommandCount": String(pending.count),
+            ], level: "WARN")
+            return false
+        }
+        await disconnect()
+        try await connect()
+        return true
+    }
+
     func eventStream() async -> AsyncStream<RemoteEvent> {
         guard let stream else { return AsyncStream { $0.finish() } }
         return stream

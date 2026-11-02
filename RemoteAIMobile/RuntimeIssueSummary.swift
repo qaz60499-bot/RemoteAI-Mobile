@@ -216,18 +216,17 @@ enum RuntimeIssueSummary {
             let session = sessionByID[sessionID]
             let source = session.map { sourceName(for: $0, runtimes: snapshot.runtimes, instances: snapshot.instances) } ?? "Web"
             let original = issue.originalMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let explanation = issue.explanation
             let detail = original?.isEmpty == false
-                ? "\(issue.message)\n原始网页错误：\(original!)"
-                : issue.message
+                ? "\(explanation.summary)\n\(explanation.impact)\n错误代码：\(issue.code)\n原始网页错误：\(original!)"
+                : "\(explanation.summary)\n\(explanation.impact)\n错误代码：\(issue.code)"
             append(
                 "provider-issue.\(sessionID)",
-                .failure,
+                explanation.deliveryUnknown ? .uncertain : .failure,
                 issue.chineseStateName,
                 source,
                 detail,
-                issue.retryable
-                    ? "先在同一网页会话核对回复和投递状态；只有确认未执行后再决定是否重试。"
-                    : "查看同一网页会话中的实际回复和错误；不要自动重发。",
+                explanation.safeAction,
                 issue.at ?? snapshot.providerObservedAt[sessionID]
             )
         }

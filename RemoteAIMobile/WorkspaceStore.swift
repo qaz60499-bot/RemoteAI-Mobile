@@ -1,6 +1,37 @@
 import Foundation
 import SwiftUI
 
+private struct WebOptimisticEchoReceipt: Codable {
+    let machineId: String
+    let sessionId: String
+    let commandId: UUID
+    var status: String
+    var accepted: Bool
+    var messageId: String?
+    var serverSessionId: String?
+    var attempts: Int
+    var retryAfter: Date?
+    var lastAttemptAt: Date?
+    var consumed: Bool
+}
+
+private struct WebOptimisticEchoMessageAssociation: Codable {
+    let machineId: String
+    let sessionId: String
+    let messageId: String
+    var commandIds: Set<UUID>
+    var ownerCommandId: UUID?
+    var isConflicted: Bool
+    var consumed: Bool
+}
+
+struct SendDeliveryDiagnostic: Equatable {
+    let sessionId: String
+    let code: String
+    let observedAt: Date
+    let message: String
+}
+
 private enum GenerationTerminalOutcome: Equatable {
     case canceled
     case interrupted
@@ -13,6 +44,32 @@ enum OpenWebTabDestination {
     case project(WebProjectDescriptor)
 }
 
+struct WebTabEntryStatus: Equatable {
+    let isLoading: Bool
+    let code: String?
+    let diagnosisCode: String?
+    let message: String
+    let observedAt: Date
+    let rawMessage: String?
+    let retryable: Bool
+    let requiresInventoryRefresh: Bool
+    let cachedSession: SessionDescriptor?
+
+    static func checking(at date: Date = Date()) -> WebTabEntryStatus {
+        WebTabEntryStatus(
+            isLoading: true,
+            code: nil,
+            diagnosisCode: nil,
+            message: "正在核验所选 Chrome 标签的 Chat 身份…",
+            observedAt: date,
+            rawMessage: nil,
+            retryable: false,
+            requiresInventoryRefresh: false,
+            cachedSession: nil
+        )
+    }
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     private struct StopRunIdentity: Codable, Equatable {
@@ -22,6 +79,7 @@ final class WorkspaceStore: ObservableObject {
         let activityAt: Date?
 
         func identifiesSameRun(as other: StopRunIdentity) -> Bool {
+            guard eventRevision == other.eventRevision else { return false }
             if let generationKey, let otherKey = other.generationKey {
                 return generationKey == otherKey
             }
@@ -32,7 +90,19 @@ final class WorkspaceStore: ObservableObject {
             return activityAt == otherActivityAt
         }
 
+        func hasSameRunBoundary(as other: StopRunIdentity, allowActivityUpdates: Bool) -> Bool {
+            guard eventRevision == other.eventRevision else { return false }
+            if generationKey != nil || other.generationKey != nil {
+                return generationKey == other.generationKey
+            }
+            if generationSequence != nil || other.generationSequence != nil {
+                return generationSequence == other.generationSequence
+            }
+            return allowActivityUpdates || activityAt == other.activityAt
+        }
+
         func canCoalesceStopTask(as other: StopRunIdentity) -> Bool {
+            guard eventRevision == other.eventRevision else { return false }
             if let generationKey, let otherKey = other.generationKey {
                 return generationKey == otherKey
             }
@@ -57,6 +127,13 @@ final class WorkspaceStore: ObservableObject {
         let task: Task<Bool, Never>
     }
 
+    private enum StopIdentityPreflightResult {
+        case readyToStop
+        case refreshedForExplicitStop
+        case noLongerGenerating
+        case unavailable
+    }
+
     @Published var machine = MachineMetadata(id: "my-pc", name: "My PC", state: .connecting)
     @Published var runtimes: [RuntimeDescriptor] = []
     @Published var instances: [InstanceDescriptor] = []
@@ -73,6 +150,8 @@ final class WorkspaceStore: ObservableObject {
     private var webTabsRefreshNeedsConnectivityRetry = false
     @Published private(set) var managingWebTabIds = Set<Int>()
     @Published var webTabDiagnosesById: [Int: WebTabDiagnosis] = [:]
+    @Published var webTabEntryStatusById: [Int: WebTabEntryStatus] = [:]
+    @Published private(set) var readOnlyCachedWebSessionIds = Set<String>()
     @Published var webTabActionNotesById: [Int: String] = [:]
     @Published private(set) var webChatRecoveryNotesBySession: [String: String] = [:]
     @Published var recentWebTabNotices: [String] = []
@@ -95,7 +174,10 @@ final class WorkspaceStore: ObservableObject {
     @Published var hasLoadedWebProjects = false
     @Published var attachmentTransferBySession: [String: AttachmentTransferProgress] = [:]
     @Published var commandStates: [UUID: CommandState] = [:]
+    @Published private(set) var sendDeliveryDiagnosticsByCommand: [UUID: SendDeliveryDiagnostic] = [:]
     @Published var errors: [String: String] = [:]
+    @Published private(set) var stopDiagnosticsBySession: [String: StopLifecycleDiagnostic] = [:]
+    @Published private(set) var connectionFailureEpisode: ConnectionFailureEpisode?
     @Published var webProviderIssuesBySession: [String: RemoteProviderSurfaceIssue] = [:]
     @Published var webProviderSurfaceStateBySession: [String: String] = [:]
     @Published var webProviderSurfaceObservedAtBySession: [String: Date] = [:]
@@ -440,6 +522,19 @@ final class WorkspaceStore: ObservableObject {
         pendingCommandPrefix(machineId: machineId) + id.uuidString.lowercased()
     }
 
+    private static func webOptimisticEchoReceiptKey(_ commandId: UUID, machineId: String, sessionId: String) -> String {
+        "web.optimistic-echo.\(machineId).\(sessionId).\(commandId.uuidString.lowercased())"
+    }
+
+    private static func webOptimisticEchoMessageAssociationKey(_ messageId: String,
+        machineId: String, sessionId: String) -> String {
+        let token = Data(messageId.utf8).base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "=", with: "")
+        return "web.optimistic-echo-message.\(machineId).\(sessionId).\(token)"
+    }
+
     private static func durationMilliseconds(since start: Date) -> String {
         String(max(0, Int(Date().timeIntervalSince(start) * 1000)))
     }
@@ -451,6 +546,41 @@ final class WorkspaceStore: ObservableObject {
             for (key, value) in transportError.diagnosticFields { fields[key] = value }
         }
         return fields
+    }
+
+    private static func sendDeliveryErrorCode(_ error: Error?) -> String {
+        guard let error else { return "DELIVERY_UNCONFIRMED" }
+        guard let transportError = error as? TransportError else { return "ACK_UNCONFIRMED" }
+        switch transportError {
+        case .offline: return "OFFLINE"
+        case .badResponse(let status): return "HTTP_\(status)"
+        case .malformedData: return "MALFORMED_DATA"
+        case .pairingRequired: return "PAIRING_REQUIRED"
+        case .disconnected: return "DISCONNECTED"
+        case .timeout: return "TIMEOUT"
+        case .insecureRelay: return "INSECURE_RELAY"
+        case .frameTooLarge: return "FRAME_TOO_LARGE"
+        case .replayDetected: return "REPLAY_DETECTED"
+        case .remote(let code, _): return code
+        }
+    }
+
+    private func recordUnknownSendDiagnostic(commandId: UUID, sessionId: String,
+        error: Error? = nil, code: String? = nil) {
+        let observedAt = Date()
+        let resolvedCode = code ?? Self.sendDeliveryErrorCode(error)
+        let timestamp = RemoteAIDate.string(observedAt)
+        let message = "发送结果未知（\(resolvedCode)，\(timestamp)）。消息可能已送达，原消息和命令已保留；不会自动重发。请先同步并核对同一 Chat 的 Windows 历史，确认未送达后再手动重试。"
+        sendDeliveryDiagnosticsByCommand[commandId] = SendDeliveryDiagnostic(
+            sessionId: sessionId,
+            code: resolvedCode,
+            observedAt: observedAt,
+            message: message
+        )
+    }
+
+    private func clearSendDeliveryDiagnostic(commandId: UUID) {
+        sendDeliveryDiagnosticsByCommand.removeValue(forKey: commandId)
     }
 
     private static func isRecoverableCommandTransportError(_ error: TransportError) -> Bool {
@@ -612,6 +742,7 @@ final class WorkspaceStore: ObservableObject {
             }
             machine.state = .online
             errors["connection"] = nil
+            finishConnectionFailureEpisode(source: "authenticated-start")
             endTransientConnectionPresentation()
             DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence)])
             scheduleWebTabsRefreshAfterConnectivityRecovery(reason: "initial-online")
@@ -729,6 +860,17 @@ final class WorkspaceStore: ObservableObject {
                 }
                 recentWebTabNotices = Array(recentWebTabNotices.prefix(5))
             }
+            for old in openWebTabs {
+                guard let current = tabs.first(where: { $0.id == old.id }),
+                      !sameOpenWebTabIdentity(old, current) else { continue }
+                webTabEntryStatusById.removeValue(forKey: old.id)
+                webTabDiagnosesById.removeValue(forKey: old.id)
+                webTabActionNotesById.removeValue(forKey: old.id)
+            }
+            let currentIDs = Set(tabs.map(\.id))
+            for staleId in Array(webTabEntryStatusById.keys) where !currentIDs.contains(staleId) {
+                webTabEntryStatusById.removeValue(forKey: staleId)
+            }
             openWebTabs = tabs
             hasLoadedOpenWebTabs = true
             openWebTabsInventoryUnverified = false
@@ -755,54 +897,399 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func enterOpenWebTab(_ tab: OpenWebTab) async -> OpenWebTabDestination? {
-        guard machine.state == .online, !isSuspended else {
-            errors["web.tabs"] = "Windows 未连接，无法打开当前 Chrome 网页。"
-            return nil
-        }
         guard managingWebTabIds.insert(tab.id).inserted else { return nil }
         defer { managingWebTabIds.remove(tab.id) }
+        let entryStartedAt = Date()
+        webTabEntryStatusById[tab.id] = .checking(at: entryStartedAt)
+        defer {
+            if let status = webTabEntryStatusById[tab.id],
+               status.isLoading, status.observedAt == entryStartedAt {
+                webTabEntryStatusById.removeValue(forKey: tab.id)
+            }
+        }
         webTabDiagnosesById.removeValue(forKey: tab.id)
         let generation = lifecycleGeneration
         let activeTransport = transport
         let activeMachineId = machine.id
+        guard machine.state == .online, !isSuspended else {
+            let cachedSession = await verifiedCachedWebSession(for: tab)
+            guard isCurrentWebTabEntryOperation(generation: generation,
+                transport: activeTransport, machineId: activeMachineId),
+                  isCurrentOpenWebTabSelection(tab) else {
+                webTabEntryStatusById.removeValue(forKey: tab.id)
+                return nil
+            }
+            let issue = Self.webTabEntryFailure(for: TransportError.offline, cachedSession: cachedSession)
+            webTabEntryStatusById[tab.id] = issue
+            errors["web.tabs"] = issue.message
+            return nil
+        }
         do {
             let entered = try await activeTransport.enterOpenWebTab(machineId: activeMachineId, tab: tab)
-            guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return nil }
+            guard isCurrentWebTabEntryOperation(generation: generation,
+                transport: activeTransport, machineId: activeMachineId) else {
+                webTabEntryStatusById.removeValue(forKey: tab.id)
+                return nil
+            }
+            guard isCurrentOpenWebTabSelection(tab) else {
+                webTabEntryStatusById.removeValue(forKey: tab.id)
+                return nil
+            }
             webTabDiagnosesById[tab.id] = entered.diagnosis
+            guard Self.webTabDiagnosisAllowsLiveEntry(entered.diagnosis) else {
+                let cachedSession = await verifiedCachedWebSession(for: tab)
+                guard isCurrentWebTabEntryOperation(generation: generation,
+                    transport: activeTransport, machineId: activeMachineId),
+                      isCurrentOpenWebTabSelection(tab) else {
+                    webTabEntryStatusById.removeValue(forKey: tab.id)
+                    return nil
+                }
+                let baseIssue = Self.webTabEntryFailure(for: TransportError.remote(
+                    entered.diagnosis.issueCode ?? "SESSION_UNAVAILABLE",
+                    entered.diagnosis.issueMessage ?? "The selected Chat is not ready for entry."
+                ), cachedSession: cachedSession)
+                let issue = Self.webTabEntryStatus(for: entered.diagnosis, preserving: baseIssue)
+                webTabEntryStatusById[tab.id] = issue
+                errors["web.tabs"] = issue.message
+                DiagnosticsLog.shared.record("web_tab_enter_not_ready", fields: [
+                    "tabId": String(tab.tabId),
+                    "code": issue.code ?? "unknown",
+                    "diagnosis": entered.diagnosis.state,
+                    "cachedHistoryAvailable": String(cachedSession != nil)
+                ], level: "WARN")
+                return nil
+            }
+            webTabEntryStatusById.removeValue(forKey: tab.id)
             errors["web.tabs"] = nil
             if let conversation = entered.conversation {
                 // This is one of the few live paths that returns a fully checked
                 // provider identity for a root Chat without a Project sidebar snapshot.
                 await clearReappearedWebSessionDeletions([conversation])
+                guard isCurrentWebTabEntryOperation(generation: generation,
+                    transport: activeTransport, machineId: activeMachineId),
+                      isCurrentOpenWebTabSelection(tab) else {
+                    webTabEntryStatusById.removeValue(forKey: tab.id)
+                    return nil
+                }
                 // Enter returns a verified existing provider identity, not a
                 // new chat. Keep the live Agent status when already available.
-                let session = sessions.first(where: { $0.id == conversation.localConversationId })
-                    ?? conversation.session
-                if !sessions.contains(where: { $0.id == session.id }) {
+                let session: SessionDescriptor
+                if let existing = sessions.first(where: { $0.id == conversation.localConversationId }) {
+                    // Reusing an ID whose cached canonical/Project identity differs
+                    // could expose another Chat's local transcript under this receipt.
+                    // Keep the row blocked until the existing metadata is reconciled.
+                    guard Self.existingWebSession(existing, matches: conversation) else {
+                        throw TransportError.malformedData
+                    }
+                    session = existing
+                } else {
+                    session = conversation.session
+                }
+                if let index = sessions.firstIndex(where: { $0.id == session.id }) {
+                    if sessions[index] != session {
+                        sessions[index] = session
+                        await persistMetadata()
+                        guard isCurrentWebTabEntryOperation(generation: generation,
+                            transport: activeTransport, machineId: activeMachineId),
+                              isCurrentOpenWebTabSelection(tab) else { return nil }
+                    }
+                } else {
                     sessions.insert(session, at: 0)
                     await persistMetadata()
+                    guard isCurrentWebTabEntryOperation(generation: generation,
+                        transport: activeTransport, machineId: activeMachineId),
+                          isCurrentOpenWebTabSelection(tab) else { return nil }
                 }
-                guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return nil }
+                guard isCurrentWebTabEntryOperation(generation: generation,
+                    transport: activeTransport, machineId: activeMachineId),
+                      isCurrentOpenWebTabSelection(tab) else { return nil }
+                sessionRouteHints[session.id] = (activeMachineId, "runtime.web", "web.chatgpt")
+                readOnlyCachedWebSessionIds.remove(session.id)
                 return .chat(session)
             }
             if let project = entered.project {
                 return .project(project)
             }
-            errors["web.tabs"] = "Chrome 已响应，但没有返回可打开的 Chat 或 Project。"
+            throw TransportError.malformedData
         } catch {
-            if isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) {
-                errors["web.tabs"] = "打开当前网页失败：\(error.localizedDescription)"
-                DiagnosticsLog.shared.record("web_tab_enter_failed",
-                    fields: Self.diagnosticFields(for: error, adding: ["tabId": String(tab.tabId)]),
-                    level: "WARN")
+            guard isCurrentWebTabEntryOperation(generation: generation,
+                transport: activeTransport, machineId: activeMachineId) else {
+                webTabEntryStatusById.removeValue(forKey: tab.id)
+                return nil
             }
+            guard isCurrentOpenWebTabSelection(tab) else {
+                webTabEntryStatusById.removeValue(forKey: tab.id)
+                return nil
+            }
+            let cachedSession = await verifiedCachedWebSession(for: tab)
+            guard isCurrentWebTabEntryOperation(generation: generation,
+                transport: activeTransport, machineId: activeMachineId),
+                  isCurrentOpenWebTabSelection(tab) else { return nil }
+            let issue = Self.webTabEntryFailure(for: error, cachedSession: cachedSession)
+            webTabEntryStatusById[tab.id] = issue
+            errors["web.tabs"] = issue.message
+            DiagnosticsLog.shared.record("web_tab_enter_failed",
+                fields: Self.diagnosticFields(for: error, adding: ["tabId": String(tab.tabId),
+                    "entryCode": issue.code ?? "unknown",
+                    "cachedHistoryAvailable": String(cachedSession != nil)]),
+                level: "WARN")
         }
         return nil
     }
 
+    func openCachedWebTabHistory(_ tab: OpenWebTab) async -> SessionDescriptor? {
+        guard let status = webTabEntryStatusById[tab.id],
+              !status.isLoading,
+              let offeredSession = status.cachedSession,
+              let currentTab = openWebTabs.first(where: { $0.id == tab.id }),
+              sameOpenWebTabIdentity(currentTab, tab) else { return nil }
+        let verifiedSession = await verifiedCachedWebSession(for: currentTab)
+        guard webTabEntryStatusById[tab.id] == status,
+              let latestTab = openWebTabs.first(where: { $0.id == tab.id }),
+              sameOpenWebTabIdentity(latestTab, tab),
+              isCurrentOpenWebTabSelection(tab),
+              let latestSession = verifiedSession,
+              latestSession.id == offeredSession.id,
+              sessions.filter({ $0.id == latestSession.id && cachedWebSessionIdentityMatches($0, tab: latestTab) }).count == 1,
+              sessions.contains(latestSession),
+              !deletedWebSessionIds.contains(latestSession.id),
+              !isWebSessionUnavailable(latestSession) else { return nil }
+        readOnlyCachedWebSessionIds.insert(latestSession.id)
+        prepareHistoricalWebChat(latestSession)
+        DiagnosticsLog.shared.record("web_tab_cached_history_opened", fields: [
+            "tabId": String(tab.tabId),
+            "session": latestSession.id,
+            "readOnly": "true"
+        ])
+        return latestSession
+    }
+
+    func isCachedWebSessionReadOnly(_ sessionId: String) -> Bool {
+        readOnlyCachedWebSessionIds.contains(sessionId)
+    }
+
+    private func verifiedCachedWebSession(for tab: OpenWebTab) async -> SessionDescriptor? {
+        guard tab.isChat,
+              let sessionId = tab.sessionId,
+              !sessionId.isEmpty,
+              !deletedWebSessionIds.contains(sessionId) else { return nil }
+        let matchingSessions = sessions.filter {
+            $0.id == sessionId && cachedWebSessionIdentityMatches($0, tab: tab)
+        }
+        guard matchingSessions.count == 1,
+              let session = matchingSessions.first,
+              !isWebSessionUnavailable(session),
+              let cachedMessages = try? await cache.recentMessages(sessionId: sessionId, limit: 1),
+              !cachedMessages.isEmpty,
+              !deletedWebSessionIds.contains(sessionId),
+              sessions.filter({ $0.id == sessionId && cachedWebSessionIdentityMatches($0, tab: tab) }).count == 1,
+              sessions.contains(session) else { return nil }
+        return session
+    }
+
+    private func sameOpenWebTabIdentity(_ lhs: OpenWebTab, _ rhs: OpenWebTab) -> Bool {
+        lhs.id == rhs.id
+            && lhs.sessionId == rhs.sessionId
+            && lhs.isChat == rhs.isChat
+            && normalizedWebCanonicalURL(lhs.canonicalUrl) == normalizedWebCanonicalURL(rhs.canonicalUrl)
+    }
+
+    private func isCurrentOpenWebTabSelection(_ tab: OpenWebTab) -> Bool {
+        guard hasLoadedOpenWebTabs else { return true }
+        guard let current = openWebTabs.first(where: { $0.id == tab.id }) else { return false }
+        return sameOpenWebTabIdentity(current, tab)
+    }
+
+    private func cachedWebSessionIdentityMatches(_ session: SessionDescriptor, tab: OpenWebTab) -> Bool {
+        guard let selectedSessionId = tab.sessionId,
+              session.id == selectedSessionId,
+              session.instanceId == "web.chatgpt",
+              Self.isSafeChatGPTCanonicalURL(session.canonicalUrl),
+              Self.isSafeChatGPTCanonicalURL(tab.canonicalUrl),
+              let sessionURL = normalizedWebCanonicalURL(session.canonicalUrl),
+              let selectedURL = normalizedWebCanonicalURL(tab.canonicalUrl),
+              sessionURL == selectedURL,
+              let sessionConversation = webConversationAlias(from: session.canonicalUrl),
+              let selectedConversation = webConversationAlias(from: tab.canonicalUrl),
+              sessionConversation == selectedConversation else { return false }
+        let selectedProject = webProjectAlias(from: tab.canonicalUrl)
+        let sessionProject = session.projectAlias ?? webProjectAlias(from: session.canonicalUrl)
+        guard sameWebProjectAlias(sessionProject, selectedProject) else { return false }
+        if let declaredProject = session.projectAlias,
+           !sameWebProjectAlias(declaredProject, webProjectAlias(from: session.canonicalUrl)) {
+            return false
+        }
+        return true
+    }
+
+    private static func existingWebSession(_ session: SessionDescriptor,
+        matches conversation: WebConversationDescriptor) -> Bool {
+        guard session.id == conversation.localConversationId,
+              session.instanceId == "web.chatgpt",
+              isSafeChatGPTCanonicalURL(session.canonicalUrl),
+              isSafeChatGPTCanonicalURL(conversation.canonicalUrl),
+              let existingURL = session.canonicalUrl.flatMap(normalizedWebURL),
+              let verifiedURL = normalizedWebURL(conversation.canonicalUrl),
+              existingURL == verifiedURL,
+              let existingConversation = URL(string: existingURL).flatMap(conversationAliasFromNormalizedURL),
+              let verifiedConversation = normalizedConversationAlias(conversation.conversationAlias)
+                    ?? URL(string: verifiedURL).flatMap(conversationAliasFromNormalizedURL),
+              existingConversation == verifiedConversation else { return false }
+        let existingProject = session.projectAlias ?? projectAliasFromURL(session.canonicalUrl)
+        let verifiedProject = conversation.projectAlias ?? projectAliasFromURL(conversation.canonicalUrl)
+        guard normalizedProjectAlias(existingProject) == normalizedProjectAlias(verifiedProject) else { return false }
+        if let existingId = session.projectId, let verifiedId = conversation.projectId,
+           existingId != verifiedId { return false }
+        return true
+    }
+
+    private static func webTabEntryFailure(for error: Error,
+        cachedSession: SessionDescriptor?, observedAt: Date = Date()) -> WebTabEntryStatus {
+        let code: String
+        let message: String
+        let rawMessage: String?
+        let retryable: Bool
+        let requiresInventoryRefresh: Bool
+        if let transportError = error as? TransportError {
+            switch transportError {
+            case .remote(let remoteCode, let detail):
+                code = remoteCode
+                rawMessage = String(detail.prefix(180))
+                switch remoteCode {
+                case "SESSION_UNAVAILABLE":
+                    message = "当前页面仍在加载或尚未建立唯一 Chat 身份；未读取网页消息。可检测此标签了解具体状态。"
+                    retryable = true
+                    requiresInventoryRefresh = false
+                case "CONVERSATION_IDENTITY_UNVERIFIED":
+                    message = "当前页面身份尚未确认；没有导入内容或绑定其他 Chat。"
+                    retryable = true
+                    requiresInventoryRefresh = false
+                case "BROWSER_BINDING_MISSING":
+                    message = "所选 Chrome 标签已变化或失去绑定；需要更新实际标签列表。"
+                    retryable = true
+                    requiresInventoryRefresh = true
+                case "BROWSER_NOT_CONNECTED", "PROVIDER_UNAVAILABLE":
+                    message = "电脑网页暂时无法提供可验证的 Chat 身份；历史与草稿已保留。"
+                    retryable = true
+                    requiresInventoryRefresh = false
+                default:
+                    message = "网页身份校验未通过；为防止串 Chat，没有打开实时内容。"
+                    retryable = false
+                    requiresInventoryRefresh = false
+                }
+            case .offline:
+                code = "PC_OFFLINE"
+                message = "Windows 当前离线；实时网页身份未核验，本地历史仍保留。"
+                rawMessage = nil
+                retryable = true
+                requiresInventoryRefresh = false
+            case .disconnected:
+                code = "RELAY_DISCONNECTED"
+                message = "手机与 Windows 的连接暂断；实时网页身份未核验，本地历史仍保留。"
+                rawMessage = nil
+                retryable = true
+                requiresInventoryRefresh = false
+            case .timeout:
+                code = "REQUEST_TIMEOUT"
+                message = "网页身份核验超时；当前结果未确认，没有读取网页消息。"
+                rawMessage = nil
+                retryable = true
+                requiresInventoryRefresh = false
+            case .malformedData:
+                code = "IDENTITY_RECEIPT_REJECTED"
+                message = "Chrome 返回的身份与所选标签不一致；为防止串 Chat，没有打开实时内容。"
+                rawMessage = transportError.localizedDescription
+                retryable = false
+                requiresInventoryRefresh = true
+            default:
+                code = "OPEN_WEB_TAB_FAILED"
+                message = "当前网页无法安全打开；本地历史与草稿已保留。"
+                rawMessage = transportError.localizedDescription
+                retryable = false
+                requiresInventoryRefresh = false
+            }
+        } else {
+            code = "OPEN_WEB_TAB_FAILED"
+            message = "当前网页无法安全打开；本地历史与草稿已保留。"
+            rawMessage = String(error.localizedDescription.prefix(180))
+            retryable = false
+            requiresInventoryRefresh = false
+        }
+        return WebTabEntryStatus(
+            isLoading: false,
+            code: code,
+            diagnosisCode: nil,
+            message: message,
+            observedAt: observedAt,
+            rawMessage: rawMessage,
+            retryable: retryable,
+            requiresInventoryRefresh: requiresInventoryRefresh,
+            cachedSession: cachedSession
+        )
+    }
+
+    private func isCurrentWebTabEntryOperation(generation: UInt64,
+        transport activeTransport: Transport, machineId activeMachineId: String) -> Bool {
+        generation == lifecycleGeneration
+            && transport === activeTransport
+            && machine.id == activeMachineId
+            && !isSuspended
+    }
+
+    private static func isSafeChatGPTCanonicalURL(_ raw: String?) -> Bool {
+        guard let raw, let components = URLComponents(string: raw),
+              components.scheme?.lowercased() == "https",
+              components.host?.lowercased() == "chatgpt.com",
+              components.user == nil,
+              components.password == nil,
+              components.port == nil || components.port == 443 else { return false }
+        return true
+    }
+
+    private static func normalizedWebURL(_ raw: String?) -> String? {
+        guard let raw, let components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased() else { return nil }
+        var path = components.percentEncodedPath
+        while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+        return "\(scheme)://\(host)\(path)"
+    }
+
+    private static func conversationAliasFromNormalizedURL(_ url: URL) -> String? {
+        let parts = url.path.split(separator: "/").map(String.init)
+        guard let marker = parts.lastIndex(of: "c"), parts.indices.contains(marker + 1) else { return nil }
+        return normalizedConversationAlias(parts[marker + 1])
+    }
+
+    private static func normalizedConversationAlias(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return value.isEmpty ? nil : value
+    }
+
+    private static func projectAliasFromURL(_ raw: String?) -> String? {
+        guard let raw, let url = URL(string: raw) else { return nil }
+        let parts = url.path.split(separator: "/").map(String.init)
+        guard parts.count >= 2, parts[0] == "g", parts[1].hasPrefix("g-") else { return nil }
+        return parts[1]
+    }
+
+    private static func normalizedProjectAlias(_ raw: String?) -> String? {
+        raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func webTabDiagnosisAllowsLiveEntry(_ diagnosis: WebTabDiagnosis) -> Bool {
+        guard diagnosis.issueCode != "CONVERSATION_IDENTITY_UNVERIFIED",
+              diagnosis.issueCode != "BROWSER_BINDING_MISSING" else { return false }
+        return ["ready", "generating", "provider-error", "retry-visible"].contains(diagnosis.state)
+    }
+
     func inspectOpenWebTab(_ tab: OpenWebTab) async {
         guard machine.state == .online, !isSuspended else {
-            errors["web.tabs"] = "Windows 未连接，无法验证 Chrome 网页是否正常。"
+            let cachedSession = await verifiedCachedWebSession(for: tab)
+            let issue = Self.webTabEntryFailure(for: TransportError.offline, cachedSession: cachedSession)
+            webTabEntryStatusById[tab.id] = issue
+            errors["web.tabs"] = issue.message
             return
         }
         guard managingWebTabIds.insert(tab.id).inserted else { return }
@@ -820,17 +1307,131 @@ final class WorkspaceStore: ObservableObject {
         do {
             let diagnosis = try await activeTransport.inspectOpenWebTab(machineId: activeMachineId, tab: tab)
             guard isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) else { return }
+            guard isCurrentOpenWebTabSelection(tab) else {
+                webTabEntryStatusById.removeValue(forKey: tab.id)
+                return
+            }
             webTabDiagnosesById[tab.id] = diagnosis
             errors["web.tabs"] = nil
+            if ["ready", "generating"].contains(diagnosis.state) {
+                if let sessionId = tab.sessionId,
+                   readOnlyCachedWebSessionIds.contains(sessionId) {
+                    // inspectOpenWebTab proves the page URL but does not return the
+                    // provider session ID. Refresh the inventory once before lifting
+                    // read-only mode so a recycled tab with the same URL cannot rebind
+                    // cached messages to a different local session.
+                    await refreshOpenWebTabs()
+                    guard isCurrentWebTabOperation(generation: generation,
+                            transport: activeTransport, machineId: activeMachineId),
+                          !openWebTabsInventoryUnverified,
+                          isCurrentOpenWebTabSelection(tab) else { return }
+                    webTabDiagnosesById[tab.id] = diagnosis
+                    clearCachedWebSessionReadOnlyAfterVerifiedPage(tab, diagnosis: diagnosis)
+                }
+                webTabEntryStatusById.removeValue(forKey: tab.id)
+            } else if let priorStatus = webTabEntryStatusById[tab.id], !priorStatus.isLoading {
+                webTabEntryStatusById[tab.id] = Self.webTabEntryStatus(
+                    for: diagnosis, preserving: priorStatus
+                )
+            }
         } catch {
             // This is a failed status check, not proof of a failed page load.
-            if isCurrentWebTabOperation(generation: generation, transport: activeTransport, machineId: activeMachineId) {
-                errors["web.tabs"] = "网页状态无法确认：\(error.localizedDescription)"
+            guard isCurrentWebTabEntryOperation(generation: generation,
+                transport: activeTransport, machineId: activeMachineId) else { return }
+            guard isCurrentOpenWebTabSelection(tab) else {
+                webTabEntryStatusById.removeValue(forKey: tab.id)
+                return
             }
+            let cachedSession = await verifiedCachedWebSession(for: tab)
+            guard isCurrentWebTabEntryOperation(generation: generation,
+                transport: activeTransport, machineId: activeMachineId),
+                  isCurrentOpenWebTabSelection(tab) else { return }
+            let issue = Self.webTabEntryFailure(for: error, cachedSession: cachedSession)
+            webTabEntryStatusById[tab.id] = issue
+            errors["web.tabs"] = issue.message
         }
     }
 
+    private static func webTabEntryStatus(for diagnosis: WebTabDiagnosis,
+        preserving prior: WebTabEntryStatus) -> WebTabEntryStatus {
+        let code: String
+        let message: String
+        let retryable: Bool
+        let requiresInventoryRefresh: Bool
+        switch diagnosis.state {
+        case "loading":
+            code = diagnosis.issueCode ?? "PAGE_LOADING"
+            message = "Chrome 正在加载所选 Chat；尚未读取网页消息。"
+            retryable = true
+            requiresInventoryRefresh = false
+        case "not-ready":
+            code = diagnosis.issueCode ?? "CONVERSATION_IDENTITY_UNVERIFIED"
+            message = "Chrome 已加载，但主会话身份或输入框尚未确认；未导入网页内容。"
+            retryable = true
+            requiresInventoryRefresh = false
+        case "closed", "navigated":
+            code = diagnosis.issueCode ?? "BROWSER_BINDING_MISSING"
+            message = "所选标签已关闭或跳转，当前页面不再代表该 Chat。"
+            retryable = false
+            requiresInventoryRefresh = true
+        case "unresponsive":
+            code = diagnosis.issueCode ?? "PAGE_UNRESPONSIVE"
+            message = "所选页面脚本暂未响应；没有改变页面。"
+            retryable = true
+            requiresInventoryRefresh = false
+        case "provider-error":
+            code = diagnosis.issueCode ?? "PROVIDER_UNAVAILABLE"
+            message = "ChatGPT 网页报告错误；本地历史与草稿已保留。"
+            retryable = true
+            requiresInventoryRefresh = false
+        case "retry-visible":
+            code = diagnosis.issueCode ?? "PROVIDER_UNAVAILABLE"
+            message = "网页显示可重试错误；尚未触发网页 Retry，也未重新发送消息。"
+            retryable = true
+            requiresInventoryRefresh = false
+        default:
+            code = diagnosis.issueCode ?? prior.code ?? "WEB_TAB_STATUS_UNKNOWN"
+            message = prior.message
+            retryable = prior.retryable
+            requiresInventoryRefresh = prior.requiresInventoryRefresh
+        }
+        return WebTabEntryStatus(
+            isLoading: false,
+            code: prior.code ?? code,
+            diagnosisCode: diagnosis.issueCode ?? (code == prior.code ? nil : code),
+            message: message,
+            observedAt: RemoteAIDate.parse(diagnosis.observedAt) ?? Date(),
+            rawMessage: diagnosis.issueMessage.map { String($0.prefix(180)) } ?? prior.rawMessage,
+            retryable: retryable,
+            requiresInventoryRefresh: requiresInventoryRefresh,
+            cachedSession: prior.cachedSession
+        )
+    }
+
+    private func clearCachedWebSessionReadOnlyAfterVerifiedPage(_ tab: OpenWebTab,
+        diagnosis: WebTabDiagnosis) {
+        guard ["ready", "generating"].contains(diagnosis.state),
+              !openWebTabsInventoryUnverified,
+              let sessionId = tab.sessionId,
+              readOnlyCachedWebSessionIds.contains(sessionId) else { return }
+        let exactMatches = sessions.filter {
+            $0.id == sessionId && cachedWebSessionIdentityMatches($0, tab: tab)
+        }
+        guard exactMatches.count == 1 else { return }
+        readOnlyCachedWebSessionIds.remove(sessionId)
+        DiagnosticsLog.shared.record("web_cached_history_read_only_cleared", fields: [
+            "tabId": String(tab.tabId),
+            "session": sessionId,
+            "diagnosis": diagnosis.state
+        ])
+    }
+
     func reopenClosedWebConversation(sessionId: String) async {
+        guard !readOnlyCachedWebSessionIds.contains(sessionId) else {
+            errors[sessionId] = "当前显示的是本地只读缓存；请先核验同一 Chat 身份，再执行网页恢复。"
+            webChatRecoveryNotesBySession[sessionId] = "只读缓存模式不会重开或刷新 Chrome 页面。"
+            return
+        }
         guard machine.state == .online, !isSuspended else {
             errors[sessionId] = "Windows 未连接，无法重开原 Chat；历史已保留。"
             return
@@ -880,6 +1481,13 @@ final class WorkspaceStore: ObservableObject {
 
     func manageOpenWebTab(_ tab: OpenWebTab, operation: String) async {
         guard machine.state == .online, !isSuspended, ["close", "reload", "hardReload", "reopen"].contains(operation) else { return }
+        if let sessionId = tab.sessionId,
+           readOnlyCachedWebSessionIds.contains(sessionId),
+           ["reload", "hardReload", "reopen"].contains(operation) {
+            errors[sessionId] = "当前显示的是本地只读缓存；请先核验同一 Chat 身份，再执行网页恢复。"
+            webChatRecoveryNotesBySession[sessionId] = "只读缓存模式不会重开或刷新 Chrome 页面。"
+            return
+        }
         guard managingWebTabIds.insert(tab.id).inserted else { return }
         defer { managingWebTabIds.remove(tab.id) }
         let generation = lifecycleGeneration
@@ -927,19 +1535,36 @@ final class WorkspaceStore: ObservableObject {
     // Chat-level manual recovery is opt-in and never guesses a tab from Chrome focus.
     // Cached history remains untouched when the Browser/Relay is unavailable.
     func recoverWebChat(_ sessionId: String, operation: String, expectedTabId: Int? = nil) async {
+        if readOnlyCachedWebSessionIds.contains(sessionId), operation != "inspect" {
+            errors[sessionId] = "当前显示的是本地只读缓存；请先核验同一 Chat 身份，再同步或操作网页。"
+            webChatRecoveryNotesBySession[sessionId] = "只读缓存模式只允许检测当前标签身份。"
+            return
+        }
         guard machine.state == .online, !isSuspended else {
             errors[sessionId] = "Windows 未连接；已保留本地历史，等待重连。"
             return
         }
         if operation == "resync" {
             webChatRecoveryNotesBySession[sessionId] = "正在补同步消息；不会刷新网页。"
-            await synchronizeVisibleSession(sessionId, force: true)
+            await synchronizeVisibleSession(sessionId, force: true, retryUnresolvedWebReceipts: true)
             webChatRecoveryNotesBySession[sessionId] = "已请求最新消息；若仍缺失，请检测网页状态。"
             return
         }
         if operation == "connection" {
+            let statusGeneration = lifecycleGeneration
+            let statusTransport = transport
+            let statusMachineId = machine.id
             do {
-                let status = try await transport.agentStatusSnapshot(machineId: machine.id)
+                let status = try await statusTransport.agentStatusSnapshot(machineId: statusMachineId)
+                guard statusGeneration == lifecycleGeneration,
+                      transport === statusTransport,
+                      machine.id == statusMachineId,
+                      machine.state == .online,
+                      !isSuspended else { return }
+                connectionPhase = .online
+                errors["connection"] = nil
+                finishConnectionFailureEpisode(source: "authenticated-chat-connection-check")
+                await recoverDelta(freshLatestSequence: status.latestSequence)
                 if status.browserConnected == false {
                     webChatRecoveryNotesBySession[sessionId] = "Agent 在线，但 Browser Bridge 未连接；等待桌面端恢复。"
                 } else {
@@ -1227,6 +1852,7 @@ final class WorkspaceStore: ObservableObject {
                 machine.state = .online
                 connectionPhase = .online
                 errors["connection"] = nil
+                finishConnectionFailureEpisode(source: "authenticated-project-retry")
                 await recoverDelta(freshLatestSequence: latest)
                 created = try await activeTransport.createWebProject(machineId: activeMachineId, projectName: trimmed, commandId: commandId)
             }
@@ -1257,6 +1883,15 @@ final class WorkspaceStore: ObservableObject {
             }
             return nil
         }
+    }
+
+    private func isCurrentProjectLoadEpoch(generation: UInt64, revision: UInt64,
+        projectAlias: String, machineId: String, transport activeTransport: Transport) -> Bool {
+        generation == lifecycleGeneration
+            && revision == projectConversationRevisions[projectAlias, default: 0]
+            && machine.id == machineId
+            && transport === activeTransport
+            && !isSuspended
     }
 
     func loadProjectConversations(projectAlias: String, refresh: Bool = true, force: Bool = true) async {
@@ -1294,14 +1929,18 @@ final class WorkspaceStore: ObservableObject {
         }
         let generation = lifecycleGeneration
         let revision = projectConversationRevisions[projectAlias, default: 0]
-        if projectConversationsByAlias[projectAlias] == nil,
-           let cached: [WebConversationDescriptor] = try? await cache.get([WebConversationDescriptor].self, key: "web.project.\(projectAlias).conversations") {
+        let activeMachineId = machine.id
+        let activeTransport = transport
+        var cached: [WebConversationDescriptor]?
+        if projectConversationsByAlias[projectAlias] == nil {
+            cached = try? await cache.get([WebConversationDescriptor].self, key: "web.project.\(projectAlias).conversations")
+            guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport) else { return }
+        }
+        if projectConversationsByAlias[projectAlias] == nil, let cached {
             // This cache contains only previously accepted authoritative snapshots.
             // Check the epoch after the await so a create/refresh cannot be erased.
-            if generation == lifecycleGeneration,
-               revision == projectConversationRevisions[projectAlias, default: 0],
-               projectConversationsByAlias[projectAlias] == nil,
-               !isSuspended {
+            if projectConversationsByAlias[projectAlias] == nil, !isSuspended {
                 let uniqueCached = Self.uniqueProjectConversations(cached)
                 projectConversationsByAlias[projectAlias] = uniqueCached
                 projectConversationSnapshotStateByAlias[projectAlias] = .staleCache
@@ -1310,6 +1949,8 @@ final class WorkspaceStore: ObservableObject {
                 // provider deletion or as authority to reorder the remaining rows.
                 if uniqueCached.count != cached.count {
                     try? await cache.put(uniqueCached, key: "web.project.\(projectAlias).conversations")
+                    guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                        projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport) else { return }
                 }
             }
         }
@@ -1324,8 +1965,9 @@ final class WorkspaceStore: ObservableObject {
         }
         let previouslyAcceptedItems = projectConversationsByAlias[projectAlias, default: []]
         do {
-            var page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, forceRefresh: force)
-            guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
+            var page = try await activeTransport.listProjectConversations(machineId: activeMachineId, projectAlias: projectAlias, limit: 50, forceRefresh: force)
+            guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport), machine.state == .online else { return }
             // An automatic read can intentionally prefer the Windows verified cache.
             // If it is stale or partial, escalate exactly once to a live DOM read even
             // when the phone already has rows; otherwise cached rows can permanently
@@ -1334,11 +1976,14 @@ final class WorkspaceStore: ObservableObject {
             let shouldRetryIncompleteLiveRead = !page.isAuthoritativeLiveDOM
             if shouldRetryIncompleteLiveRead {
                 try? await Task.sleep(nanoseconds: 650_000_000)
-                if generation == lifecycleGeneration,
-                   revision == projectConversationRevisions[projectAlias, default: 0],
-                   machine.state == .online,
-                   !isSuspended,
-                   let retry = try? await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, forceRefresh: true) {
+                guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                    projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport), machine.state == .online else { return }
+                let retry = try? await activeTransport.listProjectConversations(machineId: activeMachineId, projectAlias: projectAlias, limit: 50, forceRefresh: true)
+                guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                    projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport), machine.state == .online else { return }
+                if let retry {
+                    guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                        projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport), machine.state == .online else { return }
                     // Prefer any fresher retry. Authoritative live DOM is final; a partial
                     // retry may still contain a safe newest-head merge that the logic
                     // below can apply without deleting the verified tail.
@@ -1377,17 +2022,16 @@ final class WorkspaceStore: ObservableObject {
                             break
                         }
                         do {
-                            let nextPage = try await transport.listProjectConversations(
-                                machineId: machine.id,
+                            let nextPage = try await activeTransport.listProjectConversations(
+                                machineId: activeMachineId,
                                 projectAlias: projectAlias,
                                 limit: 50,
                                 cursor: cursor,
                                 forceRefresh: false
                             )
-                            guard generation == lifecycleGeneration,
-                                  revision == projectConversationRevisions[projectAlias, default: 0],
-                                  machine.state == .online,
-                                  !isSuspended else { return }
+                            guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                                  machine.state == .online else { return }
                             let validContinuation: Bool
                             if nextPage.hasMore {
                                 validContinuation = !nextPage.items.isEmpty
@@ -1408,10 +2052,16 @@ final class WorkspaceStore: ObservableObject {
                             nextCursor = nextPage.nextCursor
                             hasMore = nextPage.hasMore
                         } catch {
+                            guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                                  machine.state == .online else { return }
                             pagingStoppedEarly = true
                             break
                         }
                     }
+                    guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                        projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                          machine.state == .online else { return }
 
                     if !previouslyAcceptedItems.isEmpty {
                         // A stale Windows catalog is recovery evidence, never deletion
@@ -1427,6 +2077,9 @@ final class WorkspaceStore: ObservableObject {
                         let preservedItems = projectConversationsByAlias[projectAlias] ?? previouslyAcceptedItems
                         if addedVerifiedRows > 0 || repairedTitles {
                             try? await cache.put(preservedItems, key: "web.project.\(projectAlias).conversations")
+                            guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                                  machine.state == .online else { return }
                         }
                         mergeProjectSessions(preservedItems)
                         errors["web.project.\(projectAlias)"] = pagingStoppedEarly
@@ -1510,6 +2163,9 @@ final class WorkspaceStore: ObservableObject {
                     // identity-only head is positive membership evidence; it cannot
                     // delete/reorder the accepted tail and is safe to retain offline.
                     try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+                    guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                        projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                          machine.state == .online else { return }
                     mergeProjectSessions(projectConversationsByAlias[projectAlias] ?? [])
                 }
                 if mergedHead {
@@ -1552,17 +2208,16 @@ final class WorkspaceStore: ObservableObject {
                     break
                 }
                 do {
-                    let nextPage = try await transport.listProjectConversations(
-                        machineId: machine.id,
+                    let nextPage = try await activeTransport.listProjectConversations(
+                        machineId: activeMachineId,
                         projectAlias: projectAlias,
                         limit: 50,
                         cursor: cursor,
                         forceRefresh: true
                     )
-                    guard generation == lifecycleGeneration,
-                          revision == projectConversationRevisions[projectAlias, default: 0],
-                          machine.state == .online,
-                          !isSuspended else { return }
+                    guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                        projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                          machine.state == .online else { return }
                     let validContinuation: Bool
                     if nextPage.hasMore {
                         validContinuation = !nextPage.items.isEmpty
@@ -1583,10 +2238,16 @@ final class WorkspaceStore: ObservableObject {
                     nextCursor = nextPage.nextCursor
                     hasMore = nextPage.hasMore
                 } catch {
+                    guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                        projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                          machine.state == .online else { return }
                     pagingStoppedEarly = true
                     break
                 }
             }
+            guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                  machine.state == .online else { return }
 
             if pagingStoppedEarly {
                 // Never promote a half-paged snapshot to authoritative truth. A Project
@@ -1638,6 +2299,12 @@ final class WorkspaceStore: ObservableObject {
             }
 
             await clearReappearedWebSessionDeletions(authoritativeItems)
+            // Clearing a tombstone persists asynchronously. A create, newer refresh,
+            // machine switch, or suspension may win that wait; never let the older
+            // catalog mutate memory or disk after it resumes.
+            guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                  machine.state == .online else { return }
             projectConversationsByAlias[projectAlias] = authoritativeItems
             projectConversationSnapshotStateByAlias[projectAlias] = .authoritativeLiveDOM
             if let snapshotId = authoritativeSnapshotId { projectConversationSnapshotIds[projectAlias] = snapshotId }
@@ -1646,7 +2313,9 @@ final class WorkspaceStore: ObservableObject {
             else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
             projectHasMoreByAlias[projectAlias] = hasMore
             try? await cache.put(authoritativeItems, key: "web.project.\(projectAlias).conversations")
-            guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended else { return }
+            guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                  machine.state == .online else { return }
             mergeProjectSessions(authoritativeItems)
             errors["web.project.\(projectAlias)"] = nil
             let catalogDigests = DiagnosticsLog.catalogDigests(authoritativeItems.map(\.localConversationId))
@@ -1660,7 +2329,8 @@ final class WorkspaceStore: ObservableObject {
                 "durationMs": Self.durationMilliseconds(since: projectLoadStartedAt),
             ])
         } catch {
-            if generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended {
+            if isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                   projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport) {
                 projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
                 errors["web.project.\(projectAlias)"] = error.localizedDescription
                 DiagnosticsLog.shared.record("project_load_failed", fields: Self.diagnosticFields(for: error, adding: ["project": projectAlias, "durationMs": Self.durationMilliseconds(since: projectLoadStartedAt)]), level: "ERROR")
@@ -1674,6 +2344,8 @@ final class WorkspaceStore: ObservableObject {
         defer { projectConversationPageLoads.remove(projectAlias) }
         let generation = lifecycleGeneration
         let revision = projectConversationRevisions[projectAlias, default: 0]
+        let activeMachineId = machine.id
+        let activeTransport = transport
         guard machine.state == .online,
               projectHasMoreByAlias[projectAlias] == true,
               let cursor = projectNextCursorByAlias[projectAlias],
@@ -1681,8 +2353,10 @@ final class WorkspaceStore: ObservableObject {
               let expectedSnapshotId = projectConversationSnapshotIds[projectAlias],
               !expectedSnapshotId.isEmpty else { return }
         do {
-            let page = try await transport.listProjectConversations(machineId: machine.id, projectAlias: projectAlias, limit: 50, cursor: cursor, forceRefresh: true)
-            guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], machine.state == .online, !isSuspended else { return }
+            let page = try await activeTransport.listProjectConversations(machineId: activeMachineId, projectAlias: projectAlias, limit: 50, cursor: cursor, forceRefresh: true)
+            guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                  machine.state == .online else { return }
             guard page.project.projectAlias == projectAlias else {
                 projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
                 errors["web.project.\(projectAlias)"] = "ChatGPT returned conversations for a different Project; keeping the last verified list."
@@ -1692,6 +2366,8 @@ final class WorkspaceStore: ObservableObject {
                 projectConversationSnapshotStateByAlias[projectAlias] = page.state ?? .providerUnavailable
                 if mergeConversationTitleHints(page.items, projectAlias: projectAlias) {
                     try? await cache.put(projectConversationsByAlias[projectAlias] ?? [], key: "web.project.\(projectAlias).conversations")
+                    guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                        projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport) else { return }
                     mergeProjectSessions(projectConversationsByAlias[projectAlias] ?? [])
                 }
                 errors["web.project.\(projectAlias)"] = "ChatGPT conversations are temporarily incomplete; keeping the last verified list."
@@ -1717,6 +2393,19 @@ final class WorkspaceStore: ObservableObject {
             for item in page.items where !merged.contains(where: { $0.id == item.id }) { merged.append(item) }
             // Preserve the authoritative newest-first order supplied by ChatGPT.
             // Registry update timestamps reflect our scan time, not conversation age.
+            if !page.hasMore {
+                await clearReappearedWebSessionDeletions(merged)
+                guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                    projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                      machine.state == .online else { return }
+                try? await cache.put(merged, key: "web.project.\(projectAlias).conversations")
+                guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                    projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                      machine.state == .online else { return }
+            }
+            guard isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport),
+                  machine.state == .online else { return }
             projectConversationsByAlias[projectAlias] = merged
             // A load-more page alone cannot establish a complete snapshot. Keep it
             // provisional until the terminal page of the same generation arrives.
@@ -1724,17 +2413,13 @@ final class WorkspaceStore: ObservableObject {
             if let next = page.nextCursor { projectNextCursorByAlias[projectAlias] = next }
             else { projectNextCursorByAlias.removeValue(forKey: projectAlias) }
             projectHasMoreByAlias[projectAlias] = page.hasMore
-            if !page.hasMore {
-                await clearReappearedWebSessionDeletions(merged)
-                try? await cache.put(merged, key: "web.project.\(projectAlias).conversations")
-            }
-            guard generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended else { return }
             mergeProjectSessions(page.items)
             errors["web.project.\(projectAlias)"] = page.hasMore
                 ? "Project 对话仍在分页读取；尚未完成全量同步。"
                 : nil
         } catch {
-            if generation == lifecycleGeneration, revision == projectConversationRevisions[projectAlias, default: 0], !isSuspended {
+            if isCurrentProjectLoadEpoch(generation: generation, revision: revision,
+                   projectAlias: projectAlias, machineId: activeMachineId, transport: activeTransport) {
                 projectConversationSnapshotStateByAlias[projectAlias] = .providerUnavailable
                 errors["web.project.\(projectAlias)"] = error.localizedDescription
             }
@@ -1891,7 +2576,8 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func loadSession(_ sessionId: String, remoteRevision: Date? = nil, localOnly: Bool = false) async {
+    func loadSession(_ sessionId: String, remoteRevision: Date? = nil, localOnly: Bool = false,
+        retryUnresolvedWebReceipts: Bool = false) async {
         guard sessionLoads.insert(sessionId).inserted else { return }
         defer { sessionLoads.remove(sessionId) }
         let generation = lifecycleGeneration
@@ -1974,6 +2660,10 @@ final class WorkspaceStore: ObservableObject {
             await reconcilePendingUnknownCommands(with: authoritativeItems, sessionId: sessionId)
             for remoteUser in authoritativeItems where remoteUser.role == .user {
                 await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+            }
+            if route.runtimeId == "runtime.web" {
+                await reconcileLegacyWebOptimisticEchoes(with: authoritativeItems, sessionId: sessionId,
+                    forceRecheck: retryUnresolvedWebReceipts)
             }
             if route.runtimeId == "runtime.antigravity",
                sessions.first(where: { $0.id == sessionId })?.state != .busy {
@@ -2195,7 +2885,8 @@ final class WorkspaceStore: ObservableObject {
     /// event that was lost while the relay socket still looked connected. Active runs
     /// poll more frequently so a provider final/progress state appears without requiring
     /// the user to leave and reopen the chat.
-    func synchronizeVisibleSession(_ sessionId: String, force: Bool = false) async {
+    func synchronizeVisibleSession(_ sessionId: String, force: Bool = false,
+        retryUnresolvedWebReceipts: Bool = false) async {
         guard machine.state == .online, !isSuspended else { return }
         guard !sessionLoads.contains(sessionId) else { return }
         if isWebSessionUnavailable(sessionId) {
@@ -2278,7 +2969,8 @@ final class WorkspaceStore: ObservableObject {
             lastSuccessfulRemoteRevision: visibleSessionHistoryRemoteRevision[sessionId]
         ) || missedTerminalActivity
         if historyDue {
-            await loadSession(sessionId, remoteRevision: remoteStatus?.updatedAt)
+            await loadSession(sessionId, remoteRevision: remoteStatus?.updatedAt,
+                retryUnresolvedWebReceipts: retryUnresolvedWebReceipts)
         }
     }
 
@@ -2356,22 +3048,68 @@ final class WorkspaceStore: ObservableObject {
         guard olderMessageLoads.insert(sessionId).inserted else { return }
         defer { olderMessageLoads.remove(sessionId) }
         let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        let sessionRoute = routeForSession(sessionId)
+        let cachedWebReadOnly = readOnlyCachedWebSessionIds.contains(sessionId)
         guard let first = messagesBySession[sessionId]?.first, hasMoreBySession[sessionId] != false else { return }
         do {
             let page: Page<ChatMessage>
-            if machine.state == .online, let route = routeForSession(sessionId) {
-                page = try await transport.loadBefore(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, before: first.cursor, limit: 40)
-                guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+            let loadedRemotely = !cachedWebReadOnly && machine.state == .online && sessionRoute != nil
+            if loadedRemotely, let route = sessionRoute {
+                let remotePage = try await activeTransport.loadBefore(machineId: activeMachineId,
+                    runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId,
+                    before: first.cursor, limit: 40)
+                guard generation == lifecycleGeneration, transport === activeTransport,
+                      machine.id == activeMachineId, machine.state == .online, !isSuspended,
+                      !(route.runtimeId == "runtime.web" && readOnlyCachedWebSessionIds.contains(sessionId)) else { return }
+                guard remotePage.items.allSatisfy({ $0.sessionId == sessionId }) else {
+                    throw TransportError.malformedData
+                }
+                let authoritativeItems = route.runtimeId == "runtime.web"
+                    ? remotePage.items.map(Self.normalizedWebAssistantMessage)
+                    : remotePage.items
+                page = Page(items: authoritativeItems, beforeCursor: remotePage.beforeCursor,
+                    hasMore: remotePage.hasMore)
+                if route.runtimeId == "runtime.web" {
+                    await reconcilePendingUnknownCommands(with: authoritativeItems, sessionId: sessionId)
+                    guard generation == lifecycleGeneration, transport === activeTransport,
+                          machine.id == activeMachineId, machine.state == .online, !isSuspended,
+                          !readOnlyCachedWebSessionIds.contains(sessionId) else { return }
+                    for remoteUser in authoritativeItems where remoteUser.role == .user {
+                        await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+                        guard generation == lifecycleGeneration, transport === activeTransport,
+                              machine.id == activeMachineId, machine.state == .online, !isSuspended,
+                              !readOnlyCachedWebSessionIds.contains(sessionId) else { return }
+                    }
+                    await reconcileLegacyWebOptimisticEchoes(with: authoritativeItems, sessionId: sessionId)
+                    guard generation == lifecycleGeneration, transport === activeTransport,
+                          machine.id == activeMachineId, machine.state == .online, !isSuspended,
+                          !readOnlyCachedWebSessionIds.contains(sessionId) else { return }
+                }
             } else {
                 let local = try await cache.messagesBefore(sessionId: sessionId, before: first.cursor, limit: 40)
+                guard generation == lifecycleGeneration, transport === activeTransport,
+                      machine.id == activeMachineId, !isSuspended else { return }
                 page = Page(items: local, beforeCursor: local.first?.cursor, hasMore: local.count == 40)
             }
+            guard page.items.allSatisfy({ $0.sessionId == sessionId }),
+                  generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, !isSuspended else { return }
             try? await cache.upsertMessages(page.items)
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, !isSuspended,
+                  !(loadedRemotely && sessionRoute?.runtimeId == "runtime.web"
+                      && readOnlyCachedWebSessionIds.contains(sessionId)) else { return }
             merge(page.items, into: sessionId)
             hasMoreBySession[sessionId] = page.hasMore
-            errors[sessionId] = nil
+            if loadedRemotely { errors[sessionId] = nil }
         } catch {
-            if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = error.localizedDescription }
+            if generation == lifecycleGeneration, transport === activeTransport,
+               machine.id == activeMachineId, !isSuspended,
+               !cachedWebReadOnly, machine.state == .online, sessionRoute != nil {
+                errors[sessionId] = error.localizedDescription
+            }
         }
     }
 
@@ -2388,6 +3126,15 @@ final class WorkspaceStore: ObservableObject {
             if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
             errors[sessionId] = "此 Chat 已删除、归档或所属 Project 已删除。草稿已保留，未发送。"
             DiagnosticsLog.shared.record("send_blocked_deleted_web_session", fields: ["session": sessionId, "commandId": commandId.uuidString], level: "WARN")
+            return false
+        }
+        if runtimeId == "runtime.web", readOnlyCachedWebSessionIds.contains(sessionId) {
+            if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
+            errors[sessionId] = "当前显示的是本地只读缓存；请先核验同一 Chat 身份，草稿已保留，未发送。"
+            DiagnosticsLog.shared.record("send_blocked_read_only_cached_web_session", fields: [
+                "session": sessionId,
+                "commandId": commandId.uuidString,
+            ], level: "WARN")
             return false
         }
         guard attachments.count <= 8, attachments.allSatisfy({ $0.sizeBytes > 0 && $0.sizeBytes <= 20 * 1024 * 1024 }) else {
@@ -2414,6 +3161,7 @@ final class WorkspaceStore: ObservableObject {
                     machine.state = .online
                     connectionPhase = .online
                     errors["connection"] = nil
+                    finishConnectionFailureEpisode(source: "authenticated-send-recovery")
                     await recoverDelta(freshLatestSequence: authenticatedSequence)
                     recoveredConnectedTransport = true
                     DiagnosticsLog.shared.record("send_stale_offline_recovered", fields: [
@@ -2434,8 +3182,8 @@ final class WorkspaceStore: ObservableObject {
             guard recoveredConnectedTransport else {
                 if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
                 errors[sessionId] = attachments.isEmpty
-                    ? "PC Offline — draft saved. Tap Send after reconnecting."
-                    : "PC Offline — 附件需要连接 Windows 后才能上传。"
+                    ? "Windows 暂时离线，草稿已保存；连接恢复后可手动发送。"
+                    : "Windows 暂时离线；附件需要连接恢复后才能上传。"
                 DiagnosticsLog.shared.record("send_offline", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString], level: "WARN")
                 return false
             }
@@ -2517,7 +3265,7 @@ final class WorkspaceStore: ObservableObject {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             try? await cache.saveDraft("", sessionId: sessionId)
-            if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = nil }
+            clearSendDeliveryDiagnostic(commandId: commandId)
             DiagnosticsLog.shared.record("send_ok", fields: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "state": finalState.rawValue, "durationMs": Self.durationMilliseconds(since: sendStartedAt)])
             return true
         } catch is CancellationError {
@@ -2525,13 +3273,14 @@ final class WorkspaceStore: ObservableObject {
             attachmentTransferBySession.removeValue(forKey: sessionId)
             if messageCommandPersisted {
                 commandStates[commandId] = .unknown
-                errors[sessionId] = "发送确认已中断，送达状态未知。原命令已保留，核查前不会重发。"
+                recordUnknownSendDiagnostic(commandId: commandId, sessionId: sessionId, code: "ACK_INTERRUPTED")
                 return false
             }
             commandStates[commandId] = .failed
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
-            errors[sessionId] = "Attachment upload cancelled before message delivery. The composer keeps your local text/files so you can send again."
+            clearSendDeliveryDiagnostic(commandId: commandId)
+            errors[sessionId] = "附件上传在消息发送前已取消；输入框中的文字和附件仍保留，可在确认后手动发送。"
             return false
         } catch let error as TransportError where Self.isRecoverableCommandTransportError(error) {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
@@ -2549,9 +3298,11 @@ final class WorkspaceStore: ObservableObject {
             }
             guard generation == lifecycleGeneration, transport === activeTransport,
                   machine.id == activeMachineId, !isSuspended else { return false }
-            errors[sessionId] = messageCommandPersisted
-                ? "Connection dropped while sending. Delivery is unknown; check delivery status before sending again."
-                : "Attachment transfer was interrupted before message delivery was attempted. Retry from the composer reuses the same operation ID."
+            if messageCommandPersisted {
+                recordUnknownSendDiagnostic(commandId: commandId, sessionId: sessionId, error: error)
+            } else {
+                errors[sessionId] = "附件传输在消息发送前中断；草稿和附件仍保留，可在连接恢复后手动重试。"
+            }
             return false
         } catch let error as TransportError {
             guard generation == lifecycleGeneration, transport === activeTransport,
@@ -2560,11 +3311,14 @@ final class WorkspaceStore: ObservableObject {
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
                 attachmentTransferBySession.removeValue(forKey: sessionId)
                 commandStates[commandId] = .unknown
-                errors[sessionId] = "Delivery is unknown after the ChatGPT page changed. Checking durable delivery evidence; no message will be sent again."
                 DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString]), level: "WARN")
-                return await reconcileUnknownSend(commandId: commandId, runtimeId: runtimeId,
+                let reconciled = await reconcileUnknownSend(commandId: commandId, runtimeId: runtimeId,
                     instanceId: instanceId, sessionId: sessionId, generation: generation,
                     activeTransport: activeTransport, machineId: activeMachineId)
+                if !reconciled {
+                    recordUnknownSendDiagnostic(commandId: commandId, sessionId: sessionId, error: error)
+                }
+                return reconciled
             }
             if messageCommandPersisted {
                 // Only an explicit provider/Agent failure receipt can classify
@@ -2574,9 +3328,13 @@ final class WorkspaceStore: ObservableObject {
                 else {
                     commandStates[commandId] = .unknown
                     attachmentTransferBySession.removeValue(forKey: sessionId)
-                    return await reconcileUnknownSend(commandId: commandId, runtimeId: runtimeId,
+                    let reconciled = await reconcileUnknownSend(commandId: commandId, runtimeId: runtimeId,
                         instanceId: instanceId, sessionId: sessionId, generation: generation,
                         activeTransport: activeTransport, machineId: activeMachineId)
+                    if !reconciled {
+                        recordUnknownSendDiagnostic(commandId: commandId, sessionId: sessionId, error: error)
+                    }
+                    return reconciled
                 }
             }
             attachmentTransferBySession.removeValue(forKey: sessionId)
@@ -2584,6 +3342,7 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
             if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
+            clearSendDeliveryDiagnostic(commandId: commandId)
             errors[sessionId] = error.localizedDescription
             DiagnosticsLog.shared.record("send_failed", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString]), level: "ERROR")
             return false
@@ -2592,13 +3351,15 @@ final class WorkspaceStore: ObservableObject {
             attachmentTransferBySession.removeValue(forKey: sessionId)
             if messageCommandPersisted {
                 commandStates[commandId] = .unknown
-                errors[sessionId] = "发送回执无法确认：\(error.localizedDescription)。原命令已保留，不会自动重发。"
+                recordUnknownSendDiagnostic(commandId: commandId, sessionId: sessionId,
+                    error: error, code: "ACK_UNCONFIRMED")
                 return false
             }
             commandStates[commandId] = .failed
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
             if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
+            clearSendDeliveryDiagnostic(commandId: commandId)
             errors[sessionId] = error.localizedDescription
             DiagnosticsLog.shared.record("send_failed", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString]), level: "ERROR")
             return false
@@ -2608,7 +3369,8 @@ final class WorkspaceStore: ObservableObject {
     // Both automatic reconnect and the user's status check reuse this read-only
     // reconciliation. A cached ambiguous FAILED receipt is never delivery failure.
     private func reconcileUnknownSend(commandId: UUID, runtimeId: String, instanceId: String,
-        sessionId: String, generation: UInt64, activeTransport: Transport, machineId: String) async -> Bool {
+        sessionId: String, generation: UInt64, activeTransport: Transport, machineId: String,
+        forceReceiptRecheck: Bool = false) async -> Bool {
         func current() -> Bool {
             generation == lifecycleGeneration && transport === activeTransport
                 && machine.id == machineId && !isSuspended
@@ -2621,20 +3383,47 @@ final class WorkspaceStore: ObservableObject {
             machine.state = .online
             connectionPhase = .online
             errors["connection"] = nil
+            finishConnectionFailureEpisode(source: "authenticated-send-reconciliation")
             await recoverDelta(freshLatestSequence: head)
             guard current() else { return false }
-            // A successful durable Agent receipt proves the original dispatch was
-            // confirmed, even when the websocket reply was lost during reconnect.
-            // Older Windows releases lack this query; keep Unknown instead of
-            // repeating an uncertain Send or inventing a terminal failure.
-            if commandStates[commandId] == .unknown,
-               let receipt = try? await activeTransport.commandOutcome(
-                   machineId: machineId, targetCommandId: commandId),
-               receipt.accepted {
-                guard current() else { return false }
-                commandStates[commandId] = .completed
-                DiagnosticsLog.shared.record("send_durable_receipt_recovered",
-                    fields: ["session": sessionId, "commandId": commandId.uuidString])
+            // For Web, a durable accepted receipt is not enough to retire an
+            // Unknown command until its named same-session user row is present and
+            // the one-to-one reservation below succeeds. Other runtimes keep their
+            // existing direct command-outcome confirmation behavior.
+            if commandStates[commandId] == .unknown {
+                if runtimeId == "runtime.web",
+                   let receipt = await webCommandOutcomeReceipt(commandId: commandId,
+                       sessionId: sessionId, machineId: machineId, activeTransport: activeTransport,
+                        forceRecheck: forceReceiptRecheck, isCurrent: current), receipt.accepted {
+                    guard current() else { return false }
+                    if receipt.messageId != nil {
+                        let page = try await activeTransport.loadRecent(machineId: machineId,
+                            runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, limit: 50)
+                        guard current(), page.items.allSatisfy({ $0.sessionId == sessionId }) else {
+                            throw TransportError.malformedData
+                        }
+                        await reconcilePendingUnknownCommands(with: page.items, sessionId: sessionId)
+                        for remoteUser in page.items where remoteUser.role == .user {
+                            await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+                        }
+                        await reconcileLegacyWebOptimisticEchoes(with: page.items, sessionId: sessionId)
+                        try? await cache.upsertMessages(page.items)
+                        guard current() else { return false }
+                        merge(page.items, into: sessionId)
+                        releaseRecoveryDisplaySnapshot(for: sessionId)
+                        ensureSessionDescriptorExists(sessionId: sessionId, instanceId: instanceId,
+                            updatedAt: page.items.last?.createdAt ?? Date())
+                        await settleRunStateIfAuthoritativeFinalExists(page.items, sessionId: sessionId)
+                        hasMoreBySession[sessionId] = page.hasMore
+                    }
+                } else if runtimeId != "runtime.web",
+                          let receipt = try? await activeTransport.commandOutcome(
+                              machineId: machineId, targetCommandId: commandId), receipt.accepted {
+                    guard current() else { return false }
+                    commandStates[commandId] = .completed
+                    DiagnosticsLog.shared.record("send_durable_receipt_recovered",
+                        fields: ["session": sessionId, "commandId": commandId.uuidString])
+                }
             }
             for attempt in 0..<3 where commandStates[commandId] == .unknown {
                 guard current() else { return false }
@@ -2644,6 +3433,9 @@ final class WorkspaceStore: ObservableObject {
                 await reconcilePendingUnknownCommands(with: page.items, sessionId: sessionId)
                 for remoteUser in page.items where remoteUser.role == .user {
                     await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
+                }
+                if runtimeId == "runtime.web" {
+                    await reconcileLegacyWebOptimisticEchoes(with: page.items, sessionId: sessionId)
                 }
                 try? await cache.upsertMessages(page.items)
                 guard current() else { return false }
@@ -2661,7 +3453,7 @@ final class WorkspaceStore: ObservableObject {
                 try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: machineId))
                 try? await cache.saveDraft("", sessionId: sessionId)
                 guard current() else { return false }
-                errors[sessionId] = nil
+                clearSendDeliveryDiagnostic(commandId: commandId)
                 if messagesBySession[sessionId, default: []].last?.role == .user {
                     setSessionState(sessionId, .busy)
                     markLiveRunActivity(sessionId: sessionId, at: Date())
@@ -2678,7 +3470,9 @@ final class WorkspaceStore: ObservableObject {
         guard current() else { return false }
         // Keep the exact payload for future evidence matching and manual diagnosis.
         commandStates[commandId] = .unknown
-        errors[sessionId] = "送达状态仍未确认。已保留原 command ID；请核查电脑原会话，不会自动重发。"
+        if sendDeliveryDiagnosticsByCommand[commandId] == nil {
+            recordUnknownSendDiagnostic(commandId: commandId, sessionId: sessionId)
+        }
         return false
     }
 
@@ -2693,11 +3487,20 @@ final class WorkspaceStore: ObservableObject {
         guard !isSuspended else { return }
         _ = await reconcileUnknownSend(commandId: commandId, runtimeId: runtimeId,
             instanceId: instanceId, sessionId: message.sessionId, generation: generation,
-            activeTransport: activeTransport, machineId: activeMachineId)
+            activeTransport: activeTransport, machineId: activeMachineId, forceReceiptRecheck: true)
     }
 
     @discardableResult
     func stop(runtimeId: String, instanceId: String, sessionId: String) async -> Bool {
+        guard !(runtimeId == "runtime.web" && readOnlyCachedWebSessionIds.contains(sessionId)) else {
+            return false
+        }
+        if stopDiagnosticsBySession[sessionId]?.recovery == .needsComputerVerification {
+            return false
+        }
+        if stopRequestsPending.contains(sessionId), stopTasksBySession[sessionId] == nil {
+            return false
+        }
         let requestedRun = stopRunIdentity(for: sessionId)
         if let inFlight = stopTasksBySession[sessionId] {
             if inFlight.runIdentity.canCoalesceStopTask(as: requestedRun) {
@@ -2715,7 +3518,10 @@ final class WorkspaceStore: ObservableObject {
             }
             // Do not let an old Stop task become a new Stop if the target changed
             // again while this caller was waiting for it to settle.
-            guard stopRunIdentity(for: sessionId) == requestedRun else { return false }
+            guard stopRunIdentity(for: sessionId).hasSameRunBoundary(
+                as: requestedRun,
+                allowActivityUpdates: runtimeId == "runtime.web"
+            ) else { return false }
         }
         let token = UUID()
         let task = Task { @MainActor [weak self] in
@@ -2731,6 +3537,225 @@ final class WorkspaceStore: ObservableObject {
         return result
     }
 
+    @discardableResult
+    func recheckStopIdentity(sessionId: String) async -> Bool {
+        guard stopDiagnosticsBySession[sessionId]?.recovery == .needsComputerVerification,
+              !readOnlyCachedWebSessionIds.contains(sessionId),
+              machine.state == .online, !isSuspended,
+              stopTasksBySession[sessionId] == nil,
+              stopRequestsPending.insert(sessionId).inserted else { return false }
+        defer { stopRequestsPending.remove(sessionId) }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        let expectedIdentity = stopRunIdentity(for: sessionId)
+        let result = await inspectStopIdentityBeforeAction(
+            sessionId: sessionId,
+            expectedIdentity: expectedIdentity,
+            generation: generation,
+            transport: activeTransport,
+            machineId: activeMachineId,
+            stopTap: false
+        )
+        return result != .unavailable
+    }
+
+    private func setStopIdentityUnavailable(
+        sessionId: String,
+        observedAt: Date = Date(),
+        state: String? = nil,
+        source: String? = nil,
+        pageVerified: Bool = false,
+        message: String
+    ) {
+        stopDiagnosticsBySession[sessionId] = StopLifecycleDiagnostic(
+            code: .identityUnavailable,
+            observedAt: observedAt,
+            recovery: .needsComputerVerification,
+            action: .verifyOnComputer,
+            state: state,
+            source: source,
+            pageVerified: pageVerified,
+            generationIdentityRefreshed: false,
+            message: message
+        )
+        DiagnosticsLog.shared.record("stop_identity_recheck_unavailable", fields: [
+            "session": sessionId,
+            "state": state ?? "missing",
+            "source": source ?? "missing",
+            "pageVerified": String(pageVerified),
+            "observedAt": RemoteAIDate.string(observedAt),
+        ], level: "WARN")
+    }
+
+    private func inspectStopIdentityBeforeAction(
+        sessionId: String,
+        expectedIdentity: StopRunIdentity,
+        generation: UInt64,
+        transport activeTransport: Transport,
+        machineId activeMachineId: String,
+        stopTap: Bool
+    ) async -> StopIdentityPreflightResult {
+        guard generation == lifecycleGeneration,
+              transport === activeTransport,
+              machine.id == activeMachineId,
+              !isSuspended,
+              !readOnlyCachedWebSessionIds.contains(sessionId),
+              hasLoadedOpenWebTabs,
+              !openWebTabsInventoryUnverified,
+              let sessionMatches = sessions.filter({ $0.id == sessionId && $0.instanceId == "web.chatgpt" }).first,
+              sessions.filter({ $0.id == sessionId && $0.instanceId == "web.chatgpt" }).count == 1 else {
+            setStopIdentityUnavailable(
+                sessionId: sessionId,
+                message: "当前 Chrome 标签和 Chat 身份尚未核验；本次没有发送 Stop。请核验当前电脑任务后再试。"
+            )
+            return .unavailable
+        }
+        let matchingTabs = openWebTabs.filter { $0.isChat && $0.sessionId == sessionId }
+        guard matchingTabs.count == 1,
+              let tab = matchingTabs.first,
+              cachedWebSessionIdentityMatches(sessionMatches, tab: tab) else {
+            setStopIdentityUnavailable(
+                sessionId: sessionId,
+                message: "没有唯一匹配到此 Chat 的当前 Chrome 标签；本次没有发送 Stop。请先核验电脑上的原 Chat。"
+            )
+            return .unavailable
+        }
+
+        let requestStartedAt = Date()
+        do {
+            let diagnosis = try await activeTransport.inspectOpenWebTab(machineId: activeMachineId, tab: tab)
+            guard generation == lifecycleGeneration,
+                  transport === activeTransport,
+                  machine.id == activeMachineId,
+                  !isSuspended,
+                  !readOnlyCachedWebSessionIds.contains(sessionId) else {
+                return .unavailable
+            }
+            guard stopRunIdentity(for: sessionId).hasSameRunBoundary(
+                as: expectedIdentity,
+                allowActivityUpdates: true
+            ) else {
+                return .unavailable
+            }
+            guard isCurrentOpenWebTabSelection(tab),
+                  let currentSession = sessions.first(where: { $0.id == sessionId }),
+                  cachedWebSessionIdentityMatches(currentSession, tab: tab),
+                  diagnosis.tabId == tab.tabId,
+                  normalizedWebCanonicalURL(diagnosis.canonicalUrl) == normalizedWebCanonicalURL(tab.canonicalUrl) else {
+                setStopIdentityUnavailable(
+                    sessionId: sessionId,
+                    observedAt: requestStartedAt,
+                    message: "当前 Chrome 标签或 Chat 身份已变化；本次没有发送 Stop。请重新核验同一 Chat。"
+                )
+                return .unavailable
+            }
+            guard let evidence = StopIdentityEvidence.decode(diagnosis.stopIdentity) else {
+                setStopIdentityUnavailable(
+                    sessionId: sessionId,
+                    observedAt: requestStartedAt,
+                    message: "电脑未返回可验证的当前网页运行身份；本次没有发送 Stop。请在同一 Chat 核验当前任务。"
+                )
+                return .unavailable
+            }
+
+            if diagnosis.state == "ready",
+               diagnosis.generating == false,
+               evidence.pageIdentityVerified,
+               evidence.observedAt != nil {
+                terminalWebRuns.insert(sessionId)
+                stopEventRevisionsBySession[sessionId, default: 0] &+= 1
+                stopRunStartSequenceBySession.removeValue(forKey: sessionId)
+                stopRunGenerationKeyBySession.removeValue(forKey: sessionId)
+                setSessionState(sessionId, .idle)
+                liveRunStatusBySession.removeValue(forKey: sessionId)
+                clearLiveRunActivity(sessionId: sessionId)
+                stopDiagnosticsBySession.removeValue(forKey: sessionId)
+                if errors[sessionId] == "停止命令针对的生成已变化；没有停止新的生成。" {
+                    errors[sessionId] = nil
+                }
+                DiagnosticsLog.shared.record("stop_identity_recheck_idle", fields: [
+                    "session": sessionId,
+                    "tabId": String(tab.tabId),
+                    "observedAt": RemoteAIDate.string(evidence.observedAt ?? requestStartedAt),
+                ])
+                return .noLongerGenerating
+            }
+
+            guard diagnosis.state == "generating",
+                  diagnosis.generating == true,
+                  evidence.hasVerifiedCurrentIdentity,
+                  evidence.observedAt != nil else {
+                setStopIdentityUnavailable(
+                    sessionId: sessionId,
+                    observedAt: evidence.observedAt ?? requestStartedAt,
+                    state: evidence.state,
+                    source: evidence.source,
+                    pageVerified: evidence.pageVerified,
+                    message: "当前 Chat 页面尚未证明仍在运行的具体任务身份；本次没有发送 Stop。请在电脑查看同一 Chat。"
+                )
+                return .unavailable
+            }
+
+            let identityMatches = expectedIdentity.generationKey == evidence.currentGenerationKey
+            let identityRefreshed: Bool
+            if identityMatches {
+                identityRefreshed = false
+            } else {
+                identityRefreshed = adoptVerifiedStopIdentity(
+                    evidence,
+                    sessionId: sessionId,
+                    expectedLocalIdentity: expectedIdentity
+                )
+                guard identityRefreshed else { return .unavailable }
+            }
+
+            if stopTap && identityMatches {
+                return .readyToStop
+            }
+            let priorCode = stopDiagnosticsBySession[sessionId]?.code
+            stopDiagnosticsBySession[sessionId] = StopLifecycleDiagnostic(
+                code: priorCode ?? .identityChanged,
+                observedAt: evidence.observedAt ?? requestStartedAt,
+                recovery: .readyForExplicitStop,
+                action: .explicitlyStopVerifiedCurrentRun,
+                state: evidence.state,
+                source: evidence.source,
+                pageVerified: true,
+                generationIdentityRefreshed: identityRefreshed,
+                message: identityRefreshed
+                    ? "电脑已核验同一 Chat 的新一轮生成；本次没有发送 Stop。请再次点按 Stop 以明确停止当前任务。"
+                    : "已核验同一 Chat 的当前生成；本次检查没有停止任务。如需停止，请再次点按 Stop。"
+            )
+            DiagnosticsLog.shared.record("stop_identity_verified", fields: [
+                "session": sessionId,
+                "tabId": String(tab.tabId),
+                "state": evidence.state,
+                "identityRefreshed": String(identityRefreshed),
+                "observedAt": RemoteAIDate.string(evidence.observedAt ?? requestStartedAt),
+            ])
+            return .refreshedForExplicitStop
+        } catch {
+            guard generation == lifecycleGeneration,
+                  transport === activeTransport,
+                  machine.id == activeMachineId,
+                  !isSuspended,
+                  !readOnlyCachedWebSessionIds.contains(sessionId),
+                  stopRunIdentity(for: sessionId).hasSameRunBoundary(
+                    as: expectedIdentity,
+                    allowActivityUpdates: true
+                  ) else { return .unavailable }
+            setStopIdentityUnavailable(
+                sessionId: sessionId,
+                observedAt: requestStartedAt,
+                message: "未能核验当前网页任务身份；本次没有发送 Stop。请检查连接和电脑上的同一 Chat。\n\(error.localizedDescription)"
+            )
+            DiagnosticsLog.shared.record("stop_identity_recheck_failed",
+                fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
+            return .unavailable
+        }
+    }
+
     private func stopRunIdentity(for sessionId: String) -> StopRunIdentity {
         let session = sessions.first(where: { $0.id == sessionId })
         let activityAt = [
@@ -2744,6 +3769,119 @@ final class WorkspaceStore: ObservableObject {
             generationKey: stopRunGenerationKeyBySession[sessionId],
             activityAt: activityAt
         )
+    }
+
+    private func refreshStopRunIdentityIfVerified(
+        _ evidence: StopIdentityEvidence?,
+        sessionId: String,
+        expectedLocalIdentity: StopRunIdentity,
+        allowActivityUpdates: Bool
+    ) -> Bool {
+        guard let evidence,
+              evidence.hasVerifiedIdentityChange,
+              stopRunIdentity(for: sessionId).hasSameRunBoundary(
+                as: expectedLocalIdentity,
+                allowActivityUpdates: allowActivityUpdates
+              ),
+              let currentGenerationKey = evidence.currentGenerationKey else { return false }
+        stopEventRevisionsBySession[sessionId, default: 0] &+= 1
+        stopRunStartSequenceBySession.removeValue(forKey: sessionId)
+        stopRunGenerationKeyBySession[sessionId] = currentGenerationKey
+        return true
+    }
+
+    private func adoptVerifiedStopIdentity(
+        _ evidence: StopIdentityEvidence,
+        sessionId: String,
+        expectedLocalIdentity: StopRunIdentity,
+        allowActivityUpdates: Bool = true
+    ) -> Bool {
+        guard evidence.hasVerifiedCurrentIdentity,
+              stopRunIdentity(for: sessionId).hasSameRunBoundary(
+                as: expectedLocalIdentity,
+                allowActivityUpdates: allowActivityUpdates
+              ),
+              let currentGenerationKey = evidence.currentGenerationKey else { return false }
+        stopEventRevisionsBySession[sessionId, default: 0] &+= 1
+        stopRunStartSequenceBySession.removeValue(forKey: sessionId)
+        stopRunGenerationKeyBySession[sessionId] = currentGenerationKey
+        return true
+    }
+
+    private func recordUnconfirmedStop(
+        _ receipt: StopExecutionReceipt,
+        sessionId: String,
+        runIdentity: StopRunIdentity,
+        allowActivityUpdates: Bool
+    ) {
+        guard stopRunIdentity(for: sessionId).hasSameRunBoundary(
+            as: runIdentity,
+            allowActivityUpdates: allowActivityUpdates
+        ) else { return }
+        let evidence = receipt.stopIdentity
+        let identityRefreshed = refreshStopRunIdentityIfVerified(
+            evidence,
+            sessionId: sessionId,
+            expectedLocalIdentity: runIdentity,
+            allowActivityUpdates: allowActivityUpdates
+        )
+        let observedAt = evidence?.observedAt ?? Date()
+        let diagnostic: StopLifecycleDiagnostic
+        if receipt.staleGeneration {
+            if identityRefreshed {
+                diagnostic = StopLifecycleDiagnostic(
+                    code: .staleGeneration,
+                    observedAt: observedAt,
+                    recovery: .readyForExplicitStop,
+                    action: .explicitlyStopVerifiedCurrentRun,
+                    state: evidence?.state,
+                    source: evidence?.source,
+                    pageVerified: evidence?.pageVerified ?? false,
+                    generationIdentityRefreshed: true,
+                    message: "旧 Stop 未执行；电脑已核验同一 Chat 的当前任务。再次点按 Stop 才会停止当前任务。"
+                )
+            } else {
+                diagnostic = StopLifecycleDiagnostic(
+                    code: .staleGeneration,
+                    observedAt: observedAt,
+                    recovery: .needsComputerVerification,
+                    action: .verifyOnComputer,
+                    state: evidence?.state,
+                    source: evidence?.source,
+                    pageVerified: evidence?.pageVerified ?? false,
+                    generationIdentityRefreshed: false,
+                    message: "Stop 未确认；当前网页任务身份尚未核验，也没有停止新的生成。请先在电脑的同一 Chat 查看当前任务。"
+                )
+            }
+            if errors[sessionId] == "停止命令针对的生成已变化；没有停止新的生成。" {
+                errors[sessionId] = nil
+            }
+        } else {
+            diagnostic = StopLifecycleDiagnostic(
+                code: .notConfirmed,
+                observedAt: observedAt,
+                recovery: .statusVerificationRequired,
+                action: .stopAfterStatusCheck,
+                state: evidence?.state,
+                source: evidence?.source,
+                pageVerified: evidence?.pageVerified ?? false,
+                generationIdentityRefreshed: false,
+                message: "Stop 请求尚未确认；再次操作前会核验当前状态并保留原命令身份。不会自动重复停止。"
+            )
+        }
+        stopDiagnosticsBySession[sessionId] = diagnostic
+        DiagnosticsLog.shared.record("stop_unconfirmed", fields: [
+            "session": sessionId,
+            "settled": String(receipt.settled),
+            "stopped": String(receipt.stopped),
+            "staleGeneration": String(receipt.staleGeneration),
+            "identityState": evidence?.state ?? "missing",
+            "identitySource": evidence?.source ?? "missing",
+            "pageVerified": String(evidence?.pageVerified ?? false),
+            "identityRefreshed": String(identityRefreshed),
+            "recovery": diagnostic.recovery.rawValue,
+            "observedAt": RemoteAIDate.string(observedAt),
+        ], level: "WARN")
     }
 
     private func laterStopActivity(_ first: Date?, _ second: Date?) -> Date? {
@@ -2805,16 +3943,34 @@ final class WorkspaceStore: ObservableObject {
         let activeMachineId = machine.id
         let cacheKey = stopOperationCacheKey(runtimeId: runtimeId, instanceId: instanceId,
             sessionId: sessionId, machineId: activeMachineId)
-        guard stopRunIdentity(for: sessionId) == runIdentity else { return false }
+        func stillTargetsSameRun() -> Bool {
+            stopRunIdentity(for: sessionId).hasSameRunBoundary(
+                as: runIdentity,
+                allowActivityUpdates: runtimeId == "runtime.web"
+            )
+        }
+        guard stillTargetsSameRun() else { return false }
         stopRequestsPending.insert(sessionId)
         defer { stopRequestsPending.remove(sessionId) }
+
+        if runtimeId == "runtime.web", instanceId == "web.chatgpt" {
+            let preflight = await inspectStopIdentityBeforeAction(
+                sessionId: sessionId,
+                expectedIdentity: runIdentity,
+                generation: generation,
+                transport: activeTransport,
+                machineId: activeMachineId,
+                stopTap: true
+            )
+            guard preflight == .readyToStop else { return false }
+        }
 
         var commandId = UUID()
         var reusedUnknownOperation = false
         if let pending = await loadPendingStopOperation(cacheKey: cacheKey) {
             guard generation == lifecycleGeneration, transport === activeTransport,
                   machine.id == activeMachineId, !isSuspended,
-                  stopRunIdentity(for: sessionId) == runIdentity else { return false }
+                  stillTargetsSameRun() else { return false }
             // A prior request may have stopped the old generation but lost its ACK.
             // Before any explicit retry, read status and only replay its command ID
             // when the same run is still active. An old cached ACK must never idle a
@@ -2828,7 +3984,7 @@ final class WorkspaceStore: ObservableObject {
                 )
                 guard generation == lifecycleGeneration, transport === activeTransport,
                       machine.id == activeMachineId, !isSuspended,
-                      stopRunIdentity(for: sessionId) == runIdentity else { return false }
+                      stillTargetsSameRun() else { return false }
                 if !stopStatusHasFreshIdleEvidence(snapshot, requestStartedAt: statusRequestStartedAt,
                     sessionId: sessionId) {
                     errors[sessionId] = "Stop delivery is unknown and the status reply may be stale. No Stop was retried."
@@ -2838,7 +3994,7 @@ final class WorkspaceStore: ObservableObject {
                     await finishPendingStopOperation(cacheKey: cacheKey, expectedCommandId: pending.commandId)
                     guard generation == lifecycleGeneration, transport === activeTransport,
                           machine.id == activeMachineId, !isSuspended,
-                          stopRunIdentity(for: sessionId) == runIdentity else { return false }
+                          stillTargetsSameRun() else { return false }
                     if snapshot.state == .idle {
                         setSessionState(sessionId, .idle)
                         liveRunStatusBySession.removeValue(forKey: sessionId)
@@ -2881,7 +4037,7 @@ final class WorkspaceStore: ObservableObject {
         }
         guard generation == lifecycleGeneration, transport === activeTransport,
               machine.id == activeMachineId, !isSuspended,
-              stopRunIdentity(for: sessionId) == runIdentity else { return false }
+              stillTargetsSameRun() else { return false }
         let statusEvidenceAt = [
             sessions.first(where: { $0.id == sessionId })?.lastActivityAt,
             sessions.first(where: { $0.id == sessionId })?.lastProgressAt,
@@ -2898,34 +4054,48 @@ final class WorkspaceStore: ObservableObject {
         try? await cache.put(PendingStopOperation(commandId: commandId, runIdentity: persistedIdentity), key: cacheKey)
         guard generation == lifecycleGeneration, transport === activeTransport,
               machine.id == activeMachineId, !isSuspended,
-              stopRunIdentity(for: sessionId) == runIdentity else {
+              stillTargetsSameRun() else {
             if !reusedUnknownOperation { await finishPendingStopOperation(cacheKey: cacheKey, expectedCommandId: commandId) }
             return false
         }
-        let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "stopGeneration", commandId: commandId)
+        let command = RemoteCommand.make(
+            machineId: activeMachineId,
+            runtimeId: runtimeId,
+            instanceId: instanceId,
+            sessionId: sessionId,
+            action: "stopGeneration",
+            payload: ["expectedGenerationKey": runIdentity.generationKey.map(JSONValue.string) ?? .null],
+            commandId: commandId
+        )
         commandStates[command.commandId] = .pending
         do {
             let receipt = try await activeTransport.requestStop(command)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
             commandStates[command.commandId] = receipt.confirmed ? .completed : .acknowledged
-            await finishPendingStopOperation(cacheKey: cacheKey, expectedCommandId: commandId)
-            guard generation == lifecycleGeneration, transport === activeTransport,
-                  machine.id == activeMachineId, !isSuspended else { return false }
             // A successful Relay/Router ACK cannot synthesize a terminal boundary.
             // Never stop a newer generation or clear Running on unconfirmed Stop.
             if !receipt.confirmed {
-                if stopRunIdentity(for: sessionId) == runIdentity {
-                    errors[sessionId] = receipt.staleGeneration
-                        ? "停止命令针对的生成已变化；没有停止新的生成。"
-                        : "停止请求已到达执行端，但尚未确认停止；当前状态仍需重新核验。"
+                if receipt.staleGeneration {
+                    // This exact command is known not to have stopped the current run.
+                    // Clear its persisted identity; a verified refresh may create a
+                    // new explicit user action, but no retry is issued here.
+                    await finishPendingStopOperation(cacheKey: cacheKey, expectedCommandId: commandId)
+                    guard generation == lifecycleGeneration, transport === activeTransport,
+                          machine.id == activeMachineId, !isSuspended else { return false }
                 }
-                DiagnosticsLog.shared.record("stop_unconfirmed", fields: [
-                    "session": sessionId, "settled": String(receipt.settled),
-                    "stopped": String(receipt.stopped),
-                    "staleGeneration": String(receipt.staleGeneration)
-                ], level: "WARN")
+                recordUnconfirmedStop(
+                    receipt,
+                    sessionId: sessionId,
+                    runIdentity: runIdentity,
+                    allowActivityUpdates: runtimeId == "runtime.web"
+                )
                 return false
             }
+            await finishPendingStopOperation(cacheKey: cacheKey, expectedCommandId: commandId)
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, !isSuspended else { return false }
+            guard stillTargetsSameRun() else { return true }
+            stopDiagnosticsBySession.removeValue(forKey: sessionId)
             // Events delivered after the Stop was issued are authoritative. In
             // particular a newer GENERATION_STARTED must not be rolled back by this
             // request's cached/successful acknowledgement.
@@ -2938,7 +4108,7 @@ final class WorkspaceStore: ObservableObject {
                     )
                     guard generation == lifecycleGeneration, transport === activeTransport,
                           machine.id == activeMachineId, !isSuspended else { return false }
-                    guard stopRunIdentity(for: sessionId) == runIdentity else { return true }
+                    guard stillTargetsSameRun() else { return true }
                     guard stopStatusHasFreshIdleEvidence(snapshot,
                         requestStartedAt: statusRequestStartedAt, sessionId: sessionId) else {
                         errors[sessionId] = "Stop acknowledgement was replayed, but status evidence may be stale. The current run remains unchanged."
@@ -2964,13 +4134,13 @@ final class WorkspaceStore: ObservableObject {
                 } catch {
                     guard generation == lifecycleGeneration, transport === activeTransport,
                           machine.id == activeMachineId, !isSuspended else { return false }
-                    if stopRunIdentity(for: sessionId) == runIdentity {
+                    if stillTargetsSameRun() {
                         errors[sessionId] = "Stop acknowledgement could not be reconciled with current status: \(error.localizedDescription)"
                     }
                     return false
                 }
             }
-            if stopRunIdentity(for: sessionId) == runIdentity {
+            if stillTargetsSameRun() {
                 if runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
                 setSessionState(sessionId, .idle)
                 liveRunStatusBySession.removeValue(forKey: sessionId)
@@ -2986,7 +4156,7 @@ final class WorkspaceStore: ObservableObject {
                 guard generation == lifecycleGeneration, transport === activeTransport,
                       machine.id == activeMachineId, !isSuspended else { return false }
             }
-            if stopRunIdentity(for: sessionId) == runIdentity {
+            if stillTargetsSameRun() {
                 errors[sessionId] = error.localizedDescription
             }
             return false
@@ -3285,7 +4455,50 @@ final class WorkspaceStore: ObservableObject {
                       generation == self.lifecycleGeneration,
                       !self.isSuspended,
                       self.transport === monitoredTransport else { break }
-                if !(await monitoredTransport.isConnected) {
+                let relayConnected = await monitoredTransport.isConnected
+                if relayConnected,
+                   self.machine.state == .offline,
+                   self.desktopAgentConnected == false,
+                   self.connectionPhase == .windowsOffline {
+                    // Agent presence normally recovers through a health frame on this
+                    // socket. That frame can be lost while Relay remains healthy, and
+                    // CloudflareTransport then rejects getStatus locally. Use the same
+                    // monitor with a bounded backoff to refresh the Relay handshake; a
+                    // socket recycle is deferred while any command awaits its receipt.
+                    guard var episode = self.connectionFailureEpisode,
+                          episode.fingerprint == "offline",
+                          episode.isPresenceRefreshDue(at: Date()) else { continue }
+                    let attemptAt = Date()
+                    episode.recordPresenceRefreshAttempt(at: attemptAt)
+                    self.connectionFailureEpisode = episode
+                    DiagnosticsLog.shared.record("agent_presence_refresh_attempt", fields: [
+                        "attempt": String(episode.presenceRefreshAttemptCount),
+                        "nextDelaySeconds": String(Int(ConnectionFailureEpisode.offlineProbeDelay(
+                            occurrenceCount: episode.presenceRefreshAttemptCount + 1
+                        ))),
+                        "observedAt": RemoteAIDate.string(attemptAt),
+                    ])
+                    do {
+                        let refreshed = try await monitoredTransport.refreshAgentPresence()
+                        guard generation == self.lifecycleGeneration,
+                              !self.isSuspended,
+                              self.transport === monitoredTransport else { break }
+                        if !refreshed {
+                            DiagnosticsLog.shared.record("agent_presence_refresh_deferred", fields: [
+                                "attempt": String(episode.presenceRefreshAttemptCount),
+                                "reason": "pending_commands",
+                            ], level: "WARN")
+                        }
+                    } catch {
+                        guard generation == self.lifecycleGeneration,
+                              !self.isSuspended,
+                              self.transport === monitoredTransport else { break }
+                        self.applyConnectionFailure(error)
+                        if (error as? TransportError) == .pairingRequired { break }
+                    }
+                    continue
+                }
+                if !relayConnected {
                     self.machine.state = .connecting
                     self.connectionPhase = .reconnecting
                     do {
@@ -3309,6 +4522,7 @@ final class WorkspaceStore: ObservableObject {
                         self.machine.state = .online
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
+                        self.finishConnectionFailureEpisode(source: "authenticated-relay-reconnect")
                         self.endTransientConnectionPresentation()
                         DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence), "source": "reconnect"])
                         self.scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "relay-reconnect")
@@ -3339,6 +4553,7 @@ final class WorkspaceStore: ObservableObject {
                         self.machine.state = .online
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
+                        self.finishConnectionFailureEpisode(source: "authenticated-agent-recovery")
                         self.endTransientConnectionPresentation()
                         DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence), "source": "agent-recovered"])
                         self.scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "agent-recovered")
@@ -3358,26 +4573,80 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    static func connectionFailureFingerprint(for error: Error) -> String {
+        guard let transportError = error as? TransportError else {
+            let bridged = error as NSError
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+            let domain = String(bridged.domain.unicodeScalars.filter(allowed.contains).prefix(80))
+            return "\(domain.isEmpty ? "unknown" : domain)_\(bridged.code)"
+        }
+        switch transportError {
+        case .offline: return "offline"
+        case .badResponse(let status): return "http_\(status)"
+        case .malformedData: return "malformed_data"
+        case .pairingRequired: return "pairing_required"
+        case .disconnected: return "disconnected"
+        case .timeout: return "timeout"
+        case .insecureRelay: return "insecure_relay"
+        case .frameTooLarge: return "frame_too_large"
+        case .replayDetected: return "replay_detected"
+        case .remote(let code, _): return "remote_\(code.uppercased())"
+        }
+    }
+
+    private func observeConnectionFailureEpisode(for error: Error, at observedAt: Date = Date()) {
+        let fingerprint = Self.connectionFailureFingerprint(for: error)
+        if var episode = connectionFailureEpisode {
+            if episode.observe(fingerprint: fingerprint, at: observedAt) {
+                connectionFailureEpisode = episode
+                return
+            }
+            finishConnectionFailureEpisode(source: "failure_changed", recovered: false, at: observedAt)
+        }
+        connectionFailureEpisode = ConnectionFailureEpisode(fingerprint: fingerprint, observedAt: observedAt)
+        var fields = Self.diagnosticFields(for: error)
+        fields["failureCode"] = fingerprint
+        fields["occurrenceCount"] = "1"
+        fields["firstObservedAt"] = RemoteAIDate.string(observedAt)
+        DiagnosticsLog.shared.record("connection_failure", fields: fields, level: "ERROR")
+    }
+
+    private func finishConnectionFailureEpisode(
+        source: String,
+        recovered: Bool = true,
+        at recoveredAt: Date = Date()
+    ) {
+        guard let episode = connectionFailureEpisode else { return }
+        connectionFailureEpisode = nil
+        var fields = episode.summaryFields(recoveredAt: recoveredAt, source: source)
+        fields[recovered ? "outcome" : "endReason"] = recovered ? "recovered" : source
+        DiagnosticsLog.shared.record(
+            recovered ? "connection_failure_episode_recovered" : "connection_failure_episode_ended",
+            fields: fields,
+            level: recovered ? "INFO" : "WARN"
+        )
+    }
+
     private func applyConnectionFailure(_ error: Error) {
         syncState = "unknown"
         machine.state = .offline
-        DiagnosticsLog.shared.record("connection_failure", fields: Self.diagnosticFields(for: error), level: "ERROR")
+        observeConnectionFailureEpisode(for: error)
         if let transportError = error as? TransportError {
             switch transportError {
             case .pairingRequired:
                 endTransientConnectionPresentation()
                 isPaired = false
                 connectionPhase = .pairingExpired
-                errors["connection"] = "Pairing expired / Repair required — scan the current Windows pairing QR code."
+                errors["connection"] = "Windows 配对需要修复（Repair required）；请扫描当前配对码。已保留本地历史和草稿。"
                 connectionMonitorTask?.cancel()
                 connectionMonitorTask = nil
             case .offline:
                 desktopAgentConnected = false
                 connectionPhase = .windowsOffline
-                errors["connection"] = "Windows Agent offline — Relay is reachable but the RemoteAI Agent is not online."
+                errors["connection"] = "Windows Agent 当前离线（offline）；手机仍保留历史、草稿和事件游标，电脑恢复后会继续补同步。投递未知时不要重复发送。"
             case .timeout:
                 connectionPhase = .timedOut
-                errors["connection"] = "Connection timed out — check Relay reachability and the Windows Agent."
+                errors["connection"] = "连接核验超时（timeout）；尚未证明远端任务已停止或消息未送达。请检查 Relay 和 Windows Agent，再核对原会话。"
             default:
                 connectionPhase = .relayError
                 errors["connection"] = transportError.localizedDescription
@@ -4687,6 +5956,7 @@ final class WorkspaceStore: ObservableObject {
 
         switch event.type {
         case "SESSION_DELETED":
+            stopDiagnosticsBySession.removeValue(forKey: sessionId)
             if event.runtimeId == "runtime.web" {
                 liveRunStatusBySession.removeValue(forKey: sessionId)
                 stopRunStartSequenceBySession.removeValue(forKey: sessionId)
@@ -4893,6 +6163,7 @@ final class WorkspaceStore: ObservableObject {
         case "GENERATION_STARTED":
             if event.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
             if suppressTransientPresentation { return }
+            stopDiagnosticsBySession.removeValue(forKey: sessionId)
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             setSessionState(sessionId, .busy)
             liveRunStatusBySession[sessionId] = generationStartedLabel(runtimeId: event.runtimeId)
@@ -4902,6 +6173,9 @@ final class WorkspaceStore: ObservableObject {
             ])
         case "GENERATION_STOPPED":
             if event.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
+            if !suppressTransientPresentation, event.payload["ok"]?.boolValue != false {
+                stopDiagnosticsBySession.removeValue(forKey: sessionId)
+            }
             if event.payload["ok"]?.boolValue == false {
                 let outcome = generationTerminalOutcome(for: event.payload)
                 let isAntigravity = event.runtimeId == "runtime.antigravity"
@@ -5095,7 +6369,7 @@ final class WorkspaceStore: ObservableObject {
             if currentState == .busy || currentState == .waiting {
                 liveRunStatusBySession[sessionId] = message
             }
-            if previousMessage != message || previousState != issue.state {
+            if previousMessage != message || previousState != issue.state || previousIssue?.code != issue.code {
                 DiagnosticsLog.shared.record("web_provider_surface_issue", fields: [
                     "session": sessionId,
                     "state": issue.state,
@@ -5177,6 +6451,7 @@ final class WorkspaceStore: ObservableObject {
                 connectionPhase = .reconnecting
             }
             if event.state == .offline {
+                observeConnectionFailureEpisode(for: TransportError.disconnected, at: event.at)
                 errors["connection"] = "Cloudflare Relay 连接已断开，RemoteAI 正在重连；已确认的命令和事件游标会保留。"
                 // A short 1006 remains in diagnostics; it need not flash a notice.
             } else if connectionPhase == .reconnecting {
@@ -5228,7 +6503,8 @@ final class WorkspaceStore: ObservableObject {
                 systemTransportOfflineChannels.insert("windows-agent")
                 machine.state = .offline
                 connectionPhase = .windowsOffline
-                errors["connection"] = "Windows Agent 离线 — 手机仍连接 Cloudflare Relay，将在电脑恢复后自动补同步。"
+                observeConnectionFailureEpisode(for: TransportError.offline, at: event.at)
+                errors["connection"] = "Windows Agent 离线（offline）；手机仍连接 Cloudflare Relay，正在等待经身份验证的恢复状态后补同步。"
                 recentSystemNotice = "Windows Agent 已确认离线；Cloudflare Relay 连接仍会保持，电脑恢复后会自动继续。"
             }
         }
@@ -5805,6 +7081,7 @@ final class WorkspaceStore: ObservableObject {
                 && transport === activeTransport
                 && machine.id == machineId
                 && machine.state == .online
+                && !readOnlyCachedWebSessionIds.contains(sessionId)
                 && !isSuspended
         }
 
@@ -5814,7 +7091,7 @@ final class WorkspaceStore: ObservableObject {
         let unknownIds = commandStates.compactMap { $0.value == .unknown ? $0.key : nil }
         guard !unknownIds.isEmpty else { return }
 
-        var candidates: [(id: UUID, text: String, createdAt: Date)] = []
+        var candidates: [(id: UUID, text: String, createdAt: Date, runtimeId: String)] = []
         for id in unknownIds {
             guard isCurrent() else { return }
             let command = try? await cache.get(RemoteCommand.self,
@@ -5825,7 +7102,7 @@ final class WorkspaceStore: ObservableObject {
                   command.action == "sendMessage",
                   command.sessionId == sessionId else { continue }
             candidates.append((id: id, text: command.payload["text"]?.stringValue ?? "",
-                               createdAt: command.createdAt))
+                               createdAt: command.createdAt, runtimeId: command.runtimeId))
         }
 
         guard isCurrent(), !candidates.isEmpty else { return }
@@ -5841,19 +7118,27 @@ final class WorkspaceStore: ObservableObject {
         var resolvedIds = Set<UUID>()
         var exactMessageIndexes = Set<Int>()
         var exactIndexesByCommand: [UUID: Set<Int>] = [:]
+        var conflictingExactCommandIds = Set<UUID>()
         // Reserve exact rows for every known operation state, including commands
         // already resolved on an earlier bounded history page. Otherwise a later
         // retry could reuse that row as text-only evidence for another pending send.
         for (index, message) in remoteUsers.enumerated() {
-            for commandId in commandStates.keys
-            where identifies(message.id, commandId: commandId)
-                || identifies(message.providerMessageId, commandId: commandId) {
-                exactMessageIndexes.insert(index)
+            let matchingCommands = Set(commandStates.keys.filter { commandId in
+                identifies(message.id, commandId: commandId)
+                    || identifies(message.providerMessageId, commandId: commandId)
+            })
+            guard !matchingCommands.isEmpty else { continue }
+            exactMessageIndexes.insert(index)
+            if matchingCommands.count == 1, let commandId = matchingCommands.first {
                 exactIndexesByCommand[commandId, default: []].insert(index)
+            } else {
+                // Contradictory UUID aliases cannot prove which command owns this row.
+                conflictingExactCommandIds.formUnion(matchingCommands)
             }
         }
         for candidate in candidates {
-            if let exactIndexes = exactIndexesByCommand[candidate.id], !exactIndexes.isEmpty {
+            if !conflictingExactCommandIds.contains(candidate.id),
+               let exactIndexes = exactIndexesByCommand[candidate.id], !exactIndexes.isEmpty {
                 resolvedIds.insert(candidate.id)
             }
         }
@@ -5863,7 +7148,8 @@ final class WorkspaceStore: ObservableObject {
         // provider turn could belong to two same-text sends, leave both unknown.
         var candidateMessageIndexes: [UUID: Set<Int>] = [:]
         var messageCandidateIds: [Int: Set<UUID>] = [:]
-        for candidate in candidates where !resolvedIds.contains(candidate.id) && !candidate.text.isEmpty {
+        for candidate in candidates where candidate.runtimeId != "runtime.web"
+            && !resolvedIds.contains(candidate.id) && !candidate.text.isEmpty {
             for (index, message) in remoteUsers.enumerated() where !exactMessageIndexes.contains(index) {
                 guard message.text == candidate.text else { continue }
                 // Preserve protection against an earlier identical prompt while
@@ -5888,11 +7174,15 @@ final class WorkspaceStore: ObservableObject {
             guard commandStates[candidate.id] == .unknown else { continue }
             commandStates[candidate.id] = .completed
             try? await cache.remove(key: Self.pendingCommandKey(candidate.id, machineId: machineId))
+            clearSendDeliveryDiagnostic(commandId: candidate.id)
             guard isCurrent() else { return }
         }
     }
 
     private func reconcileOptimisticUserEcho(_ serverMessage: ChatMessage, sessionId: String) async {
+        guard serverMessage.sessionId == sessionId, serverMessage.role == .user else { return }
+        if routeForSession(sessionId)?.runtimeId == "runtime.web",
+           readOnlyCachedWebSessionIds.contains(sessionId) { return }
         if routeForSession(sessionId)?.runtimeId == "runtime.codex",
            let providerId = serverMessage.providerMessageId, providerId != serverMessage.id {
             // An authoritative native turn maps the old API ID to the original
@@ -5900,6 +7190,30 @@ final class WorkspaceStore: ObservableObject {
             messagesBySession[sessionId]?.removeAll { $0.id == providerId && $0.role == .user }
             try? await cache.deleteMessage(id: providerId)
         }
+        let commandIdentities = Set([serverMessage.id, serverMessage.providerMessageId]
+            .compactMap { value in UUID(uuidString: value ?? "")?.uuidString.lowercased() })
+        if !commandIdentities.isEmpty {
+            let exactMatches = messagesBySession[sessionId, default: []].filter { message in
+                guard message.role == .user, message.sequence == nil,
+                      let identity = UUID(uuidString: message.id)?.uuidString.lowercased() else { return false }
+                return commandIdentities.contains(identity)
+            }
+            if exactMatches.count == 1, let optimistic = exactMatches.first {
+                if let commandId = UUID(uuidString: optimistic.id) {
+                    if commandStates[commandId] == .unknown {
+                        commandStates[commandId] = .completed
+                        try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: machine.id))
+                    }
+                    clearSendDeliveryDiagnostic(commandId: commandId)
+                }
+                await removeOptimisticUserMessage(optimistic, sessionId: sessionId)
+                return
+            }
+        }
+        // Web history and a mobile Send command have independent clocks and provider
+        // IDs. A matching body/time window cannot establish that those rows are the
+        // same operation, so Web reconciliation is identity-only.
+        if routeForSession(sessionId)?.runtimeId == "runtime.web" { return }
         guard let optimistic = messagesBySession[sessionId, default: []].last(where: {
             guard $0.role == .user, $0.sequence == nil,
                   UUID(uuidString: $0.id) != nil,
@@ -5909,8 +7223,254 @@ final class WorkspaceStore: ObservableObject {
             let elapsed = serverMessage.createdAt.timeIntervalSince($0.createdAt)
             return elapsed >= -5 && elapsed < 180
         }) else { return }
-        messagesBySession[sessionId]?.removeAll { $0.id == optimistic.id }
+        await removeOptimisticUserMessage(optimistic, sessionId: sessionId)
+    }
+
+    private func removeOptimisticUserMessage(_ optimistic: ChatMessage, sessionId: String) async {
+        guard optimistic.sessionId == sessionId, optimistic.role == .user,
+              messagesBySession[sessionId, default: []].contains(where: { $0.id == optimistic.id && $0.role == .user }) else { return }
+        messagesBySession[sessionId]?.removeAll { $0.id == optimistic.id && $0.role == .user }
         try? await cache.deleteMessage(id: optimistic.id)
+    }
+
+    private func webCommandOutcomeReceipt(commandId: UUID, sessionId: String, machineId: String,
+        activeTransport: Transport, forceRecheck: Bool = false,
+        isCurrent: () -> Bool) async -> WebOptimisticEchoReceipt? {
+        let key = Self.webOptimisticEchoReceiptKey(commandId, machineId: machineId, sessionId: sessionId)
+        var cached = try? await cache.get(WebOptimisticEchoReceipt.self, key: key)
+        guard isCurrent() else { return nil }
+        if let saved = cached,
+           (saved.machineId != machineId || saved.sessionId != sessionId || saved.commandId != commandId) {
+            cached = nil
+        }
+
+        let now = Date()
+        if let cached {
+            guard !cached.consumed, cached.messageId == nil else { return cached }
+            let unresolved = ["NOT_FOUND", "RUNNING", "UNKNOWN_DELIVERY", "UNAVAILABLE"]
+                .contains(cached.status)
+            guard unresolved else { return cached }
+            guard forceRecheck
+                || (cached.attempts < 2 && (cached.retryAfter.map { $0 <= now } ?? false)) else {
+                return cached
+            }
+        }
+        let nextAttempt = (cached?.attempts ?? 0) + 1
+        do {
+            let outcome = try await activeTransport.commandOutcome(machineId: machineId, targetCommandId: commandId)
+            guard isCurrent() else { return nil }
+            let sameReceiptSession = outcome.sessionId == nil || outcome.sessionId == sessionId
+            let accepted = outcome.accepted && sameReceiptSession
+            cached = WebOptimisticEchoReceipt(
+                machineId: machineId,
+                sessionId: sessionId,
+                commandId: commandId,
+                status: outcome.status,
+                accepted: accepted,
+                messageId: accepted ? outcome.messageId : nil,
+                serverSessionId: outcome.sessionId,
+                attempts: nextAttempt,
+                retryAfter: ["NOT_FOUND", "RUNNING", "UNKNOWN_DELIVERY"].contains(outcome.status)
+                    ? now.addingTimeInterval(300)
+                    : nil,
+                lastAttemptAt: now,
+                consumed: false
+            )
+        } catch {
+            guard isCurrent() else { return nil }
+            cached = WebOptimisticEchoReceipt(
+                machineId: machineId,
+                sessionId: sessionId,
+                commandId: commandId,
+                status: "UNAVAILABLE",
+                accepted: false,
+                messageId: nil,
+                serverSessionId: nil,
+                attempts: nextAttempt,
+                retryAfter: now.addingTimeInterval(300),
+                lastAttemptAt: now,
+                consumed: false
+            )
+        }
+        if let cached { try? await cache.put(cached, key: key) }
+        guard isCurrent() else { return nil }
+        return cached
+    }
+
+    private func reconcileLegacyWebOptimisticEchoes(with remote: [ChatMessage], sessionId: String,
+        forceRecheck: Bool = false) async {
+        guard routeForSession(sessionId)?.runtimeId == "runtime.web",
+              remote.allSatisfy({ $0.sessionId == sessionId }) else { return }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let machineId = machine.id
+        func isCurrent() -> Bool {
+            generation == lifecycleGeneration && transport === activeTransport
+                && machine.id == machineId && machine.state == .online
+                && !readOnlyCachedWebSessionIds.contains(sessionId) && !isSuspended
+        }
+        guard isCurrent() else { return }
+
+        let remoteIdentityValues = Set(remote.filter { $0.role == .user }.flatMap { message in
+            [message.id, message.providerMessageId].compactMap { $0?.lowercased() }
+        })
+        let optimisticCommands = messagesBySession[sessionId, default: []].compactMap { message -> (ChatMessage, UUID)? in
+            guard message.role == .user, message.sequence == nil,
+                  let commandId = UUID(uuidString: message.id),
+                  !remoteIdentityValues.contains(commandId.uuidString.lowercased()) else { return nil }
+            return (message, commandId)
+        }
+        guard !optimisticCommands.isEmpty else { return }
+
+        var lookupsThisPass = 0
+        var exactReceiptMatches: [(optimistic: ChatMessage, commandId: UUID,
+            receipt: WebOptimisticEchoReceipt, receiptKey: String, messageId: String)] = []
+        for (optimistic, commandId) in optimisticCommands {
+            guard isCurrent() else { return }
+            guard messagesBySession[sessionId, default: []].contains(where: { $0.id == optimistic.id && $0.role == .user }) else { continue }
+            let receiptKey = Self.webOptimisticEchoReceiptKey(commandId, machineId: machineId, sessionId: sessionId)
+            var cached = try? await cache.get(WebOptimisticEchoReceipt.self, key: receiptKey)
+            guard isCurrent() else { return }
+            if let saved = cached,
+               (saved.machineId != machineId || saved.sessionId != sessionId || saved.commandId != commandId) {
+                cached = nil
+            }
+            let retryableReceipt = cached.map {
+                ["NOT_FOUND", "RUNNING", "UNKNOWN_DELIVERY", "UNAVAILABLE"].contains($0.status)
+                    && !$0.consumed && $0.messageId == nil
+            } ?? false
+            if cached == nil || (retryableReceipt
+                && (forceRecheck || (cached?.attempts ?? 0) < 2
+                    && (cached?.retryAfter.map({ $0 <= Date() }) ?? false))) {
+                guard lookupsThisPass < 5 else { continue }
+                lookupsThisPass += 1
+                cached = await webCommandOutcomeReceipt(commandId: commandId, sessionId: sessionId,
+                    machineId: machineId, activeTransport: activeTransport,
+                    forceRecheck: forceRecheck, isCurrent: isCurrent)
+                guard isCurrent() else { return }
+            }
+
+            guard let receipt = cached, receipt.accepted,
+                  receipt.serverSessionId == nil || receipt.serverSessionId == sessionId else { continue }
+            guard let messageId = receipt.messageId, !messageId.isEmpty,
+                  remote.contains(where: { $0.sessionId == sessionId && $0.role == .user && $0.id == messageId }) else { continue }
+            exactReceiptMatches.append((optimistic, commandId, receipt, receiptKey, messageId))
+        }
+
+        func persistAssociation(_ association: WebOptimisticEchoMessageAssociation,
+            messageId: String) async -> Bool {
+            guard isCurrent() else { return false }
+            let key = Self.webOptimisticEchoMessageAssociationKey(messageId, machineId: machineId, sessionId: sessionId)
+            do {
+                try await cache.put(association, key: key)
+                return isCurrent()
+            } catch {
+                DiagnosticsLog.shared.record("web_optimistic_echo_association_cache_failed", fields: [
+                    "session": sessionId,
+                    "messageId": messageId,
+                ], level: "WARN")
+                return false
+            }
+        }
+
+        func recordConflict(messageId: String, commandIds: Set<UUID>) async {
+            let key = Self.webOptimisticEchoMessageAssociationKey(messageId, machineId: machineId, sessionId: sessionId)
+            var association = try? await cache.get(WebOptimisticEchoMessageAssociation.self, key: key)
+            guard isCurrent() else { return }
+            if let saved = association,
+               (saved.machineId != machineId || saved.sessionId != sessionId || saved.messageId != messageId) {
+                association = nil
+            }
+            var conflict = association ?? WebOptimisticEchoMessageAssociation(
+                machineId: machineId,
+                sessionId: sessionId,
+                messageId: messageId,
+                commandIds: [],
+                ownerCommandId: nil,
+                isConflicted: false,
+                consumed: false
+            )
+            conflict.commandIds.formUnion(commandIds)
+            conflict.isConflicted = true
+            _ = await persistAssociation(conflict, messageId: messageId)
+        }
+
+        func reserveMessage(_ messageId: String, commandId: UUID) async -> Bool {
+            let key = Self.webOptimisticEchoMessageAssociationKey(messageId, machineId: machineId, sessionId: sessionId)
+            var association = try? await cache.get(WebOptimisticEchoMessageAssociation.self, key: key)
+            guard isCurrent() else { return false }
+            if let saved = association,
+               (saved.machineId != machineId || saved.sessionId != sessionId || saved.messageId != messageId) {
+                association = nil
+            }
+            var reservation = association ?? WebOptimisticEchoMessageAssociation(
+                machineId: machineId,
+                sessionId: sessionId,
+                messageId: messageId,
+                commandIds: [],
+                ownerCommandId: nil,
+                isConflicted: false,
+                consumed: false
+            )
+            guard !reservation.isConflicted else {
+                reservation.commandIds.insert(commandId)
+                _ = await persistAssociation(reservation, messageId: messageId)
+                return false
+            }
+            if let owner = reservation.ownerCommandId, owner != commandId {
+                reservation.commandIds.insert(commandId)
+                reservation.isConflicted = true
+                _ = await persistAssociation(reservation, messageId: messageId)
+                return false
+            }
+            reservation.commandIds.insert(commandId)
+            reservation.ownerCommandId = commandId
+            // This write reserves one provider row for one exact command before the
+            // optimistic bubble is deleted. The same owner may safely finish cleanup
+            // after restart; another command cannot consume this messageId.
+            return await persistAssociation(reservation, messageId: messageId)
+        }
+
+        func markAssociationConsumed(_ messageId: String, commandId: UUID) async {
+            let key = Self.webOptimisticEchoMessageAssociationKey(messageId, machineId: machineId, sessionId: sessionId)
+            guard var association = try? await cache.get(WebOptimisticEchoMessageAssociation.self, key: key),
+                  isCurrent(), association.ownerCommandId == commandId, !association.isConflicted else { return }
+            association.consumed = true
+            _ = await persistAssociation(association, messageId: messageId)
+        }
+
+        for (messageId, matches) in Dictionary(grouping: exactReceiptMatches, by: { $0.messageId }) {
+            guard isCurrent() else { return }
+            if matches.count > 1 {
+                // Two durable command receipts naming one user row cannot both be
+                // consumed. Preserve every optimistic bubble and persist the conflict
+                // so a restart cannot silently make the association appear unique.
+                await recordConflict(messageId: messageId, commandIds: Set(matches.map { $0.commandId }))
+                continue
+            }
+            guard let match = matches.first,
+                  await reserveMessage(messageId, commandId: match.commandId) else { continue }
+            guard messagesBySession[sessionId, default: []].contains(where: {
+                $0.id == match.optimistic.id && $0.role == .user
+            }) else { continue }
+            await removeOptimisticUserMessage(match.optimistic, sessionId: sessionId)
+            guard isCurrent() else { return }
+            let optimisticStillPresent = messagesBySession[sessionId, default: []].contains {
+                $0.id == match.optimistic.id && $0.role == .user
+            }
+            if !optimisticStillPresent {
+                var receipt = match.receipt
+                receipt.consumed = true
+                try? await cache.put(receipt, key: match.receiptKey)
+                await markAssociationConsumed(messageId, commandId: match.commandId)
+                if commandStates[match.commandId] == .unknown {
+                    commandStates[match.commandId] = .completed
+                    try? await cache.remove(key: Self.pendingCommandKey(match.commandId, machineId: machineId))
+                    clearSendDeliveryDiagnostic(commandId: match.commandId)
+                    guard isCurrent() else { return }
+                }
+            }
+        }
     }
 
     static func adjacentExactWebAssistantDuplicateIDs(_ messages: [ChatMessage]) -> Set<String> {

@@ -25,6 +25,23 @@ enum ConnectionDiagnosticPhase: String, Codable, Equatable {
     case relayError
     case timedOut
 
+    var chineseDisplayName: String {
+        switch self {
+        case .idle: return "尚未连接"
+        case .relayConnecting: return "正在连接 Relay"
+        case .relayConnected: return "Relay 已连接，正在核验电脑"
+        case .authenticating: return "正在验证连接身份"
+        case .loadingRuntimes: return "正在加载电脑运行环境"
+        case .online: return "连接已确认"
+        case .reconnecting: return "正在恢复 Relay 连接"
+        case .windowsReconnecting: return "正在等待 Windows Agent 恢复"
+        case .windowsOffline: return "Windows Agent 已离线"
+        case .pairingExpired: return "配对状态需要检查"
+        case .relayError: return "Relay 连接异常"
+        case .timedOut: return "连接核验超时"
+        }
+    }
+
     var displayName: String {
         switch self {
         case .idle: return "Idle"

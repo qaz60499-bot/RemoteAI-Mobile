@@ -34,6 +34,13 @@ final class UnknownDeliveryTests: XCTestCase {
         let attempts = await mock.actionAttemptCount("sendMessage")
         XCTAssertEqual(attempts, 1, "A status check must not issue any additional provider send")
         XCTAssertEqual(store.commandStates[commandId], .unknown)
+        let diagnostic = try XCTUnwrap(store.sendDeliveryDiagnosticsByCommand[commandId])
+        XCTAssertEqual(diagnostic.sessionId, "photo-upload")
+        XCTAssertEqual(diagnostic.code, "WEB_SEND_DELIVERY_UNKNOWN")
+        XCTAssertTrue(diagnostic.message.contains("WEB_SEND_DELIVERY_UNKNOWN"))
+        XCTAssertTrue(diagnostic.message.contains("不会自动重发"))
+        XCTAssertNil(store.errors["photo-upload"],
+            "Unknown delivery is presented on the exact command bubble without overwriting unrelated session errors")
         let pending: RemoteCommand? = try await cache.get(RemoteCommand.self,
             key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
         XCTAssertEqual(pending?.commandId, commandId)
@@ -53,6 +60,10 @@ final class UnknownDeliveryTests: XCTestCase {
         XCTAssertFalse(sent)
         XCTAssertEqual(store.commandStates[commandId], .unknown,
             "Cancelling a confirmation cannot prove an already-dispatched send failed")
+        let diagnostic = try XCTUnwrap(store.sendDeliveryDiagnosticsByCommand[commandId])
+        XCTAssertEqual(diagnostic.sessionId, "photo-upload")
+        XCTAssertEqual(diagnostic.code, "ACK_INTERRUPTED")
+        XCTAssertTrue(diagnostic.message.contains("不会自动重发"))
         let pending: RemoteCommand? = try await cache.get(RemoteCommand.self,
             key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
         XCTAssertEqual(pending?.commandId, commandId)

@@ -107,6 +107,7 @@ protocol Transport: AnyObject {
     var isConnected: Bool { get async }
     func connect() async throws
     func disconnect() async
+    func refreshAgentPresence() async throws -> Bool
     func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope
     func eventStream() async -> AsyncStream<RemoteEvent>
     func healthStream() async -> AsyncStream<TransportHealthEvent>
@@ -188,16 +189,20 @@ enum TransportError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .offline: return "PC is offline"
-        case .badResponse(let code): return "Relay returned HTTP \(code)"
-        case .malformedData: return "Malformed relay data"
-        case .pairingRequired: return "Pairing is required"
-        case .disconnected: return "Connection closed"
-        case .timeout: return "RemoteAI request timed out"
-        case .insecureRelay: return "RemoteAI Relay must use HTTPS/WSS"
-        case .frameTooLarge: return "RemoteAI relay frame exceeds the protocol size limit"
-        case .replayDetected: return "RemoteAI rejected a replayed relay message"
-        case .remote(let code, let message): return "\(code): \(message)"
+        case .offline: return "Windows Agent 暂时离线（offline）；历史和草稿已保留，等待电脑恢复。"
+        case .badResponse(let code): return "Relay 返回 HTTP \(code)；连接暂时不可用，请检查连接。"
+        case .malformedData: return "收到的 Relay 数据格式异常（malformedData）；未确认的命令不能自动重发。"
+        case .pairingRequired: return "需要有效配对（pairingRequired）；请检查现有配对状态。"
+        case .disconnected: return "连接已中断（disconnected）；正在等待重连，消息送达结果需单独核对。"
+        case .timeout: return "请求超时（timeout）；尚不能确认消息是否送达，请先核查原命令。"
+        case .insecureRelay: return "Relay 地址必须使用 HTTPS/WSS（insecureRelay）。"
+        case .frameTooLarge: return "Relay 数据超过协议大小限制（frameTooLarge）。"
+        case .replayDetected: return "已拒绝重复的 Relay 数据帧（replayDetected）；请重新同步状态。"
+        case .remote(let code, let message):
+            let explainedCodes: Set<String> = ["SESSION_UNAVAILABLE", "CONVERSATION_IDENTITY_UNVERIFIED", "BROWSER_BINDING_MISSING", "PROVIDER_RATE_LIMITED", "PROVIDER_UNAVAILABLE", "WEB_SEND_DELIVERY_UNKNOWN", "PAGE_TRANSLATION_ACTIVE"]
+            guard explainedCodes.contains(code) else { return "\(code): \(message)" }
+            let explanation = WebErrorExplanation.resolve(code: code, original: message)
+            return "\(explanation.summary)（\(code)）。\(explanation.impact) \(explanation.safeAction)"
         }
     }
 
@@ -258,6 +263,7 @@ struct WebTabDiagnosis: Decodable {
     let draftPresent: Bool?
     let pendingUploads: Bool?
     let busy: Bool?
+    let stopIdentity: JSONValue?
 }
 
 struct OpenWebTab: Decodable, Identifiable {
@@ -357,16 +363,37 @@ struct StopExecutionReceipt: Equatable {
     let settled: Bool
     let staleGeneration: Bool
     let agentConfirmedIdle: Bool
-    var confirmed: Bool { settled && !staleGeneration && (stopped || alreadyIdle) && agentConfirmedIdle }
+    let requiresVerifiedIdentity: Bool
+    let identityMatchesRequestedGeneration: Bool
+    let stopIdentity: StopIdentityEvidence?
+    var confirmed: Bool {
+        let identityIsVerified = !requiresVerifiedIdentity || stopIdentity.map {
+            $0.state == "matched" && $0.hasVerifiedCurrentIdentity
+        } == true
+        return settled && !staleGeneration && (stopped || alreadyIdle)
+            && agentConfirmedIdle && identityIsVerified
+            && (!requiresVerifiedIdentity || identityMatchesRequestedGeneration)
+    }
 }
 
 extension Transport {
+    // A fresh device Relay handshake reports the Agent's current presence. Callers
+    // use this only after a bounded offline interval; this never retries a command.
+    func refreshAgentPresence() async throws -> Bool {
+        // Transports must opt in only when they can preserve unresolved command
+        // outcomes while refreshing the presence handshake.
+        return false
+    }
+
     // A successful command envelope means delivery, not that the executor stopped.
     func requestStop(_ command: RemoteCommand) async throws -> StopExecutionReceipt {
         let result = try await requireSuccess(execute(command))
         guard let object = result.objectValue else { throw TransportError.malformedData }
         let stopped = object["stopped"]?.boolValue == true
         let alreadyIdle = object["alreadyIdle"]?.boolValue == true
+        let identity = StopIdentityEvidence.decode(object["stopIdentity"])
+        let requestedGenerationKey = command.payload["expectedGenerationKey"] ?? .null
+        let responseExpectedGenerationKey = object["stopIdentity"]?.objectValue?["expectedGenerationKey"]
         return StopExecutionReceipt(
             stopped: stopped,
             alreadyIdle: alreadyIdle,
@@ -374,7 +401,10 @@ extension Transport {
             staleGeneration: object["staleGeneration"]?.boolValue == true,
             // Only the Agent's registry reconciliation may clear a Web run.
             agentConfirmedIdle: command.runtimeId != "runtime.web"
-                || object["confirmedIdle"]?.boolValue == true
+                || object["confirmedIdle"]?.boolValue == true,
+            requiresVerifiedIdentity: command.runtimeId == "runtime.web",
+            identityMatchesRequestedGeneration: responseExpectedGenerationKey == Optional(requestedGenerationKey),
+            stopIdentity: identity
         )
     }
 
@@ -391,7 +421,7 @@ extension Transport {
 
     // Query the Windows durable receipt without re-dispatching the original Send.
     // A missing/running/uncertain result is never proof of failed delivery.
-    func commandOutcome(machineId: String, targetCommandId: UUID) async throws -> (status: String, accepted: Bool) {
+    func commandOutcome(machineId: String, targetCommandId: UUID) async throws -> (status: String, accepted: Bool, messageId: String?, sessionId: String?) {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web",
             instanceId: "agent", action: "getCommandOutcome",
             payload: ["targetCommandId": .string(targetCommandId.uuidString)])
@@ -402,8 +432,23 @@ extension Transport {
               ["NOT_FOUND", "RUNNING", "COMPLETED", "FAILED", "UNKNOWN_DELIVERY"].contains(status) else {
             throw TransportError.malformedData
         }
-        let accepted = status == "COMPLETED" && object["outcome"]?.objectValue?["ok"]?.boolValue == true
-        return (status, accepted)
+        let outcome = object["outcome"]?.objectValue
+        let result = outcome?["result"]?.objectValue
+        // Older completed results may omit `accepted`; only an explicit rejection
+        // overrides the durable command envelope. A receipt ID is usable only when
+        // both layers confirm the send was accepted.
+        let accepted = status == "COMPLETED"
+            && outcome?["ok"]?.boolValue == true
+            && result?["accepted"]?.boolValue != false
+        let rawMessageId = result?["messageId"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let messageId = accepted && rawMessageId?.isEmpty == false && (rawMessageId?.count ?? 0) <= 200
+            ? rawMessageId
+            : nil
+        let rawSessionId = result?["sessionId"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionId = rawSessionId?.isEmpty == false && (rawSessionId?.count ?? 0) <= 200
+            ? rawSessionId
+            : nil
+        return (status, accepted, messageId, sessionId)
     }
 
     func agentStatusSnapshot(machineId: String) async throws -> AgentStatusSnapshot {

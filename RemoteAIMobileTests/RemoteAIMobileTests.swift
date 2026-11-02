@@ -3200,7 +3200,7 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testRestartReconcilesUnknownDeliveryFromAuthoritativeServerState() async throws {
+    func testRestartDoesNotResolveUnknownWebDeliveryFromBodyOnlyHistory() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("sqlite3")
         defer { try? FileManager.default.removeItem(at: url) }
         let cache = try SQLiteStore(url: url)
@@ -3223,12 +3223,17 @@ final class RemoteAIMobileTests: XCTestCase {
         await restored.refreshSessions(runtime: web, instance: photo)
         await restored.loadSession("photo-upload")
 
-        XCTAssertEqual(restored.commandStates[commandId], .completed, "Remote history should resolve unknown delivery after restart")
+        XCTAssertEqual(restored.commandStates[commandId], .unknown,
+            "Same-text history without command/provider identity or an accepted durable receipt cannot resolve Web delivery")
         let restartServerUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "restart-unknown")
         XCTAssertEqual(restartServerUserCount, 1)
-        XCTAssertEqual(restored.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "restart-unknown" }.count, 1)
+        let visibleUsers = restored.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "restart-unknown" }
+        XCTAssertEqual(visibleUsers.count, 2, "The unresolved optimistic bubble and distinct provider row remain visible")
+        XCTAssertTrue(visibleUsers.contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame })
         let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
-        XCTAssertNil(pending)
+        XCTAssertEqual(pending?.commandId, commandId)
+        let sendAttempts = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(sendAttempts, 1, "Restart reconciliation must not retry an unknown Web send")
         await restored.suspend()
     }
 
@@ -3329,7 +3334,7 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
-    func testWebSendDeliveryUnknownAutoReconcilesCommittedProviderTurnWithoutSecondSend() async throws {
+    func testWebSendDeliveryUnknownAfterCommitStaysUnknownWithoutExactIdentity() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .webSendDeliveryUnknownAfterCommit, historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
@@ -3338,21 +3343,23 @@ final class RemoteAIMobileTests: XCTestCase {
 
         let sent = await store.send(text: "delivery-committed", runtimeId: "runtime.web", instanceId: "photo", sessionId: "photo-upload", commandId: commandId)
 
-        XCTAssertTrue(sent, "A provider user turn found by read-only reconciliation should resolve unknown delivery")
-        XCTAssertEqual(store.commandStates[commandId], .completed)
+        XCTAssertFalse(sent, "Same-text provider history alone cannot confirm an unknown Web command")
+        XCTAssertEqual(store.commandStates[commandId], .unknown)
+        XCTAssertNotNil(store.sendDeliveryDiagnosticsByCommand[commandId])
         let sendAttempts = await mock.actionAttemptCount("sendMessage")
         XCTAssertEqual(sendAttempts, 1, "Reconciliation must never issue a second send side effect")
         let serverUserCount = await mock.userMessageCount(sessionId: "photo-upload", text: "delivery-committed")
         XCTAssertEqual(serverUserCount, 1)
-        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "delivery-committed" }.count, 1)
-        XCTAssertEqual(store.liveRunStatusBySession["photo-upload"], "已确认发送，等待远端响应…")
+        let visibleUsers = store.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "delivery-committed" }
+        XCTAssertEqual(visibleUsers.count, 2, "The unknown optimistic command and provider row remain separate without identity")
+        XCTAssertTrue(visibleUsers.contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame })
         let pending: RemoteCommand? = try await cache.get(RemoteCommand.self, key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
-        XCTAssertNil(pending)
+        XCTAssertEqual(pending?.commandId, commandId)
         await store.suspend()
     }
 
     @MainActor
-    func testLegacyChromeListenerClosedReconcilesCommittedSendWithoutDuplicate() async throws {
+    func testLegacyChromeListenerClosedWithoutExactReceiptStaysUnknownWithoutDuplicateSend() async throws {
         let cache = try SQLiteStore.inMemory()
         let mock = MockTransport(scenario: .webSendLegacyChromeChannelClosedAfterCommit, historyCount: 0)
         let store = WorkspaceStore(transport: mock, cache: cache)
@@ -3364,13 +3371,19 @@ final class RemoteAIMobileTests: XCTestCase {
             instanceId: "photo", sessionId: "photo-upload", commandId: commandId
         )
 
-        XCTAssertTrue(sent, "Old Agent channel-closure errors must reconcile a committed provider turn")
-        XCTAssertEqual(store.commandStates[commandId], .completed)
+        XCTAssertFalse(sent, "An old Agent channel closure plus matching body is not exact delivery evidence")
+        XCTAssertEqual(store.commandStates[commandId], .unknown)
+        XCTAssertEqual(store.sendDeliveryDiagnosticsByCommand[commandId]?.code, "WEB_SELECTOR_FAILED")
         let sendCount = await mock.actionAttemptCount("sendMessage")
         XCTAssertEqual(sendCount, 1, "Never automatically resend a possibly committed provider turn")
         let providerCount = await mock.userMessageCount(sessionId: "photo-upload", text: "legacy-listener-channel-closed")
         XCTAssertEqual(providerCount, 1)
-        XCTAssertEqual(store.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "legacy-listener-channel-closed" }.count, 1)
+        let visibleUsers = store.messagesBySession["photo-upload", default: []].filter { $0.role == .user && $0.text == "legacy-listener-channel-closed" }
+        XCTAssertEqual(visibleUsers.count, 2)
+        XCTAssertTrue(visibleUsers.contains { $0.id.caseInsensitiveCompare(commandId.uuidString) == .orderedSame })
+        let pending: RemoteCommand? = try await cache.get(RemoteCommand.self,
+            key: "pending.command.my-pc.\(commandId.uuidString.lowercased())")
+        XCTAssertEqual(pending?.commandId, commandId)
         await store.suspend()
     }
 
@@ -3463,7 +3476,8 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(stopped)
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
         XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
-        XCTAssertTrue(store.errors["photo-upload"]?.contains("尚未确认停止") == true)
+        XCTAssertEqual(store.stopDiagnosticsBySession["photo-upload"]?.code, .notConfirmed)
+        XCTAssertEqual(store.stopDiagnosticsBySession["photo-upload"]?.recovery, .statusVerificationRequired)
         XCTAssertFalse(store.stopRequestsPending.contains("photo-upload"))
         let attempts = await mock.actionAttemptCount("stopGeneration")
         XCTAssertEqual(attempts, 1)
@@ -3491,7 +3505,8 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertFalse(stopped, "A DOM idle response is not an Agent-confirmed terminal state")
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .busy)
         XCTAssertNotNil(store.liveRunStatusBySession["photo-upload"])
-        XCTAssertTrue(store.errors["photo-upload"]?.contains("尚未确认停止") == true)
+        XCTAssertEqual(store.stopDiagnosticsBySession["photo-upload"]?.code, .notConfirmed)
+        XCTAssertEqual(store.stopDiagnosticsBySession["photo-upload"]?.recovery, .statusVerificationRequired)
         await store.suspend()
     }
 

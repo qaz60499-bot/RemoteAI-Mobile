@@ -196,6 +196,96 @@ final class ProjectConvergenceTests: XCTestCase {
         await store.suspend()
     }
 
+    @MainActor
+    func testStaleSixtyFiveRowSnapshotPreservesCachedTwoHundredThirtyUntilFullLiveSnapshot() async throws {
+        let alias = "g-p-remoteai"
+        let cachedRows = (0..<230).map { index in
+            conversation(alias: "seed-\(index)", title: "Seed \(index)", age: TimeInterval(index))
+        }
+        let cache = try SQLiteStore.inMemory()
+        try await cache.put(cachedRows, key: "web.project.\(alias).conversations")
+
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: alias, count: 65)
+        await mock.setScenario(.staleWebCatalog)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        store.machine.state = .online
+
+        await store.loadProjectConversations(projectAlias: alias, refresh: true, force: true)
+
+        XCTAssertEqual(store.projectConversationsByAlias[alias]?.map(\.id), cachedRows.map(\.id),
+            "A stable but stale 65-row Windows snapshot is positive recovery evidence, not deletion authority")
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias[alias], .staleCache)
+        let stillCached: [WebConversationDescriptor]? = try await cache.get(
+            [WebConversationDescriptor].self,
+            key: "web.project.\(alias).conversations"
+        )
+        XCTAssertEqual(stillCached?.map(\.id), cachedRows.map(\.id),
+            "The stale prefix must not replace the last accepted 230-row phone cache")
+
+        await mock.setScenario(.normal)
+        await store.loadProjectConversations(projectAlias: alias, refresh: true, force: true)
+
+        XCTAssertEqual(store.projectConversationsByAlias[alias]?.map(\.conversationAlias),
+            (0..<65).map { "seed-\($0)" },
+            "A complete, stably paged live snapshot may replace the catalog and confirm the 165 missing rows")
+        XCTAssertEqual(store.projectConversationSnapshotStateByAlias[alias], .authoritativeLiveDOM)
+        let authoritativeCache: [WebConversationDescriptor]? = try await cache.get(
+            [WebConversationDescriptor].self,
+            key: "web.project.\(alias).conversations"
+        )
+        XCTAssertEqual(authoritativeCache?.count, 65)
+        await store.suspend()
+    }
+
+    @MainActor
+    func testProjectRevisionChangeDuringDelayedRefreshCannotReplaceAcceptedCatalog() async throws {
+        let alias = "g-p-remoteai"
+        let cachedRows = (0..<230).map { index in
+            conversation(alias: "seed-\(index)", title: "Seed \(index)", age: TimeInterval(index))
+        }
+        let cache = try SQLiteStore.inMemory()
+        try await cache.put(cachedRows, key: "web.project.\(alias).conversations")
+
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: alias, count: 65)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        store.machine.state = .online
+        store.projectConversationsByAlias[alias] = cachedRows
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 350_000_000)
+        await mock.failNextAction("createConversation")
+        let baselineAttempts = await mock.actionAttemptCount("listProjectConversations")
+
+        let delayedRefresh = Task { @MainActor in
+            await store.loadProjectConversations(projectAlias: alias, refresh: true, force: true)
+        }
+        for _ in 0..<120 {
+            if await mock.actionAttemptCount("listProjectConversations") > baselineAttempts { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let startedAttempts = await mock.actionAttemptCount("listProjectConversations")
+        XCTAssertGreaterThan(startedAttempts, baselineAttempts,
+            "The test must advance the create revision while the provider snapshot is delayed")
+
+        let failedCreate = await store.createWebConversation(projectAlias: alias)
+        XCTAssertNil(failedCreate, "The injected failure advances only the local Project revision")
+        await delayedRefresh.value
+
+        XCTAssertEqual(store.projectConversationsByAlias[alias]?.map(\.id), cachedRows.map(\.id),
+            "A delayed response from the previous revision must not replace the last accepted 230 rows")
+        let durableRows: [WebConversationDescriptor]? = try await cache.get(
+            [WebConversationDescriptor].self,
+            key: "web.project.\(alias).conversations"
+        )
+        XCTAssertEqual(durableRows?.map(\.id), cachedRows.map(\.id),
+            "The stale response must not overwrite the durable accepted catalog")
+
+        await mock.setResponseDelay(action: "listProjectConversations", nanoseconds: 0)
+        await store.suspend()
+    }
+
     private func conversation(alias: String, title: String, age: TimeInterval) -> WebConversationDescriptor {
         let updatedAt = Date().addingTimeInterval(-age)
         return WebConversationDescriptor(

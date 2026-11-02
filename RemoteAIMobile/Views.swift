@@ -319,6 +319,42 @@ struct InstanceView: View {
     private var isChatGPTWeb: Bool { runtime.id == "runtime.web" && instance.id == "web.chatgpt" }
     private var isAntigravity: Bool { runtime.id == "runtime.antigravity" }
     private var supportsProjects: Bool { isChatGPTWeb || isAntigravity }
+    private func enterWebTab(_ tab: OpenWebTab) {
+        guard enteringWebTabId == nil else { return }
+        enteringWebTabId = tab.id
+        Task { @MainActor in
+            let destination = await store.enterOpenWebTab(tab)
+            if enteringWebTabId == tab.id { enteringWebTabId = nil }
+            guard let destination else { return }
+            switch destination {
+            case .chat(let session):
+                enteredWebTabSession = session
+                openEnteredWebTabSession = true
+            case .project(let project):
+                enteredWebTabProject = project
+                openEnteredWebTabProject = true
+            }
+        }
+    }
+    private func inspectWebTab(_ tab: OpenWebTab) {
+        guard enteringWebTabId == nil else { return }
+        enteringWebTabId = tab.id
+        Task { @MainActor in
+            await store.inspectOpenWebTab(tab)
+            if enteringWebTabId == tab.id { enteringWebTabId = nil }
+        }
+    }
+    private func openCachedWebTabHistory(_ tab: OpenWebTab) {
+        guard enteringWebTabId == nil else { return }
+        enteringWebTabId = tab.id
+        Task { @MainActor in
+            let session = await store.openCachedWebTabHistory(tab)
+            if enteringWebTabId == tab.id { enteringWebTabId = nil }
+            guard let session else { return }
+            selectedHistoricalWebSession = session
+            openHistoricalWebSession = true
+        }
+    }
     private func webTabStatus(_ tab: OpenWebTab) -> String {
         if tab.busy { return "Agent 正在生成回复 · 禁止重载与关闭" }
         if let report = store.webTabDiagnosesById[tab.id] {
@@ -373,121 +409,165 @@ struct InstanceView: View {
                             .font(.caption).foregroundColor(.secondary)
                     }
                     ForEach(store.openWebTabs) { tab in
-                        HStack(spacing: 10) {
-                            Button {
-                                guard enteringWebTabId == nil else { return }
-                                enteringWebTabId = tab.id
-                                Task {
-                                    let destination = await store.enterOpenWebTab(tab)
-                                    enteringWebTabId = nil
-                                    if let destination {
-                                        switch destination {
-                                        case .chat(let session):
-                                            enteredWebTabSession = session
-                                            openEnteredWebTabSession = true
-                                        case .project(let project):
-                                            enteredWebTabProject = project
-                                            openEnteredWebTabProject = true
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 10) {
+                                Button { enterWebTab(tab) } label: {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: tab.isChat ? "bubble.left.and.bubble.right" : "folder")
+                                            .foregroundColor(.secondary)
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            HStack(spacing: 5) {
+                                                Text(tab.title).font(.subheadline).lineLimit(2)
+                                                Image(systemName: "chevron.right").font(.caption2)
+                                                if store.webTabEntryStatusById[tab.id]?.isLoading == true {
+                                                    ProgressView().controlSize(.small)
+                                                }
+                                            }
+                                            Text(tab.busy ? "正在生成 · 不可关闭/刷新" : (tab.loading ? "网页加载中" : (tab.active ? "电脑当前标签页" : "后台标签页")))
+                                                .font(.caption2).foregroundColor(.secondary)
+                                            Text(webTabStatus(tab))
+                                                .font(.caption2).foregroundColor(.secondary)
+                                            Text("执行：\(tab.executionState ?? "Unknown") · Agent 最近记录")
+                                                .font(.caption2).foregroundColor(.secondary)
+                                            if let value = tab.lastActivityAt, let date = RemoteAIDate.parse(value) {
+                                                FixedTimestamp(date: date, prefix: "最后活动")
+                                            }
+                                            if let value = tab.lastProgressAt, let date = RemoteAIDate.parse(value) {
+                                                FixedTimestamp(date: date, prefix: "最近实际进展")
+                                            }
+                                            if let action = tab.lastProgressSummary {
+                                                Text("最近事件：\(action)").font(.caption2).foregroundColor(.secondary)
+                                            }
+                                            if let diagnosis = store.webTabDiagnosesById[tab.id],
+                                               diagnosis.draftPresent == true || diagnosis.pendingUploads == true {
+                                                Text("Blocked · 草稿或上传尚未完成，禁止关闭与刷新")
+                                                    .font(.caption2).foregroundColor(.orange)
+                                            }
+                                            if let diagnosis = store.webTabDiagnosesById[tab.id] {
+                                                if let issue = diagnosis.issueMessage, !issue.isEmpty {
+                                                    Text("原因：\(issue)").font(.caption2).foregroundColor(.secondary)
+                                                }
+                                                if let code = diagnosis.issueCode, !code.isEmpty {
+                                                    Text("错误代码：\(code)").font(.caption2).foregroundColor(.secondary)
+                                                }
+                                                if let observed = diagnosis.observedAt.flatMap(RemoteAIDate.parse) {
+                                                    FixedTimestamp(date: observed, prefix: "最后检测")
+                                                }
+                                            }
+                                            if let note = store.webTabActionNotesById[tab.id] {
+                                                Text("最近操作：\(note)").font(.caption2).foregroundColor(.secondary)
+                                            }
+                                            if let sessionId = tab.sessionId,
+                                               let recovery = store.webChatRecoveryNotesBySession[sessionId] {
+                                                Text("网页恢复：\(recovery)").font(.caption2).foregroundColor(.secondary)
+                                            }
+                                            if let sessionId = tab.sessionId,
+                                               let problem = store.errors[sessionId], !problem.isEmpty {
+                                                Text("最近失败：\(problem)").font(.caption2).foregroundColor(.orange)
+                                            }
+                                        }
+                                        Spacer(minLength: 4)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("open-web-tab-\(tab.id)")
+                                .disabled(enteringWebTabId != nil || store.machine.state != .online
+                                    || store.webTabEntryStatusById[tab.id]?.requiresInventoryRefresh == true)
+                                Menu {
+                                    Button { inspectWebTab(tab) } label: {
+                                        Label("检测网页实际状态", systemImage: "stethoscope")
+                                    }
+                                    Button {
+                                        refreshingWebTab = tab
+                                        refreshingWebTabOperation = "hardReload"
+                                        showingWebTabReloadConfirmation = true
+                                    } label: {
+                                        Label("强制重载（绕过缓存）…", systemImage: "arrow.triangle.2.circlepath")
+                                    }
+                                    Button {
+                                        Task { await store.manageOpenWebTab(tab, operation: "reopen") }
+                                    } label: {
+                                        Label("重新打开此网页（复用标签）", systemImage: "arrow.up.forward.app")
+                                    }
+                                    Button {
+                                        refreshingWebTab = tab
+                                        refreshingWebTabOperation = "reload"
+                                        showingWebTabReloadConfirmation = true
+                                    } label: {
+                                        Label("刷新此标签页…", systemImage: "arrow.clockwise")
+                                    }
+                                    Button(role: .destructive) {
+                                        closingWebTab = tab
+                                        showingCloseWebTabConfirmation = true
+                                    } label: {
+                                        Label("关闭此标签页", systemImage: "xmark.circle")
+                                    }
+                                } label: {
+                                    Image(systemName: "ellipsis.circle").font(.title3)
+                                }
+                                .disabled(tab.busy || store.machine.state != .online || store.managingWebTabIds.contains(tab.id))
+                            }
+                            .padding(.vertical, 3)
+
+                            if let entry = store.webTabEntryStatusById[tab.id] {
+                                VStack(alignment: .leading, spacing: 5) {
+                                    HStack(spacing: 6) {
+                                        if entry.isLoading || enteringWebTabId == tab.id {
+                                            ProgressView().controlSize(.small)
+                                        }
+                                        Text(entry.message)
+                                            .font(.caption)
+                                            .foregroundColor(entry.isLoading ? .secondary : .orange)
+                                    }
+                                    if let code = entry.code {
+                                        Text("错误代码：\(code)").font(.caption2).foregroundColor(.secondary)
+                                    }
+                                    if let diagnosisCode = entry.diagnosisCode,
+                                       diagnosisCode != entry.code {
+                                        Text("网页状态码：\(diagnosisCode)").font(.caption2).foregroundColor(.secondary)
+                                    }
+                                    if let raw = entry.rawMessage, !raw.isEmpty {
+                                        Text("网页返回：\(raw)").font(.caption2).foregroundColor(.secondary).lineLimit(2)
+                                    }
+                                    FixedTimestamp(date: entry.observedAt, prefix: "观测时间")
+                                    HStack(spacing: 12) {
+                                        if entry.isLoading || enteringWebTabId == tab.id {
+                                            Text("正在核验；不会读取未经确认的实时内容。")
+                                                .font(.caption2).foregroundColor(.secondary)
+                                        } else {
+                                            Button {
+                                                if entry.requiresInventoryRefresh {
+                                                    Task { await store.refreshOpenWebTabs() }
+                                                } else {
+                                                    inspectWebTab(tab)
+                                                }
+                                            } label: {
+                                                Label(entry.requiresInventoryRefresh ? "更新标签列表" : "检测当前网页", systemImage: entry.requiresInventoryRefresh ? "arrow.clockwise" : "stethoscope")
+                                            }
+                                            .font(.caption)
+                                            .disabled(store.machine.state != .online || store.managingWebTabIds.contains(tab.id))
+                                            if let cached = entry.cachedSession {
+                                                Button {
+                                                    openCachedWebTabHistory(tab)
+                                                } label: {
+                                                    Label("只读查看已缓存历史 · \(cached.title)", systemImage: "clock")
+                                                }
+                                                .font(.caption)
+                                                .disabled(enteringWebTabId != nil)
+                                            }
                                         }
                                     }
+                                    Text(entry.requiresInventoryRefresh
+                                        ? "安全操作：更新电脑当前标签列表后再选择；不会按旧标签 ID 打开内容。"
+                                        : "安全操作：只核验所选标签；未确认身份前不会导入网页内容。")
+                                        .font(.caption2).foregroundColor(.secondary)
                                 }
-                            } label: {
-                                HStack(spacing: 10) {
-                                    Image(systemName: tab.isChat ? "bubble.left.and.bubble.right" : "folder")
-                                        .foregroundColor(.secondary)
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack(spacing: 5) {
-                                            Text(tab.title).font(.subheadline).lineLimit(2)
-                                            Image(systemName: "chevron.right").font(.caption2)
-                                        }
-                                        Text(tab.busy ? "正在生成 · 不可关闭/刷新" : (tab.loading ? "网页加载中" : (tab.active ? "电脑当前标签页" : "后台标签页")))
-                                            .font(.caption2).foregroundColor(.secondary)
-                                        Text(webTabStatus(tab))
-                                            .font(.caption2).foregroundColor(.secondary)
-                                        Text("执行：\(tab.executionState ?? "Unknown") · Agent 最近记录")
-                                            .font(.caption2).foregroundColor(.secondary)
-                                        if let value = tab.lastActivityAt, let date = RemoteAIDate.parse(value) {
-                                            FixedTimestamp(date: date, prefix: "最后活动")
-                                        }
-                                        if let value = tab.lastProgressAt, let date = RemoteAIDate.parse(value) {
-                                            FixedTimestamp(date: date, prefix: "最近实际进展")
-                                        }
-                                        if let action = tab.lastProgressSummary {
-                                            Text("最近事件：\(action)").font(.caption2).foregroundColor(.secondary)
-                                        }
-                                        if let diagnosis = store.webTabDiagnosesById[tab.id],
-                                           diagnosis.draftPresent == true || diagnosis.pendingUploads == true {
-                                            Text("Blocked · 草稿或上传尚未完成，禁止关闭与刷新")
-                                                .font(.caption2).foregroundColor(.orange)
-                                        }
-                                        if let diagnosis = store.webTabDiagnosesById[tab.id] {
-                                            if let issue = diagnosis.issueMessage, !issue.isEmpty {
-                                                Text("原因：\(issue)").font(.caption2).foregroundColor(.secondary)
-                                            }
-                                            if let code = diagnosis.issueCode, !code.isEmpty {
-                                                Text("错误代码：\(code)").font(.caption2).foregroundColor(.secondary)
-                                            }
-                                            if let observed = diagnosis.observedAt.flatMap(RemoteAIDate.parse) {
-                                                FixedTimestamp(date: observed, prefix: "最后检测")
-                                            }
-                                        }
-                                        if let note = store.webTabActionNotesById[tab.id] {
-                                            Text("最近操作：\(note)").font(.caption2).foregroundColor(.secondary)
-                                        }
-                                        if let sessionId = tab.sessionId,
-                                           let recovery = store.webChatRecoveryNotesBySession[sessionId] {
-                                            Text("网页恢复：\(recovery)").font(.caption2).foregroundColor(.secondary)
-                                        }
-                                        if let sessionId = tab.sessionId,
-                                           let problem = store.errors[sessionId], !problem.isEmpty {
-                                            Text("最近失败：\(problem)").font(.caption2).foregroundColor(.orange)
-                                        }
-                                    }
-                                    Spacer(minLength: 4)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .contentShape(Rectangle())
+                                .padding(.leading, 34)
+                                .padding(.bottom, 4)
                             }
-                            .buttonStyle(.plain)
-                            .accessibilityIdentifier("open-web-tab-\(tab.id)")
-                            .disabled(enteringWebTabId != nil || store.machine.state != .online)
-                            Menu {
-                                Button {
-                                    Task { await store.inspectOpenWebTab(tab) }
-                                } label: {
-                                    Label("检测网页实际状态", systemImage: "stethoscope")
-                                }
-                                Button {
-                                    refreshingWebTab = tab
-                                    refreshingWebTabOperation = "hardReload"
-                                    showingWebTabReloadConfirmation = true
-                                } label: {
-                                    Label("强制重载（绕过缓存）…", systemImage: "arrow.triangle.2.circlepath")
-                                }
-                                Button {
-                                    Task { await store.manageOpenWebTab(tab, operation: "reopen") }
-                                } label: {
-                                    Label("重新打开此网页（复用标签）", systemImage: "arrow.up.forward.app")
-                                }
-                                Button {
-                                    refreshingWebTab = tab
-                                    refreshingWebTabOperation = "reload"
-                                    showingWebTabReloadConfirmation = true
-                                } label: {
-                                    Label("刷新此标签页…", systemImage: "arrow.clockwise")
-                                }
-                                Button(role: .destructive) {
-                                    closingWebTab = tab
-                                    showingCloseWebTabConfirmation = true
-                                } label: {
-                                    Label("关闭此标签页", systemImage: "xmark.circle")
-                                }
-                            } label: {
-                                Image(systemName: "ellipsis.circle").font(.title3)
-                            }
-                            .disabled(tab.busy || store.machine.state != .online || store.managingWebTabIds.contains(tab.id))
                         }
-                        .padding(.vertical, 3)
                     }
                     Button {
                         DiagnosticsLog.shared.record("web_tabs_refresh_tapped")
@@ -1268,6 +1348,9 @@ struct ChatView: View {
     private var currentWebSessionUnavailable: Bool {
         runtime.kind == .web && store.isWebSessionUnavailable(currentSession)
     }
+    private var currentWebSessionReadOnly: Bool {
+        runtime.kind == .web && store.readOnlyCachedWebSessionIds.contains(session.id)
+    }
     private var currentWebProviderIssue: RemoteProviderSurfaceIssue? {
         runtime.kind == .web ? store.webProviderIssuesBySession[session.id] : nil
     }
@@ -1294,6 +1377,7 @@ struct ChatView: View {
         return notice
     }
     private var isGenerating: Bool {
+        if currentWebSessionReadOnly { return false }
         if currentSessionState == .error { return false }
         return currentSessionState == .busy
             || currentSessionState == .waiting
@@ -1302,10 +1386,8 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             if store.shouldDisplayConnectionBanner {
-                StatusBanner(
-                    text: store.errors["connection"] ?? store.connectionPhase.displayName,
-                    systemImage: "wifi.exclamationmark"
-                )
+                ConnectionLifecycleBanner(phase: store.connectionPhase, error: store.errors["connection"],
+                    episode: store.connectionFailureEpisode, observedAt: store.desktopStatusUpdatedAt)
             }
             if let syncError = store.errors["sync"] {
                 StatusBanner(text: "同步异常：\(syncError)", systemImage: "arrow.triangle.2.circlepath")
@@ -1315,6 +1397,9 @@ struct ChatView: View {
                     text: "此 Chat 已删除、归档或所属 Project 已删除。手机仍保留本地消息和草稿，远端操作已停用。",
                     systemImage: "archivebox"
                 )
+            }
+            if currentWebSessionReadOnly {
+                StatusBanner(text: "正在只读查看已核验的本地历史；网页身份尚未重新确认。历史和草稿保留，发送、停止和刷新已停用。请返回网页列表重新核验原 Chat。", systemImage: "lock.doc")
             }
             if let notice = relevantSystemNotice {
                 StatusBanner(
@@ -1328,7 +1413,10 @@ struct ChatView: View {
                     issue: issue,
                     surfaceState: currentWebProviderSurfaceState ?? "degraded",
                     surfaceObservedAt: store.webProviderSurfaceObservedAtBySession[session.id],
-                    sessionState: currentSessionState
+                    sessionState: currentSessionState,
+                    canCheck: store.machine.state == .online && !currentWebSessionReadOnly,
+                    inspect: { Task { await store.recoverWebChat(session.id, operation: "inspect") } },
+                    resync: { Task { await store.recoverWebChat(session.id, operation: "resync") } }
                 )
             } else if runtime.kind == .web, currentWebProviderSurfaceState == "unknown" {
                 WebProviderSurfaceUnknownBanner(
@@ -1347,6 +1435,13 @@ struct ChatView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 5)
             }
+            if let diagnostic = store.stopDiagnosticsBySession[session.id] {
+                StopLifecycleDiagnosticBanner(diagnostic: diagnostic,
+                    canAct: store.machine.state == .online && !currentWebSessionReadOnly && !store.stopRequestsPending.contains(session.id),
+                    canRecheck: runtime.kind == .web,
+                    recheck: { Task { _ = await store.recheckStopIdentity(sessionId: session.id) } },
+                    stop: { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } })
+            }
             if let error = store.errors[session.id], error != currentWebProviderIssue?.message {
                 ErrorBanner(text: error) { store.clearError(sessionId: session.id) }
             }
@@ -1362,7 +1457,7 @@ struct ChatView: View {
                                 let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
                                 // Definite failures restore the composer and use a new operation.
                                 // Only unknown delivery is replayed with the original command ID.
-                                let retryable = !currentWebSessionUnavailable
+                                let retryable = !currentWebSessionUnavailable && !currentWebSessionReadOnly
                                     && commandState == .unknown
                                     && UUID(uuidString: message.id) != nil
                                 if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
@@ -1380,6 +1475,11 @@ struct ChatView: View {
                                     MessageRow(message: message, commandState: commandState, retry: retryable ? { Task { await store.retry(message: message, runtimeId: runtime.id, instanceId: instance.id, model: supportsModelSelection ? selectedModel : "") } } : nil, retryContextKey: selectedModel, onSelectText: { text, monospaced in
                                         textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
                                     }).equatable().id(message.id)
+                                }
+                                if let commandId = UUID(uuidString: message.id),
+                                   let diagnostic = store.sendDeliveryDiagnosticsByCommand[commandId],
+                                   diagnostic.sessionId == session.id {
+                                    SendDeliveryDiagnosticBanner(diagnostic: diagnostic)
                                 }
                             }
                             Color.clear
@@ -1490,7 +1590,7 @@ struct ChatView: View {
                         Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) }
                     }
                     .font(.caption)
-                    .disabled(currentWebSessionUnavailable || store.stopRequestsPending.contains(session.id))
+                    .disabled(currentWebSessionUnavailable || currentWebSessionReadOnly || store.stopRequestsPending.contains(session.id))
                 }
             }
             ToolbarItem(placement: .navigationBarTrailing) {
@@ -1499,8 +1599,8 @@ struct ChatView: View {
                         Button("重新同步消息") { Task { await store.recoverWebChat(session.id, operation: "resync") } }
                         Button("检测网页运行状态") { Task { await store.recoverWebChat(session.id, operation: "inspect") } }
                         Button("检查连接并补同步") { Task { await store.recoverWebChat(session.id, operation: "connection") } }
-                        Button("重开原 Chat 网页") { Task { await store.reopenClosedWebConversation(sessionId: session.id) } }
-                        Button("刷新当前网页…", role: .destructive) { showingWebReloadConfirmation = true }
+                        Button("重开原 Chat 网页") { Task { await store.reopenClosedWebConversation(sessionId: session.id) } }.disabled(currentWebSessionReadOnly)
+                        Button("刷新当前网页…", role: .destructive) { showingWebReloadConfirmation = true }.disabled(currentWebSessionReadOnly)
                     } label: {
                         Image(systemName: "arrow.clockwise.circle")
                     }
@@ -1631,7 +1731,7 @@ struct ChatView: View {
                     draft: draft,
                     focused: $focused,
                     attachments: $pendingAttachments,
-                    enabled: store.machine.state == .online && !sending && !currentWebSessionUnavailable,
+                    enabled: store.machine.state == .online && !sending && !currentWebSessionUnavailable && !currentWebSessionReadOnly,
                     isGenerating: isGenerating,
                     isRecording: speechInput.isRecording,
                     addPhoto: { showPhotoPicker = true },
@@ -1742,7 +1842,7 @@ struct ChatView: View {
                 }
             }
             await store.loadSession(session.id, localOnly: runtime.kind == .web)
-            if runtime.kind == .web && !currentWebSessionUnavailable {
+            if runtime.kind == .web && !currentWebSessionUnavailable && !currentWebSessionReadOnly {
                 // A newly opened/switching Chat gets one exact status + recent-history
                 // reconciliation before it can be treated as current. The existing
                 // push and bounded visible-session loop remain the ongoing path.
@@ -1759,7 +1859,7 @@ struct ChatView: View {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_500_000_000)
                 guard !Task.isCancelled else { break }
-                if scenePhase == .active {
+                if scenePhase == .active && !currentWebSessionReadOnly {
                     await store.synchronizeVisibleSession(session.id)
                 }
             }
@@ -3077,12 +3177,82 @@ private struct MessageAttachmentView: View {
     }
 }
 
+struct ConnectionLifecycleBanner: View {
+    let phase: ConnectionDiagnosticPhase
+    let error: String?
+    let episode: ConnectionFailureEpisode?
+    let observedAt: Date?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            StatusBanner(text: error ?? phase.chineseDisplayName, systemImage: "wifi.exclamationmark")
+            if let episode {
+                Text("错误代码：\(episode.fingerprint)").font(.caption2).foregroundColor(.secondary)
+                FixedTimestamp(date: episode.lastObservedAt, prefix: "最近观测")
+            } else {
+                Text("状态代码：\(phase.rawValue)").font(.caption2).foregroundColor(.secondary)
+                if let observedAt { FixedTimestamp(date: observedAt, prefix: "最近观测") }
+            }
+            Text("远程状态暂时无法确认；本地历史和草稿保留。等待连接恢复后补同步，送达未知的消息不会自动重发。")
+                .font(.caption)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+    }
+}
+
+struct StopLifecycleDiagnosticBanner: View {
+    let diagnostic: StopLifecycleDiagnostic
+    let canAct: Bool
+    let canRecheck: Bool
+    let recheck: () -> Void
+    let stop: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("停止尚未确认", systemImage: "pause.circle").font(.caption.weight(.semibold))
+            Text(diagnostic.message).font(.caption)
+            Text("错误代码：\(diagnostic.code.rawValue)").font(.caption2).foregroundColor(.secondary)
+            FixedTimestamp(date: diagnostic.observedAt, prefix: "最近观测")
+            if canRecheck && diagnostic.recovery == .needsComputerVerification {
+                Button("核验当前任务", action: recheck).font(.caption).disabled(!canAct)
+            }
+            if diagnostic.recovery == .readyForExplicitStop {
+                Button("停止已核验的当前任务", action: stop).font(.caption).disabled(!canAct)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.orange.opacity(0.12))
+    }
+}
+
+struct SendDeliveryDiagnosticBanner: View {
+    let diagnostic: SendDeliveryDiagnostic
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("消息送达尚未确认", systemImage: "questionmark.circle").font(.caption.weight(.semibold))
+            Text(diagnostic.message).font(.caption)
+            Text("错误代码：\(diagnostic.code)").font(.caption2).foregroundColor(.secondary)
+            FixedTimestamp(date: diagnostic.observedAt, prefix: "最近观测")
+            Text("请核查此条原消息；不会自动创建新的发送命令。").font(.caption)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.orange.opacity(0.12))
+    }
+}
+
 struct ErrorBanner: View { let text: String; let dismiss: () -> Void; var body: some View { HStack { Image(systemName: "exclamationmark.triangle"); Text(text).font(.caption); Spacer(); Button(action: dismiss) { Image(systemName: "xmark") } }.padding(10).background(Color.red.opacity(0.12)) } }
 struct WebProviderSurfaceIssueBanner: View {
     let issue: RemoteProviderSurfaceIssue
     let surfaceState: String
     let surfaceObservedAt: Date?
     let sessionState: SessionState
+    let canCheck: Bool
+    let inspect: () -> Void
+    let resync: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -3096,8 +3266,10 @@ struct WebProviderSurfaceIssueBanner: View {
                     .font(.caption)
                     .textSelection(.enabled)
             }
-            Text("说明：\(issue.message)")
+            Text("说明：\(issue.explanation.summary)")
                 .font(.caption)
+            Text("实际影响：\(issue.explanation.impact)").font(.caption)
+            Text("安全处理：\(issue.explanation.safeAction)").font(.caption)
             Text("错误代码：\(issue.code)")
                 .font(.caption2)
                 .foregroundColor(.secondary)
@@ -3108,11 +3280,19 @@ struct WebProviderSurfaceIssueBanner: View {
             }
             if surfaceState == "unknown", let surfaceObservedAt {
                 FixedTimestamp(date: surfaceObservedAt, prefix: "网页状态最后核对")
+            } else if let surfaceObservedAt {
+                FixedTimestamp(date: surfaceObservedAt, prefix: "最近观测")
             }
+            HStack {
+                Button("检测网页状态", action: inspect)
+                Button(issue.explanation.deliveryUnknown ? "核查原消息" : "重新同步消息", action: resync)
+            }
+            .font(.caption)
+            .disabled(!canCheck)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)
-        .background(Color.red.opacity(0.12))
+        .background((issue.explanation.deliveryUnknown || issue.retryable ? Color.orange : Color.red).opacity(0.12))
     }
 }
 
