@@ -200,15 +200,13 @@ final class RemoteAIMobileUITests: XCTestCase {
         let composer = app.textViews["MessageComposer"]
         let typingBegan = ProcessInfo.processInfo.systemUptime
         composer.tap()
-        // The CI screenshot/AX hierarchy for the pinned iPhone 13 Pro proves
-        // that the English software keyboard's S key occupies x=58..97,
-        // y=614..660 in the 390x844 point display. Querying either the
-        // keyboard element or a key by AX label walks the continuously
-        // changing 30K transcript and blocked XCTest for >90 seconds.
-        // Send one *real* touch to that physical key instead; a missing keyboard
-        // fails the exact composer-draft assertion below. This does not seed a
-        // mock draft, pause the stream, or weaken the functional requirement.
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.20, dy: 0.754)).tap()
+        // Send real keyboard input to the already focused composer without an
+        // application-root coordinate tap. On a continuously changing 30K transcript,
+        // resolving the entire app accessibility snapshot for that tap timed out in
+        // CI even after the composer had become hittable. typeText avoids querying
+        // keyboard keys or global coordinates; the exact visible draft below must
+        // still prove that the input was actually delivered during streaming.
+        composer.typeText("s")
         let typedDraft = try XCTUnwrap(composer.value as? String)
         XCTAssertEqual(typedDraft.lowercased(), "s", "A real keyboard touch must update the draft during streaming")
         XCTAssertTrue(progress.exists, "Typing must finish while the stream is still live")
