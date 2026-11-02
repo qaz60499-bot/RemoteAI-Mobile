@@ -128,8 +128,21 @@ def main():
     if args.only:
         methods = [m for m in methods if m.rsplit("/", 1)[-1] in args.only]
         assert len(methods) == len(set(args.only)), "Requested UI test was not discovered"
-    # Exercise the changed behavior before spending time on navigation regressions.
-    methods.sort(key=lambda method: ("LongStreaming" not in method, method))
+    # Run the shorter 30k interaction before the longer 50k interaction. Both
+    # retain their full assertions and fresh simulator boot. On hosted macOS
+    # runners, XCTest's UI/AX service can retain expensive snapshot state across
+    # simulator shutdown/boot even though the mock SQLite store is in-memory.
+    # The previous alphabetical order always put 50k first; that case passed,
+    # while the following 30k case twice stalled at the first keyboard touch.
+    # Keep this ordering explicit while investigating any remaining freeze.
+    def method_order(method):
+        name = method.rsplit("/", 1)[-1]
+        if name == "testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable":
+            return (0, 0)
+        if name == "testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable":
+            return (0, 1)
+        return (1, name)
+    methods.sort(key=method_order)
     # Compile once, outside the per-method simulator launch deadline.
     run(["xcodebuild", "build-for-testing", "-project", "RemoteAIMobile.xcodeproj",
          "-scheme", "RemoteAIMobile", "-configuration", "Debug",
