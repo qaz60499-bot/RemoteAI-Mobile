@@ -69,6 +69,37 @@ class RecoveryGateTests(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertEqual(recoveries, [])
 
+    def test_30k_stream_runs_before_50k_without_skipping_either_test(self):
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                folder = pathlib.Path("RemoteAIMobileUITests")
+                folder.mkdir()
+                folder.joinpath("Streaming.swift").write_text(
+                    "final class Streaming: XCTestCase {\n"
+                    "func testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable() {}\n"
+                    "func testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable() {}\n"
+                    "func testOtherNavigation() {}\n}"
+                )
+                observed = []
+                def run_test(command, evidence):
+                    observed.append(command[-1].rsplit("/", 1)[-1])
+                with patch("sys.argv", ["runner", "--udid", "00000000-0000-0000-0000-000000000000"]), \
+                     patch.object(runner, "run"), \
+                     patch.object(runner, "boot_candidate"), \
+                     patch.object(runner, "sample_app_process"), \
+                     patch.object(runner, "preserve_evidence"), \
+                     patch.object(runner, "run_test", side_effect=run_test):
+                    runner.main()
+                self.assertEqual(observed, [
+                    "testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable",
+                    "testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable",
+                    "testOtherNavigation",
+                ])
+            finally:
+                os.chdir(previous)
+
 
 if __name__ == "__main__":
     unittest.main()
