@@ -7230,7 +7230,22 @@ final class WorkspaceStore: ObservableObject {
         }
         let commandIdentities = Set([serverMessage.id, serverMessage.providerMessageId]
             .compactMap { value in UUID(uuidString: value ?? "")?.uuidString.lowercased() })
-        if !commandIdentities.isEmpty {
+        // One provider user row cannot simultaneously prove two distinct mobile
+        // Send commands. This can arise when messageId and externalId both look
+        // like tracked command UUIDs. Leave both outcomes unconfirmed; do not
+        // remove an optimistic bubble or consume either pending command.
+        let trackedCommands = commandIdentities.compactMap { value -> UUID? in
+            guard let commandId = UUID(uuidString: value), commandStates[commandId] != nil else {
+                return nil
+            }
+            return commandId
+        }
+        if identityRuntimeId == "runtime.web", trackedCommands.count > 1 { return }
+        // A provider row may expose separate command and external UUID aliases.
+        // If they disagree, even a single matching optimistic bubble is not
+        // trustworthy evidence: do not mark either Unknown send as Completed.
+        // The pending-command reconciliation keeps such rows ambiguous as well.
+        if commandIdentities.count == 1 {
             let exactMatches = messagesBySession[sessionId, default: []].filter { message in
                 guard message.role == .user, message.sequence == nil,
                       let identity = UUID(uuidString: message.id)?.uuidString.lowercased() else { return false }
