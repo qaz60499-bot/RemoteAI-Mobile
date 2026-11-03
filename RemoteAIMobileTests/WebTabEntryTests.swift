@@ -326,7 +326,7 @@ final class WebTabEntryTests: XCTestCase {
     }
 
     @MainActor
-    func testUnverifiedEntryPreservesDiagnosisCodeObservedTimeAndOriginalMessage() async throws {
+    func testExactPersistedChatOpensWhenPageIdentityIsUnverifiedWithoutImportingPageHistory() async throws {
         let mock = MockTransport(historyCount: 1)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)
         try await mock.connect()
@@ -360,7 +360,7 @@ final class WebTabEntryTests: XCTestCase {
             localConversationId: sessionId,
             canonicalUrl: tab.canonicalUrl,
             projectId: nil,
-            displayTitle: tab.title,
+            displayTitle: "Unverified page title must not replace the persisted Chat",
             projectAlias: "g-p-remoteai",
             conversationAlias: "seed-0",
             lastVisited: observedAt,
@@ -375,16 +375,225 @@ final class WebTabEntryTests: XCTestCase {
             issueMessage: "Conversation identity and composer are not verified.",
             observedAt: observedAt
         ))
+        let cachedMessagesBeforeEntry = try await cache.recentMessages(sessionId: sessionId, limit: 10)
 
         let destination = await store.enterOpenWebTab(tab)
 
-        XCTAssertNil(destination, "A receipt containing a Chat cannot override an unverified page diagnosis")
+        guard case .chat(let openedSession)? = destination else {
+            await store.suspend()
+            return XCTFail("The exact persisted Chat receipt should open even while page identity is unverified")
+        }
+        XCTAssertEqual(openedSession, session, "Use the already-persisted identity, not page metadata")
+        XCTAssertEqual(store.sessions, [session], "Entry must not import or replace a transcript/session from the page")
+        XCTAssertNil(store.messagesBySession[sessionId], "Entry itself must not import page history")
+        XCTAssertFalse(store.isCachedWebSessionReadOnly(sessionId),
+            "Opening the Chat must leave normal Agent-validated sending available")
+        XCTAssertTrue(ChatComposerSendAvailability.enabled(machineOnline: true, isWeb: true,
+            sending: false, sessionUnavailable: false,
+            readOnly: store.isCachedWebSessionReadOnly(sessionId)))
+        let cachedMessagesAfterEntry = try await cache.recentMessages(sessionId: sessionId, limit: 10)
+        XCTAssertEqual(cachedMessagesAfterEntry, cachedMessagesBeforeEntry)
         let issue = try XCTUnwrap(store.webTabEntryStatusById[tab.id])
         XCTAssertEqual(issue.code, "CONVERSATION_IDENTITY_UNVERIFIED")
         XCTAssertEqual(issue.observedAt, observedAt)
         XCTAssertEqual(issue.rawMessage, "Conversation identity and composer are not verified.")
         XCTAssertNotNil(issue.cachedSession, "The row may offer only the exact locally cached Chat history")
         XCTAssertTrue(issue.message.contains("身份"))
+        await store.suspend()
+    }
+
+    @MainActor
+    func testUnverifiedPersistedEntryKeepsAgentHistorySynchronizationAvailable() async throws {
+        let mock = MockTransport(historyCount: 1)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+        let tab = try XCTUnwrap(store.openWebTabs.first(where: \.isChat))
+        let sessionId = try XCTUnwrap(tab.sessionId)
+        let session = SessionDescriptor(id: sessionId, instanceId: "web.chatgpt",
+            title: tab.title, state: .idle, updatedAt: Date(),
+            projectAlias: "g-p-remoteai", canonicalUrl: tab.canonicalUrl)
+        store.sessions = [session]
+        let conversation = WebConversationDescriptor(localConversationId: sessionId,
+            canonicalUrl: tab.canonicalUrl, projectId: nil, displayTitle: tab.title,
+            projectAlias: "g-p-remoteai", conversationAlias: "seed-0",
+            lastVisited: Date(), updatedAt: Date())
+        await mock.setEnteredOpenWebTabFixture(try enterFixture(tab: tab, conversation: conversation,
+            project: nil, diagnosisState: "not-ready",
+            issueCode: "CONVERSATION_IDENTITY_UNVERIFIED"))
+
+        let destination = await store.enterOpenWebTab(tab)
+        guard case .chat(let openedSession)? = destination else {
+            await store.suspend()
+            return XCTFail("The exact persisted Chat should open")
+        }
+        XCTAssertEqual(openedSession.id, sessionId)
+        await store.synchronizeVisibleSession(sessionId, force: true)
+        let historyReads = await mock.actionAttemptCount("loadRecentMessages")
+        XCTAssertGreaterThan(historyReads, 0,
+            "Unverified DOM diagnosis must not block history from the exact persisted Agent Chat")
+        XCTAssertEqual(store.webTabDiagnosesById[tab.id]?.issueCode, "CONVERSATION_IDENTITY_UNVERIFIED",
+            "The Agent-backed sync remains available without rewriting or trusting the DOM diagnosis")
+        XCTAssertFalse(store.isCachedWebSessionReadOnly(sessionId))
+        await store.suspend()
+    }
+
+    @MainActor
+    func testUnverifiedEntryRejectsWrongChatProjectAndTabReceipts() async throws {
+        let mock = MockTransport(historyCount: 0)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+        let tab = try XCTUnwrap(store.openWebTabs.first(where: \.isChat))
+        let sessionId = try XCTUnwrap(tab.sessionId)
+        let session = SessionDescriptor(id: sessionId, instanceId: "web.chatgpt",
+            title: tab.title, state: .idle, updatedAt: Date(),
+            projectAlias: "g-p-remoteai", canonicalUrl: tab.canonicalUrl)
+        store.sessions = [session]
+        let now = Date()
+        let wrongChat = WebConversationDescriptor(localConversationId: "webconv-other-chat",
+            canonicalUrl: tab.canonicalUrl, projectId: nil, displayTitle: tab.title,
+            projectAlias: "g-p-remoteai", conversationAlias: "seed-0",
+            lastVisited: now, updatedAt: now)
+        let wrongProject = WebConversationDescriptor(localConversationId: sessionId,
+            canonicalUrl: tab.canonicalUrl, projectId: nil, displayTitle: tab.title,
+            projectAlias: "g-p-photo", conversationAlias: "seed-0",
+            lastVisited: now, updatedAt: now)
+        let correctConversation = WebConversationDescriptor(localConversationId: sessionId,
+            canonicalUrl: tab.canonicalUrl, projectId: nil, displayTitle: tab.title,
+            projectAlias: "g-p-remoteai", conversationAlias: "seed-0",
+            lastVisited: now, updatedAt: now)
+        let fixtures: [(String, [String: JSONValue])] = [
+            ("wrong Chat", try enterFixture(tab: tab, conversation: wrongChat, project: nil,
+                diagnosisState: "not-ready", issueCode: "CONVERSATION_IDENTITY_UNVERIFIED")),
+            ("wrong Project", try enterFixture(tab: tab, conversation: wrongProject, project: nil,
+                diagnosisState: "not-ready", issueCode: "CONVERSATION_IDENTITY_UNVERIFIED")),
+            ("wrong tab", try enterFixture(tab: tab, conversation: correctConversation, project: nil,
+                diagnosisState: "not-ready", issueCode: "CONVERSATION_IDENTITY_UNVERIFIED",
+                receiptTabId: tab.tabId + 100, diagnosisTabId: tab.tabId + 100))
+        ]
+
+        for (identity, fixture) in fixtures {
+            await mock.setEnteredOpenWebTabFixture(fixture)
+            let destination = await store.enterOpenWebTab(tab)
+            XCTAssertNil(destination, "An unverified diagnosis cannot open a receipt for a different \(identity)")
+            XCTAssertEqual(store.webTabEntryStatusById[tab.id]?.code, "IDENTITY_RECEIPT_REJECTED")
+            XCTAssertEqual(store.sessions, [session])
+            XCTAssertFalse(store.isCachedWebSessionReadOnly(sessionId))
+        }
+        await store.suspend()
+    }
+
+    @MainActor
+    func testUnverifiedEntryDoesNotAcceptUnknownUnboundChat() async throws {
+        let mock = MockTransport(historyCount: 0)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+        let boundTab = try XCTUnwrap(store.openWebTabs.first(where: \.isChat))
+        let sessionId = try XCTUnwrap(boundTab.sessionId)
+        let unboundTab = OpenWebTab(tabId: boundTab.tabId, title: boundTab.title,
+            canonicalUrl: boundTab.canonicalUrl, active: boundTab.active,
+            loading: boundTab.loading, kind: boundTab.kind, sessionId: nil,
+            busy: boundTab.busy)
+        let unknownConversation = WebConversationDescriptor(localConversationId: sessionId,
+            canonicalUrl: unboundTab.canonicalUrl, projectId: nil, displayTitle: unboundTab.title,
+            projectAlias: "g-p-remoteai", conversationAlias: "seed-0",
+            lastVisited: Date(), updatedAt: Date())
+        store.openWebTabs = [unboundTab]
+        store.sessions = []
+        await mock.setEnteredOpenWebTabFixture(try enterFixture(tab: unboundTab,
+            conversation: unknownConversation, project: nil, diagnosisState: "not-ready",
+            issueCode: "CONVERSATION_IDENTITY_UNVERIFIED"))
+
+        let destination = await store.enterOpenWebTab(unboundTab)
+
+        XCTAssertNil(destination, "A new or unbound receipt cannot bypass page identity verification")
+        XCTAssertTrue(store.sessions.isEmpty)
+        XCTAssertNil(store.webTabEntryStatusById[unboundTab.id]?.cachedSession)
+        let attempts = await mock.actionAttemptCount("manageOpenWebTab")
+        XCTAssertEqual(attempts, 1, "The server receipt is validated before the unbound case is rejected")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testGeneratingEntryRemainsLiveAndWritable() async throws {
+        let mock = MockTransport(historyCount: 0)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+        let tab = try XCTUnwrap(store.openWebTabs.first(where: \.isChat))
+        let sessionId = try XCTUnwrap(tab.sessionId)
+        let session = SessionDescriptor(id: sessionId, instanceId: "web.chatgpt",
+            title: tab.title, state: .busy, updatedAt: Date(),
+            projectAlias: "g-p-remoteai", canonicalUrl: tab.canonicalUrl)
+        store.sessions = [session]
+        let conversation = WebConversationDescriptor(localConversationId: sessionId,
+            canonicalUrl: tab.canonicalUrl, projectId: nil, displayTitle: tab.title,
+            projectAlias: "g-p-remoteai", conversationAlias: "seed-0",
+            lastVisited: Date(), updatedAt: Date())
+        await mock.setEnteredOpenWebTabFixture(try enterFixture(tab: tab, conversation: conversation,
+            project: nil, diagnosisState: "generating", diagnosisBusy: true))
+
+        let destination = await store.enterOpenWebTab(tab)
+
+        guard case .chat(let openedSession)? = destination else {
+            await store.suspend()
+            return XCTFail("A verified generating Chat should remain enterable")
+        }
+        XCTAssertEqual(openedSession.id, sessionId)
+        XCTAssertEqual(store.webTabDiagnosesById[tab.id]?.state, "generating")
+        XCTAssertFalse(store.isCachedWebSessionReadOnly(sessionId))
+        XCTAssertTrue(ChatComposerSendAvailability.enabled(machineOnline: true, isWeb: true,
+            sending: false, sessionUnavailable: false,
+            readOnly: store.isCachedWebSessionReadOnly(sessionId)))
+        await store.suspend()
+    }
+
+    @MainActor
+    func testUnverifiedGeneratingReceiptOpensKnownDesktopChatWithoutLocalCatalogRow() async throws {
+        let mock = MockTransport(historyCount: 0)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+        let tab = try XCTUnwrap(store.openWebTabs.first(where: \.isChat))
+        let sessionId = try XCTUnwrap(tab.sessionId)
+        let conversation = WebConversationDescriptor(localConversationId: sessionId,
+            canonicalUrl: tab.canonicalUrl, projectId: nil, displayTitle: tab.title,
+            projectAlias: "g-p-remoteai", conversationAlias: "seed-0",
+            lastVisited: Date(), updatedAt: Date())
+        await mock.setEnteredOpenWebTabFixture(try enterFixture(tab: tab, conversation: conversation,
+            project: nil, diagnosisState: "generating", diagnosisBusy: true,
+            issueCode: "CONVERSATION_IDENTITY_UNVERIFIED",
+            issueMessage: "Conversation identity is not verified."))
+
+        let destination = await store.enterOpenWebTab(tab)
+
+        guard case .chat(let openedSession)? = destination else {
+            await store.suspend()
+            return XCTFail("An exact persisted generating Chat should open without a local catalog row")
+        }
+        XCTAssertEqual(openedSession.id, sessionId)
+        XCTAssertEqual(store.sessions.map(\.id), [sessionId],
+            "The validated receipt may create the Chat's metadata row without importing messages")
+        XCTAssertNil(store.messagesBySession[sessionId])
+        XCTAssertEqual(store.webTabDiagnosesById[tab.id]?.state, "generating")
+        XCTAssertEqual(store.webTabEntryStatusById[tab.id]?.code, "CONVERSATION_IDENTITY_UNVERIFIED")
+        XCTAssertFalse(store.isCachedWebSessionReadOnly(sessionId),
+            "The Chat remains writable through the Agent's independent send preflight")
+        XCTAssertTrue(ChatComposerSendAvailability.enabled(machineOnline: true, isWeb: true,
+            sending: false, sessionUnavailable: false,
+            readOnly: store.isCachedWebSessionReadOnly(sessionId)))
         await store.suspend()
     }
 
@@ -659,9 +868,11 @@ final class WebTabEntryTests: XCTestCase {
 
     private func enterFixture(tab: OpenWebTab, conversation: WebConversationDescriptor?, project: WebProjectDescriptor?,
         diagnosisState: String = "ready", diagnosisBusy: Bool = false,
-        issueCode: String? = nil, issueMessage: String? = nil, observedAt: Date? = nil) throws -> [String: JSONValue] {
+        issueCode: String? = nil, issueMessage: String? = nil, observedAt: Date? = nil,
+        receiptTabId: Int? = nil, diagnosisTabId: Int? = nil) throws -> [String: JSONValue] {
+        let returnedTabId = receiptTabId ?? tab.tabId
         var diagnosis: [String: JSONValue] = [
-            "tabId": .number(Double(tab.tabId)),
+            "tabId": .number(Double(diagnosisTabId ?? returnedTabId)),
             "state": .string(diagnosisState),
             "canonicalUrl": .string(tab.canonicalUrl),
             "generating": .bool(diagnosisBusy),
@@ -671,7 +882,7 @@ final class WebTabEntryTests: XCTestCase {
         if let issueMessage { diagnosis["issueMessage"] = .string(issueMessage) }
         if let observedAt { diagnosis["observedAt"] = .string(RemoteAIDate.string(observedAt)) }
         var result: [String: JSONValue] = [
-            "tabId": .number(Double(tab.tabId)),
+            "tabId": .number(Double(returnedTabId)),
             "diagnosis": .object(diagnosis)
         ]
         if let conversation { result["conversation"] = try JSONValue.encode(conversation) }

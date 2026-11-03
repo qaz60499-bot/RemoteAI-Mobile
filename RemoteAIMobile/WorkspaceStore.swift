@@ -954,6 +954,35 @@ final class WorkspaceStore: ObservableObject {
                 let issue = Self.webTabEntryStatus(for: entered.diagnosis, preserving: baseIssue)
                 webTabEntryStatusById[tab.id] = issue
                 errors["web.tabs"] = issue.message
+                if let persistedSession = persistedWebChatSession(
+                    for: tab, conversation: entered.conversation, diagnosis: entered.diagnosis
+                ) {
+                    // The Agent's persisted tab receipt and any existing local Chat
+                    // identity match exactly, so it is safe to open the Chat shell.
+                    // Entry imports no page history; Agent independently validates
+                    // history reads and sends.
+                    if !sessions.contains(where: { $0.id == persistedSession.id }) {
+                        sessions.insert(persistedSession, at: 0)
+                        await persistMetadata()
+                        guard isCurrentWebTabEntryOperation(generation: generation,
+                            transport: activeTransport, machineId: activeMachineId),
+                              isCurrentOpenWebTabSelection(tab) else { return nil }
+                    }
+                    guard let conversation = entered.conversation,
+                          let currentSession = sessions.first(where: { $0.id == persistedSession.id }),
+                          sessions.filter({ $0.id == persistedSession.id }).count == 1,
+                          cachedWebSessionIdentityMatches(currentSession, tab: tab),
+                          Self.existingWebSession(currentSession, matches: conversation),
+                          !isWebSessionUnavailable(currentSession) else { return nil }
+                    readOnlyCachedWebSessionIds.remove(currentSession.id)
+                    sessionRouteHints[currentSession.id] = (activeMachineId, "runtime.web", "web.chatgpt")
+                    DiagnosticsLog.shared.record("web_tab_enter_persisted_chat_identity_unverified", fields: [
+                        "tabId": String(tab.tabId),
+                        "session": currentSession.id,
+                        "diagnosis": entered.diagnosis.state
+                    ], level: "WARN")
+                    return .chat(currentSession)
+                }
                 DiagnosticsLog.shared.record("web_tab_enter_not_ready", fields: [
                     "tabId": String(tab.tabId),
                     "code": issue.code ?? "unknown",
@@ -1123,6 +1152,34 @@ final class WorkspaceStore: ObservableObject {
             return false
         }
         return true
+    }
+
+    private func persistedWebChatSession(for tab: OpenWebTab,
+        conversation: WebConversationDescriptor?, diagnosis: WebTabDiagnosis) -> SessionDescriptor? {
+        guard diagnosis.tabId == tab.tabId,
+              ["not-ready", "generating"].contains(diagnosis.state),
+              diagnosis.issueCode == "CONVERSATION_IDENTITY_UNVERIFIED",
+              tab.isChat,
+              let boundSessionId = tab.sessionId,
+              !boundSessionId.isEmpty,
+              let conversation,
+              conversation.localConversationId == boundSessionId,
+              !deletedWebSessionIds.contains(boundSessionId) else { return nil }
+        let matches = sessions.filter { $0.id == boundSessionId }
+        guard matches.count <= 1 else { return nil }
+        let session: SessionDescriptor
+        if let existing = matches.first {
+            guard cachedWebSessionIdentityMatches(existing, tab: tab),
+                  Self.existingWebSession(existing, matches: conversation) else { return nil }
+            session = existing
+        } else {
+            // The returned receipt is authoritative for this already-bound tab and
+            // Transport has checked its Chat, Project, URL and session IDs. A local
+            // catalog row is helpful but not required to open an existing desktop Chat.
+            session = conversation.session
+        }
+        guard !isWebSessionUnavailable(session) else { return nil }
+        return session
     }
 
     private static func existingWebSession(_ session: SessionDescriptor,
