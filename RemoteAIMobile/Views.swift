@@ -1570,6 +1570,7 @@ struct ChatView: View {
                                 isFollowing: didInitialScrollToBottom
                                     && !userBrowsingHistory
                                     && !loadingOlder
+                                    && !focused
                                     && !messages.isEmpty
                             )
                             .allowsHitTesting(false)
@@ -1611,15 +1612,26 @@ struct ChatView: View {
                                 didInitialScrollToBottom = true
                             }
                         } else if !userBrowsingHistory {
-                            // A final assistant row can replace a 50K streaming row
-                            // before its new SwiftUI layout has committed. Scroll on
-                            // the following main pass so the final copy footer, not
-                            // the old streaming row, ends up in the viewport.
+                            // The last message can replace a very tall streaming row.
+                            // Anchor the actual final row's bottom, not only the 1pt
+                            // tail sentinel (which may be retained by LazyVStack).
                             DispatchQueue.main.async {
                                 guard !userBrowsingHistory else { return }
+                                if let lastID = messages.last?.id {
+                                    proxy.scrollTo(lastID, anchor: .bottom)
+                                }
                                 proxy.scrollTo("bottom", anchor: .bottom)
                             }
                         }
+                    }
+                    .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidHideNotification)) { _ in
+                        guard didInitialScrollToBottom, !userBrowsingHistory, !loadingOlder else { return }
+                        // Keyboard dismissal changes the usable viewport after the
+                        // earlier tap callback. Correct the anchor at that boundary.
+                        if let lastID = messages.last?.id {
+                            proxy.scrollTo(lastID, anchor: .bottom)
+                        }
+                        proxy.scrollTo("bottom", anchor: .bottom)
                     }
                     .onChange(of: session.id) { _ in
                         didInitialScrollToBottom = false
@@ -1632,10 +1644,14 @@ struct ChatView: View {
                             focused = false
                             userBrowsingHistory = false
                             isAtBottom = true
-                            // Defer until keyboard dismissal/layout updates the
-                            // visible transcript height; UIKit's tail follower
-                            // keeps subsequent final-row height changes anchored.
+                            // Aim at the last actual row. A 30K/50K assistant
+                            // message can grow beyond the visible viewport, while
+                            // the LazyVStack bottom sentinel can lag its layout.
                             DispatchQueue.main.async {
+                                guard !userBrowsingHistory else { return }
+                                if let lastID = messages.last?.id {
+                                    proxy.scrollTo(lastID, anchor: .bottom)
+                                }
                                 proxy.scrollTo("bottom", anchor: .bottom)
                             }
                         } label: {
