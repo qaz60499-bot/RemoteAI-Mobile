@@ -1611,8 +1611,12 @@ struct ChatView: View {
                                 didInitialScrollToBottom = true
                             }
                         } else if !userBrowsingHistory {
-                            userBrowsingHistory = false
-                            withAnimation(.easeOut(duration: 0.18)) {
+                            // A final assistant row can replace a 50K streaming row
+                            // before its new SwiftUI layout has committed. Scroll on
+                            // the following main pass so the final copy footer, not
+                            // the old streaming row, ends up in the viewport.
+                            DispatchQueue.main.async {
+                                guard !userBrowsingHistory else { return }
                                 proxy.scrollTo("bottom", anchor: .bottom)
                             }
                         }
@@ -1625,8 +1629,13 @@ struct ChatView: View {
 
                     if didInitialScrollToBottom, !isAtBottom, !messages.isEmpty {
                         Button {
+                            focused = false
                             userBrowsingHistory = false
-                            withAnimation(.easeOut(duration: 0.18)) {
+                            isAtBottom = true
+                            // Defer until keyboard dismissal/layout updates the
+                            // visible transcript height; UIKit's tail follower
+                            // keeps subsequent final-row height changes anchored.
+                            DispatchQueue.main.async {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                             }
                         } label: {

@@ -232,6 +232,13 @@ final class RemoteAIMobileUITests: XCTestCase {
         let finalSummary = try XCTUnwrap(finalCopy.value as? String)
         XCTAssertTrue(finalSummary.contains("字符数=\(chars)"), "The real final must contain every expected character")
         XCTAssertTrue(finalSummary.contains(marker), "The canonical final must begin with the expected marker")
+        // The final row and the keyboard-adjusted ScrollView can finish separate
+        // layout passes on a busy simulator. Require the actual footer to become
+        // tappable; a merely existing offscreen button is still a test failure.
+        for _ in 0..<20 {
+            if finalCopy.isHittable { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
         XCTAssertTrue(finalCopy.isHittable, "The final message footer must be visible after returning to the latest reply")
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "streaming-tail-\(chars)"
