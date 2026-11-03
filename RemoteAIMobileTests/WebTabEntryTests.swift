@@ -403,6 +403,93 @@ final class WebTabEntryTests: XCTestCase {
     }
 
     @MainActor
+    func testProjectBoundRootConversationURLUsesAgentProjectIdentityInsteadOfRejectingExistingChat() async throws {
+        let mock = MockTransport(historyCount: 0)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+        let original = try XCTUnwrap(store.openWebTabs.first(where: \.isChat))
+        let sessionId = try XCTUnwrap(original.sessionId)
+        let projectURL = original.canonicalUrl
+        let rootURL = "https://chatgpt.com/c/seed-0"
+        let existing = SessionDescriptor(id: sessionId, instanceId: "web.chatgpt",
+            title: "Existing Project Chat", state: .idle, updatedAt: Date(),
+            projectAlias: "g-p-remoteai", canonicalUrl: projectURL)
+        store.sessions = [existing]
+        let conversation = WebConversationDescriptor(localConversationId: sessionId,
+            canonicalUrl: projectURL, projectId: nil, displayTitle: existing.title,
+            projectAlias: "g-p-remoteai", conversationAlias: "seed-0",
+            lastVisited: Date(), updatedAt: Date())
+        var rootTab = OpenWebTab(tabId: original.tabId, title: original.title,
+            canonicalUrl: rootURL, active: original.active, loading: false,
+            kind: original.kind, sessionId: sessionId, busy: false)
+        // Real Windows listOpenWebTabs returns this even when Chrome omits
+        // the Project path. The iOS v87 model silently discarded the field.
+        rootTab.projectAlias = "g-p-remoteai"
+        store.openWebTabs = [rootTab]
+        await mock.setEnteredOpenWebTabFixture(try enterFixture(
+            tab: rootTab, conversation: conversation, project: nil,
+            diagnosisState: "not-ready", issueCode: "CONVERSATION_IDENTITY_UNVERIFIED"))
+
+        let destination = await store.enterOpenWebTab(rootTab)
+
+        guard case .chat(let opened)? = destination else {
+            await store.suspend()
+            return XCTFail("The exact Agent-bound Chat must open despite different URL routes")
+        }
+        XCTAssertEqual(opened.id, sessionId)
+        XCTAssertEqual(store.sessions, [existing], "Do not replace persisted Chat or import any unverified DOM history")
+        XCTAssertFalse(store.isCachedWebSessionReadOnly(sessionId))
+        await store.suspend()
+    }
+
+    @MainActor
+    func testRootURLCannotBorrowAnExistingChatFromAnotherAgentProject() async throws {
+        let mock = MockTransport(historyCount: 0)
+        await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)
+        try await mock.connect()
+        let store = WorkspaceStore(transport: mock, cache: try SQLiteStore.inMemory())
+        store.machine.state = .online
+        await store.refreshOpenWebTabs()
+        let original = try XCTUnwrap(store.openWebTabs.first(where: \.isChat))
+        let sessionId = try XCTUnwrap(original.sessionId)
+        let existing = SessionDescriptor(id: sessionId, instanceId: "web.chatgpt",
+            title: original.title, state: .idle, updatedAt: Date(),
+            projectAlias: "g-p-remoteai", canonicalUrl: original.canonicalUrl)
+        store.sessions = [existing]
+        var wrongProjectTab = OpenWebTab(tabId: original.tabId, title: original.title,
+            canonicalUrl: "https://chatgpt.com/c/seed-0", active: false,
+            loading: false, kind: original.kind, sessionId: sessionId, busy: false)
+        wrongProjectTab.projectAlias = "g-p-another-project"
+        store.openWebTabs = [wrongProjectTab]
+        let conversation = WebConversationDescriptor(localConversationId: sessionId,
+            canonicalUrl: original.canonicalUrl, projectId: nil, displayTitle: original.title,
+            projectAlias: "g-p-remoteai", conversationAlias: "seed-0",
+            lastVisited: Date(), updatedAt: Date())
+        await mock.setEnteredOpenWebTabFixture(try enterFixture(tab: wrongProjectTab,
+            conversation: conversation, project: nil, diagnosisState: "not-ready",
+            issueCode: "CONVERSATION_IDENTITY_UNVERIFIED"))
+
+        let destination = await store.enterOpenWebTab(wrongProjectTab)
+
+        XCTAssertNil(destination, "A different Project cannot reuse an existing session ID")
+        XCTAssertEqual(store.sessions, [existing])
+        await store.suspend()
+    }
+
+    func testWebTabInventoryDecodesExplicitAgentProjectIdentity() throws {
+        let json = """
+        {"tabId":12,"title":"Chat","canonicalUrl":"https://chatgpt.com/c/seed-0",
+         "active":false,"loading":false,"kind":"conversation","sessionId":"webconv-one",
+         "busy":false,"projectAlias":"g-p-remoteai"}
+        """
+        let tab = try JSONDecoder().decode(OpenWebTab.self, from: Data(json.utf8))
+        XCTAssertEqual(tab.projectAlias, "g-p-remoteai")
+    }
+
+    @MainActor
     func testUnverifiedPersistedEntryKeepsAgentHistorySynchronizationAvailable() async throws {
         let mock = MockTransport(historyCount: 1)
         await mock.seedProjectConversations(alias: "g-p-remoteai", count: 1)

@@ -275,6 +275,9 @@ struct OpenWebTab: Decodable, Identifiable {
     let kind: String
     let sessionId: String?
     let busy: Bool
+    // Windows inventory already resolves this from the durable session binding.
+    // A root /c/<id> URL need not contain its owning Project in the path.
+    var projectAlias: String? = nil
     var executionState: String? = nil
     var lastActivityAt: String? = nil
     var lastProgressAt: String? = nil

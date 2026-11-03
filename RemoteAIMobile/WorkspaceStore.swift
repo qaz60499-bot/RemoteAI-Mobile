@@ -972,7 +972,7 @@ final class WorkspaceStore: ObservableObject {
                           let currentSession = sessions.first(where: { $0.id == persistedSession.id }),
                           sessions.filter({ $0.id == persistedSession.id }).count == 1,
                           cachedWebSessionIdentityMatches(currentSession, tab: tab),
-                          Self.existingWebSession(currentSession, matches: conversation),
+                          existingWebSession(currentSession, matches: conversation),
                           !isWebSessionUnavailable(currentSession) else { return nil }
                     readOnlyCachedWebSessionIds.remove(currentSession.id)
                     sessionRouteHints[currentSession.id] = (activeMachineId, "runtime.web", "web.chatgpt")
@@ -1010,7 +1010,7 @@ final class WorkspaceStore: ObservableObject {
                     // Reusing an ID whose cached canonical/Project identity differs
                     // could expose another Chat's local transcript under this receipt.
                     // Keep the row blocked until the existing metadata is reconciled.
-                    guard Self.existingWebSession(existing, matches: conversation) else {
+                    guard existingWebSession(existing, matches: conversation) else {
                         throw TransportError.malformedData
                     }
                     session = existing
@@ -1138,19 +1138,20 @@ final class WorkspaceStore: ObservableObject {
               session.instanceId == "web.chatgpt",
               Self.isSafeChatGPTCanonicalURL(session.canonicalUrl),
               Self.isSafeChatGPTCanonicalURL(tab.canonicalUrl),
-              let sessionURL = normalizedWebCanonicalURL(session.canonicalUrl),
-              let selectedURL = normalizedWebCanonicalURL(tab.canonicalUrl),
-              sessionURL == selectedURL,
               let sessionConversation = webConversationAlias(from: session.canonicalUrl),
               let selectedConversation = webConversationAlias(from: tab.canonicalUrl),
               sessionConversation == selectedConversation else { return false }
-        let selectedProject = webProjectAlias(from: tab.canonicalUrl)
-        let sessionProject = session.projectAlias ?? webProjectAlias(from: session.canonicalUrl)
+        // The Agent supplies Project identity separately from the address.
+        // A root /c/<id> path and /g/<project>/c/<id> can be one Chat.
+        let tabURLProject = webProjectAlias(from: tab.canonicalUrl)
+        let sessionURLProject = webProjectAlias(from: session.canonicalUrl)
+        let selectedProject = tab.projectAlias ?? tabURLProject
+        let sessionProject = session.projectAlias ?? sessionURLProject
         guard sameWebProjectAlias(sessionProject, selectedProject) else { return false }
-        if let declaredProject = session.projectAlias,
-           !sameWebProjectAlias(declaredProject, webProjectAlias(from: session.canonicalUrl)) {
-            return false
-        }
+        if let declaredProject = tab.projectAlias, let inURL = tabURLProject,
+           !sameWebProjectAlias(declaredProject, inURL) { return false }
+        if let declaredProject = session.projectAlias, let inURL = sessionURLProject,
+           !sameWebProjectAlias(declaredProject, inURL) { return false }
         return true
     }
 
@@ -1170,7 +1171,7 @@ final class WorkspaceStore: ObservableObject {
         let session: SessionDescriptor
         if let existing = matches.first {
             guard cachedWebSessionIdentityMatches(existing, tab: tab),
-                  Self.existingWebSession(existing, matches: conversation) else { return nil }
+                  existingWebSession(existing, matches: conversation) else { return nil }
             session = existing
         } else {
             // The returned receipt is authoritative for this already-bound tab and
@@ -1182,22 +1183,26 @@ final class WorkspaceStore: ObservableObject {
         return session
     }
 
-    private static func existingWebSession(_ session: SessionDescriptor,
+    private func existingWebSession(_ session: SessionDescriptor,
         matches conversation: WebConversationDescriptor) -> Bool {
         guard session.id == conversation.localConversationId,
               session.instanceId == "web.chatgpt",
-              isSafeChatGPTCanonicalURL(session.canonicalUrl),
-              isSafeChatGPTCanonicalURL(conversation.canonicalUrl),
-              let existingURL = session.canonicalUrl.flatMap(normalizedWebURL),
-              let verifiedURL = normalizedWebURL(conversation.canonicalUrl),
-              existingURL == verifiedURL,
-              let existingConversation = URL(string: existingURL).flatMap(conversationAliasFromNormalizedURL),
-              let verifiedConversation = normalizedConversationAlias(conversation.conversationAlias)
-                    ?? URL(string: verifiedURL).flatMap(conversationAliasFromNormalizedURL),
-              existingConversation == verifiedConversation else { return false }
-        let existingProject = session.projectAlias ?? projectAliasFromURL(session.canonicalUrl)
-        let verifiedProject = conversation.projectAlias ?? projectAliasFromURL(conversation.canonicalUrl)
-        guard normalizedProjectAlias(existingProject) == normalizedProjectAlias(verifiedProject) else { return false }
+              Self.isSafeChatGPTCanonicalURL(session.canonicalUrl),
+              Self.isSafeChatGPTCanonicalURL(conversation.canonicalUrl),
+              let existingConversation = webConversationAlias(from: session.canonicalUrl),
+              let verifiedConversation = webConversationAlias(from: conversation.canonicalUrl),
+              existingConversation == verifiedConversation,
+              conversation.conversationAlias == nil
+                || normalizedWebConversationAlias(conversation.conversationAlias) == verifiedConversation else { return false }
+        let sessionURLProject = webProjectAlias(from: session.canonicalUrl)
+        let conversationURLProject = webProjectAlias(from: conversation.canonicalUrl)
+        let existingProject = session.projectAlias ?? sessionURLProject
+        let verifiedProject = conversation.projectAlias ?? conversationURLProject
+        guard sameWebProjectAlias(existingProject, verifiedProject) else { return false }
+        if let declared = session.projectAlias, let inURL = sessionURLProject,
+           !sameWebProjectAlias(declared, inURL) { return false }
+        if let declared = conversation.projectAlias, let inURL = conversationURLProject,
+           !sameWebProjectAlias(declared, inURL) { return false }
         if let existingId = session.projectId, let verifiedId = conversation.projectId,
            existingId != verifiedId { return false }
         return true
@@ -1304,38 +1309,6 @@ final class WorkspaceStore: ObservableObject {
               components.password == nil,
               components.port == nil || components.port == 443 else { return false }
         return true
-    }
-
-    private static func normalizedWebURL(_ raw: String?) -> String? {
-        guard let raw, let components = URLComponents(string: raw),
-              let scheme = components.scheme?.lowercased(),
-              let host = components.host?.lowercased() else { return nil }
-        var path = components.percentEncodedPath
-        while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
-        return "\(scheme)://\(host)\(path)"
-    }
-
-    private static func conversationAliasFromNormalizedURL(_ url: URL) -> String? {
-        let parts = url.path.split(separator: "/").map(String.init)
-        guard let marker = parts.lastIndex(of: "c"), parts.indices.contains(marker + 1) else { return nil }
-        return normalizedConversationAlias(parts[marker + 1])
-    }
-
-    private static func normalizedConversationAlias(_ raw: String?) -> String? {
-        guard let raw else { return nil }
-        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return value.isEmpty ? nil : value
-    }
-
-    private static func projectAliasFromURL(_ raw: String?) -> String? {
-        guard let raw, let url = URL(string: raw) else { return nil }
-        let parts = url.path.split(separator: "/").map(String.init)
-        guard parts.count >= 2, parts[0] == "g", parts[1].hasPrefix("g-") else { return nil }
-        return parts[1]
-    }
-
-    private static func normalizedProjectAlias(_ raw: String?) -> String? {
-        raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private static func webTabDiagnosisAllowsLiveEntry(_ diagnosis: WebTabDiagnosis) -> Bool {
