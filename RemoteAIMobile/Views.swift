@@ -1304,8 +1304,8 @@ struct ChatView: View {
         .toolbar {
             ToolbarItem(placement: .principal) { VStack(spacing: 1) { Text(instance.name).font(.subheadline.weight(.semibold)); Text(session.title).font(.caption2).foregroundColor(.secondary); Text(store.machine.state.rawValue).font(.caption2).foregroundColor(store.machine.state == .online ? .green : .secondary) } }
             ToolbarItem(placement: .navigationBarTrailing) { if store.machine.state == .online && isGenerating { Button("Stop") { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } }.font(.caption).disabled(store.stopRequestsPending.contains(session.id)) } }
-            if runtime.kind == .web {
-                ToolbarItem(placement: .navigationBarTrailing) {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                if runtime.kind == .web {
                     Menu {
                         Button("重新同步消息") { Task { await store.recoverWebChat(session.id, operation: "resync") } }
                         Button("检测网页运行状态") { Task { await store.recoverWebChat(session.id, operation: "inspect") } }
