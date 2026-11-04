@@ -259,6 +259,23 @@ final class WorkspaceStore: ObservableObject {
         return false
     }
 
+    // A ChatGPT SPA shell can appear before its exact conversation transcript mounts.
+    // Only this history-read selector failure is transient; send, auth, and identity errors are not.
+    static func isTransientUnreadableWebHistory(_ error: Error, runtimeId: String?) -> Bool {
+        guard runtimeId == "runtime.web",
+              let transportError = error as? TransportError,
+              case .remote(let code, let message) = transportError else { return false }
+        return code == "WEB_SELECTOR_FAILED"
+            && message.contains("ChatGPT conversation exposed no readable messages")
+    }
+
+    static func verifiedRunActivityAt(lastProgressAt: Date?, lastActivityAt: Date?) -> Date? {
+        // Do not invent a new timestamp from status polling.
+        lastProgressAt ?? lastActivityAt
+    }
+
+    private static let waitingForWebTranscriptNote = "电脑端 ChatGPT 暂未提供可验证的历史消息；保留缓存，继续等待原会话加载。"
+
     init(transport: Transport, cache: SQLiteStore) {
         self.transport = transport
         self.cache = cache
@@ -1607,6 +1624,9 @@ final class WorkspaceStore: ObservableObject {
                 }
             }
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: authoritativeItems.last?.createdAt ?? Date())
+            if webChatRecoveryNotesBySession[sessionId] == Self.waitingForWebTranscriptNote {
+                webChatRecoveryNotesBySession.removeValue(forKey: sessionId)
+            }
             await settleRunStateIfAuthoritativeFinalExists(authoritativeItems, sessionId: sessionId)
             if hasMoreBySession[sessionId] != page.hasMore {
                 hasMoreBySession[sessionId] = page.hasMore
@@ -1631,6 +1651,20 @@ final class WorkspaceStore: ObservableObject {
         } catch {
             guard generation == lifecycleGeneration, !isSuspended else { return }
             let hasUsableLocalHistory = !messagesBySession[sessionId, default: []].isEmpty
+            if Self.isTransientUnreadableWebHistory(error, runtimeId: routeForSession(sessionId)?.runtimeId) {
+                // Preserve local history and failed-read revision so a later mounted
+                // transcript can be imported without clearing the visible Chat.
+                if errors[sessionId]?.hasPrefix("WEB_SELECTOR_FAILED: ChatGPT conversation exposed no readable messages") == true {
+                    errors[sessionId] = nil
+                }
+                webChatRecoveryNotesBySession[sessionId] = Self.waitingForWebTranscriptNote
+                DiagnosticsLog.shared.record("session_history_not_ready", fields: [
+                    "session": sessionId,
+                    "code": "WEB_SELECTOR_FAILED",
+                    "cachedRows": String(messagesBySession[sessionId, default: []].count)
+                ], level: "WARN")
+                return
+            }
             if let transportError = error as? TransportError,
                hasUsableLocalHistory,
                transportError == .timeout || transportError == .disconnected || transportError == .offline {
@@ -1721,15 +1755,15 @@ final class WorkspaceStore: ObservableObject {
             }
             if snapshot.state == .busy || snapshot.state == .waiting {
                 if route.runtimeId == "runtime.web" { terminalWebRuns.remove(sessionId) }
-                let activeAt = snapshot.lastProgressAt ?? snapshot.lastActivityAt ?? Date()
-                markLiveRunActivity(sessionId: sessionId, at: activeAt)
-                if route.runtimeId == "runtime.web" {
-                    // A status poll is authoritative recovery evidence for a run that
-                    // may have started while the phone was backgrounded/disconnected.
-                    // Project screens render their own row array, so promote the active
-                    // desktop conversation there as well instead of waiting for a new
-                    // live GENERATION_STARTED/MESSAGE_UPDATED frame.
-                    promoteProjectConversationActivity(sessionId: sessionId, at: activeAt)
+                if let activeAt = Self.verifiedRunActivityAt(
+                    lastProgressAt: snapshot.lastProgressAt,
+                    lastActivityAt: snapshot.lastActivityAt
+                ) {
+                    markLiveRunActivity(sessionId: sessionId, at: activeAt)
+                    if route.runtimeId == "runtime.web" {
+                        // Promote Project activity only with verified Agent evidence.
+                        promoteProjectConversationActivity(sessionId: sessionId, at: activeAt)
+                    }
                 }
                 if let raw = snapshot.lastProgressStatus, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     let label = route.runtimeId == "runtime.web" ? webProcessStatusLabel(raw) : processStatusLabel(for: raw)
