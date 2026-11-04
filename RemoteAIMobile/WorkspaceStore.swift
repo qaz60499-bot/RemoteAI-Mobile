@@ -1,14 +1,41 @@
 import Foundation
 import SwiftUI
 
+private enum GenerationTerminalOutcome: Equatable {
+    case canceled
+    case interrupted
+    case unknown
+    case failed
+}
+
+enum OpenWebTabDestination {
+    case chat(SessionDescriptor)
+    case project(WebProjectDescriptor)
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     @Published var machine = MachineMetadata(id: "my-pc", name: "My PC", state: .connecting)
     @Published var runtimes: [RuntimeDescriptor] = []
     @Published var instances: [InstanceDescriptor] = []
     @Published var sessions: [SessionDescriptor] = []
+    @Published private(set) var codexSessionLimits: [String: Int] = [:]
+    @Published private(set) var codexSessionsMayHaveMore: [String: Bool] = [:]
     @Published var messagesBySession: [String: [ChatMessage]] = [:]
     @Published var webProjects: [WebProjectDescriptor] = []
+    @Published var openWebTabs: [OpenWebTab] = []
+    @Published var hasLoadedOpenWebTabs = false
+    @Published private(set) var openWebTabsInventoryUnverified = true
+    @Published private(set) var openWebTabsLastVerifiedAt: Date?
+    private var webTabsRefreshNeedsConnectivityRetry = false
+    @Published private(set) var managingWebTabIds = Set<Int>()
+    @Published var webTabDiagnosesById: [Int: WebTabDiagnosis] = [:]
+    @Published var webTabActionNotesById: [Int: String] = [:]
+    @Published private(set) var webChatRecoveryNotesBySession: [String: String] = [:]
+    @Published var recentWebTabNotices: [String] = []
+    private var explicitlyClosedWebTabIDs = Set<Int>()
+    @Published var antigravityProjects: [WebProjectDescriptor] = []
+    @Published var hasLoadedAntigravityProjects = false
     @Published var projectConversationsByAlias: [String: [WebConversationDescriptor]] = [:]
     @Published var projectNextCursorByAlias: [String: String] = [:]
     @Published var projectHasMoreByAlias: [String: Bool] = [:]
@@ -17,12 +44,19 @@ final class WorkspaceStore: ObservableObject {
     @Published var projectConversationLoadingByAlias: [String: Bool] = [:]
     @Published var liveRunStatusBySession: [String: String] = [:]
     @Published private(set) var deltaRecoveryDisplayMessagesBySession: [String: [ChatMessage]]? = nil
+    // A late delta page must never re-freeze a chat after a newer live reply
+    // has already been applied during the same catch-up pass.
+    private var recoveryLivePresentationSessions = Set<String>()
     private var liveRunActivityAtBySession: [String: Date] = [:]
     private var terminalWebRuns = Set<String>()
     @Published var hasLoadedWebProjects = false
     @Published var attachmentTransferBySession: [String: AttachmentTransferProgress] = [:]
     @Published var commandStates: [UUID: CommandState] = [:]
     @Published var errors: [String: String] = [:]
+    @Published var webProviderIssuesBySession: [String: RemoteProviderSurfaceIssue] = [:]
+    @Published var webProviderSurfaceStateBySession: [String: String] = [:]
+    @Published var webProviderSurfaceObservedAtBySession: [String: Date] = [:]
+    @Published var webProviderRecoveryObservedAtBySession: [String: Date] = [:]
     @Published var hasMoreBySession: [String: Bool] = [:]
     @Published var isPaired = false
     @Published var pairingStage: PairingStage?
@@ -39,7 +73,13 @@ final class WorkspaceStore: ObservableObject {
         deferringTransientConnectionPresentation && isPaired ? .online : machine.state
     }
     var shouldDisplayConnectionBanner: Bool {
-        !deferringTransientConnectionPresentation && (machine.state != .online || connectionPhase != .online)
+        guard !deferringTransientConnectionPresentation else { return false }
+        // An authenticated Agent is already usable. Refreshing slow runtime metadata
+        // is not a transport failure and should not flash a reconnect banner.
+        if machine.state == .online && (connectionPhase == .online || connectionPhase == .loadingRuntimes) {
+            return false
+        }
+        return true
     }
 
     static let connectingStateMaxDuration: TimeInterval = 45
@@ -88,6 +128,7 @@ final class WorkspaceStore: ObservableObject {
     // awaiting I/O. Keep per-operation gates at the Store boundary, not only in Views.
     private var refreshWebProjectsInFlight = false
     private var refreshWebProjectsQueued = false
+    private var webProjectsRefreshDeferredForActiveChat = false
     private var webProjectsRefreshNeedsConnectivityRetry = false
     private var lastWebProjectsRefreshAt: Date?
     private static let webProjectsAutomaticRefreshMinimumInterval: TimeInterval = 20
@@ -103,9 +144,12 @@ final class WorkspaceStore: ObservableObject {
     private var sessionLoads = Set<String>()
     private var visibleSessionSyncAt: [String: Date] = [:]
     private var visibleSessionHistorySyncAt: [String: Date] = [:]
+    private var visibleSessionHistoryRemoteRevision: [String: Date] = [:]
+    // Only sparse active Web histories need bounded re-reads after a successful empty page.
+    private var sparseWebHistoryRetryAt: [String: Date] = [:]
+    private var sparseWebHistoryRetryCounts: [String: Int] = [:]
     private var systemTransportOfflineChannels = Set<String>()
-    private var webProviderIssueMessageBySession: [String: String] = [:]
-    private var webProviderIssueStateBySession: [String: String] = [:]
+    private var webProviderStatusReceivedAtBySession: [String: Date] = [:]
     private var webBindingDetachedSessions = Set<String>()
     private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 2.5
     private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 20
@@ -123,9 +167,13 @@ final class WorkspaceStore: ObservableObject {
     private var olderMessageLoads = Set<String>()
     private var creatingWebProjects = Set<String>()
     private var creatingWebConversations = Set<String>()
+    private var reopeningWebConversations = Set<String>()
     private var creatingSessions = Set<String>()
     private var stopTasksBySession: [String: Task<Bool, Never>] = [:]
+    @Published private(set) var stopRequestsPending = Set<String>()
     private var commandSendsInFlight = Set<UUID>()
+    // Distinct command UUIDs from a rapid second tap must not send twice to the same chat.
+    private var sessionSendsInFlight = Set<String>()
     private var metadataRefreshInFlight = false
     private var metadataRefreshQueued = false
     private var metadataRefreshDeferredForDelta = false
@@ -148,6 +196,34 @@ final class WorkspaceStore: ObservableObject {
     // catalog is still intentionally lazy. Keep that route so opening a conversation
     // can recover its history before the instance/session list has been expanded.
     private var sessionRouteHints: [String: (machineId: String, runtimeId: String, instanceId: String)] = [:]
+
+    // A successful loadRecent of 0/1 transcript rows is not proof that an active
+    // ChatGPT conversation has all its previous turns. Never retry healthy streams.
+    static func sparseWebHistoryRetryDue(
+        isWeb: Bool, isActive: Bool, transcriptCount: Int,
+        lastSuccessfulHistoryAt: Date?, lastRetryAt: Date?, retryCount: Int,
+        now: Date
+    ) -> Bool {
+        guard isWeb, isActive, transcriptCount <= 1,
+              let lastSuccessfulHistoryAt, (0..<3).contains(retryCount) else { return false }
+        let delay: [TimeInterval] = [15, 30, 60]
+        let reference = max(lastSuccessfulHistoryAt, lastRetryAt ?? lastSuccessfulHistoryAt)
+        return now.timeIntervalSince(reference) >= delay[retryCount]
+    }
+
+    static func visibleHistoryReloadDue(
+        force: Bool,
+        hasSuccessfulHistory: Bool,
+        terminalTransition: Bool,
+        remoteStatusIsTerminal: Bool,
+        remoteRevision: Date?,
+        lastSuccessfulRemoteRevision: Date?
+    ) -> Bool {
+        force
+            || !hasSuccessfulHistory
+            || terminalTransition
+            || (remoteStatusIsTerminal && remoteRevision != nil && remoteRevision != lastSuccessfulRemoteRevision)
+    }
 
     private static func pendingCommandPrefix(machineId: String) -> String {
         "pending.command.\(machineId)."
@@ -265,7 +341,12 @@ final class WorkspaceStore: ObservableObject {
         }
         isPaired = PairingKeyStore.isPaired(machineId: machine.id)
         if !isPaired && !(transport is MockTransport) {
-            try? await cache.clearAll()
+            // A locked/unavailable Keychain and an explicitly revoked pairing both
+            // report no usable key here. Neither is proof that cached conversations
+            // or drafts may be destroyed. Keep the disk cache intact; only hide its
+            // contents in this unpaired UI lifecycle. Re-pairing an actual different
+            // machine still follows the explicit cache reset in savePairing().
+            DiagnosticsLog.shared.record("pairing_key_unavailable_cache_preserved", level: "WARN")
             runtimes.removeAll()
             instances.removeAll()
             sessions.removeAll()
@@ -325,6 +406,7 @@ final class WorkspaceStore: ObservableObject {
             errors["connection"] = nil
             endTransientConnectionPresentation()
             DiagnosticsLog.shared.record("connection_online", fields: ["sequence": String(authenticatedSequence)])
+            scheduleWebTabsRefreshAfterConnectivityRecovery(reason: "initial-online")
             startConnectionMonitor()
             scheduleWebProjectsRefreshAfterConnectivityRecovery(reason: "initial-online")
 
@@ -389,22 +471,338 @@ final class WorkspaceStore: ObservableObject {
         await start()
     }
 
+    func refreshAntigravityProjects() async {
+        guard machine.state == .online, !isSuspended else { return }
+        let generation = lifecycleGeneration
+        do {
+            let projects = try await transport.listAntigravityProjects(machineId: machine.id)
+            guard generation == lifecycleGeneration, !isSuspended, machine.state == .online else { return }
+            antigravityProjects = projects
+            hasLoadedAntigravityProjects = true
+            errors["antigravity.projects"] = nil
+        } catch {
+            if generation == lifecycleGeneration, !isSuspended {
+                errors["antigravity.projects"] = error.localizedDescription
+            }
+        }
+    }
+
+    func refreshOpenWebTabs() async {
+        guard machine.state == .online, !isSuspended else {
+            webTabsRefreshNeedsConnectivityRetry = true
+            // A visible refresh control must not silently leave a stale spinner
+            // when the phone is offline or the app's transport is suspended.
+            openWebTabsInventoryUnverified = true
+            errors["web.tabs"] = machine.state != .online
+                ? "Windows Agent 未连接，当前 Chrome 标签数无法确认。请在连接恢复后更新列表。"
+                : "手机连接已暂停，当前 Chrome 标签数无法确认。请恢复应用连接后更新列表。"
+            DiagnosticsLog.shared.record("web_tabs_request_skipped", fields: [
+                "machineState": String(describing: machine.state),
+                "suspended": String(isSuspended),
+            ], level: "WARN")
+            return
+        }
+        let generation = lifecycleGeneration
+        let commandId = UUID()
+        DiagnosticsLog.shared.record("web_tabs_request_begin", fields: ["commandId": commandId.uuidString])
+        do {
+            let tabs = try await transport.listOpenWebTabs(machineId: machine.id, commandId: commandId)
+            guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+            // Only an authoritative Chrome inventory may establish disappearance.
+            // A network/bridge error never means a tab was closed.
+            if hasLoadedOpenWebTabs {
+                let currentIDs = Set(tabs.map(\.id))
+                for old in openWebTabs where !currentIDs.contains(old.id) {
+                    let intentional = explicitlyClosedWebTabIDs.remove(old.id) != nil
+                    let text = intentional
+                        ? "已关闭：\(old.title)（只关闭网页，未删除历史）"
+                        : "标签页已消失：\(old.title)；未收到本手机关闭确认，可能在电脑端关闭或被自动回收"
+                    recentWebTabNotices.insert(text, at: 0)
+                }
+                recentWebTabNotices = Array(recentWebTabNotices.prefix(5))
+            }
+            openWebTabs = tabs
+            hasLoadedOpenWebTabs = true
+            openWebTabsInventoryUnverified = false
+            openWebTabsLastVerifiedAt = Date()
+            webTabsRefreshNeedsConnectivityRetry = false
+            errors["web.tabs"] = nil
+            DiagnosticsLog.shared.record("web_tabs_request_verified", fields: ["commandId": commandId.uuidString, "count": String(tabs.count)])
+        } catch {
+            if generation == lifecycleGeneration, !isSuspended {
+                // Keep the last verified inventory, but do not present its counts as current.
+                openWebTabsInventoryUnverified = true
+                errors["web.tabs"] = error.localizedDescription
+                if let transportError = error as? TransportError {
+                    switch transportError {
+                    case .offline, .disconnected, .timeout:
+                        webTabsRefreshNeedsConnectivityRetry = true
+                    default:
+                        break
+                    }
+                }
+                DiagnosticsLog.shared.record("web_tabs_request_failed", fields: Self.diagnosticFields(for: error, adding: ["commandId": commandId.uuidString]), level: "WARN")
+            }
+        }
+    }
+
+    func enterOpenWebTab(_ tab: OpenWebTab) async -> OpenWebTabDestination? {
+        guard machine.state == .online, !isSuspended else {
+            errors["web.tabs"] = "Windows 未连接，无法打开当前 Chrome 网页。"
+            return nil
+        }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        do {
+            let entered = try await activeTransport.enterOpenWebTab(machineId: activeMachineId, tab: tab)
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, machine.state == .online, !isSuspended else { return nil }
+            errors["web.tabs"] = nil
+            if let conversation = entered.conversation {
+                // Enter returns a verified existing provider identity, not a
+                // new chat. Keep the live Agent status when already available.
+                let session = sessions.first(where: { $0.id == conversation.localConversationId })
+                    ?? conversation.session
+                if !sessions.contains(where: { $0.id == session.id }) {
+                    sessions.insert(session, at: 0)
+                    await persistMetadata()
+                }
+                return .chat(session)
+            }
+            if let project = entered.project {
+                return .project(project)
+            }
+            errors["web.tabs"] = "Chrome 已响应，但没有返回可打开的 Chat 或 Project。"
+        } catch {
+            if generation == lifecycleGeneration, !isSuspended {
+                errors["web.tabs"] = "打开当前网页失败：\(error.localizedDescription)"
+                DiagnosticsLog.shared.record("web_tab_enter_failed",
+                    fields: Self.diagnosticFields(for: error, adding: ["tabId": String(tab.tabId)]),
+                    level: "WARN")
+            }
+        }
+        return nil
+    }
+
+    func inspectOpenWebTab(_ tab: OpenWebTab) async {
+        guard machine.state == .online, !isSuspended else {
+            errors["web.tabs"] = "Windows 未连接，无法验证 Chrome 网页是否正常。"
+            return
+        }
+        do {
+            let diagnosis = try await transport.inspectOpenWebTab(machineId: machine.id, tab: tab)
+            webTabDiagnosesById[tab.id] = diagnosis
+            errors["web.tabs"] = nil
+        } catch {
+            // This is a failed status check, not proof of a failed page load.
+            errors["web.tabs"] = "网页状态无法确认：\(error.localizedDescription)"
+        }
+    }
+
+    func reopenClosedWebConversation(sessionId: String) async {
+        guard machine.state == .online, !isSuspended else {
+            errors[sessionId] = "Windows 未连接，不能重新打开原 Chat；本地历史已保留。"
+            return
+        }
+        // A slow Chrome startup must not turn repeated taps into new tab allocations.
+        guard reopeningWebConversations.insert(sessionId).inserted else { return }
+        defer { reopeningWebConversations.remove(sessionId) }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        webChatRecoveryNotesBySession[sessionId] = "正在按原会话身份重新打开网页，不会创建新 Chat…"
+        do {
+            // resumeSession is an explicit, identity-scoped open command. Never
+            // substitute a title, Project home, or the active Chrome tab.
+            try await activeTransport.reopenVerifiedWebConversation(machineId: activeMachineId, sessionId: sessionId)
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+            await refreshOpenWebTabs()
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+            let matches = openWebTabsInventoryUnverified ? [] :
+                openWebTabs.filter { $0.sessionId == sessionId && $0.isChat }
+            guard matches.count == 1, let tab = matches.first else {
+                webChatRecoveryNotesBySession[sessionId] = "网页打开请求已返回，但原 Chat 标签身份尚未核实；历史保留，未再次重开。"
+                errors[sessionId] = "无法确认原 Chat 已在 Chrome 打开；请先检查标签，再决定是否再次操作。"
+                return
+            }
+            // A returned inventory binding is not proof that the renderer is ready.
+            // Forget any earlier diagnosis so a failed fresh probe cannot look successful.
+            webTabDiagnosesById.removeValue(forKey: tab.id)
+            await inspectOpenWebTab(tab)
+            guard generation == lifecycleGeneration, !isSuspended else { return }
+            if let diagnosis = webTabDiagnosesById[tab.id],
+               ["ready", "generating", "retry-visible"].contains(diagnosis.state) {
+                webChatRecoveryNotesBySession[sessionId] = "已验证原 Chat 的网页身份与状态，正在同步消息。"
+                errors[sessionId] = nil
+                await synchronizeVisibleSession(sessionId, force: true)
+            } else {
+                webChatRecoveryNotesBySession[sessionId] = "已找到原 Chat 标签，但网页仍未就绪；不会刷新或操作其他 Chat。"
+            }
+        } catch {
+            guard generation == lifecycleGeneration, !isSuspended else { return }
+            errors[sessionId] = "重新打开原 Chat 未确认：\(error.localizedDescription)"
+            webChatRecoveryNotesBySession[sessionId] = "当前操作未确认，保留历史；不会自动再次打开或发送消息。"
+        }
+    }
+
+    func manageOpenWebTab(_ tab: OpenWebTab, operation: String) async {
+        guard machine.state == .online, !isSuspended, ["close", "reload", "hardReload", "reopen"].contains(operation) else { return }
+        guard managingWebTabIds.insert(tab.id).inserted else { return }
+        defer { managingWebTabIds.remove(tab.id) }
+        guard !tab.busy else {
+            errors["web.tabs"] = "该 Chat 正在生成回复，不能关闭或刷新。"
+            return
+        }
+        do {
+            webTabDiagnosesById.removeValue(forKey: tab.id)
+            webTabActionNotesById[tab.id] = "正在执行操作，等待 Chrome 确认…"
+            try await transport.manageOpenWebTab(machineId: machine.id, tab: tab, operation: operation)
+            if operation == "close" {
+                explicitlyClosedWebTabIDs.insert(tab.id)
+                webTabActionNotesById[tab.id] = "Chrome 已接受关闭请求"
+            } else {
+                webTabActionNotesById[tab.id] = "Chrome 已接受页面操作；尚未验证加载完成"
+            }
+            await refreshOpenWebTabs()
+            if operation != "close" {
+                // A browser navigation acknowledgement is NOT health proof.
+                // Check only the selected page after a short settle period.
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                await inspectOpenWebTab(tab)
+            }
+        } catch {
+            errors["web.tabs"] = "网页操作未确认：\(error.localizedDescription)"
+            webTabActionNotesById[tab.id] = "操作未确认；不能判定页面已经刷新或关闭"
+            // Do not remove a tab from the UI on an unconfirmed browser action.
+        }
+    }
+
+    // Chat-level recovery never infers a target from the current Chrome window.
+    // A fresh, unique tab/session binding is required before any navigation.
+    func recoverWebChat(_ sessionId: String, operation: String) async {
+        guard machine.state == .online, !isSuspended else {
+            errors[sessionId] = "Windows 未连接，无法完成网页恢复；已保留本地历史。"
+            return
+        }
+        if operation == "resync" {
+            webChatRecoveryNotesBySession[sessionId] = "正在重新同步消息，不会刷新或停止电脑网页。"
+            await synchronizeVisibleSession(sessionId, force: true)
+            webChatRecoveryNotesBySession[sessionId] = "已请求同步；如仍缺少回复，请检查电脑端网页状态。"
+            return
+        }
+        guard ["inspect", "rebind", "reload", "hardReload"].contains(operation) else { return }
+        webChatRecoveryNotesBySession[sessionId] = "正在核验当前 Chat 的 Chrome 标签身份…"
+        await refreshOpenWebTabs()
+        guard !openWebTabsInventoryUnverified else {
+            errors[sessionId] = "无法验证当前 Chrome 标签身份，未执行网页操作。"
+            return
+        }
+        let candidates = openWebTabs.filter { $0.sessionId == sessionId && $0.isChat }
+        guard candidates.count == 1, let tab = candidates.first else {
+            if candidates.isEmpty {
+                // A historical Chat need not have an open desktop tab. This is not
+                // evidence of a broken identity or a failed message synchronization.
+                // Do not guess another tab from its title, Project, or Chrome focus.
+                errors[sessionId] = "此 Chat 当前没有已验证的打开标签；历史仍可查看和同步。未操作其他网页，也未自动新建标签。"
+            } else {
+                errors[sessionId] = "此 Chat 对应多个打开标签，无法安全确定操作目标。未操作任何网页，请先核对电脑端标签。"
+            }
+            webChatRecoveryNotesBySession[sessionId] = "网页身份尚未验证；不会操作其他 Chat。"
+            return
+        }
+        if operation == "rebind" {
+            if let destination = await enterOpenWebTab(tab),
+               case .chat(let verifiedSession) = destination,
+               verifiedSession.id == sessionId {
+                webChatRecoveryNotesBySession[sessionId] = "已验证并重新绑定原 Chat，正在同步历史与执行状态。"
+                await synchronizeVisibleSession(sessionId, force: true)
+            } else {
+                errors[sessionId] = "当前 Chrome 标签无法确认属于这个 Chat，未创建新标签或改变其他会话。"
+            }
+            return
+        }
+        if operation == "inspect" {
+            await inspectOpenWebTab(tab)
+            if let diagnosis = webTabDiagnosesById[tab.tabId] {
+                webChatRecoveryNotesBySession[sessionId] = "网页状态：\(diagnosis.state)" +
+                    (diagnosis.issueMessage.map { " · \($0)" } ?? "")
+            } else {
+                errors[sessionId] = errors["web.tabs"] ?? "当前网页状态无法验证。"
+            }
+            return
+        }
+        guard managingWebTabIds.insert(tab.id).inserted else {
+            errors[sessionId] = "当前网页已有操作正在执行；请等该操作返回后再处理。"
+            return
+        }
+        defer { managingWebTabIds.remove(tab.id) }
+        do {
+            webChatRecoveryNotesBySession[sessionId] = "已确认风险，正在刷新所选网页…"
+            try await transport.manageOpenWebTab(machineId: machine.id, tab: tab,
+                operation: operation, userConfirmedDisruptive: true)
+            // Browser navigation acceptance is not proof of page readiness.
+            webChatRecoveryNotesBySession[sessionId] = "已发起刷新，正在恢复原会话绑定和历史…"
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            await refreshOpenWebTabs()
+            await synchronizeVisibleSession(sessionId, force: true)
+            if let after = openWebTabs.first(where: { $0.tabId == tab.id && $0.sessionId == sessionId }) {
+                await inspectOpenWebTab(after)
+                let diagnosis = webTabDiagnosesById[tab.id]
+                webChatRecoveryNotesBySession[sessionId] = "已请求同步原 Chat · 网页状态：\(diagnosis?.state ?? "待确认")"
+            } else {
+                webChatRecoveryNotesBySession[sessionId] = "刷新后尚未验证原会话绑定；历史已保留，请重新检测。"
+            }
+        } catch {
+            errors[sessionId] = "当前网页刷新未确认：\(error.localizedDescription)；没有操作其他 Chat。"
+            webChatRecoveryNotesBySession[sessionId] = "网页操作未确认；保留本地历史，等待重新检测。"
+        }
+    }
+
+    private var hasActiveChatGPTWebRun: Bool {
+        sessions.contains { $0.instanceId == "web.chatgpt" && ($0.state == .busy || $0.state == .waiting) }
+            || liveRunStatusBySession.keys.contains { id in
+                sessions.contains { $0.id == id && $0.instanceId == "web.chatgpt" }
+            }
+    }
+
+    private func resumeDeferredWebProjectsRefreshIfIdle() {
+        guard webProjectsRefreshDeferredForActiveChat, !hasActiveChatGPTWebRun,
+              machine.state == .online, !isSuspended else { return }
+        // Reserve the deferred refresh synchronously. Several terminal/status
+        // callbacks can arrive before an asynchronous Task starts; without this
+        // reservation they each queue a refresh, and a later cache-first result
+        // can regress an already authoritative Project list back to stale.
+        // refreshWebProjects(force: false) will restore the deferred flag itself
+        // if another Chat begins before the scheduled read executes.
+        webProjectsRefreshDeferredForActiveChat = false
+        Task { @MainActor [weak self] in
+            await self?.refreshWebProjects(force: false)
+        }
+    }
+
     func refreshWebProjects(force: Bool = true) async {
         if refreshWebProjectsInFlight {
             refreshWebProjectsQueued = true
             return
         }
         if !force {
-            let webRunActive = sessions.contains { session in
-                session.projectAlias?.isEmpty == false && (session.state == .busy || session.state == .waiting)
-            } || liveRunStatusBySession.keys.contains { sessionId in
-                sessions.contains { $0.id == sessionId && $0.projectAlias?.isEmpty == false }
-            }
-            if webRunActive {
+            if hasActiveChatGPTWebRun {
+                // Yield to the active web page, but never silently forget the
+                // requested catalog refresh. A later terminal/session-status
+                // transition must recheck the cached Projects.
+                webProjectsRefreshDeferredForActiveChat = true
+                if webProjectsSnapshotState == .authoritativeLiveDOM {
+                    webProjectsSnapshotState = .staleCache
+                }
                 DiagnosticsLog.shared.record("projects_refresh_deferred_active_chat", fields: ["cachedCount": String(webProjects.count)])
                 return
             }
-            if let lastWebProjectsRefreshAt,
+            let wasDeferred = webProjectsRefreshDeferredForActiveChat
+            webProjectsRefreshDeferredForActiveChat = false
+            if !wasDeferred, let lastWebProjectsRefreshAt,
                Date().timeIntervalSince(lastWebProjectsRefreshAt) < Self.webProjectsAutomaticRefreshMinimumInterval,
                webProjectsSnapshotState == .authoritativeLiveDOM {
                 DiagnosticsLog.shared.record("projects_refresh_skipped_fresh", fields: ["cachedCount": String(webProjects.count)])
@@ -420,7 +818,10 @@ final class WorkspaceStore: ObservableObject {
                 // Preserve the prior coalescing contract: a request that arrived while
                 // discovery was in flight gets one authoritative rerun even if the first
                 // request just refreshed the TTL.
-                Task { @MainActor [weak self] in await self?.refreshWebProjects(force: true) }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.refreshWebProjects(force: !self.hasActiveChatGPTWebRun)
+                }
             }
         }
         let generation = lifecycleGeneration
@@ -1019,6 +1420,45 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    func deleteSession(runtime: RuntimeDescriptor, instance: InstanceDescriptor, session: SessionDescriptor) async -> Bool {
+        // Only provider-backed Antigravity deletion and native Codex archiving
+        // are supported. Web must not be silently unregistered as if deleted.
+        guard (runtime.kind == .antigravity || runtime.kind == .codex), session.instanceId == instance.id else { return false }
+        guard machine.state == .online else {
+            errors["instance.\(instance.id)"] = "PC Offline — cannot confirm upstream deletion."
+            return false
+        }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let activeMachineId = machine.id
+        let operationKey = "deleteSession.\(runtime.id).\(session.id)"
+        do {
+            let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
+            try await activeTransport.deleteSession(machineId: activeMachineId, runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id, commandId: commandId)
+            guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
+            await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
+            sessionRevisions[instance.id, default: 0] &+= 1
+            sessions.removeAll { $0.id == session.id }
+            messagesBySession.removeValue(forKey: session.id)
+            liveRunStatusBySession.removeValue(forKey: session.id)
+            await persistMetadata()
+            errors["instance.\(instance.id)"] = nil
+            return true
+        } catch {
+            if generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended {
+                if !isUnknownDelivery(error) { await finishPendingOperation(key: operationKey, machineId: activeMachineId) }
+                errors["instance.\(instance.id)"] = error.localizedDescription
+            }
+            return false
+        }
+    }
+
+    func loadMoreCodexSessions(runtime: RuntimeDescriptor, instance: InstanceDescriptor) async {
+        guard runtime.kind == .codex, !sessionRefreshes.contains(instance.id) else { return }
+        codexSessionLimits[instance.id] = min(5000, codexSessionLimits[instance.id, default: 100] + 100)
+        await refreshSessions(runtime: runtime, instance: instance)
+    }
+
     func refreshSessions(runtime: RuntimeDescriptor, instance: InstanceDescriptor) async {
         guard sessionRefreshes.insert(instance.id).inserted else { return }
         defer { sessionRefreshes.remove(instance.id) }
@@ -1026,11 +1466,33 @@ final class WorkspaceStore: ObservableObject {
         let revision = sessionRevisions[instance.id, default: 0]
         guard machine.state == .online else { return }
         do {
-            let remote = try await transport.listSessions(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id)
+            let limit = runtime.kind == .codex ? codexSessionLimits[instance.id, default: 100] : nil
+            let remote = try await transport.listSessions(machineId: machine.id, runtimeId: runtime.id, instanceId: instance.id, limit: limit)
             guard generation == lifecycleGeneration, revision == sessionRevisions[instance.id, default: 0], machine.state == .online, !isSuspended else { return }
-            sessions.removeAll { $0.instanceId == instance.id }
-            sessions.append(contentsOf: remote)
-            sortSessionsCanonical()
+            if let limit { codexSessionsMayHaveMore[instance.id] = remote.count >= limit && limit < 5000 }
+            // An unchanged authoritative catalog must not invalidate every Chat row,
+            // disturb scroll position, or write the same SQLite metadata again.
+            // Keep the existing event revision guard above: a stale list response
+            // must never overwrite a newer session created by a live event.
+            let currentRows = sessions.filter { $0.instanceId == instance.id }
+            let currentById = Dictionary(uniqueKeysWithValues: currentRows.map { ($0.id, $0) })
+            let remoteRows = remote.map { row in
+                var updated = row
+                if let current = currentById[row.id],
+                   let known = current.backgroundTaskStatus,
+                   known.observedAt >= (row.backgroundTaskStatus?.observedAt ?? .distantPast) {
+                    updated.backgroundTaskStatus = known
+                    updated.backgroundTaskStatusReceivedAt = current.backgroundTaskStatusReceivedAt
+                }
+                return updated
+            }.sorted(by: Self.sessionOrdersBefore)
+            let catalogChanged = currentRows != remoteRows
+            if catalogChanged {
+                var merged = sessions.filter { $0.instanceId != instance.id }
+                merged.append(contentsOf: remoteRows)
+                merged.sort(by: Self.sessionOrdersBefore)
+                sessions = merged
+            }
 
             // listSessions carries durable Agent-side Project identity and titles.
             // Repair safe metadata in already-loaded rows without reordering them.
@@ -1043,14 +1505,15 @@ final class WorkspaceStore: ObservableObject {
                     key: "web.project.\(alias).conversations"
                 )
             }
-            await persistMetadata()
-            errors["instance.\(instance.id)"] = nil
+            if catalogChanged || !reconciledProjects.isEmpty { await persistMetadata() }
+            if errors["instance.\(instance.id)"] != nil { errors["instance.\(instance.id)"] = nil }
+            if instance.id == "web.chatgpt" { resumeDeferredWebProjectsRefreshIfIdle() }
         } catch {
             if generation == lifecycleGeneration, !isSuspended { errors["instance.\(instance.id)"] = error.localizedDescription }
         }
     }
 
-    func loadSession(_ sessionId: String) async {
+    func loadSession(_ sessionId: String, remoteRevision: Date? = nil) async {
         guard sessionLoads.insert(sessionId).inserted else { return }
         defer { sessionLoads.remove(sessionId) }
         let generation = lifecycleGeneration
@@ -1128,6 +1591,10 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.upsertMessages(authoritativeItems)
             merge(authoritativeItems, into: sessionId)
             if route.runtimeId == "runtime.web" {
+                // A verified history page is sufficient to clean legacy visual
+                // transcript artifacts. This load path has no status snapshot;
+                // provider issue observations are reconciled separately by
+                // refreshVisibleSessionStatus, not invented from this history read.
                 await collapseWebTranscriptArtifacts(sessionId: sessionId)
                 // A successful authoritative history read proves that this exact web
                 // conversation is available again, even if the WEB_BINDING_CHANGED
@@ -1156,6 +1623,11 @@ final class WorkspaceStore: ObservableObject {
             // this visible conversation. Periodic status probes must not immediately
             // reload the same long transcript again unless later evidence invalidates it.
             visibleSessionHistorySyncAt[sessionId] = Date()
+            if let remoteRevision {
+                // This is a remote revision token, not a wall-clock freshness comparison.
+                // Advance it only after loadRecent succeeded so failures remain retryable.
+                visibleSessionHistoryRemoteRevision[sessionId] = remoteRevision
+            }
         } catch {
             guard generation == lifecycleGeneration, !isSuspended else { return }
             let hasUsableLocalHistory = !messagesBySession[sessionId, default: []].isEmpty
@@ -1197,6 +1669,21 @@ final class WorkspaceStore: ObservableObject {
             if let index = sessions.firstIndex(where: { $0.id == sessionId }) {
                 let current = sessions[index]
                 var updated = current
+                if let receivedBackgroundTaskStatus = snapshot.backgroundTaskStatus {
+                    if current.backgroundTaskStatus == nil
+                        || receivedBackgroundTaskStatus.observedAt > (current.backgroundTaskStatus?.observedAt ?? .distantPast) {
+                        updated.backgroundTaskStatus = receivedBackgroundTaskStatus
+                        updated.backgroundTaskStatusReceivedAt = Date()
+                    }
+                } else if (current.instanceId == "antigravity.desktop" || current.backgroundTaskStatus != nil),
+                          requestStartedAt >= (current.backgroundTaskStatusReceivedAt ?? .distantPast) {
+                    updated.backgroundTaskStatus = BackgroundTaskStatusSnapshot(
+                        state: .unavailable,
+                        observedAt: current.backgroundTaskStatus?.observedAt ?? .distantPast,
+                        error: "后台任务状态未提供"
+                    )
+                    updated.backgroundTaskStatusReceivedAt = Date()
+                }
                 if !staleIdleSnapshot {
                     updated.state = snapshot.state
                     updated.lastProgressStatus = snapshot.lastProgressStatus
@@ -1267,16 +1754,38 @@ final class WorkspaceStore: ObservableObject {
                 // poll carries the same providerSurfaceIssue metadata so a phone that
                 // was backgrounded or briefly disconnected still converges to the real
                 // ChatGPT page state after reconnect.
-                applyWebProviderSurfaceIssue(sessionId: sessionId, issue: snapshot.providerSurfaceIssue)
+                applyWebProviderSurfaceIssue(
+                    sessionId: sessionId,
+                    issue: snapshot.providerSurfaceIssue,
+                    surfaceState: snapshot.providerSurfaceState
+                        ?? "degraded",
+                    statusObservedAt: snapshot.providerSurfaceObservedAt ?? snapshot.providerSurfaceIssue?.at,
+                    requestStartedAt: requestStartedAt
+                )
             }
             return snapshot
         } catch let error as TransportError where error == .disconnected || error == .timeout || error == .offline {
+            markBackgroundTaskStatusUnavailable(sessionId, requestStartedAt: requestStartedAt)
             DiagnosticsLog.shared.record("session_status_deferred", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
             return nil
         } catch {
+            markBackgroundTaskStatusUnavailable(sessionId, requestStartedAt: requestStartedAt)
             DiagnosticsLog.shared.record("session_status_failed", fields: Self.diagnosticFields(for: error, adding: ["session": sessionId]), level: "WARN")
             return nil
         }
+    }
+
+    private func markBackgroundTaskStatusUnavailable(_ sessionId: String, requestStartedAt: Date) {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        let currentSession = sessions[index]
+        guard currentSession.instanceId == "antigravity.desktop" || currentSession.backgroundTaskStatus != nil else { return }
+        guard requestStartedAt >= (currentSession.backgroundTaskStatusReceivedAt ?? .distantPast) else { return }
+        sessions[index].backgroundTaskStatus = BackgroundTaskStatusSnapshot(
+            state: .unavailable,
+            observedAt: currentSession.backgroundTaskStatus?.observedAt ?? .distantPast,
+            error: "后台任务状态暂不可用"
+        )
+        sessions[index].backgroundTaskStatusReceivedAt = Date()
     }
 
     /// Catch up a conversation that is currently visible on the phone. Websocket push
@@ -1326,17 +1835,21 @@ final class WorkspaceStore: ObservableObject {
         let remoteStatus = await refreshVisibleSessionStatus(sessionId, rejectEvidencePoorIdle: recoveredLiveActivityDuringSync)
         guard machine.state == .online, !isSuspended else { return }
 
+        let terminalTransition = active
+            && remoteStatus.map { $0.state == .idle || $0.state == .error } == true
         let stillActive = remoteStatus.map { $0.state == .busy || $0.state == .waiting } ?? active
         let remoteEvidenceAt = remoteStatus.flatMap { snapshot in
             [snapshot.lastProgressAt, snapshot.lastActivityAt].compactMap { $0 }.max()
         }
-        let terminalTransition = active
-            && remoteStatus.map { $0.state == .idle || $0.state == .error } == true
-        let missedTerminalActivity = !stillActive
+        // Older Agents omit updatedAt. Keep their existing terminal evidence as a
+        // fallback so a newer final/activity timestamp can still recover history.
+        // Current Agents use the exact remote revision path below and never compare
+        // that server timestamp with the phone's catalog Date.
+        let missedTerminalActivity = remoteStatus?.updatedAt == nil
+            && !stillActive
             && remoteEvidenceAt.map { remoteAt in
                 knownActivityBeforeStatus.map { remoteAt > $0 } ?? true
             } == true
-
         // Full history/DOM reconciliation is intentionally evidence-driven. Re-reading
         // and re-merging the latest 50 messages on a fixed 10/30-second timer makes long
         // contexts stutter even though push/cursor state is healthy. Reload only when:
@@ -1344,13 +1857,43 @@ final class WorkspaceStore: ObservableObject {
         // - the prior authoritative history watermark was invalidated (for example a
         //   large cursor fast-forward clears it),
         // - an active run became terminal, so a missed final must be recovered, or
-        // - terminal status proves newer remote activity than the phone has observed.
-        let historyDue = force
-            || visibleSessionHistorySyncAt[sessionId] == nil
-            || terminalTransition
-            || missedTerminalActivity
+        // - status reports a different remote session revision than the last successful
+        //   history read, including an ordinary idle catalog/message update.
+        // updatedAt is a server revision token. The decision compares exact equality
+        // with the revision last covered by a successful loadRecent; the phone and PC
+        // clocks may be skewed, so their Date values are never ordered here.
+        // An active Web chat can report a successful EMPTY history page before the
+        // provider-identified older turns have reached the Agent. Without a bounded
+        // retry this success watermark suppresses recovery until leaving/re-entering.
+        let transcriptCount = messagesBySession[sessionId, default: []]
+            .filter { $0.role == .user || $0.role == .assistant }.count
+        if !stillActive || transcriptCount > 1 || force {
+            sparseWebHistoryRetryAt.removeValue(forKey: sessionId)
+            sparseWebHistoryRetryCounts.removeValue(forKey: sessionId)
+        }
+        let sparseRetry = Self.sparseWebHistoryRetryDue(
+            isWeb: routeForSession(sessionId)?.runtimeId == "runtime.web",
+            isActive: stillActive,
+            transcriptCount: transcriptCount,
+            lastSuccessfulHistoryAt: visibleSessionHistorySyncAt[sessionId],
+            lastRetryAt: sparseWebHistoryRetryAt[sessionId],
+            retryCount: sparseWebHistoryRetryCounts[sessionId] ?? 0,
+            now: Date()
+        )
+        let historyDue = Self.visibleHistoryReloadDue(
+            force: force,
+            hasSuccessfulHistory: visibleSessionHistorySyncAt[sessionId] != nil,
+            terminalTransition: terminalTransition,
+            remoteStatusIsTerminal: remoteStatus.map { $0.state == .idle || $0.state == .error } ?? false,
+            remoteRevision: remoteStatus?.updatedAt,
+            lastSuccessfulRemoteRevision: visibleSessionHistoryRemoteRevision[sessionId]
+        ) || missedTerminalActivity || sparseRetry
         if historyDue {
-            await loadSession(sessionId)
+            if sparseRetry {
+                sparseWebHistoryRetryAt[sessionId] = Date()
+                sparseWebHistoryRetryCounts[sessionId, default: 0] += 1
+            }
+            await loadSession(sessionId, remoteRevision: remoteStatus?.updatedAt)
         }
     }
 
@@ -1448,9 +1991,14 @@ final class WorkspaceStore: ObservableObject {
     }
 
     @discardableResult
-    func send(text: String, runtimeId: String, instanceId: String, sessionId: String, attachments: [PendingAttachment] = [], model: String = "", commandId: UUID = UUID()) async -> Bool {
+    func send(text: String, runtimeId: String, instanceId: String, sessionId: String, attachments: [PendingAttachment] = [], model: String = "", reasoningEffort: String = "", commandId: UUID = UUID()) async -> Bool {
         guard commandSendsInFlight.insert(commandId).inserted else { return false }
         defer { commandSendsInFlight.remove(commandId) }
+        guard sessionSendsInFlight.insert(sessionId).inserted else {
+            DiagnosticsLog.shared.record("duplicate_send_in_flight_suppressed", fields: ["runtime": runtimeId, "session": sessionId])
+            return false
+        }
+        defer { sessionSendsInFlight.remove(sessionId) }
         let generation = lifecycleGeneration
         let sendStartedAt = Date()
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1551,6 +2099,7 @@ final class WorkspaceStore: ObservableObject {
 
             var payload: [String: JSONValue] = ["text": .string(trimmed)]
             if !model.isEmpty { payload["model"] = .string(model) }
+            if runtimeId == "runtime.codex", !reasoningEffort.isEmpty { payload["reasoningEffort"] = .string(reasoningEffort) }
             if !remoteAttachments.isEmpty { payload["attachmentIds"] = .array(remoteAttachments.map { .string($0.attachmentId) }) }
             let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "sendMessage", payload: payload, commandId: commandId)
             try? await cache.put(command, key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
@@ -1651,12 +2200,12 @@ final class WorkspaceStore: ObservableObject {
             DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "persisted": String(messageCommandPersisted)]), level: "WARN")
             return false
         } catch let error as TransportError {
-            if case .remote(let code, _) = error, code == "WEB_SEND_DELIVERY_UNKNOWN" {
+            if Self.isUnknownWebSendOutcome(error, runtimeId: runtimeId) {
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
                 attachmentTransferBySession.removeValue(forKey: sessionId)
                 commandStates[commandId] = .unknown
                 errors[sessionId] = "Delivery is unknown after the ChatGPT page changed. Retry replays the exact same command ID; RemoteAI will reconcile before any duplicate is allowed."
-                DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString, "remoteCode": code]), level: "WARN")
+                DiagnosticsLog.shared.record("send_unknown_delivery", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString]), level: "WARN")
                 // Unknown delivery must never be resolved by blindly sending again. First
                 // perform bounded read-only reconciliation: if the provider user turn is
                 // already visible, loadSession matches it to the persisted command payload
@@ -1810,18 +2359,52 @@ final class WorkspaceStore: ObservableObject {
         let generation = lifecycleGeneration
         let activeTransport = transport
         let activeMachineId = machine.id
+        stopRequestsPending.insert(sessionId)
+        defer { stopRequestsPending.remove(sessionId) }
         let operationKey = "stop.\(runtimeId).\(instanceId).\(sessionId)"
         let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
         guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
         let command = RemoteCommand.make(machineId: activeMachineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "stopGeneration", commandId: commandId)
         commandStates[command.commandId] = .pending
         do {
-            let state = try await activeTransport.send(command)
+            let receipt = try await activeTransport.requestStop(command)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
-            commandStates[command.commandId] = state
+            // Receiving COMMAND_RESULT does not establish a terminal run state.
+            // In particular, settled=false and stale-generation are not success.
+            commandStates[command.commandId] = receipt.confirmed ? .completed : .acknowledged
+            if !receipt.confirmed {
+                // A definitive nonterminal reply is complete for this command.
+                // Release its idempotency key so the next *user-initiated* Stop
+                // can probe the current generation instead of replaying this
+                // same acknowledged-but-unconfirmed response forever.
+                // Transport-unknown delivery still retains its key in catch.
+                await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
+                errors[sessionId] = receipt.staleGeneration
+                    ? "停止请求对应的生成已变化；没有停止新的生成。请核对当前网页状态。"
+                    : "停止请求已送达，但执行端尚未确认停止。当前仍显示运行中；请检测网页状态后再操作。"
+                DiagnosticsLog.shared.record("stop_unconfirmed", fields: [
+                    "commandId": commandId.uuidString,
+                    "session": sessionId,
+                    "stopped": String(receipt.stopped),
+                    "settled": String(receipt.settled),
+                    "staleGeneration": String(receipt.staleGeneration),
+                ], level: "WARN")
+                return false
+            }
             await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
+            // A verified Stop is also an authoritative terminal recovery when
+            // GENERATION_STOPPED was lost across Relay. Clear BOTH the session
+            // state and the live-status marker or the UI continues to say Running.
+            if runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
             setSessionState(sessionId, .idle)
+            liveRunStatusBySession.removeValue(forKey: sessionId)
+            clearLiveRunActivity(sessionId: sessionId)
             errors[sessionId] = nil
+            DiagnosticsLog.shared.record("stop_confirmed", fields: [
+                "commandId": commandId.uuidString,
+                "session": sessionId,
+                "runtime": runtimeId,
+            ])
             return true
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
@@ -1836,7 +2419,10 @@ final class WorkspaceStore: ObservableObject {
         runtime: RuntimeDescriptor,
         instance: InstanceDescriptor,
         title: String,
-        model: String = ""
+        model: String = "",
+        reasoningEffort: String = "",
+        projectAlias: String? = nil,
+        codexProjectPath: String? = nil
     ) async -> Bool {
         guard creatingSessions.insert(instance.id).inserted else { return false }
         defer { creatingSessions.remove(instance.id) }
@@ -1848,6 +2434,18 @@ final class WorkspaceStore: ObservableObject {
         if (runtime.kind == .codex || runtime.kind == .antigravity), !model.isEmpty {
             payload["model"] = .string(model)
         }
+        if runtime.kind == .antigravity, let projectAlias, !projectAlias.isEmpty {
+            payload["projectAlias"] = .string(projectAlias)
+        }
+        if runtime.kind == .codex {
+            if !reasoningEffort.isEmpty { payload["reasoningEffort"] = .string(reasoningEffort) }
+            // Explicitly use the existing CLI executor. Codex Desktop cannot
+            // create an owner-bound native Thread through its follower IPC.
+            payload["createMode"] = .string("cli")
+            if let codexProjectPath, !codexProjectPath.isEmpty {
+                payload["projectPath"] = .string(codexProjectPath)
+            }
+        }
         guard machine.state == .online else {
             errors[instance.id] = "PC Offline — new sessions are not queued automatically."
             return false
@@ -1855,7 +2453,7 @@ final class WorkspaceStore: ObservableObject {
         let activeTransport = transport
         let activeMachineId = machine.id
         sessionRevisions[instance.id, default: 0] &+= 1
-        let operationKey = "createSession.\(runtime.id).\(instance.id).\(effectiveTitle).\(model)"
+        let operationKey = "createSession.\(runtime.id).\(instance.id).\(effectiveTitle).\(model).\(reasoningEffort).\(projectAlias ?? codexProjectPath ?? "")"
         do {
             let commandId = await pendingOperationCommandId(key: operationKey, machineId: activeMachineId)
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
@@ -1879,11 +2477,11 @@ final class WorkspaceStore: ObservableObject {
                 return true
             } else {
                 guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return false }
-                await finishPendingOperation(key: operationKey, machineId: activeMachineId, expectedCommandId: commandId)
-                sessionRevisions[instance.id, default: 0] &+= 1
-                await refreshMetadata()
-                errors[instance.id] = nil
-                return true
+                // The command may have reached Windows even if the transport
+                // cannot decode a Session. Do not claim success or discard the
+                // original idempotency key; an explicit retry must reuse it.
+                errors[instance.id] = "Chat creation outcome is unverified. No Chat identity returned; Retry uses the original command ID."
+                return false
             }
         } catch {
             if generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended {
@@ -1944,8 +2542,11 @@ final class WorkspaceStore: ObservableObject {
         liveRunStatusBySession.removeAll()
         terminalWebRuns.removeAll()
         liveRunActivityAtBySession.removeAll()
-        webProviderIssueMessageBySession.removeAll()
-        webProviderIssueStateBySession.removeAll()
+        webProviderIssuesBySession.removeAll()
+        webProviderSurfaceStateBySession.removeAll()
+        webProviderSurfaceObservedAtBySession.removeAll()
+        webProviderRecoveryObservedAtBySession.removeAll()
+        webProviderStatusReceivedAtBySession.removeAll()
         webBindingDetachedSessions.removeAll()
         webProjectsSnapshotId = nil
         projectConversationSnapshotIds.removeAll()
@@ -2027,10 +2628,24 @@ final class WorkspaceStore: ObservableObject {
         try? await cache.remove(key: cacheKey)
     }
 
+    private static func isUnknownWebSendOutcome(_ error: TransportError, runtimeId: String) -> Bool {
+        guard case .remote(let code, let message) = error else { return false }
+        if code == "WEB_SEND_DELIVERY_UNKNOWN" { return true }
+        // Compatibility with the running pre-fix Windows Agent. Its Chrome async
+        // listener can close after the provider accepted Send. The exact Chrome
+        // signature is ambiguous, so read-only history reconciliation must win
+        // over treating it as a definite failure or automatically replaying Send.
+        guard runtimeId == "runtime.web", code == "WEB_SELECTOR_FAILED" else { return false }
+        return message.range(of: "A listener indicated an asynchronous response by returning true", options: .caseInsensitive) != nil
+            && message.range(of: "message channel closed before a response was received", options: .caseInsensitive) != nil
+    }
+
     private func isUnknownDelivery(_ error: Error) -> Bool {
         guard let transportError = error as? TransportError else { return false }
         if transportError == .disconnected || transportError == .timeout { return true }
-        if case .remote(let code, _) = transportError { return code == "WEB_SEND_DELIVERY_UNKNOWN" }
+        if case .remote(let code, _) = transportError {
+            return code == "WEB_SEND_DELIVERY_UNKNOWN" || code == "CREATE_SESSION_RESULT_UNVERIFIED"
+        }
         return false
     }
 
@@ -2197,17 +2812,23 @@ final class WorkspaceStore: ObservableObject {
         do {
             let rows = try await transport.listInstances(machineId: machine.id, runtimeId: runtime.id)
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
-            instances.removeAll { $0.runtimeId == runtime.id }
-            instances.append(contentsOf: rows)
-            instances.sort { lhs, rhs in
+            let orderInstances: (InstanceDescriptor, InstanceDescriptor) -> Bool = { lhs, rhs in
                 if lhs.runtimeId == rhs.runtimeId { return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending }
                 return lhs.runtimeId < rhs.runtimeId
+            }
+            let currentRows = instances.filter { $0.runtimeId == runtime.id }
+            let remoteRows = rows.sorted(by: orderInstances)
+            if currentRows != remoteRows {
+                var merged = instances.filter { $0.runtimeId != runtime.id }
+                merged.append(contentsOf: remoteRows)
+                merged.sort(by: orderInstances)
+                instances = merged
+                await persistMetadata()
             }
             // Instance discovery stays cheap. Session history is loaded only after the
             // user opens one instance, otherwise Codex1...Codex11 would all scan their
             // JSONL stores just to render this list.
-            errors["runtime.\(runtime.id)"] = nil
-            await persistMetadata()
+            if errors["runtime.\(runtime.id)"] != nil { errors["runtime.\(runtime.id)"] = nil }
         } catch {
             if generation == lifecycleGeneration, !isSuspended { errors["runtime.\(runtime.id)"] = error.localizedDescription }
         }
@@ -2239,12 +2860,14 @@ final class WorkspaceStore: ObservableObject {
         do {
             let remoteRuntimes = try await transport.listRuntimes(machineId: machine.id)
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
-            if !remoteRuntimes.isEmpty { runtimes = remoteRuntimes }
+            if !remoteRuntimes.isEmpty, runtimes != remoteRuntimes {
+                runtimes = remoteRuntimes
+                await persistMetadata()
+            }
             // Runtime instance discovery is intentionally lazy. Each RuntimeView
             // refreshes only the selected runtime, which keeps app launch and
             // reconnects from scanning every Codex workspace.
-            errors["sync"] = nil
-            await persistMetadata()
+            if errors["sync"] != nil { errors["sync"] = nil }
         } catch {
             if generation == lifecycleGeneration, !isSuspended { errors["sync"] = error.localizedDescription }
         }
@@ -3003,6 +3626,10 @@ final class WorkspaceStore: ObservableObject {
         }
         tracker.advanceMonotonically(to: event.sequence)
         await applyEvent(event)
+        if let sessionId = event.sessionId,
+           ["MESSAGE_ADDED", "MESSAGE_UPDATED", "MESSAGE_REMOVED", "SESSION_DELETED"].contains(event.type) {
+            releaseRecoveryDisplaySnapshot(for: sessionId)
+        }
         try? await cache.setLastSequence(event.sequence)
     }
 
@@ -3064,6 +3691,7 @@ final class WorkspaceStore: ObservableObject {
             return
         }
         deltaRecoveryInFlight = true
+        recoveryLivePresentationSessions.removeAll()
         let generation = lifecycleGeneration
         defer {
             deltaRecoveryInFlight = false
@@ -3079,6 +3707,7 @@ final class WorkspaceStore: ObservableObject {
                 if deltaRecoveryDisplayMessagesBySession != nil {
                     deltaRecoveryDisplayMessagesBySession = nil
                 }
+                recoveryLivePresentationSessions.removeAll()
                 if authoritativeResyncAfterDelta,
                    generation == lifecycleGeneration,
                    machine.state == .online,
@@ -3136,6 +3765,7 @@ final class WorkspaceStore: ObservableObject {
                     authoritativeResyncProjectAliases.formUnion(projectConversationsByAlias.keys)
                     visibleSessionSyncAt.removeAll()
                     visibleSessionHistorySyncAt.removeAll()
+                    visibleSessionHistoryRemoteRevision.removeAll()
                     metadataRefreshDeferredForDelta = true
                     DiagnosticsLog.shared.record("delta_recovery_fast_forward", fields: [
                         "cursor": String(previousCursor),
@@ -3173,10 +3803,10 @@ final class WorkspaceStore: ObservableObject {
                     // loaded on the phone even though a delta burst usually belongs to
                     // one active conversation.
                     let affectedSessionIds = Set(result.events.compactMap { $0.sessionId })
-                    if !affectedSessionIds.isEmpty {
+                    if coalesceHistoricalPresentation && !affectedSessionIds.isEmpty {
                         var displaySnapshot = deltaRecoveryDisplayMessagesBySession ?? [:]
                         var snapshotChanged = deltaRecoveryDisplayMessagesBySession == nil
-                        for sessionId in affectedSessionIds where displaySnapshot[sessionId] == nil {
+                        for sessionId in affectedSessionIds where displaySnapshot[sessionId] == nil && !recoveryLivePresentationSessions.contains(sessionId) {
                             displaySnapshot[sessionId] = messagesBySession[sessionId, default: []]
                             snapshotChanged = true
                         }
@@ -3225,12 +3855,12 @@ final class WorkspaceStore: ObservableObject {
                         if suppressEventPresentation {
                             switch event.type {
                             case "GENERATION_STARTED":
-                                coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                                coalescedSessionPresentation[sessionId] = (true, generationStartedLabel(runtimeId: event.runtimeId), event.createdAt)
                             case "MESSAGE_UPDATED" where event.payload["partial"]?.boolValue != false:
                                 coalescedSessionPresentation[sessionId] = (true, "正在生成回答…", event.createdAt)
                             case "TOOL_STARTED", "TOOL_FINISHED":
                                 if coalescedSessionPresentation[sessionId]?.active != false {
-                                    coalescedSessionPresentation[sessionId] = (true, "ChatGPT 正在处理…", event.createdAt)
+                                    coalescedSessionPresentation[sessionId] = (true, generationStartedLabel(runtimeId: event.runtimeId), event.createdAt)
                                 }
                             case "MESSAGE_ADDED" where event.payload["role"]?.stringValue == "assistant":
                                 coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
@@ -3251,6 +3881,11 @@ final class WorkspaceStore: ObservableObject {
                     // the only authority allowed to mutate current transport presentation.
                     if event.type != "TRANSPORT_STATUS" {
                         await applyEvent(event, suppressTransientPresentation: suppressEventPresentation)
+                        if !suppressEventPresentation,
+                           let sessionId = event.sessionId,
+                           ["MESSAGE_ADDED", "MESSAGE_UPDATED", "MESSAGE_REMOVED", "SESSION_DELETED"].contains(event.type) {
+                            releaseRecoveryDisplaySnapshot(for: sessionId)
+                        }
                     }
                     cursor = event.sequence
                     try? await cache.setLastSequence(cursor)
@@ -3311,6 +3946,17 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    private func releaseRecoveryDisplaySnapshot(for sessionId: String) {
+        guard deltaRecoveryInFlight else { return }
+        recoveryLivePresentationSessions.insert(sessionId)
+        // The canonical messagesBySession has already been updated by applyEvent.
+        // Leaving the earlier copy here hides a real reply until every other
+        // session's historical delta pages have completed.
+        if deltaRecoveryDisplayMessagesBySession?[sessionId] != nil {
+            deltaRecoveryDisplayMessagesBySession?.removeValue(forKey: sessionId)
+        }
+    }
+
     private func applyEvent(_ event: RemoteEvent, suppressTransientPresentation: Bool = false) async {
         if event.type == "TRANSPORT_STATUS" {
             // Historical delta recovery can contain many old Relay/Browser status
@@ -3328,7 +3974,7 @@ final class WorkspaceStore: ObservableObject {
 
         let runEventTypes = ["MESSAGE_UPDATED", "MESSAGE_ADDED", "TOOL_STARTED", "TOOL_FINISHED", "GENERATION_STARTED", "GENERATION_STOPPED"]
         let sessionCatalogMutatingEventTypes = Set(runEventTypes + [
-            "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS",
+            "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "SESSION_DELETED",
             "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED", "WEB_BINDING_CHANGED", "MESSAGE_REMOVED",
         ])
         if sessionCatalogMutatingEventTypes.contains(event.type) {
@@ -3386,6 +4032,11 @@ final class WorkspaceStore: ObservableObject {
         }
 
         switch event.type {
+        case "SESSION_DELETED":
+            sessions.removeAll { $0.id == sessionId }
+            messagesBySession.removeValue(forKey: sessionId)
+            liveRunStatusBySession.removeValue(forKey: sessionId)
+            await persistMetadata()
         case "MESSAGE_REMOVED":
             if let messageID = event.payload["messageId"]?.stringValue {
                 messagesBySession[sessionId]?.removeAll { $0.id == messageID }
@@ -3578,7 +4229,7 @@ final class WorkspaceStore: ObservableObject {
             if suppressTransientPresentation { return }
             markLiveRunActivity(sessionId: sessionId, at: event.createdAt)
             setSessionState(sessionId, .busy)
-            liveRunStatusBySession[sessionId] = "ChatGPT 正在处理…"
+            liveRunStatusBySession[sessionId] = generationStartedLabel(runtimeId: event.runtimeId)
             DiagnosticsLog.shared.record("generation_state_applied", fields: [
                 "state": SessionState.busy.rawValue,
                 "sequence": String(event.sequence),
@@ -3586,28 +4237,51 @@ final class WorkspaceStore: ObservableObject {
         case "GENERATION_STOPPED":
             if event.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
             if event.payload["ok"]?.boolValue == false {
-                // A provider can terminate a Web generation after exposing only a DOM
-                // prefix (for example when ChatGPT shows a strong rate-limit banner).
-                // That prefix is transient UI state, not a durable assistant reply.
-                // Remove any already-flushed Streaming bubble instead of promoting it
-                // to final content when the terminal event explicitly reports failure.
-                discardStreamingPlaceholder(sessionId: sessionId)
-                await settleRunningToolRows(sessionId: sessionId)
-                setSessionState(sessionId, .error)
+                let outcome = generationTerminalOutcome(for: event.payload)
+                let isAntigravity = event.runtimeId == "runtime.antigravity"
+                if outcome == .failed && !isAntigravity {
+                    // Web DOM prefixes are transient and do not represent a durable reply.
+                    // Antigravity publishes partial output as a durable MESSAGE_ADDED event.
+                    discardStreamingPlaceholder(sessionId: sessionId)
+                } else {
+                    await preservePartialAssistantOutput(sessionId: sessionId)
+                }
+                await settleRunningToolRows(sessionId: sessionId, status: "Interrupted")
+                let state: SessionState
+                switch outcome {
+                case .canceled, .interrupted:
+                    state = .idle
+                case .unknown:
+                    state = .unknown
+                case .failed:
+                    state = .error
+                }
+                setSessionState(sessionId, state)
                 DiagnosticsLog.shared.record("generation_state_applied", fields: [
-                    "state": SessionState.error.rawValue,
+                    "state": state.rawValue,
                     "sequence": String(event.sequence),
                 ])
                 liveRunStatusBySession.removeValue(forKey: sessionId)
                 clearLiveRunActivity(sessionId: sessionId)
-                let code = event.payload["errorCode"]?.stringValue ?? "PROVIDER_UNAVAILABLE"
+                let code = event.payload["errorCode"]?.stringValue ?? "GENERATION_FAILED"
                 let message = event.payload["errorMessage"]?.stringValue
                 if let message, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     errors[sessionId] = message
-                } else if code == "PROVIDER_RATE_LIMITED" {
-                    errors[sessionId] = "ChatGPT 请求过快，当前会话已被临时限流。本次回答未完成，RemoteAI 没有保存截断内容，请稍后重试。"
                 } else {
-                    errors[sessionId] = "ChatGPT 本次生成未完成（\(code)）。RemoteAI 没有保存截断回答。"
+                    switch outcome {
+                    case .canceled:
+                        errors[sessionId] = "生成已取消；已保留当前可见的部分输出。"
+                    case .interrupted:
+                        errors[sessionId] = "生成已中断；已保留当前可见的部分输出，请核对原会话后再重试。"
+                    case .unknown:
+                        errors[sessionId] = "生成结果未知；已保留当前可见的部分输出，请核对原会话后再重试。"
+                    case .failed:
+                        if code == "PROVIDER_RATE_LIMITED" {
+                            errors[sessionId] = "ChatGPT 请求过快，当前会话已被临时限流。本次回答未完成，RemoteAI 没有保存截断内容，请稍后重试。"
+                        } else {
+                            errors[sessionId] = "本次生成未完成（\(code)）。请核对原会话后再重试。"
+                        }
+                    }
                 }
             } else {
                 flushStreaming(sessionId: sessionId)
@@ -3625,12 +4299,38 @@ final class WorkspaceStore: ObservableObject {
                 let degraded = event.payload["state"]?.stringValue == "degraded"
                 let issue: RemoteProviderSurfaceIssue? = degraded ? RemoteProviderSurfaceIssue(
                     code: event.payload["code"]?.stringValue ?? "PROVIDER_UNAVAILABLE",
-                    state: event.payload["providerState"]?.stringValue ?? "degraded",
+                    state: event.payload["issueState"]?.stringValue ?? event.payload["providerState"]?.stringValue ?? "degraded",
                     message: event.payload["message"]?.stringValue ?? "ChatGPT 网页当前不可用，RemoteAI 正在等待恢复。",
                     retryable: event.payload["retryable"]?.boolValue == true,
-                    at: event.payload["at"]?.stringValue.flatMap(RemoteAIDate.parse)
+                    at: event.payload["at"]?.stringValue.flatMap(RemoteAIDate.parse),
+                    originalMessage: event.payload["originalMessage"]?.stringValue
                 ) : nil
-                applyWebProviderSurfaceIssue(sessionId: sessionId, issue: issue)
+                let surfaceState = event.payload["state"]?.stringValue ?? "unknown"
+                let eventIssue: RemoteProviderSurfaceIssue?
+                if degraded {
+                    eventIssue = issue
+                } else if surfaceState == "unknown",
+                          let code = event.payload["code"]?.stringValue,
+                          let message = event.payload["message"]?.stringValue {
+                    eventIssue = RemoteProviderSurfaceIssue(
+                        code: code,
+                        state: event.payload["issueState"]?.stringValue ?? event.payload["providerState"]?.stringValue ?? "degraded",
+                        message: message,
+                        retryable: event.payload["retryable"]?.boolValue == true,
+                        at: event.payload["at"]?.stringValue.flatMap(RemoteAIDate.parse),
+                        originalMessage: event.payload["originalMessage"]?.stringValue
+                    )
+                } else {
+                    eventIssue = nil
+                }
+                applyWebProviderSurfaceIssue(
+                    sessionId: sessionId,
+                    issue: eventIssue,
+                    surfaceState: surfaceState,
+                    statusObservedAt: event.payload["statusObservedAt"]?.stringValue.flatMap(RemoteAIDate.parse)
+                        ?? event.payload["at"]?.stringValue.flatMap(RemoteAIDate.parse)
+                        ?? event.createdAt
+                )
                 return
             }
             await requestMetadataRefresh()
@@ -3676,15 +4376,53 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func applyWebProviderSurfaceIssue(sessionId: String, issue: RemoteProviderSurfaceIssue?) {
-        if let issue {
+    private func applyWebProviderSurfaceIssue(
+        sessionId: String,
+        issue: RemoteProviderSurfaceIssue?,
+        surfaceState: String,
+        statusObservedAt: Date?,
+        requestStartedAt: Date? = nil
+    ) {
+        if let requestStartedAt,
+           let lastReceivedAt = webProviderStatusReceivedAtBySession[sessionId],
+           requestStartedAt < lastReceivedAt {
+            DiagnosticsLog.shared.record("stale_web_provider_status_ignored", fields: ["session": sessionId], level: "WARN")
+            return
+        }
+        // A delayed Relay event or earlier status RPC must not reintroduce a
+        // resolved Try Again / connection error after a newer provider observation.
+        // Compare source timestamps for this same Chat, not arrival order on iOS.
+        if let statusObservedAt,
+           let latest = webProviderSurfaceObservedAtBySession[sessionId],
+           statusObservedAt < latest {
+            DiagnosticsLog.shared.record("older_web_provider_observation_ignored", fields: ["session": sessionId], level: "WARN")
+            return
+        }
+        webProviderStatusReceivedAtBySession[sessionId] = Date()
+        webProviderSurfaceStateBySession[sessionId] = surfaceState
+        if let statusObservedAt {
+            webProviderSurfaceObservedAtBySession[sessionId] = statusObservedAt
+        } else {
+            webProviderSurfaceObservedAtBySession.removeValue(forKey: sessionId)
+        }
+
+        if surfaceState == "degraded", let issue {
             let message = issue.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "ChatGPT 网页当前不可用，RemoteAI 正在等待恢复。"
                 : issue.message
-            let previousMessage = webProviderIssueMessageBySession[sessionId]
-            let previousState = webProviderIssueStateBySession[sessionId]
-            webProviderIssueMessageBySession[sessionId] = message
-            webProviderIssueStateBySession[sessionId] = issue.state
+            let normalizedIssue = RemoteProviderSurfaceIssue(
+                code: issue.code,
+                state: issue.state,
+                message: message,
+                retryable: issue.retryable,
+                at: issue.at,
+                originalMessage: issue.originalMessage
+            )
+            let previousIssue = webProviderIssuesBySession[sessionId]
+            let previousMessage = previousIssue?.message
+            let previousState = previousIssue?.state
+            webProviderIssuesBySession[sessionId] = normalizedIssue
+            webProviderRecoveryObservedAtBySession.removeValue(forKey: sessionId)
             errors[sessionId] = message
 
             let currentState = sessions.first(where: { $0.id == sessionId })?.state
@@ -3692,7 +4430,6 @@ final class WorkspaceStore: ObservableObject {
                 liveRunStatusBySession[sessionId] = message
             }
             if previousMessage != message || previousState != issue.state {
-                recentSystemNotice = message
                 DiagnosticsLog.shared.record("web_provider_surface_issue", fields: [
                     "session": sessionId,
                     "state": issue.state,
@@ -3703,8 +4440,35 @@ final class WorkspaceStore: ObservableObject {
             return
         }
 
-        guard let previousMessage = webProviderIssueMessageBySession.removeValue(forKey: sessionId) else { return }
-        let previousState = webProviderIssueStateBySession.removeValue(forKey: sessionId) ?? "degraded"
+        if surfaceState == "unknown" {
+            guard let issue else { return }
+            let message = issue.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "ChatGPT 网页当前状态无法确认；保留最近一次异常信息。"
+                : issue.message
+            let retainedIssue = RemoteProviderSurfaceIssue(
+                code: issue.code,
+                state: issue.state,
+                message: message,
+                retryable: issue.retryable,
+                at: issue.at,
+                originalMessage: issue.originalMessage
+            )
+            let previousMessage = webProviderIssuesBySession[sessionId]?.message
+            webProviderIssuesBySession[sessionId] = retainedIssue
+            if errors[sessionId] == nil || errors[sessionId] == previousMessage {
+                errors[sessionId] = message
+            }
+            return
+        }
+
+        guard surfaceState == "online",
+              let previousIssue = webProviderIssuesBySession.removeValue(forKey: sessionId) else { return }
+        let previousMessage = previousIssue.message
+        if let statusObservedAt {
+            webProviderRecoveryObservedAtBySession[sessionId] = statusObservedAt
+        } else {
+            webProviderRecoveryObservedAtBySession.removeValue(forKey: sessionId)
+        }
         if errors[sessionId] == previousMessage { errors[sessionId] = nil }
         if liveRunStatusBySession[sessionId] == previousMessage {
             let currentState = sessions.first(where: { $0.id == sessionId })?.state
@@ -3714,10 +4478,9 @@ final class WorkspaceStore: ObservableObject {
                 liveRunStatusBySession.removeValue(forKey: sessionId)
             }
         }
-        recentSystemNotice = "电脑端 ChatGPT 网页已恢复；当前会话正在补同步。"
         DiagnosticsLog.shared.record("web_provider_surface_recovered", fields: [
             "session": sessionId,
-            "previousState": previousState,
+            "previousState": previousIssue.state,
         ])
     }
 
@@ -3773,6 +4536,7 @@ final class WorkspaceStore: ObservableObject {
                 if recovered && !deferringTransientConnectionPresentation {
                     recentSystemNotice = "Windows Agent 已重新连上 Relay，正在补同步当前会话。"
                 }
+                scheduleWebTabsRefreshAfterConnectivityRecovery(reason: "agent-online")
             case .connecting, .reconnecting:
                 if machine.state != .online {
                     // During initial connection there is no previously authenticated
@@ -3801,6 +4565,23 @@ final class WorkspaceStore: ObservableObject {
                 errors["connection"] = "Windows Agent 离线 — 手机仍连接 Cloudflare Relay，将在电脑恢复后自动补同步。"
                 recentSystemNotice = "Windows Agent 已确认离线；Cloudflare Relay 连接仍会保持，电脑恢复后会自动继续。"
             }
+        }
+    }
+
+    private func scheduleWebTabsRefreshAfterConnectivityRecovery(reason: String) {
+        guard webTabsRefreshNeedsConnectivityRetry else { return }
+        let generation = lifecycleGeneration
+        Task { @MainActor [weak self] in
+            guard let self,
+                  generation == self.lifecycleGeneration,
+                  !self.isSuspended,
+                  self.machine.state == .online,
+                  self.webTabsRefreshNeedsConnectivityRetry else { return }
+            // Claim the one pending read-only recovery before suspending for network IO.
+            // Do not create a second polling loop or repeat any provider send.
+            self.webTabsRefreshNeedsConnectivityRetry = false
+            DiagnosticsLog.shared.record("web_tabs_connectivity_recovery", fields: ["reason": reason])
+            await self.refreshOpenWebTabs()
         }
     }
 
@@ -3892,6 +4673,14 @@ final class WorkspaceStore: ObservableObject {
         if lower.contains("reading") && trimmed.count < 120 { return trimmed }
         if !trimmed.contains("\n"), trimmed.count <= 80 { return trimmed }
         return "正在生成回答…"
+    }
+
+    private func generationStartedLabel(runtimeId: String) -> String {
+        switch runtimeId {
+        case "runtime.codex": return "Codex 正在处理…"
+        case "runtime.antigravity": return "Antigravity 正在处理…"
+        default: return "ChatGPT 正在处理…"
+        }
     }
 
     func webProcessStatusLabel(_ raw: String) -> String {
@@ -3988,9 +4777,66 @@ final class WorkspaceStore: ObservableObject {
         return false
     }
 
+    private func generationTerminalOutcome(for payload: [String: JSONValue]) -> GenerationTerminalOutcome {
+        let reason = payload["reason"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let delivery = payload["delivery"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let code = payload["errorCode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() ?? ""
+
+        if delivery == "unknown" || reason.contains("unknown") { return .unknown }
+        if ["canceled", "cancelled"].contains(reason)
+            || code == "GENERATION_CANCELED"
+            || payload["stopped"]?.boolValue == true {
+            return .canceled
+        }
+        if reason == "interrupted" || code == "GENERATION_INTERRUPTED" { return .interrupted }
+        if ["failed", "error", "provider-error"].contains(reason) || !code.isEmpty {
+            return .failed
+        }
+        // A negative terminal event without a classified provider outcome is not
+        // proof of failure or cancellation. Keep the transcript recoverable.
+        return .unknown
+    }
+
+    private func preservePartialAssistantOutput(sessionId: String) async {
+        let streamedText = assistantStreams[sessionId]?.text
+        flushStreaming(sessionId: sessionId)
+        if let stream = assistantStreams[sessionId] {
+            stream.performance.stopFrames()
+            assistantStreams.removeValue(forKey: sessionId)
+        }
+        incompleteAssistantStreams.removeValue(forKey: sessionId)
+        if incompleteAssistantStreams.isEmpty, errors["sync"]?.hasPrefix("Streaming") == true {
+            errors.removeValue(forKey: "sync")
+        }
+        streamingBuffers.removeValue(forKey: sessionId)
+
+        guard var local = messagesBySession[sessionId] else { return }
+        var changed: [ChatMessage] = []
+        for index in local.indices where local[index].role == .assistant
+            && local[index].kind == .text
+            && local[index].toolStatus == "Streaming" {
+            if let streamedText { local[index].text = streamedText }
+            local[index].toolStatus = nil
+            changed.append(local[index])
+        }
+        if !changed.isEmpty {
+            messagesBySession[sessionId] = local
+            try? await cache.upsertMessages(changed)
+        }
+    }
+
     private func setSessionState(_ sessionId: String, _ state: SessionState) {
         if let index = sessions.firstIndex(where: { $0.id == sessionId }), sessions[index].state != state {
+            let webTerminal = sessions[index].instanceId == "web.chatgpt"
+                && state != .busy && state != .waiting
             sessions[index].state = state
+            if webTerminal {
+                // The caller clears its live progress marker after setting the
+                // terminal state; reconcile on the next MainActor turn.
+                Task { @MainActor [weak self] in
+                    self?.resumeDeferredWebProjectsRefreshIfIdle()
+                }
+            }
         }
     }
 
@@ -4270,13 +5116,13 @@ final class WorkspaceStore: ObservableObject {
         await settleRunningToolRows(sessionId: sessionId)
     }
 
-    private func settleRunningToolRows(sessionId: String, toolName: String? = nil) async {
+    private func settleRunningToolRows(sessionId: String, toolName: String? = nil, status: String = "Completed") async {
         var changed: [ChatMessage] = []
         if var local = messagesBySession[sessionId] {
             for index in local.indices where local[index].kind == .toolEvent
                 && local[index].toolStatus == "Running"
                 && (toolName == nil || local[index].toolName == toolName) {
-                local[index].toolStatus = "Completed"
+                local[index].toolStatus = status
                 changed.append(local[index])
             }
             if !changed.isEmpty { messagesBySession[sessionId] = local }
@@ -4295,7 +5141,11 @@ final class WorkspaceStore: ObservableObject {
                 guard message.role == .user else { return false }
                 if message.id.caseInsensitiveCompare(id.uuidString) == .orderedSame { return true }
                 guard !text.isEmpty, message.text == text else { return false }
-                return abs(message.createdAt.timeIntervalSince(command.createdAt)) < 300
+                // Identical prompts can be sent in separate operations minutes apart.
+                // A provider turn older than this command is not evidence of this
+                // operation's delivery. Allow only a small cross-device clock skew.
+                let elapsed = message.createdAt.timeIntervalSince(command.createdAt)
+                return elapsed >= -5 && elapsed < 300
             }
             if delivered {
                 commandStates[id] = .completed
@@ -4305,10 +5155,29 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func reconcileOptimisticUserEcho(_ serverMessage: ChatMessage, sessionId: String) async {
-        guard let optimistic = messagesBySession[sessionId, default: []].last(where: {
-            $0.role == .user && $0.sequence == nil && UUID(uuidString: $0.id) != nil && $0.text == serverMessage.text && abs($0.createdAt.timeIntervalSince(serverMessage.createdAt)) < 180
+        if routeForSession(sessionId)?.runtimeId == "runtime.codex",
+           let providerId = serverMessage.providerMessageId, providerId != serverMessage.id {
+            // An authoritative native turn maps the old API ID to the original
+            // client ID. Remove only that exact alias, never another equal prompt.
+            messagesBySession[sessionId]?.removeAll { $0.id == providerId && $0.role == .user }
+            try? await cache.deleteMessage(id: providerId)
+        }
+        // A history replay of an already displayed provider row cannot be the echo
+        // of a new optimistic send with the same text.
+        guard !messagesBySession[sessionId, default: []].contains(where: {
+            $0.role == .user && $0.id == serverMessage.id
         }) else { return }
-        messagesBySession[sessionId]?.removeAll { $0.id == optimistic.id }
+        guard let optimistic = messagesBySession[sessionId, default: []].last(where: {
+            guard $0.role == .user, $0.sequence == nil,
+                  UUID(uuidString: $0.id) != nil,
+                  $0.text == serverMessage.text else { return false }
+            // A paired live trace placed the canonical user timestamp 17 seconds
+            // before the phone send. Keep a bounded tolerance, not a 180s backmatch.
+            let elapsed = serverMessage.createdAt.timeIntervalSince($0.createdAt)
+            return elapsed >= -30 && elapsed < 180
+        }) else { return }
+        // Publish provider echo and optimistic removal in the same transcript update.
+        merge([serverMessage], into: sessionId, removing: [optimistic.id])
         try? await cache.deleteMessage(id: optimistic.id)
     }
 
@@ -4360,11 +5229,14 @@ final class WorkspaceStore: ObservableObject {
         })
     }
 
-    private func reconcileAntigravityAuthoritativeAssistantWindow(_ authoritative: [ChatMessage], sessionId: String) async {
+    func reconcileAntigravityAuthoritativeAssistantWindow(_ authoritative: [ChatMessage], sessionId: String) async {
         let local = messagesBySession[sessionId, default: []]
         let staleIDs = Self.staleAntigravityAssistantIDs(local: local, authoritative: authoritative)
         guard !staleIDs.isEmpty else { return }
-        messagesBySession[sessionId]?.removeAll { staleIDs.contains($0.id) }
+        // Publish the replacement transcript as one list update. Removing legacy
+        // planner rows before awaiting cache deletion lets the visible LazyVStack
+        // lay out a temporary, shorter history before canonical rows are merged.
+        merge(authoritative, into: sessionId, removing: staleIDs)
         for id in staleIDs { try? await cache.deleteMessage(id: id) }
         DiagnosticsLog.shared.record("antigravity_history_reconciled", fields: [
             "session": sessionId,
@@ -4372,10 +5244,11 @@ final class WorkspaceStore: ObservableObject {
         ])
     }
 
-    private func merge(_ incoming: [ChatMessage], into sessionId: String) {
+    private func merge(_ incoming: [ChatMessage], into sessionId: String, removing removedIDs: Set<String> = []) {
         let current = messagesBySession[sessionId, default: []]
         let visibleExisting = current.filter {
-            !($0.kind == .toolEvent
+            !removedIDs.contains($0.id)
+                && !($0.kind == .toolEvent
                 && $0.toolName == "ChatGPT Web"
                 && isTransientWebProcessDetail($0.detail))
         }
@@ -4386,6 +5259,7 @@ final class WorkspaceStore: ObservableObject {
         }
         var map = Dictionary(uniqueKeysWithValues: visibleExisting.map { ($0.id, $0) })
         if visibleExisting.count == current.count,
+           removedIDs.isEmpty,
            visibleIncoming.allSatisfy({ map[$0.id] == $0 }) {
             return
         }
