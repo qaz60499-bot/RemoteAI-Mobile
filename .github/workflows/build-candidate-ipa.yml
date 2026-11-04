@@ -30,7 +30,9 @@ jobs:
   build:
     name: Candidate Test + Device IPA
     if: github.event_name == 'workflow_dispatch'
-    runs-on: macos-15
+    # Temporary switch: macos-15 ARM64 hosted capacity cancelled Build90 before any steps.
+    # Keep Xcode 16.4 / iOS 18.5 pinned on the macOS 15 Intel image.
+    runs-on: macos-15-intel
     timeout-minutes: 45
     steps:
       - name: Checkout
