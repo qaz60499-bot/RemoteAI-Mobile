@@ -1415,6 +1415,42 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testUnreadableWebTranscriptIsDeferredOnlyForTheSpecificHistorySnapshotFailure() {
+        let temporaryShell = TransportError.remote(
+            "WEB_SELECTOR_FAILED",
+            "ChatGPT conversation exposed no readable messages (roleNodes=0, turnNodes=0, articleNodes=0, loginLike=true, unavailableLike=false)"
+        )
+        XCTAssertTrue(WorkspaceStore.isTransientUnreadableWebHistory(temporaryShell, runtimeId: "runtime.web"))
+        XCTAssertFalse(WorkspaceStore.isTransientUnreadableWebHistory(temporaryShell, runtimeId: "runtime.codex"))
+        XCTAssertFalse(WorkspaceStore.isTransientUnreadableWebHistory(
+            TransportError.remote("WEB_SELECTOR_FAILED", "ChatGPT composer selector not found"),
+            runtimeId: "runtime.web"
+        ))
+        XCTAssertFalse(WorkspaceStore.isTransientUnreadableWebHistory(
+            TransportError.remote("CONVERSATION_IDENTITY_UNVERIFIED", "Different conversation identity"),
+            runtimeId: "runtime.web"
+        ))
+        XCTAssertFalse(WorkspaceStore.isTransientUnreadableWebHistory(
+            TransportError.remote("WEB_BINDING_CHANGED", "Tab changed during read"),
+            runtimeId: "runtime.web"
+        ))
+    }
+
+    @MainActor
+    func testBusyStatusPollWithoutEvidenceDoesNotInventFreshRunActivity() {
+        let evidence = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertNil(WorkspaceStore.verifiedRunActivityAt(lastProgressAt: nil, lastActivityAt: nil))
+        XCTAssertEqual(
+            WorkspaceStore.verifiedRunActivityAt(lastProgressAt: nil, lastActivityAt: evidence),
+            evidence
+        )
+        XCTAssertEqual(
+            WorkspaceStore.verifiedRunActivityAt(lastProgressAt: evidence.addingTimeInterval(5), lastActivityAt: evidence),
+            evidence.addingTimeInterval(5)
+        )
+    }
+
+    @MainActor
     func testUnchangedRemoteRevisionDoesNotReloadHistoryAndBusyRevisionStaysProtected() {
         let revision = Date(timeIntervalSince1970: 946_684_800)
         XCTAssertFalse(WorkspaceStore.visibleHistoryReloadDue(
