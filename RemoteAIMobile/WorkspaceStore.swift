@@ -4178,6 +4178,12 @@ final class WorkspaceStore: ObservableObject {
                 if base.role == .user { await reconcileOptimisticUserEcho(base, sessionId: sessionId) }
                 let message = ChatMessage(id: base.id, sessionId: base.sessionId, sequence: event.sequence, role: base.role, kind: base.kind, text: base.text, toolName: nil, toolStatus: nil, detail: nil, attachments: base.attachments, createdAt: base.createdAt)
                 merge([message], into: sessionId)
+                if !suppressTransientPresentation {
+                    // A live final can arrive between historical delta pages.
+                    // Publish the canonical message and unmask its frozen transcript
+                    // in the same MainActor turn, before the cache write suspends.
+                    releaseRecoveryDisplaySnapshot(for: sessionId)
+                }
                 try? await cache.upsertMessages([message])
             }
         case "TOOL_STARTED", "TOOL_FINISHED":
