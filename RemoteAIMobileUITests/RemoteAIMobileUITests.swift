@@ -152,11 +152,14 @@ final class RemoteAIMobileUITests: XCTestCase {
         let app = makeMockApp()
         app.launchEnvironment["REMOTEAI_UI_STRESS_CHARS"] = String(chars)
         app.launchEnvironment["REMOTEAI_UI_STRESS_DIRECT"] = "1"
-        // Hosted-runner accessibility setup can consume tens of seconds before the
-        // composer interaction starts. The shorter 30k fixture can otherwise reach
-        // terminal before XCUI samples a second progress label on slow runners.
-        // Keep every assertion; lengthen only this deterministic test-only stream.
-        let fixtureChunkMilliseconds = chars <= 30_000 ? 250 : 150
+        // Hosted Intel simulators can spend over 80 seconds on XCUI accessibility
+        // startup, typing and main-thread idle waits. The old 30k=75s / 50k=75s
+        // fixtures could finish and replace the streaming row in the middle of
+        // typeText, truncating a keystroke sequence (e.g. "still responsive" -> "stil").
+        // Exercise the entire interaction while generation is live; keep every
+        // assertion, including the final exact draft match and stream completion.
+        // These delays affect the isolated UI mock only, never production streaming.
+        let fixtureChunkMilliseconds = chars <= 30_000 ? 420 : 300
         app.launchEnvironment["REMOTEAI_UI_STRESS_CHUNK_MS"] = String(fixtureChunkMilliseconds)
         app.launch()
         let progress = app.staticTexts["assistant-stream-progress"]
