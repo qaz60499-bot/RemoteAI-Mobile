@@ -197,14 +197,18 @@ final class WorkspaceStore: ObservableObject {
     // can recover its history before the instance/session list has been expanded.
     private var sessionRouteHints: [String: (machineId: String, runtimeId: String, instanceId: String)] = [:]
 
-    // A successful loadRecent of 0/1 transcript rows is not proof that an active
-    // ChatGPT conversation has all its previous turns. Never retry healthy streams.
+    // An active Web Chat with 0/1 rows may not have hydrated its transcript.
+    // An idle Web Chat can also be missing its final or older Assistant turns;
+    // a successful cached read must not permanently suppress bounded recovery.
     static func sparseWebHistoryRetryDue(
         isWeb: Bool, isActive: Bool, transcriptCount: Int,
+        lastTranscriptRoleIsUser: Bool = false, hasAssistantGap: Bool = false,
         lastSuccessfulHistoryAt: Date?, lastRetryAt: Date?, retryCount: Int,
         now: Date
     ) -> Bool {
-        guard isWeb, isActive, transcriptCount <= 1,
+        let incompleteRunningHistory = isActive && transcriptCount <= 1
+        let missingIdleAssistant = !isActive && (lastTranscriptRoleIsUser || hasAssistantGap)
+        guard isWeb, (incompleteRunningHistory || missingIdleAssistant),
               let lastSuccessfulHistoryAt, (0..<3).contains(retryCount) else { return false }
         let delay: [TimeInterval] = [15, 30, 60]
         let reference = max(lastSuccessfulHistoryAt, lastRetryAt ?? lastSuccessfulHistoryAt)
@@ -1899,9 +1903,18 @@ final class WorkspaceStore: ObservableObject {
         // An active Web chat can report a successful EMPTY history page before the
         // provider-identified older turns have reached the Agent. Without a bounded
         // retry this success watermark suppresses recovery until leaving/re-entering.
-        let transcriptCount = messagesBySession[sessionId, default: []]
-            .filter { $0.role == .user || $0.role == .assistant }.count
-        if !stillActive || transcriptCount > 1 || force {
+        let transcriptRows = messagesBySession[sessionId, default: []]
+            .filter { $0.role == .user || $0.role == .assistant }
+        let transcriptCount = transcriptRows.count
+        let verifiedIdle = remoteStatus?.state == .idle
+        let lastTranscriptRoleIsUser = verifiedIdle && transcriptRows.last?.role == .user
+        // Missing older Assistant replies also appear as consecutive user rows,
+        // even if the newest user already has a completed Assistant reply.
+        let hasAssistantGap = verifiedIdle && zip(transcriptRows, transcriptRows.dropFirst()).contains {
+            $0.0.role == .user && $0.1.role == .user
+        }
+        let sparseCandidate = stillActive ? transcriptCount <= 1 : (lastTranscriptRoleIsUser || hasAssistantGap)
+        if !sparseCandidate || force {
             sparseWebHistoryRetryAt.removeValue(forKey: sessionId)
             sparseWebHistoryRetryCounts.removeValue(forKey: sessionId)
         }
@@ -1909,6 +1922,8 @@ final class WorkspaceStore: ObservableObject {
             isWeb: routeForSession(sessionId)?.runtimeId == "runtime.web",
             isActive: stillActive,
             transcriptCount: transcriptCount,
+            lastTranscriptRoleIsUser: lastTranscriptRoleIsUser,
+            hasAssistantGap: hasAssistantGap,
             lastSuccessfulHistoryAt: visibleSessionHistorySyncAt[sessionId],
             lastRetryAt: sparseWebHistoryRetryAt[sessionId],
             retryCount: sparseWebHistoryRetryCounts[sessionId] ?? 0,
