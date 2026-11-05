@@ -56,6 +56,40 @@ final class RemoteAIMobileTests: XCTestCase {
         ), "Failed initial read follows the existing recovery path")
     }
 
+    @MainActor
+    func testIdleWebHistoryWithUnansweredLastUserRetriesOnlyThreeTimes() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let oldRead = now.addingTimeInterval(-180)
+        XCTAssertTrue(WorkspaceStore.sparseWebHistoryRetryDue(
+            isWeb: true, isActive: false, transcriptCount: 9, lastTranscriptRoleIsUser: true,
+            lastSuccessfulHistoryAt: oldRead, lastRetryAt: nil, retryCount: 0, now: now
+        ), "An idle Web history ending with a user may be missing its Assistant")
+        XCTAssertFalse(WorkspaceStore.sparseWebHistoryRetryDue(
+            isWeb: true, isActive: false, transcriptCount: 9, lastTranscriptRoleIsUser: true,
+            lastSuccessfulHistoryAt: oldRead, lastRetryAt: now.addingTimeInterval(-29), retryCount: 1, now: now
+        ), "Retries must respect the backoff window")
+        XCTAssertTrue(WorkspaceStore.sparseWebHistoryRetryDue(
+            isWeb: true, isActive: false, transcriptCount: 9, lastTranscriptRoleIsUser: true,
+            lastSuccessfulHistoryAt: oldRead, lastRetryAt: now.addingTimeInterval(-31), retryCount: 1, now: now
+        ))
+        XCTAssertTrue(WorkspaceStore.sparseWebHistoryRetryDue(
+            isWeb: true, isActive: false, transcriptCount: 9, hasAssistantGap: true,
+            lastSuccessfulHistoryAt: oldRead, lastRetryAt: nil, retryCount: 0, now: now
+        ), "An older missing Assistant must retry even if the newest turn is complete")
+        XCTAssertFalse(WorkspaceStore.sparseWebHistoryRetryDue(
+            isWeb: true, isActive: false, transcriptCount: 9, hasAssistantGap: true,
+            lastSuccessfulHistoryAt: oldRead, lastRetryAt: oldRead, retryCount: 3, now: now
+        ), "Never retry indefinitely")
+        for (web, lastUser, count, attempts) in [
+            (true, false, 9, 0), (false, true, 9, 0), (true, true, 9, 3)
+        ] {
+            XCTAssertFalse(WorkspaceStore.sparseWebHistoryRetryDue(
+                isWeb: web, isActive: false, transcriptCount: count, lastTranscriptRoleIsUser: lastUser,
+                lastSuccessfulHistoryAt: oldRead, lastRetryAt: oldRead, retryCount: attempts, now: now
+            ), "Healthy, non-Web or exhausted idle histories do not retry")
+        }
+    }
+
     func testExistingWebTabEnterRestoresChatAndProjectWithoutCreatingAnything() async throws {
         let mock = MockTransport(historyCount: 0)
         try await mock.connect()
