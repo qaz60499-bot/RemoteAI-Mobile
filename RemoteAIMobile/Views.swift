@@ -1200,7 +1200,9 @@ struct ChatView: View {
                                 let retryable = commandState == .unknown && UUID(uuidString: message.id) != nil
                                 if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
                                     AssistantStreamRow(stream: stream, message: message, followTail: {
-                                        guard !userBrowsingHistory else { return }
+                                        // Streaming auto-scroll must never interrupt an active
+                                        // keyboard composition or steal first-responder focus.
+                                        guard !userBrowsingHistory, !focused else { return }
                                         proxy.scrollTo("bottom", anchor: .bottom)
                                     }, onSelectText: { text, monospaced in
                                         textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
@@ -1265,7 +1267,7 @@ struct ChatView: View {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                                 didInitialScrollToBottom = true
                             }
-                        } else if !userBrowsingHistory {
+                        } else if !userBrowsingHistory && !focused {
                             userBrowsingHistory = false
                             withAnimation(.easeOut(duration: 0.18)) {
                                 proxy.scrollTo("bottom", anchor: .bottom)
