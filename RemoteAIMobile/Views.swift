@@ -1204,7 +1204,7 @@ struct ChatView: View {
                                         // Streaming auto-scroll must never interrupt an active
                                         // keyboard composition or steal first-responder focus.
                                         guard !userBrowsingHistory, !focused, !composerEditing else { return }
-                                        proxy.scrollTo("bottom", anchor: .bottom)
+                                        proxy.scrollTo(messages.last?.id ?? "bottom", anchor: .bottom)
                                     }, onSelectText: { text, monospaced in
                                         textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
                                     }).id(message.id)
@@ -1261,7 +1261,7 @@ struct ChatView: View {
                     .onAppear {
                         guard !didInitialScrollToBottom, !messages.isEmpty else { return }
                         DispatchQueue.main.async {
-                            proxy.scrollTo("bottom", anchor: .bottom)
+                            proxy.scrollTo(messages.last?.id ?? "bottom", anchor: .bottom)
                             didInitialScrollToBottom = true
                         }
                     }
@@ -1269,13 +1269,13 @@ struct ChatView: View {
                         guard !loadingOlder, !messages.isEmpty else { return }
                         if !didInitialScrollToBottom {
                             DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                                proxy.scrollTo(messages.last?.id ?? "bottom", anchor: .bottom)
                                 didInitialScrollToBottom = true
                             }
                         } else if !userBrowsingHistory && !focused && !composerEditing {
                             userBrowsingHistory = false
                             withAnimation(.easeOut(duration: 0.18)) {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                                proxy.scrollTo(messages.last?.id ?? "bottom", anchor: .bottom)
                             }
                         }
                     }
@@ -1289,8 +1289,10 @@ struct ChatView: View {
                     if didInitialScrollToBottom, !isAtBottom, !messages.isEmpty {
                         Button {
                             userBrowsingHistory = false
+                            // A very tall history row can leave the sentinel
+                            // outside the LazyVStack's realized layout.
                             withAnimation(.easeOut(duration: 0.18)) {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                                proxy.scrollTo(messages.last?.id ?? "bottom", anchor: .bottom)
                             }
                         } label: {
                             Image(systemName: "arrow.down")
