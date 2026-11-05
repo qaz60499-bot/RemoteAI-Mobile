@@ -89,6 +89,20 @@ final class ProtocolSecurityTests: XCTestCase {
         }
     }
 
+    func testWebTabCommandsPassOutboundProtocolValidation() throws {
+        // Regression: these three actions are in protocol-v1.json and Transport,
+        // but were missing from the iOS outbound allowlist. This caused an
+        // immediate malformedData before the Windows Agent saw any command.
+        for action in ["listOpenWebTabs", "inspectOpenWebTab", "manageOpenWebTab"] {
+            var object = validCommandObject()
+            object["instanceId"] = "web.chatgpt"
+            object["sessionId"] = NSNull()
+            object["action"] = action
+            let command = try ProtocolSecurity.decodeCommand(json(object))
+            XCTAssertNoThrow(try ProtocolSecurity.validate(command, expectedMachineId: "my-pc"), action)
+        }
+    }
+
     func testProtocolNegativeMatrix() throws {
         var passed = 0
         var total = 0

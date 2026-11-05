@@ -3,8 +3,9 @@ import Foundation
 enum MockScenario: String, CaseIterable {
     case normal, commandFailure, disconnect, disconnectImmediatelyAfterSend
     case disconnectAfterAttachmentChunk, disconnectAfterCreateProject
-    case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, alreadyExecutedThenSuccess, deltaOnlySend
+    case webSendNotAccepted, webSendDeliveryUnknown, webSendDeliveryUnknownAfterCommit, webSendLegacyChromeChannelClosedAfterCommit, webSendLegacyUnrelatedSelectorFailure, alreadyExecutedThenSuccess, deltaOnlySend
     case duplicateEvent, sequenceGap, partialWebCatalog, partialWebCatalogWithNewHead, staleWebCatalog, staleThenFreshProjectConversations, verifiedWebCatalogCache, unclassifiedWebCatalog, offline
+    case malformedCreateReplyAfterCommit, stopUnconfirmed, stopPageIdleButAgentUnconfirmed, stopConfirmedWithoutEvent
 }
 
 actor MockTransport: Transport {
@@ -21,15 +22,21 @@ actor MockTransport: Transport {
     private var sessions: [ServerSession] = []
     private var sessionStatusOverrides: [String: String] = [:]
     private var sessionStatusActivityOverrides: [String: Date] = [:]
+    private var sessionStatusRevisionOverrides: [String: Date] = [:]
+    private var sessionsWithoutStatusRevision = Set<String>()
+    private var sessionBackgroundTaskStatusOverrides: [String: JSONValue] = [:]
+    private var providerSurfaceStatusOverrides: [String: [String: JSONValue]] = [:]
     private var webProjects: [WebProjectDescriptor] = []
     private var webProjectConversations: [String: [WebConversationDescriptor]] = [:]
     private var attachmentUploads: [String: (name: String, contentType: String, sizeBytes: Int, data: Data, nextIndex: Int)] = [:]
     private var commandAttempts: [String: Int] = [:]
+    private var actionFailureCounts: [String: Int] = [:]
     private var lastPreferCacheByAction: [String: Bool] = [:]
     private var connectAttempts = 0
     private var executionDelayNanoseconds: UInt64 = 0
     private var requestDelayNanoseconds: [String: UInt64] = [:]
     private var responseDelayNanoseconds: [String: UInt64] = [:]
+    private var deltaPageLimitForTests: Int? = nil
     private var finishedAttachmentData: [String: Data] = [:]
     private var activeMessageAttachmentReads = 0
     private var peakMessageAttachmentReads = 0
@@ -133,18 +140,53 @@ actor MockTransport: Transport {
         sessionStatusOverrides[sessionId] = "idle"
     }
     func setScenario(_ value: MockScenario) { scenario = value }
-    func setSessionStatus(_ sessionId: String, status: String, lastActivityAt: Date? = nil) {
+    func setSessionStatus(_ sessionId: String, status: String, lastActivityAt: Date? = nil, updatedAt: Date? = nil) {
         sessionStatusOverrides[sessionId] = status
         if let lastActivityAt {
             sessionStatusActivityOverrides[sessionId] = lastActivityAt
         } else {
             sessionStatusActivityOverrides.removeValue(forKey: sessionId)
         }
+        if let updatedAt {
+            sessionStatusRevisionOverrides[sessionId] = updatedAt
+            sessionsWithoutStatusRevision.remove(sessionId)
+        } else {
+            sessionStatusRevisionOverrides.removeValue(forKey: sessionId)
+        }
+    }
+    func omitSessionStatusRevision(_ sessionId: String) { sessionsWithoutStatusRevision.insert(sessionId) }
+    func setBackgroundTaskStatus(_ sessionId: String, snapshot: BackgroundTaskStatusSnapshot?) {
+        guard let snapshot, let value = try? JSONValue.encode(snapshot) else {
+            sessionBackgroundTaskStatusOverrides.removeValue(forKey: sessionId)
+            return
+        }
+        sessionBackgroundTaskStatusOverrides[sessionId] = value
+    }
+    func setProviderSurfaceStatus(_ sessionId: String, state: String, observedAt: Date, issue: RemoteProviderSurfaceIssue?) {
+        var metadata: [String: JSONValue] = [
+            "providerSurfaceState": .string(state),
+            "providerSurfaceObservedAt": .string(RemoteAIDate.string(observedAt))
+        ]
+        if let issue {
+            metadata["providerSurfaceIssue"] = .object([
+                "code": .string(issue.code),
+                "state": .string(issue.state),
+                "message": .string(issue.message),
+                "originalMessage": issue.originalMessage.map(JSONValue.string) ?? .null,
+                "retryable": .bool(issue.retryable),
+                "at": issue.at.map { .string(RemoteAIDate.string($0)) } ?? .null
+            ])
+        } else {
+            metadata["providerSurfaceIssue"] = .null
+        }
+        providerSurfaceStatusOverrides[sessionId] = metadata
     }
     func setSequence(_ value: Int64) { sequence = max(0, value) }
     func setExecutionDelay(nanoseconds: UInt64) { executionDelayNanoseconds = nanoseconds }
     func setRequestDelay(action: String, nanoseconds: UInt64) { requestDelayNanoseconds[action] = nanoseconds }
     func setResponseDelay(action: String, nanoseconds: UInt64) { responseDelayNanoseconds[action] = nanoseconds }
+    func setDeltaPageLimitForTests(_ value: Int) { deltaPageLimitForTests = max(1, value) }
+    func failNextAction(_ action: String, count: Int = 1) { actionFailureCounts[action] = max(0, count) }
     func actionAttemptCount(_ action: String) -> Int { commandAttempts[action, default: 0] }
     func lastPreferCacheValue(_ action: String) -> Bool? { lastPreferCacheByAction[action] }
     func connectionAttemptCount() -> Int { connectAttempts }
@@ -293,6 +335,12 @@ actor MockTransport: Transport {
             processedCommands[command.commandId] = response
             return response
         }
+        if actionFailureCounts[command.action, default: 0] > 0 {
+            actionFailureCounts[command.action, default: 0] -= 1
+            let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "MOCK_ACTION_FAILURE", message: "Mock action failed once", retryable: true, details: nil), idempotentReplay: nil)
+            processedCommands[command.commandId] = response
+            return response
+        }
         if command.action == "sendMessage", scenario == .alreadyExecutedThenSuccess, commandAttempts[command.action] == 1 {
             return CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "ALREADY_EXECUTED", message: "Mock command is still executing", retryable: true, details: nil), idempotentReplay: true)
         }
@@ -303,6 +351,20 @@ actor MockTransport: Transport {
         }
         if command.action == "sendMessage", scenario == .webSendDeliveryUnknown {
             let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SEND_DELIVERY_UNKNOWN", message: "Mock page changed without proof of delivery", retryable: false, details: nil), idempotentReplay: nil)
+            processedCommands[command.commandId] = response
+            return response
+        }
+        if command.action == "sendMessage", scenario == .webSendLegacyUnrelatedSelectorFailure {
+            let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SELECTOR_FAILED", message: "No visible Send control", retryable: false, details: nil), idempotentReplay: nil)
+            processedCommands[command.commandId] = response
+            return response
+        }
+        if command.action == "sendMessage", scenario == .webSendLegacyChromeChannelClosedAfterCommit {
+            let text = command.payload["text"]?.stringValue ?? ""
+            let sessionId = command.sessionId ?? ""
+            let user = ServerMessage(messageId: "legacy-provider-user-\(command.commandId.uuidString.lowercased())", sessionId: sessionId, role: "user", content: text, externalId: nil, createdAt: Date())
+            history[sessionId, default: []].append(user)
+            let response = CommandResponseEnvelope(ok: false, result: nil, error: RemoteErrorPayload(code: "WEB_SELECTOR_FAILED", message: "A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received", retryable: true, details: nil), idempotentReplay: nil)
             processedCommands[command.commandId] = response
             return response
         }
@@ -337,6 +399,47 @@ actor MockTransport: Transport {
             response = try success(instances.filter { $0.runtimeId == command.runtimeId })
         case "listSessions":
             response = try success(sessions.filter { $0.instanceId == command.instanceId })
+        case "listOpenWebTabs":
+            let conversations = webProjectConversations["g-p-remoteai"] ?? []
+            let chat = conversations.first
+            let chatURL = chat?.canonicalUrl ?? "https://chatgpt.com"
+            response = CommandResponseEnvelope(ok: true, result: .array([
+                .object([
+                    "tabId": .number(12), "title": .string("Project smoke"),
+                    "canonicalUrl": .string(chatURL), "active": .bool(true),
+                    "loading": .bool(false), "kind": .string("conversation"),
+                    "sessionId": chat.map { .string($0.localConversationId) } ?? .null,
+                    "busy": .bool(false)
+                ]),
+                .object([
+                    "tabId": .number(13), "title": .string("RemoteAI Project"),
+                    "canonicalUrl": .string(webProjects[0].canonicalUrl), "active": .bool(false),
+                    "loading": .bool(false), "kind": .string("project"),
+                    "sessionId": .null, "busy": .bool(false)
+                ])
+            ]), error: nil, idempotentReplay: nil)
+        case "manageOpenWebTab":
+            let operation = command.payload["operation"]?.stringValue ?? ""
+            let tabId = command.payload["tabId"]?.intValue ?? -1
+            if operation == "enter", tabId == 12,
+               let conversation = webProjectConversations["g-p-remoteai"]?.first,
+               command.payload["expectedUrl"]?.stringValue == conversation.canonicalUrl {
+                response = success([
+                    "tabId": .number(12),
+                    "conversation": try JSONValue.encode(conversation)
+                ])
+            } else if operation == "enter", tabId == 13,
+                      command.payload["expectedUrl"]?.stringValue == webProjects[0].canonicalUrl {
+                response = success([
+                    "tabId": .number(13),
+                    "project": try JSONValue.encode(webProjects[0])
+                ])
+            } else {
+                response = CommandResponseEnvelope(ok: false, result: nil,
+                    error: RemoteErrorPayload(code: "BROWSER_BINDING_MISSING",
+                        message: "The selected Chrome tab no longer matches its verified identity",
+                        retryable: false, details: nil), idempotentReplay: nil)
+            }
         case "loadRecentMessages":
             let limit = Int(command.payload["limit"]?.intValue ?? 40)
             response = try success(Array(history[command.sessionId ?? "", default: []].suffix(max(1, min(limit, 100)))))
@@ -483,7 +586,7 @@ actor MockTransport: Transport {
         case "getChangesAfterCursor":
             let cursor = command.payload["cursor"]?.intValue ?? 0
             let limit = Int(command.payload["limit"]?.intValue ?? 500)
-            let events = Array(eventLog.filter { $0.sequence > cursor }.sorted { $0.sequence < $1.sequence }.prefix(max(1, min(limit, 1000))))
+            let events = Array(eventLog.filter { $0.sequence > cursor }.sorted { $0.sequence < $1.sequence }.prefix(max(1, min(limit, 1000, deltaPageLimitForTests ?? 1000))))
             response = try success(DeltaSyncResult(events: events, nextCursor: events.last?.sequence ?? cursor, hasMore: eventLog.filter { $0.sequence > (events.last?.sequence ?? cursor) }.isEmpty == false))
         case "createSession":
             if command.runtimeId == "runtime.web" {
@@ -502,8 +605,19 @@ actor MockTransport: Transport {
             if scenario != .deltaOnlySend { Task { await self.simulateResponse(for: command, user: user) } }
             response = success(["accepted": .bool(true), "sessionId": .string(sessionId), "messageId": .string(user.messageId)])
         case "stopGeneration", "stopSession":
-            await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: command.sessionId, type: "GENERATION_STOPPED", payload: ["ok": .bool(true)])
-            response = success(["stopped": .bool(true)])
+            if scenario == .stopUnconfirmed || scenario == .stopPageIdleButAgentUnconfirmed {
+                // A page may report an idle control even though the Agent could
+                // not reconcile its registry. Neither response is terminal proof.
+                response = scenario == .stopPageIdleButAgentUnconfirmed
+                    ? success(["stopped": .bool(false), "alreadyIdle": .bool(true), "settled": .bool(true), "confirmedIdle": .bool(false)])
+                    : success(["stopped": .bool(true), "settled": .bool(false), "confirmedIdle": .bool(false)])
+            } else {
+                if let sessionId = command.sessionId { sessionStatusOverrides[sessionId] = "idle" }
+                if scenario != .stopConfirmedWithoutEvent {
+                    await emit(runtimeId: command.runtimeId, instanceId: command.instanceId, sessionId: command.sessionId, type: "GENERATION_STOPPED", payload: ["ok": .bool(true)])
+                }
+                response = success(["stopped": .bool(true), "settled": .bool(true), "confirmedIdle": .bool(true)])
+            }
         case "createConversation":
             let alias = command.payload["projectAlias"]?.stringValue
             let now = Date()
@@ -536,12 +650,23 @@ actor MockTransport: Transport {
                 metadata["lastProgressStatus"] = .string("Thinking")
                 metadata["lastProgressAt"] = .string(RemoteAIDate.string(now))
             }
-            response = success([
+            if let backgroundTaskStatus = sessionBackgroundTaskStatusOverrides[sessionId] {
+                metadata["backgroundTaskStatus"] = backgroundTaskStatus
+            }
+            if let providerSurfaceStatus = providerSurfaceStatusOverrides[sessionId] {
+                for (key, value) in providerSurfaceStatus { metadata[key] = value }
+            }
+            var statusResponse: [String: JSONValue] = [
                 "sessionId": .string(sessionId),
                 "status": .string(sessionStatusOverrides[sessionId] ?? (active ? "generating" : (stored?.status ?? "idle"))),
                 "browserConnected": .bool(true),
                 "metadata": .object(metadata)
-            ])
+            ]
+            if !sessionsWithoutStatusRevision.contains(sessionId),
+               let updatedAt = sessionStatusRevisionOverrides[sessionId] ?? stored?.updatedAt {
+                statusResponse["updatedAt"] = .string(RemoteAIDate.string(updatedAt))
+            }
+            response = success(statusResponse)
         case "resumeSession", "openConversation", "focusConversation", "registerCurrentPage", "unregisterConversation":
             response = success(["ok": .bool(true)])
         default:
@@ -549,6 +674,12 @@ actor MockTransport: Transport {
         }
         processedCommands[command.commandId] = response
         if let delay = responseDelayNanoseconds[command.action], delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+        if scenario == .malformedCreateReplyAfterCommit, command.action == "createSession" {
+            // The server committed the session and cached its real result, but
+            // the first reply body was corrupted in transit. A retry with the
+            // same command ID recovers that committed result, not a new Chat.
+            return success(["unverified": .bool(true)])
+        }
         if scenario == .disconnectImmediatelyAfterSend, command.action == "sendMessage" {
             connected = false
             throw TransportError.disconnected
