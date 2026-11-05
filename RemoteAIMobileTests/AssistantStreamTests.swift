@@ -62,6 +62,28 @@ final class AssistantStreamTests: XCTestCase {
         subscription.cancel()
     }
 
+    func testComposerPriorityPreservesAllDeltasAndPublishesLatestOnResume() {
+        let stream = AssistantStream(id: "editing", revision: 0, text: "begin")
+        var publications = 0
+        let subscription = stream.objectWillChange.sink { publications += 1 }
+
+        stream.prioritizeComposerInput(for: 30)
+        XCTAssertTrue(stream.append(id: "editing", baseRevision: 0, revision: 1, delta: " during"))
+        stream.flushPresentation()
+        XCTAssertTrue(stream.append(id: "editing", baseRevision: 1, revision: 2, delta: " input"))
+        stream.flushPresentation()
+
+        XCTAssertEqual(stream.visibleText, "begin", "Only the visual refresh is deferred")
+        XCTAssertEqual(publications, 0)
+        XCTAssertEqual(stream.text, "begin during input", "The full stream must still be retained")
+
+        stream.finishComposerInput()
+        XCTAssertEqual(stream.visibleText, "begin during input")
+        XCTAssertEqual(stream.visibleBytes, "begin during input".utf8.count)
+        XCTAssertEqual(publications, 1)
+        subscription.cancel()
+    }
+
     func testUnicodeDuplicateGapAndRewrite() {
         let stream = AssistantStream(id: "one", revision: 1, text: "中文🙂")
         XCTAssertTrue(stream.append(id: "one", baseRevision: 1, revision: 2, delta: " e\u{301}"))
