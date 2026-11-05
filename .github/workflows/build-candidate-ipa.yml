@@ -6,7 +6,7 @@ on:
       gate:
         description: Validation scope
         type: choice
-        options: [candidate, streaming, sync]
+        options: [candidate, streaming, sync, package]
         default: candidate
 
 permissions:
@@ -191,6 +191,9 @@ jobs:
           xcodebuild test -project RemoteAIMobile.xcodeproj -scheme RemoteAIMobile -configuration Debug -destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}' -only-testing:RemoteAIMobileTests/AssistantStreamTests | tee build/stream-unit.log
 
       - name: UI tests with isolated simulator process lifecycle
+        # Package-only CI reuses separately verified real XCTest UI evidence.
+        # It must NOT present itself as a full candidate gate.
+        if: inputs.gate != 'package'
         shell: bash
         run: |
           set -euo pipefail
@@ -343,7 +346,11 @@ jobs:
             echo '- Candidate only; not final release acceptance'
             echo '- External Live iOS Relay pairing smoke: intentionally excluded from this workflow'
             echo '- Protocol Security / Fuzz: PASS'
-            echo '- Unit/UI: PASS'
+            echo '- Unit tests: PASS'
+            echo '- UI in this workflow: ${{ inputs.gate == 'package' && 'NOT_RUN (artifact-only)' || 'PASS' }}'
+            echo '- Prior streaming UI and unit PASS: run 41982479687; exact app code matches via Git diff.'
+            echo '- Prior sync UI PASS: run 41988178746; that full run failed later at unattended performance sampler.'
+            echo '- Full candidate gate still required for final release acceptance.'
             echo '- Device architecture: `arm64`'
             echo '- Bundle ID: `com.remoteai.mobile`'
             echo '- IPA: `${{ steps.ipa.outputs.name }}`'
