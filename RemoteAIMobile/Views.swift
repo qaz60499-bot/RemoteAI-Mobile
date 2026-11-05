@@ -1072,7 +1072,7 @@ struct ChatView: View {
     let session: SessionDescriptor
     // The composer alone observes keystrokes. ChatView keeps the reference but
     // does not invalidate the history/scroll tree for every text edit.
-    @StateObject private var draft = ComposerDraft()
+    @State private var draft = ComposerDraft()
     private var input: String {
         get { draft.text }
         nonmutating set { draft.text = newValue }
@@ -1092,6 +1092,7 @@ struct ChatView: View {
     @State private var isAtBottom = true
     @State private var didInitialScrollToBottom = false
     @State private var userBrowsingHistory = false
+    @State private var composerEditing = false
     @StateObject private var speechInput = SpeechInputController()
     @State private var textSelectionRequest: TextSelectionRequest?
     @FocusState private var focused: Bool
@@ -1202,7 +1203,7 @@ struct ChatView: View {
                                     AssistantStreamRow(stream: stream, message: message, followTail: {
                                         // Streaming auto-scroll must never interrupt an active
                                         // keyboard composition or steal first-responder focus.
-                                        guard !userBrowsingHistory, !focused else { return }
+                                        guard !userBrowsingHistory, !focused, !composerEditing else { return }
                                         proxy.scrollTo("bottom", anchor: .bottom)
                                     }, onSelectText: { text, monospaced in
                                         textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
@@ -1235,7 +1236,7 @@ struct ChatView: View {
                     }
                     .background(Color(.systemGroupedBackground))
                     .simultaneousGesture(
-                        TapGesture().onEnded { focused = false }
+                        TapGesture().onEnded { focused = false; composerEditing = false }
                     )
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 8)
@@ -1267,7 +1268,7 @@ struct ChatView: View {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                                 didInitialScrollToBottom = true
                             }
-                        } else if !userBrowsingHistory && !focused {
+                        } else if !userBrowsingHistory && !focused && !composerEditing {
                             userBrowsingHistory = false
                             withAnimation(.easeOut(duration: 0.18)) {
                                 proxy.scrollTo("bottom", anchor: .bottom)
@@ -1277,6 +1278,7 @@ struct ChatView: View {
                     .onChange(of: session.id) { _ in
                         didInitialScrollToBottom = false
                         userBrowsingHistory = false
+                        composerEditing = false
                         isAtBottom = true
                     }
 
@@ -1460,6 +1462,7 @@ struct ChatView: View {
                         let commandId = composerCommandId ?? UUID()
                         let correctingActiveRun = isGenerating
                         focused = false
+                        composerEditing = false
                         input = ""
                         pendingAttachments.removeAll()
                         sending = true
@@ -1519,6 +1522,12 @@ struct ChatView: View {
             TextSelectionSheet(text: request.text, monospaced: request.monospaced)
         }
         .onDisappear { speechInput.stop() }
+        .onChange(of: focused) { active in
+            // Retain user intent through temporary UIKit focus transitions during
+            // live-stream layout updates. Only transcript tap, send or chat change
+            // should resume automatic tail following.
+            if active { composerEditing = true }
+        }
         .onChange(of: scenePhase) { phase in
             if phase != .active {
                 speechInput.stop()
