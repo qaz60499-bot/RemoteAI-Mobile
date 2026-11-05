@@ -111,9 +111,9 @@ jobs:
           import subprocess, sys
           command = ["xcrun", "simctl", *sys.argv[1:]]
           try:
-              result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
+              result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
           except subprocess.TimeoutExpired:
-              print("CoreSimulator command timed out after 45 seconds: " + " ".join(command), file=sys.stderr)
+              print("CoreSimulator command timed out after 120 seconds: " + " ".join(command), file=sys.stderr)
               raise SystemExit(124)
           if result.stderr:
               print(result.stderr.rstrip(), file=sys.stderr)
@@ -130,14 +130,22 @@ jobs:
             simctl_bounded create "$1" com.apple.CoreSimulator.SimDeviceType.iPhone-13-Pro "$IOS_SIM_RUNTIME"
           }
 
-          # Reuse the release workflow's bounded simulator create path: the
-          # read-only `simctl list runtimes` probe can hang before creation.
+          # GitHub-hosted Intel runners can take >45s to initialize CoreSimulator.
+          # Preserve the pinned device/runtime; recover only this ephemeral runner
+          # with bounded retries. Do not hide a genuinely unavailable simulator.
           recycle_core_simulator 8
-          if ! UDID=$(create_simulator RemoteAI-Candidate-iPhone13Pro); then
-            echo "Initial CoreSimulator create failed or timed out; recycling CoreSimulatorService and retrying once."
-            recycle_core_simulator 12
-            UDID=$(create_simulator RemoteAI-Candidate-iPhone13Pro)
-          fi
+          UDID=""
+          for attempt in 1 2 3; do
+            if UDID=$(create_simulator RemoteAI-Candidate-iPhone13Pro); then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              echo "CoreSimulator create failed after 3 bounded attempts on hosted runner." >&2
+              exit 124
+            fi
+            echo "CoreSimulator create attempt $attempt failed; recycling ephemeral hosted service."
+            recycle_core_simulator "$((8 + 4 * attempt))"
+          done
           [[ "$UDID" =~ ^[0-9A-Fa-f-]{36}$ ]]
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
           echo "Created pinned simulator: $UDID"
