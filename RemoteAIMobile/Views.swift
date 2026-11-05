@@ -1072,7 +1072,7 @@ struct ChatView: View {
     let session: SessionDescriptor
     // The composer alone observes keystrokes. ChatView keeps the reference but
     // does not invalidate the history/scroll tree for every text edit.
-    @State private var draft = ComposerDraft()
+    @StateObject private var draft = ComposerDraft()
     private var input: String {
         get { draft.text }
         nonmutating set { draft.text = newValue }
