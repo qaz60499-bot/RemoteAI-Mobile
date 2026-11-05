@@ -1236,7 +1236,11 @@ struct ChatView: View {
                     }
                     .background(Color(.systemGroupedBackground))
                     .simultaneousGesture(
-                        TapGesture().onEnded { focused = false; composerEditing = false }
+                        TapGesture().onEnded {
+                            focused = false
+                            composerEditing = false
+                            store.assistantStreams[session.id]?.finishComposerInput()
+                        }
                     )
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 8)
@@ -1448,6 +1452,11 @@ struct ChatView: View {
                     addPhoto: { showPhotoPicker = true },
                     addFile: { showFilePicker = true },
                     toggleVoice: { toggleVoiceInput() },
+                    onDraftEdited: {
+                        if focused || composerEditing {
+                            store.assistantStreams[session.id]?.prioritizeComposerInput(for: 1.8)
+                        }
+                    },
                     stop: { Task { await store.stop(runtimeId: runtime.id, instanceId: instance.id, sessionId: session.id) } },
                     send: {
                         // Reject a second tap synchronously, before SwiftUI re-renders disabled controls.
@@ -1463,6 +1472,7 @@ struct ChatView: View {
                         let correctingActiveRun = isGenerating
                         focused = false
                         composerEditing = false
+                        store.assistantStreams[session.id]?.finishComposerInput()
                         input = ""
                         pendingAttachments.removeAll()
                         sending = true
@@ -1521,12 +1531,18 @@ struct ChatView: View {
         .sheet(item: $textSelectionRequest) { request in
             TextSelectionSheet(text: request.text, monospaced: request.monospaced)
         }
-        .onDisappear { speechInput.stop() }
+        .onDisappear {
+            speechInput.stop()
+            store.assistantStreams[session.id]?.finishComposerInput()
+        }
         .onChange(of: focused) { active in
             // Retain user intent through temporary UIKit focus transitions during
             // live-stream layout updates. Only transcript tap, send or chat change
             // should resume automatic tail following.
-            if active { composerEditing = true }
+            if active {
+                composerEditing = true
+                store.assistantStreams[session.id]?.prioritizeComposerInput(for: 5)
+            }
         }
         .onChange(of: scenePhase) { phase in
             if phase != .active {
@@ -1629,6 +1645,7 @@ struct Composer: View {
     let addPhoto: () -> Void
     let addFile: () -> Void
     let toggleVoice: () -> Void
+    let onDraftEdited: () -> Void
     let stop: () -> Void
     let send: () -> Void
 
@@ -1691,6 +1708,7 @@ struct Composer: View {
 
                 TextEditor(text: $draft.text)
                     .focused(focused)
+                    .onChange(of: draft.text) { _ in onDraftEdited() }
                     .frame(minHeight: 36, maxHeight: 92)
                     .padding(.horizontal, 7).padding(.vertical, 2)
                     .background(RoundedRectangle(cornerRadius: 18).fill(Color(.secondarySystemBackground)))
