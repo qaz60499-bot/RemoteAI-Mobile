@@ -97,7 +97,7 @@ actor MockTransport: Transport {
                     messageId: "mock-\(i)",
                     sessionId: "photo-upload",
                     role: assistant ? "assistant" : "user",
-                    content: assistant ? "Mock assistant response \(i). This verifies long-history pagination without rendering everything at once." + (stressChars > 0 ? String(repeating: "\n历史 Markdown **文字** `code` 中文🙂", count: 500) : "") : "Mock user message \(i)",
+                    content: assistant ? "Mock assistant response \(i). This verifies long-history pagination without rendering everything at once." + (stressChars > 0 && i == historyCount - 20 ? String(repeating: "\n历史 Markdown **文字** `code` 中文🙂", count: 500) : "") : "Mock user message \(i)",
                     externalId: nil,
                     createdAt: now.addingTimeInterval(Double(i - historyCount) * 30)
                 ))
