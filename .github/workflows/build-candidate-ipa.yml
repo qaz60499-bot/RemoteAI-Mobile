@@ -219,7 +219,10 @@ jobs:
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
 
       - name: Streaming cadence and process samples without accessibility polling
-        if: inputs.gate != 'streaming'
+        # The targeted sync gate keeps protocol, unit and sync UI coverage, but
+        # does not require the separate long-stream unattended performance sampler.
+        # Full candidate validation continues to require this metric step.
+        if: inputs.gate == 'candidate'
         run: |
           set -euo pipefail
           python3 scripts/sample_streaming_performance.py --udid '${{ steps.simulator.outputs.udid }}' | tee build/stream-performance.log
