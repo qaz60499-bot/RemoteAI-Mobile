@@ -19,6 +19,10 @@ final class AssistantStream: ObservableObject {
     var visibleBytes: Int { presentation.bytes }
     private(set) var utf8Count: Int
     private(set) var materializedBytes = 0
+    // Incoming deltas never stop while the keyboard has priority. Briefly hold
+    // only view publications so UIKit can process real text editing without
+    // competing with long-response layout and accessibility snapshots.
+    private var presentationDeferredUntil: TimeInterval = 0
 
     init(id: String, revision: Int64, text: String) {
         self.id = id
@@ -39,7 +43,18 @@ final class AssistantStream: ObservableObject {
 
     // Called by the Store's existing 90 ms flush, not once per network event.
     // Only the active row observes this object; history arrays stay untouched.
+    func prioritizeComposerInput(for seconds: TimeInterval = 1.8) {
+        presentationDeferredUntil = max(presentationDeferredUntil,
+            ProcessInfo.processInfo.systemUptime + max(0, seconds))
+    }
+
+    func finishComposerInput() {
+        presentationDeferredUntil = 0
+        flushPresentation()
+    }
+
     func flushPresentation() {
+        guard ProcessInfo.processInfo.systemUptime >= presentationDeferredUntil else { return }
         performance.published()
         let next = AssistantStreamPresentation(text: preview, bytes: utf8Count)
         if presentation != next { presentation = next }
