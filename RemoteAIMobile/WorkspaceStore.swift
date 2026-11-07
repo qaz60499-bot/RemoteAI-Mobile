@@ -146,6 +146,9 @@ final class WorkspaceStore: ObservableObject {
     // Only sparse active Web histories need bounded re-reads after a successful empty page.
     private var sparseWebHistoryRetryAt: [String: Date] = [:]
     private var sparseWebHistoryRetryCounts: [String: Int] = [:]
+    // Only a user-requested reopen that passed the exact-tab/renderer checks may
+    // unlock bounded idle-empty history retries. A generic binding event cannot.
+    private var verifiedReopenEmptyWebHistorySessions = Set<String>()
     private var systemTransportOfflineChannels = Set<String>()
     private var webProviderStatusReceivedAtBySession: [String: Date] = [:]
     private var webBindingDetachedSessions = Set<String>()
@@ -166,6 +169,9 @@ final class WorkspaceStore: ObservableObject {
     private var creatingWebProjects = Set<String>()
     private var creatingWebConversations = Set<String>()
     private var reopeningWebConversations = Set<String>()
+    // Only a visible, user-opened archived Web Chat may request one explicit
+    // same-UUID recovery per app lifecycle; passive sync must never open tabs.
+    private var visibleArchivedWebReopenAttempts = Set<String>()
     private var creatingSessions = Set<String>()
     private var stopTasksBySession: [String: Task<Bool, Never>] = [:]
     @Published private(set) var stopRequestsPending = Set<String>()
@@ -202,12 +208,14 @@ final class WorkspaceStore: ObservableObject {
     static func sparseWebHistoryRetryDue(
         isWeb: Bool, isActive: Bool, transcriptCount: Int,
         lastTranscriptRoleIsUser: Bool = false, hasAssistantGap: Bool = false,
+        allowVerifiedIdleEmptyRetry: Bool = false,
         lastSuccessfulHistoryAt: Date?, lastRetryAt: Date?, retryCount: Int,
         now: Date
     ) -> Bool {
         let incompleteRunningHistory = isActive && transcriptCount <= 1
         let missingIdleAssistant = !isActive && (lastTranscriptRoleIsUser || hasAssistantGap)
-        guard isWeb, (incompleteRunningHistory || missingIdleAssistant),
+        let verifiedIdleEmpty = !isActive && transcriptCount == 0 && allowVerifiedIdleEmptyRetry
+        guard isWeb, (incompleteRunningHistory || missingIdleAssistant || verifiedIdleEmpty),
               let lastSuccessfulHistoryAt, (0..<3).contains(retryCount) else { return false }
         let delay: [TimeInterval] = [15, 30, 60]
         let reference = max(lastSuccessfulHistoryAt, lastRetryAt ?? lastSuccessfulHistoryAt)
@@ -622,6 +630,70 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    // Called only when the person opens this Chat view, never by background
+    // polling, Project catalog refresh, push, or reconnect. A cold archived
+    // Project Chat with no User/Assistant needs an explicitly reopened original
+    // Provider page; loadRecent alone is existing-tab-only and cannot hydrate it.
+    func recoverArchivedWebHistoryOnVisibleOpen(_ sessionId: String) async {
+        guard machine.state == .online, !isSuspended,
+              routeForSession(sessionId)?.runtimeId == "runtime.web",
+              let session = sessions.first(where: { $0.id == sessionId }),
+              let canonical = session.canonicalUrl,
+              let url = URL(string: canonical),
+              url.scheme == "https", url.host == "chatgpt.com",
+              let projectAlias = session.projectAlias,
+              let providerAlias = webConversationAlias(from: canonical),
+              UUID(uuidString: providerAlias) != nil else { return }
+        let path = url.path.split(separator: "/").map(String.init)
+        guard path.count == 4, path[0] == "g", path[2] == "c",
+              sameWebProjectAlias(path[1], projectAlias),
+              path[3].lowercased() == providerAlias.lowercased() else { return }
+        // A cached User-only transcript or an unanswered old User is *not*
+        // complete history: the missing Assistant is the exact reported bug.
+        // Do not reopen a healthy complete pair or an actively generating Chat.
+        let transcript = messagesBySession[sessionId, default: []]
+            .filter { $0.role == .user || $0.role == .assistant }
+        let needsOriginalHistory = transcript.isEmpty
+            || !transcript.contains(where: { $0.role == .assistant })
+            || transcript.last?.role == .user
+            || zip(transcript, transcript.dropFirst()).contains {
+                $0.0.role == .user && $0.1.role == .user
+            }
+        guard needsOriginalHistory,
+              session.state != .busy, session.state != .waiting,
+              liveRunStatusBySession[sessionId] == nil,
+              !sessionSendsInFlight.contains(sessionId),
+              !reopeningWebConversations.contains(sessionId),
+              visibleArchivedWebReopenAttempts.insert(sessionId).inserted else { return }
+
+        let generation = lifecycleGeneration
+        await refreshOpenWebTabs()
+        guard !Task.isCancelled, generation == lifecycleGeneration,
+              machine.state == .online, !isSuspended,
+              !openWebTabsInventoryUnverified else { return }
+        // Never create a duplicate tab if that Provider UUID is already open,
+        // even when the old A01 Project/session binding is wrong or missing.
+        let providerTabs = openWebTabs.filter {
+            webConversationAlias(from: $0.canonicalUrl)?.lowercased()
+                == providerAlias.lowercased()
+        }
+        if providerTabs.count == 1,
+           let tab = providerTabs.first,
+           tab.isChat, tab.sessionId == sessionId {
+            await synchronizeVisibleSession(sessionId, force: true)
+            return
+        }
+        guard providerTabs.isEmpty else {
+            webChatRecoveryNotesBySession[sessionId] =
+                "原 Chat 网页已存在但身份未核实；没有另开标签或合并历史。"
+            return
+        }
+        // The user explicitly entered this old Chat. The existing verified
+        // resumeSession path opens only its exact canonical UUID in a background
+        // tab and then checks the unique binding before syncing messages.
+        await reopenClosedWebConversation(sessionId: sessionId)
+    }
+
     func reopenClosedWebConversation(sessionId: String) async {
         guard machine.state == .online, !isSuspended else {
             errors[sessionId] = "Windows 未连接，不能重新打开原 Chat；本地历史已保留。"
@@ -660,6 +732,20 @@ final class WorkspaceStore: ObservableObject {
                 webChatRecoveryNotesBySession[sessionId] = "已验证原 Chat 的网页身份与状态，正在同步消息。"
                 errors[sessionId] = nil
                 await synchronizeVisibleSession(sessionId, force: true)
+                // The old Windows Agent could acknowledge an empty history page.
+                // Only this explicit, verified same-Chat reopen gets up to three
+                // further passive reads, without any additional resume/navigation.
+                guard generation == lifecycleGeneration, transport === activeTransport,
+                      machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+                let hasTranscript = messagesBySession[sessionId, default: []].contains {
+                    $0.role == .user || $0.role == .assistant
+                }
+                if !hasTranscript {
+                    verifiedReopenEmptyWebHistorySessions.insert(sessionId)
+                    sparseWebHistoryRetryAt[sessionId] = Date()
+                    sparseWebHistoryRetryCounts[sessionId] = 0
+                    webChatRecoveryNotesBySession[sessionId] = Self.waitingForWebTranscriptNote
+                }
             } else {
                 webChatRecoveryNotesBySession[sessionId] = "已找到原 Chat 标签，但网页仍未就绪；不会刷新或操作其他 Chat。"
             }
@@ -1613,6 +1699,11 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.upsertMessages(authoritativeItems)
             merge(authoritativeItems, into: sessionId)
             if route.runtimeId == "runtime.web" {
+                // A genuine nonempty remote page supersedes any previously
+                // armed idle-empty recovery window for this exact session.
+                if authoritativeItems.contains(where: { $0.role == .user || $0.role == .assistant }) {
+                    verifiedReopenEmptyWebHistorySessions.remove(sessionId)
+                }
                 // A verified history page is sufficient to clean legacy visual
                 // transcript artifacts. This load path has no status snapshot;
                 // provider issue observations are reconciled separately by
@@ -1914,7 +2005,9 @@ final class WorkspaceStore: ObservableObject {
         let hasAssistantGap = verifiedIdle && zip(transcriptRows, transcriptRows.dropFirst()).contains {
             $0.0.role == .user && $0.1.role == .user
         }
-        let sparseCandidate = stillActive ? transcriptCount <= 1 : (lastTranscriptRoleIsUser || hasAssistantGap)
+        let verifiedIdleEmptyRetry = !stillActive && transcriptCount == 0
+            && verifiedReopenEmptyWebHistorySessions.contains(sessionId)
+        let sparseCandidate = stillActive ? transcriptCount <= 1 : (lastTranscriptRoleIsUser || hasAssistantGap || verifiedIdleEmptyRetry)
         if !sparseCandidate || force {
             sparseWebHistoryRetryAt.removeValue(forKey: sessionId)
             sparseWebHistoryRetryCounts.removeValue(forKey: sessionId)
@@ -1925,6 +2018,7 @@ final class WorkspaceStore: ObservableObject {
             transcriptCount: transcriptCount,
             lastTranscriptRoleIsUser: lastTranscriptRoleIsUser,
             hasAssistantGap: hasAssistantGap,
+            allowVerifiedIdleEmptyRetry: verifiedIdleEmptyRetry,
             lastSuccessfulHistoryAt: visibleSessionHistorySyncAt[sessionId],
             lastRetryAt: sparseWebHistoryRetryAt[sessionId],
             retryCount: sparseWebHistoryRetryCounts[sessionId] ?? 0,
@@ -2592,6 +2686,7 @@ final class WorkspaceStore: ObservableObject {
         webProviderRecoveryObservedAtBySession.removeAll()
         webProviderStatusReceivedAtBySession.removeAll()
         webBindingDetachedSessions.removeAll()
+        verifiedReopenEmptyWebHistorySessions.removeAll()
         webProjectsSnapshotId = nil
         projectConversationSnapshotIds.removeAll()
         lastWebProjectsRefreshAt = nil
