@@ -1533,6 +1533,12 @@ struct ChatView: View {
                     ?? ""
             }
             await store.loadSession(session.id)
+            // Entering an archived Web Chat is an explicit user navigation.
+            // Only an empty, exact Provider-UUID conversation may recover its
+            // original page once; ordinary background sync never opens tabs.
+            if runtime.kind == .web && !Task.isCancelled {
+                await store.recoverArchivedWebHistoryOnVisibleOpen(session.id)
+            }
             if let mock = store.transport as? MockTransport {
                 await mock.runStressIfRequested(sessionId: session.id)
             }
