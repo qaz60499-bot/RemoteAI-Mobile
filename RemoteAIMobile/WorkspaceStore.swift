@@ -142,6 +142,9 @@ final class WorkspaceStore: ObservableObject {
     private var sessionLoads = Set<String>()
     private var visibleSessionSyncAt: [String: Date] = [:]
     private var visibleSessionHistorySyncAt: [String: Date] = [:]
+    // Only a successfully decoded remote history page may update these counts.
+    // Local cached messages are not evidence that the manual resync read them.
+    private var visibleSessionLastRemoteHistoryRoles: [String: (user: Int, assistant: Int)] = [:]
     private var visibleSessionHistoryRemoteRevision: [String: Date] = [:]
     // Only sparse active Web histories need bounded re-reads after a successful empty page.
     private var sparseWebHistoryRetryAt: [String: Date] = [:]
@@ -287,7 +290,10 @@ final class WorkspaceStore: ObservableObject {
         lastProgressAt ?? lastActivityAt
     }
 
-    private static let waitingForWebTranscriptNote = "电脑端 ChatGPT 暂未提供可验证的历史消息；保留缓存，继续等待原会话加载。"
+    private static let waitingForWebTranscriptNote = "电脑端历史读取暂不可用 [WEB_SELECTOR_FAILED]：未找到可验证的 ChatGPT 消息正文；已保留旧缓存，等待原会话恢复。"
+    private static let emptyBusyWebTranscriptNote = "当前只收到 Running 状态，电脑端尚未返回可验证的历史消息。不会把空历史误判为同步完成。"
+    private static let readingEmptyBusyWebTranscriptNote = "正在读取本 Chat 的历史正文；当前只有 Running 并不代表消息已同步。"
+    private static let missingIdleWebReplyNote = "已取得部分历史，但最后一条是 User，尚未确认对应 Assistant 回复；已保留现有消息并继续核验。"
 
     init(transport: Transport, cache: SQLiteStore) {
         self.transport = transport
@@ -805,9 +811,61 @@ final class WorkspaceStore: ObservableObject {
             return
         }
         if operation == "resync" {
-            webChatRecoveryNotesBySession[sessionId] = "正在重新同步消息，不会刷新或停止电脑网页。"
-            await synchronizeVisibleSession(sessionId, force: true)
-            webChatRecoveryNotesBySession[sessionId] = "已请求同步；如仍缺少回复，请检查电脑端网页状态。"
+            // A user-triggered resync must attempt a real history page read.
+            // The periodic reconciler can return without reading while delta
+            // recovery or another session load is in progress.
+            let generation = lifecycleGeneration
+            let activeTransport = transport
+            let activeMachineId = machine.id
+            webChatRecoveryNotesBySession[sessionId] = "正在重新读取此 Chat 的最近历史，不会刷新或停止电脑网页。"
+            await recoverDelta()
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, machine.state == .online, !isSuspended else {
+                webChatRecoveryNotesBySession[sessionId] = "连接状态发生变化，本次历史同步未完成；原消息已保留。"
+                return
+            }
+            for _ in 0..<8 {
+                if !sessionLoads.contains(sessionId) { break }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard generation == lifecycleGeneration, transport === activeTransport,
+                      machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+            }
+            guard !sessionLoads.contains(sessionId) else {
+                webChatRecoveryNotesBySession[sessionId] = "本 Chat 已有历史读取任务正在执行；尚未确认同步完成。"
+                return
+            }
+            let readStartedAt = Date()
+            await loadSession(sessionId)
+            guard generation == lifecycleGeneration, transport === activeTransport,
+                  machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+            let remoteRoles = visibleSessionLastRemoteHistoryRoles[sessionId]
+            let fetchedUser = remoteRoles?.user ?? 0
+            let fetchedAssistant = remoteRoles?.assistant ?? 0
+            let providerWarning = webProviderIssuesBySession[sessionId].map {
+                " · 当前网页异常 [\($0.code)]：\($0.message)"
+            } ?? ""
+            if let readAt = visibleSessionHistorySyncAt[sessionId], readAt >= readStartedAt,
+               fetchedUser + fetchedAssistant > 0 {
+                if fetchedAssistant == 0 {
+                    webChatRecoveryNotesBySession[sessionId] =
+                        "本次仅从电脑端读取到 \(fetchedUser) 条 User 消息，Assistant 回复尚未取回；历史不完整。\(providerWarning)"
+                } else {
+                    webChatRecoveryNotesBySession[sessionId] =
+                        "本次从电脑端读取到 User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条；较早历史是否完整尚未验证。\(providerWarning)"
+                }
+            } else if let providerIssue = webProviderIssuesBySession[sessionId] {
+                // Reuse the existing per-Chat provider status/error channel; a
+                // page failure is not proof of a completed/empty transcript.
+                webChatRecoveryNotesBySession[sessionId] =
+                    "历史未补齐 · 网页异常 [\(providerIssue.code)]：\(providerIssue.message)"
+            } else if webChatRecoveryNotesBySession[sessionId] == Self.waitingForWebTranscriptNote {
+                // Preserve the existing specific unreadable-source diagnosis.
+            } else if let error = errors[sessionId] {
+                webChatRecoveryNotesBySession[sessionId] = "重新同步未完成：\(error)"
+            } else {
+                webChatRecoveryNotesBySession[sessionId] =
+                    "本次未取得可验证的历史正文；保留本地消息，等待电脑端原 Chat 可读取。"
+            }
             return
         }
         guard ["inspect", "rebind", "reload", "hardReload"].contains(operation) else { return }
@@ -843,11 +901,18 @@ final class WorkspaceStore: ObservableObject {
         }
         if operation == "inspect" {
             await inspectOpenWebTab(tab)
-            if let diagnosis = webTabDiagnosesById[tab.tabId] {
-                webChatRecoveryNotesBySession[sessionId] = "网页状态：\(diagnosis.state)" +
-                    (diagnosis.issueMessage.map { " · \($0)" } ?? "")
+            if let diagnosis = webTabDiagnosesById[tab.tabId],
+               diagnosis.tabId == tab.tabId {
+                // The explicit status check is bound to this exact known tab.
+                // Surface specific source errors (including unverified identity)
+                // without treating Unknown as Idle or dropping earlier messages.
+                let issueCode = diagnosis.issueCode.map { " [\($0)]" } ?? ""
+                let issueText = diagnosis.issueMessage.map { " · \($0)" } ?? ""
+                webChatRecoveryNotesBySession[sessionId] =
+                    "网页状态：\(diagnosis.state)\(issueCode)\(issueText)"
             } else {
                 errors[sessionId] = errors["web.tabs"] ?? "当前网页状态无法验证。"
+                webChatRecoveryNotesBySession[sessionId] = "本 Chat 网页诊断未完成，不能证明状态正常。"
             }
             return
         }
@@ -1689,6 +1754,15 @@ final class WorkspaceStore: ObservableObject {
         // wait for the network read just to discover that the conversation already
         // completed successfully on the PC.
         await settleRunStateIfAuthoritativeFinalExists(cachedMessages, sessionId: sessionId)
+        // Opening a busy Chat with no durable turns must not look like a
+        // successful Running-only sync while the initial remote read is pending.
+        if routeForSession(sessionId)?.runtimeId == "runtime.web",
+           !cachedMessages.contains(where: { $0.role == .user || $0.role == .assistant }),
+           let currentState = sessions.first(where: { $0.id == sessionId })?.state,
+           currentState == .busy || currentState == .waiting,
+           webChatRecoveryNotesBySession[sessionId] == nil {
+            webChatRecoveryNotesBySession[sessionId] = Self.readingEmptyBusyWebTranscriptNote
+        }
         guard machine.state == .online, let route = routeForSession(sessionId) else { return }
         await hydrateSessionDescriptorIfNeeded(sessionId: sessionId, route: route, generation: generation)
         do {
@@ -1729,7 +1803,24 @@ final class WorkspaceStore: ObservableObject {
                 }
             }
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: authoritativeItems.last?.createdAt ?? Date())
-            if webChatRecoveryNotesBySession[sessionId] == Self.waitingForWebTranscriptNote {
+            if route.runtimeId == "runtime.web", authoritativeItems.isEmpty,
+               let sessionState = sessions.first(where: { $0.id == sessionId })?.state,
+               sessionState == .busy || sessionState == .waiting {
+                // Running + an empty remote page is not an authenticated empty
+                // transcript. Retain cached turns, tell the user the source is
+                // incomplete, and allow the existing bounded sparse rechecks.
+                webChatRecoveryNotesBySession[sessionId] = Self.emptyBusyWebTranscriptNote
+            } else if route.runtimeId == "runtime.web",
+                      authoritativeItems.last?.role == .user,
+                      sessions.first(where: { $0.id == sessionId })?.state == .idle {
+                // A successful partial User-only page is not proof that an
+                // archived Assistant reply was restored. This is a warning,
+                // not an invented provider error or terminal result.
+                webChatRecoveryNotesBySession[sessionId] = Self.missingIdleWebReplyNote
+            } else if webChatRecoveryNotesBySession[sessionId] == Self.waitingForWebTranscriptNote
+                || webChatRecoveryNotesBySession[sessionId] == Self.emptyBusyWebTranscriptNote
+                || webChatRecoveryNotesBySession[sessionId] == Self.readingEmptyBusyWebTranscriptNote
+                || webChatRecoveryNotesBySession[sessionId] == Self.missingIdleWebReplyNote {
                 webChatRecoveryNotesBySession.removeValue(forKey: sessionId)
             }
             await settleRunStateIfAuthoritativeFinalExists(authoritativeItems, sessionId: sessionId)
@@ -1747,6 +1838,10 @@ final class WorkspaceStore: ObservableObject {
             // A successful authoritative history read is the recovery watermark for
             // this visible conversation. Periodic status probes must not immediately
             // reload the same long transcript again unless later evidence invalidates it.
+            visibleSessionLastRemoteHistoryRoles[sessionId] = (
+                user: authoritativeItems.filter { $0.role == .user }.count,
+                assistant: authoritativeItems.filter { $0.role == .assistant }.count
+            )
             visibleSessionHistorySyncAt[sessionId] = Date()
             if let remoteRevision {
                 // This is a remote revision token, not a wall-clock freshness comparison.
@@ -2670,6 +2765,7 @@ final class WorkspaceStore: ObservableObject {
         // Always clear connection-derived cache before reconnecting so an older cached
         // MachineMetadata cannot overwrite the just-paired machine during start().
         try await cache.clearAll()
+        visibleSessionLastRemoteHistoryRoles.removeAll()
         runtimes.removeAll()
         instances.removeAll()
         sessions.removeAll()
@@ -3893,6 +3989,7 @@ final class WorkspaceStore: ObservableObject {
                     authoritativeResyncProjectAliases.formUnion(projectConversationsByAlias.keys)
                     visibleSessionSyncAt.removeAll()
                     visibleSessionHistorySyncAt.removeAll()
+                    visibleSessionLastRemoteHistoryRoles.removeAll()
                     visibleSessionHistoryRemoteRevision.removeAll()
                     metadataRefreshDeferredForDelta = true
                     DiagnosticsLog.shared.record("delta_recovery_fast_forward", fields: [
