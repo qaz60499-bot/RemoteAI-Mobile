@@ -659,11 +659,20 @@ final class WorkspaceStore: ObservableObject {
             || zip(transcript, transcript.dropFirst()).contains {
                 $0.0.role == .user && $0.1.role == .user
             }
-        guard needsOriginalHistory,
-              session.state != .busy, session.state != .waiting,
-              liveRunStatusBySession[sessionId] == nil,
+        guard needsOriginalHistory, !Task.isCancelled,
               !sessionSendsInFlight.contains(sessionId),
-              !reopeningWebConversations.contains(sessionId),
+              !reopeningWebConversations.contains(sessionId) else { return }
+        // A reopened archived Chat can be stuck on a stale phone-side Running
+        // snapshot. Do not treat that as a new live generation, but require a
+        // fresh authoritative idle status from the exact Windows session before
+        // attempting a page recovery. A real Busy/Waiting run remains untouched.
+        if session.state == .busy || session.state == .waiting
+            || liveRunStatusBySession[sessionId] != nil {
+            guard let fresh = await refreshVisibleSessionStatus(sessionId, rejectEvidencePoorIdle: true),
+                  fresh.state == .idle else { return }
+        }
+        guard !Task.isCancelled, machine.state == .online, !isSuspended,
+              !sessionSendsInFlight.contains(sessionId),
               visibleArchivedWebReopenAttempts.insert(sessionId).inserted else { return }
 
         let generation = lifecycleGeneration
