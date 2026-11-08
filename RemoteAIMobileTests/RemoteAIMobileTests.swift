@@ -4,6 +4,69 @@ import Combine
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
+
+    func testOlderHistoryProofWireDoesNotCertifyShortWebCache() throws {
+        let one = ServerMessage(
+            messageId: "older-history-one", sessionId: "same-chat",
+            role: "user", content: "Older original body",
+            externalId: "123e4567-e89b-42d3-a456-426614174000", createdAt: Date()
+        )
+        let wire = try JSONValue.encode([one])
+        let legacy = try OlderHistoryProofCodec.decode(wire, runtimeId: "runtime.web", limit: 40)
+        XCTAssertEqual(legacy.items.count, 1)
+        XCTAssertTrue(legacy.hasMore, "A short legacy cache page must not certify the Provider archive start")
+
+        let unproven: JSONValue = .object([
+            "historyProofVersion": .number(1),
+            "items": wire, "hasMore": .bool(true), "serverStartProven": .bool(false)
+        ])
+        let pending = try OlderHistoryProofCodec.decode(unproven, runtimeId: "runtime.web", limit: 40)
+        XCTAssertEqual(pending.items.count, 1)
+        XCTAssertTrue(pending.hasMore)
+
+        let proven: JSONValue = .object([
+            "historyProofVersion": .number(1),
+            "items": wire, "hasMore": .bool(false), "serverStartProven": .bool(true)
+        ])
+        let complete = try OlderHistoryProofCodec.decode(proven, runtimeId: "runtime.web", limit: 40)
+        XCTAssertEqual(complete.items.count, 1)
+        XCTAssertFalse(complete.hasMore)
+        XCTAssertEqual(complete.items[0].content, "Older original body")
+    }
+
+    func testOlderHistoryProofWireRejectsUnverifiedTerminalAndMalformedMetadata() throws {
+        let empty: JSONValue = .array([])
+        XCTAssertThrowsError(try OlderHistoryProofCodec.decode(empty, runtimeId: "runtime.web", limit: 40)) { error in
+            guard case TransportError.remote(let code, _) = error else {
+                return XCTFail("Unverified Web terminal must fail with an actionable Provider error")
+            }
+            XCTAssertEqual(code, "WEB_SELECTOR_FAILED")
+        }
+        let verifiedEmpty: JSONValue = .object([
+            "historyProofVersion": .number(1),
+            "items": empty, "hasMore": .bool(false), "serverStartProven": .bool(true)
+        ])
+        XCTAssertFalse(try OlderHistoryProofCodec.decode(verifiedEmpty, runtimeId: "runtime.web", limit: 40).hasMore)
+
+        let unprovenEmpty: JSONValue = .object([
+            "historyProofVersion": .number(1),
+            "items": empty, "hasMore": .bool(true), "serverStartProven": .bool(false)
+        ])
+        XCTAssertThrowsError(try OlderHistoryProofCodec.decode(unprovenEmpty, runtimeId: "runtime.web", limit: 40))
+        let contradictory: JSONValue = .object([
+            "historyProofVersion": .number(1),
+            "items": empty, "hasMore": .bool(false), "serverStartProven": .bool(false)
+        ])
+        XCTAssertThrowsError(try OlderHistoryProofCodec.decode(contradictory, runtimeId: "runtime.web", limit: 40))
+        let falseString: JSONValue = .object([
+            "historyProofVersion": .number(1),
+            "items": empty, "hasMore": .bool(false), "serverStartProven": .string("true")
+        ])
+        XCTAssertThrowsError(try OlderHistoryProofCodec.decode(falseString, runtimeId: "runtime.web", limit: 40))
+        let nonWeb = try OlderHistoryProofCodec.decode(empty, runtimeId: "runtime.codex", limit: 40)
+        XCTAssertFalse(nonWeb.hasMore, "Unrelated runtimes must retain their existing paging semantics")
+    }
+
     @MainActor
     func testActiveSparseWebHistoryRetryHasStrictBackoffAndStopsWhenHealthy() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
