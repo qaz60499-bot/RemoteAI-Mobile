@@ -58,6 +58,10 @@ final class WorkspaceStore: ObservableObject {
     @Published var webProviderSurfaceObservedAtBySession: [String: Date] = [:]
     @Published var webProviderRecoveryObservedAtBySession: [String: Date] = [:]
     @Published var hasMoreBySession: [String: Bool] = [:]
+    // A short Windows cache page cannot certify the Provider archive beginning.
+    // After one empty/failed older-page attempt, require explicit user recheck
+    // instead of repeatedly querying the same unverified source on scroll.
+    private var webOlderPageNeedsExplicitRetry = Set<String>()
     @Published var isPaired = false
     @Published var pairingStage: PairingStage?
     @Published var connectionPhase: ConnectionDiagnosticPhase = .relayConnecting
@@ -405,6 +409,7 @@ final class WorkspaceStore: ObservableObject {
             hasLoadedWebProjects = false
             attachmentTransferBySession.removeAll()
             hasMoreBySession.removeAll()
+            webOlderPageNeedsExplicitRetry.removeAll()
             machine.state = .offline
             connectionPhase = .pairingExpired
             errors["connection"] = "Not paired — scan the Windows pairing code to load your real runtimes and ChatGPT Projects."
@@ -598,6 +603,22 @@ final class WorkspaceStore: ObservableObject {
                   machine.id == activeMachineId, machine.state == .online, !isSuspended else { return nil }
             errors["web.tabs"] = nil
             if let conversation = entered.conversation {
+                // For a previously known durable Project Chat, compare the
+                // returned BrowserHost registration against its established
+                // membership before reusing a cached SessionDescriptor.
+                // A stale root/foreign-tab registration must not become proof
+                // of successful reconnect in the phone UI.
+                if let prior = sessions.first(where: { $0.id == conversation.localConversationId }),
+                   let establishedProject = prior.projectAlias,
+                   let establishedAlias = webConversationAlias(from: prior.canonicalUrl),
+                   UUID(uuidString: establishedAlias) != nil {
+                    guard sameWebProjectAlias(conversation.projectAlias, establishedProject),
+                          let returnedAlias = webConversationAlias(from: conversation.canonicalUrl),
+                          returnedAlias.lowercased() == establishedAlias.lowercased() else {
+                        errors["web.tabs"] = "当前标签无法证实属于原 Chat 和 Project；未重新绑定或读取其他 Chat。"
+                        return nil
+                    }
+                }
                 // Enter returns a verified existing provider identity, not a
                 // new chat. Keep the live Agent status when already available.
                 let session = sessions.first(where: { $0.id == conversation.localConversationId })
@@ -836,6 +857,10 @@ final class WorkspaceStore: ObservableObject {
                 webChatRecoveryNotesBySession[sessionId] = "本 Chat 已有历史读取任务正在执行；尚未确认同步完成。"
                 return
             }
+            // Explicit resync re-arms one safe older-page attempt after the
+            // current-document/Project guard has a chance to recover. This
+            // still uses the guarded older-page read below without navigation.
+            webOlderPageNeedsExplicitRetry.remove(sessionId)
             let readStartedAt = Date()
             await loadSession(sessionId)
             guard generation == lifecycleGeneration, transport === activeTransport,
@@ -846,6 +871,40 @@ final class WorkspaceStore: ObservableObject {
             let providerWarning = webProviderIssuesBySession[sessionId].map {
                 " · 当前网页异常 [\($0.code)]：\($0.message)"
             } ?? ""
+            // Manual resync means more than re-reading the same short local
+            // recent window. Ask for AT MOST one older page, only for an idle,
+            // still-bound Web Chat with a real cached cursor. Windows must
+            // independently authorize Project/Session/current-document/User
+            // UUID before reading Provider content; this never opens Chrome,
+            // sends a message, stops a generation or retries a delivery.
+            if webBindingDetachedSessions.contains(sessionId) {
+                webChatRecoveryNotesBySession[sessionId] =
+                    "原 Chat 当前没有可信的绑定标签；本次仅核对到电脑缓存 User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条。旧 Assistant 历史未补齐，请先人工核验原网页身份。"
+                return
+            }
+            var verifiedOlderNewRows = 0
+            if routeForSession(sessionId)?.runtimeId == "runtime.web",
+               hasMoreBySession[sessionId] == true,
+               sessions.first(where: { $0.id == sessionId })?.state == .idle,
+               !sessionSendsInFlight.contains(sessionId),
+               !olderMessageLoads.contains(sessionId) {
+                let earlierIds = Set(messagesBySession[sessionId, default: []].map(\.id))
+                await loadOlder(sessionId)
+                guard generation == lifecycleGeneration, transport === activeTransport,
+                      machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+                verifiedOlderNewRows = messagesBySession[sessionId, default: []].filter {
+                    !earlierIds.contains($0.id) && ($0.role == .user || $0.role == .assistant)
+                }.count
+                if webChatRecoveryNotesBySession[sessionId]?.hasPrefix("旧历史") == true {
+                    // Preserve exact failed/empty Provider source diagnosis.
+                    return
+                }
+            }
+            if verifiedOlderNewRows > 0 {
+                webChatRecoveryNotesBySession[sessionId] =
+                    "本次补入较早消息 \(verifiedOlderNewRows) 条；原 Assistant 全历史是否完整仍待 Provider 起点核验。"
+                return
+            }
             if let readAt = visibleSessionHistorySyncAt[sessionId], readAt >= readStartedAt,
                fetchedUser + fetchedAssistant > 0 {
                 if fetchedAssistant == 0 {
@@ -898,8 +957,14 @@ final class WorkspaceStore: ObservableObject {
         if operation == "rebind" {
             if let destination = await enterOpenWebTab(tab),
                case .chat(let verifiedSession) = destination,
-               verifiedSession.id == sessionId {
-                webChatRecoveryNotesBySession[sessionId] = "已验证并重新绑定原 Chat，正在同步历史与执行状态。"
+               verifiedSession.id == sessionId,
+               let expectedProject = sessions.first(where: { $0.id == sessionId })?.projectAlias,
+               sameWebProjectAlias(verifiedSession.projectAlias, expectedProject) {
+                // Only an explicit, identity-checked existing-tab enter may
+                // clear a detached marker. A delayed binding event alone cannot
+                // authorize this Chat's older Provider archive.
+                webBindingDetachedSessions.remove(sessionId)
+                webChatRecoveryNotesBySession[sessionId] = "已核验原 Chat 的现有标签绑定；当前文档和旧历史来源仍须独立验证，正在同步历史与执行状态。"
                 await synchronizeVisibleSession(sessionId, force: true)
             } else {
                 errors[sessionId] = "当前 Chrome 标签无法确认属于这个 Chat，未创建新标签或改变其他会话。"
@@ -1808,18 +1873,23 @@ final class WorkspaceStore: ObservableObject {
                 // provider issue observations are reconciled separately by
                 // refreshVisibleSessionStatus, not invented from this history read.
                 await collapseWebTranscriptArtifacts(sessionId: sessionId)
-                // A successful authoritative history read proves that this exact web
-                // conversation is available again, even if the WEB_BINDING_CHANGED
-                // recovery push was missed while the phone was backgrounded. Do not
-                // leave an old "switched Project/conversation" banner pinned forever.
-                if webBindingDetachedSessions.remove(sessionId) != nil,
-                   (recentSystemNotice?.contains("ChatGPT 标签页") == true
-                       || recentSystemNotice?.contains("标签页绑定") == true) {
-                    recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机已补同步最新状态。"
-                }
+                // loadRecent can return durable Windows cache while the actual
+                // Chrome tab is still closed or belongs to another Chat. It is
+                // NOT a current-document or Provider archive identity proof.
+                // Only an exact tab-binding event below may clear the detached
+                // marker; a cached 3 User + 1 Assistant page must not claim
+                // the original Assistant history or binding is recovered.
             }
             ensureSessionDescriptorExists(sessionId: sessionId, instanceId: route.instanceId, updatedAt: authoritativeItems.last?.createdAt ?? Date())
-            if route.runtimeId == "runtime.web", authoritativeItems.isEmpty,
+            if route.runtimeId == "runtime.web", webBindingDetachedSessions.contains(sessionId) {
+                // A successful local-cache page cannot erase the more precise
+                // same-Chat tabClosed/project-navigation diagnosis.
+            } else if route.runtimeId == "runtime.web",
+                      webOlderPageNeedsExplicitRetry.contains(sessionId),
+                      webChatRecoveryNotesBySession[sessionId]?.hasPrefix("旧历史") == true {
+                // Keep the last failed/empty older-page reason until an explicit
+                // scoped retry. A later 4-row recent-cache read is not recovery.
+            } else if route.runtimeId == "runtime.web", authoritativeItems.isEmpty,
                let sessionState = sessions.first(where: { $0.id == sessionId })?.state,
                sessionState == .busy || sessionState == .waiting {
                 // Running + an empty remote page is not an authenticated empty
@@ -1842,14 +1912,29 @@ final class WorkspaceStore: ObservableObject {
                 webChatRecoveryNotesBySession.removeValue(forKey: sessionId)
             }
             await settleRunStateIfAuthoritativeFinalExists(authoritativeItems, sessionId: sessionId)
-            if hasMoreBySession[sessionId] != page.hasMore {
-                hasMoreBySession[sessionId] = page.hasMore
+            // The transport sets hasMore=false whenever the Windows cache
+            // returns fewer than 50 messages. For durable Web Chats that is
+            // NOT evidence that the Provider's older Assistant archive ends.
+            // Permit one explicit top-scroll older-page request, still gated
+            // on the exact existing Chat+Project+document in BrowserHost.
+            let mayHaveUnverifiedWebOlder = route.runtimeId == "runtime.web"
+                && !authoritativeItems.isEmpty
+                && !webOlderPageNeedsExplicitRetry.contains(sessionId)
+            // A previous older-page failure blocks automatic retries even
+            // when a new recent page is saturated and claims hasMore=true.
+            let historyHasMore = (route.runtimeId == "runtime.web"
+                && webOlderPageNeedsExplicitRetry.contains(sessionId))
+                ? false : (page.hasMore || mayHaveUnverifiedWebOlder)
+            if hasMoreBySession[sessionId] != historyHasMore {
+                hasMoreBySession[sessionId] = historyHasMore
             }
             // A successful history read must not erase a provider terminal failure that
             // was delivered as GENERATION_STOPPED. Keeping the error while the session
             // is explicitly .error lets ChatView continue showing rate-limit / unusual-
             // activity evidence even while periodic reconciliation polls are running.
-            if sessions.first(where: { $0.id == sessionId })?.state != .error,
+            if !(route.runtimeId == "runtime.web"
+                    && webOlderPageNeedsExplicitRetry.contains(sessionId)),
+               sessions.first(where: { $0.id == sessionId })?.state != .error,
                errors[sessionId] != nil {
                 errors.removeValue(forKey: sessionId)
             }
@@ -2240,8 +2325,44 @@ final class WorkspaceStore: ObservableObject {
         guard olderMessageLoads.insert(sessionId).inserted else { return }
         defer { olderMessageLoads.remove(sessionId) }
         let generation = lifecycleGeneration
-        guard let first = messagesBySession[sessionId]?.first, hasMoreBySession[sessionId] != false else { return }
+        guard let firstVisible = messagesBySession[sessionId]?.first,
+              hasMoreBySession[sessionId] != false else { return }
+        let isWebRemoteRead = machine.state == .online
+            && routeForSession(sessionId)?.runtimeId == "runtime.web"
+        if isWebRemoteRead && (webOlderPageNeedsExplicitRetry.contains(sessionId)
+                             || webBindingDetachedSessions.contains(sessionId)) {
+            // A detached Chat or a failed Provider page cannot be retried by
+            // passive top-scroll; only the explicit resync path may re-arm it.
+            hasMoreBySession[sessionId] = false
+            if webBindingDetachedSessions.contains(sessionId) {
+                webChatRecoveryNotesBySession[sessionId] =
+                    "原 Chat 当前标签已断开；不能仅凭缓存游标读取更早消息。请先人工核验同 Project/Session 的网页身份。"
+            }
+            return
+        }
+        // Web cold-history pagination must begin at the oldest actual cached
+        // Provider USER UUID, not an optimistic bubble, tool status, synthetic
+        // Assistant prefix or historical local ID. The Windows adapter still
+        // independently checks the matching durable message ID + timestamp.
+        let first: ChatMessage
+        if isWebRemoteRead {
+            guard let providerUserAnchor = messagesBySession[sessionId]?.first(where: { message in
+                message.sessionId == sessionId
+                    && message.kind == .text && message.role == .user
+                    && message.providerMessageId.flatMap { UUID(uuidString: $0) } != nil
+            }) else {
+                webOlderPageNeedsExplicitRetry.insert(sessionId)
+                hasMoreBySession[sessionId] = false
+                webChatRecoveryNotesBySession[sessionId] =
+                    "旧历史读取缺少本 Chat 的可信 Provider User UUID 游标；不会用工具状态或本地消息冒充来源。请人工核验原 Chat 后重试。"
+                return
+            }
+            first = providerUserAnchor
+        } else {
+            first = firstVisible
+        }
         do {
+            let previousMessageIDs = Set(messagesBySession[sessionId, default: []].map(\.id))
             let page: Page<ChatMessage>
             if machine.state == .online, let route = routeForSession(sessionId) {
                 page = try await transport.loadBefore(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, before: first.cursor, limit: 40)
@@ -2252,10 +2373,39 @@ final class WorkspaceStore: ObservableObject {
             }
             try? await cache.upsertMessages(page.items)
             merge(page.items, into: sessionId)
-            hasMoreBySession[sessionId] = page.hasMore
-            errors[sessionId] = nil
+            if isWebRemoteRead && !page.items.isEmpty
+                && page.items.allSatisfy({ previousMessageIDs.contains($0.id) }) {
+                // Neither a replayed cached slice nor a stale server response
+                // advances the oldest durable cursor. Stop passive retries.
+                webOlderPageNeedsExplicitRetry.insert(sessionId)
+                hasMoreBySession[sessionId] = false
+                webChatRecoveryNotesBySession[sessionId] =
+                    "旧历史分页未补入任何新的消息 ID；当前游标无法推进。原有缓存不丢弃，请核验原 Chat 后人工重试。"
+                return
+            }
+            if isWebRemoteRead && page.items.isEmpty {
+                // A plain [] has no exposed serverStartProven field in this
+                // protocol. Do not claim the historical Assistant archive is
+                // complete merely because a Windows cache returned zero.
+                webOlderPageNeedsExplicitRetry.insert(sessionId)
+                webChatRecoveryNotesBySession[sessionId] = "旧历史分页返回空页，但尚无可核实的 Provider 历史起点证明；不能判定原 Assistant 已完整恢复。"
+            }
+            // A short nonempty Web page might be only the next local slice:
+            // do not silently disable further authenticated Provider pages.
+            hasMoreBySession[sessionId] = !webOlderPageNeedsExplicitRetry.contains(sessionId)
+                && (page.hasMore || (isWebRemoteRead && !page.items.isEmpty))
+            if sessions.first(where: { $0.id == sessionId })?.state != .error {
+                errors[sessionId] = nil
+            }
         } catch {
-            if generation == lifecycleGeneration, !isSuspended { errors[sessionId] = error.localizedDescription }
+            if generation == lifecycleGeneration, !isSuspended {
+                errors[sessionId] = error.localizedDescription
+                if isWebRemoteRead {
+                    webOlderPageNeedsExplicitRetry.insert(sessionId)
+                    hasMoreBySession[sessionId] = false
+                    webChatRecoveryNotesBySession[sessionId] = "旧历史读取失败：\(error.localizedDescription)。已保留缓存；请先核验原 Chat 网页身份，再由人工重新尝试。"
+                }
+            }
         }
     }
 
@@ -2812,6 +2962,7 @@ final class WorkspaceStore: ObservableObject {
         webProviderRecoveryObservedAtBySession.removeAll()
         webProviderStatusReceivedAtBySession.removeAll()
         webBindingDetachedSessions.removeAll()
+        webOlderPageNeedsExplicitRetry.removeAll()
         verifiedReopenEmptyWebHistorySessions.removeAll()
         webProjectsSnapshotId = nil
         projectConversationSnapshotIds.removeAll()
@@ -3773,7 +3924,29 @@ final class WorkspaceStore: ObservableObject {
               !canonicalUrl.isEmpty else { return }
 
         let localConversationId = event.payload["localConversationId"]?.stringValue ?? sessionId
+        // Registration is metadata only, not authority to move an existing
+        // phone Chat into another Project or accept a foreign local Session.
+        guard localConversationId == sessionId else { return }
         let conversationAlias = event.payload["conversationAlias"]?.stringValue
+        if let current = sessions.first(where: { $0.id == sessionId }) {
+            if let existingProject = current.projectAlias,
+               !sameWebProjectAlias(existingProject, projectAlias) { return }
+            if let existingAlias = webConversationAlias(from: current.canonicalUrl),
+               UUID(uuidString: existingAlias) != nil,
+               let newAlias = conversationAlias,
+               UUID(uuidString: newAlias) != nil,
+               existingAlias.lowercased() != newAlias.lowercased() { return }
+        }
+        // A generic /c/UUID root is not proof of Project membership. Require
+        // a matching Project route when the event claims a durable UUID.
+        if let conversationAlias, UUID(uuidString: conversationAlias) != nil {
+            guard let url = URL(string: canonicalUrl),
+                  url.scheme == "https", url.host == "chatgpt.com" else { return }
+            let components = url.path.split(separator: "/").map(String.init)
+            guard components.count == 4, components[0] == "g", components[2] == "c",
+                  sameWebProjectAlias(components[1], projectAlias),
+                  components[3].lowercased() == conversationAlias.lowercased() else { return }
+        }
         let title = event.payload["displayTitle"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveTitle = title.flatMap { $0.isEmpty ? nil : $0 }
             ?? sessions.first(where: { $0.id == localConversationId })?.title
@@ -4585,18 +4758,22 @@ final class WorkspaceStore: ObservableObject {
             let activeTabId = event.payload["activeTabId"]?.intValue
             if activeTabId == nil && ["tabClosed", "conversationContextChanged", "projectContextChanged", "tabReassignedToRegisteredConversation"].contains(reason) {
                 webBindingDetachedSessions.insert(sessionId)
+                // A binding fault belongs to this exact Chat, not a global
+                // notice that could be shown while another Chat is selected.
                 switch reason {
                 case "tabClosed":
-                    recentSystemNotice = "电脑端对应的 ChatGPT 标签页已关闭；RemoteAI 会在需要时重新打开并绑定该会话。"
+                    webChatRecoveryNotesBySession[sessionId] = "本 Chat 的电脑端 ChatGPT 标签页已关闭；原历史缓存保留，旧 Assistant 仍未证明完整。需人工核验原网页和绑定，不会自动重发未知结果消息。"
                 case "conversationContextChanged":
-                    recentSystemNotice = "电脑端 ChatGPT 标签页已切换到其他对话；手机当前会话不会跟着串线，RemoteAI 会按原会话身份重新绑定。"
+                    webChatRecoveryNotesBySession[sessionId] = "本 Chat 的电脑端标签已切换到其他对话；保留原 Session/Project 及历史，当前网页不可作为旧历史来源。"
                 case "projectContextChanged":
-                    recentSystemNotice = "电脑端 ChatGPT 标签页已切换到其他 Project；手机当前 Project/Chat 身份保持不变。"
+                    webChatRecoveryNotesBySession[sessionId] = "本 Chat 的电脑端标签已切换到其他 Project；保留原 Session/Project 及历史，禁止跨 Project 读取。"
                 default:
-                    recentSystemNotice = "电脑端 ChatGPT 标签页绑定发生变化；RemoteAI 正在重新核对当前会话。"
+                    webChatRecoveryNotesBySession[sessionId] = "本 Chat 的电脑端标签绑定发生变化；当前网页身份待核验，旧 Assistant 历史未证明完整。"
                 }
-            } else if activeTabId != nil, webBindingDetachedSessions.remove(sessionId) != nil {
-                recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。"
+            } else if activeTabId != nil, webBindingDetachedSessions.contains(sessionId) {
+                // Events can arrive after this tab was reassigned or navigated;
+                // do not silently clear a real tabClosed failure.
+                webChatRecoveryNotesBySession[sessionId] = "本 Chat 收到重新绑定事件，但旧标签断开状态尚未重新核验；请检查并重新连接当前 Chat。旧 Assistant 不自动判定为已恢复。"
             }
             await requestMetadataRefresh()
         case "WEB_PAGE_REGISTERED":
@@ -4607,8 +4784,10 @@ final class WorkspaceStore: ObservableObject {
             // a later Project DOM scan.
             await applyWebPageRegistrationEvent(event, sessionId: sessionId, suppressPresentation: suppressTransientPresentation)
             if event.payload["activeTabId"]?.intValue != nil,
-               webBindingDetachedSessions.remove(sessionId) != nil {
-                recentSystemNotice = "电脑端 ChatGPT 会话已重新绑定；手机正在补同步最新状态。"
+               webBindingDetachedSessions.contains(sessionId) {
+                // Registration updates scoped metadata, but does not attest
+                // that the current Chrome document still belongs to this Chat.
+                webChatRecoveryNotesBySession[sessionId] = "本 Chat 收到新标签注册；此前断开状态仍待独立核验，请手动检查并重新连接。旧 Assistant 不自动判定为已恢复。"
             }
             await requestMetadataRefresh()
         case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "WEB_PAGE_UNREGISTERED":
