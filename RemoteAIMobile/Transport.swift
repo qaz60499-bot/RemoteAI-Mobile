@@ -256,7 +256,8 @@ enum OlderHistoryProofCodec {
                     "Older Chat history remains unverified by the Windows Provider source"
                 )
             }
-            return Page(items: items, beforeCursor: items.first?.cursor, hasMore: hasMore)
+            return Page(items: items, beforeCursor: items.first?.cursor, hasMore: hasMore,
+                        serverStartProven: serverStartProven)
         }
         let items = try raw.decode([ServerMessage].self).map { $0.chatMessage }
         guard items.count <= safeLimit else { throw TransportError.malformedData }
