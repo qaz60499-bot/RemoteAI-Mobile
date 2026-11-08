@@ -34,7 +34,7 @@ final class RemoteAIMobileTests: XCTestCase {
         XCTAssertEqual(complete.items.count, 1)
         XCTAssertFalse(complete.hasMore)
         XCTAssertEqual(complete.serverStartProven, true)
-        XCTAssertEqual(complete.items[0].content, "Older original body")
+        XCTAssertEqual(complete.items[0].text, "Older original body")
     }
 
     func testOlderHistoryProofWireRejectsUnverifiedTerminalAndMalformedMetadata() throws {
