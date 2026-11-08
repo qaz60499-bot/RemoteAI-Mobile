@@ -292,7 +292,9 @@ final class WorkspaceStore: ObservableObject {
 
     private static let waitingForWebTranscriptNote = "电脑端历史读取暂不可用 [WEB_SELECTOR_FAILED]：未找到可验证的 ChatGPT 消息正文；已保留旧缓存，等待原会话恢复。"
     private static let emptyBusyWebTranscriptNote = "当前只收到 Running 状态，电脑端尚未返回可验证的历史消息。不会把空历史误判为同步完成。"
-    private static let readingEmptyBusyWebTranscriptNote = "正在读取本 Chat 的历史正文；当前只有 Running 并不代表消息已同步。"
+    private static let readingEmptyBusyWebTranscriptNote = "正在读取本 Chat 的历史正文；当前只有 Running 并不代表消息已同步."
+    private static let offlineWebTranscriptNote = "Windows Agent 当前未连接，无法读取原 Chat 历史正文；已保留手机中的消息，Running 不是同步完成。"
+    private static let missingWebHistoryRouteNote = "此 Chat 的 Windows 同步路由尚未建立，无法确认原历史；已保留本地消息，请检查原 Project/会话连接。"
     private static let missingIdleWebReplyNote = "已取得部分历史，但最后一条是 User，尚未确认对应 Assistant 回复；已保留现有消息并继续核验。"
 
     init(transport: Transport, cache: SQLiteStore) {
@@ -885,7 +887,12 @@ final class WorkspaceStore: ObservableObject {
             } else {
                 errors[sessionId] = "此 Chat 对应多个打开标签，无法安全确定操作目标。未操作任何网页，请先核对电脑端标签。"
             }
-            webChatRecoveryNotesBySession[sessionId] = "网页身份尚未验证；不会操作其他 Chat。"
+            if operation == "inspect", let earlierIssue = webProviderIssuesBySession[sessionId] {
+                webChatRecoveryNotesBySession[sessionId] =
+                    "当前没有可验证的原 Chat 标签，无法进行新的网页检查；此前本 Chat 报告 [\(earlierIssue.code)]：\(earlierIssue.message)。此错误可能已过期。"
+            } else {
+                webChatRecoveryNotesBySession[sessionId] = "网页身份尚未验证；不会操作其他 Chat。"
+            }
             return
         }
         if operation == "rebind" {
@@ -1763,7 +1770,16 @@ final class WorkspaceStore: ObservableObject {
            webChatRecoveryNotesBySession[sessionId] == nil {
             webChatRecoveryNotesBySession[sessionId] = Self.readingEmptyBusyWebTranscriptNote
         }
-        guard machine.state == .online, let route = routeForSession(sessionId) else { return }
+        let isWebHistory = routeForSession(sessionId)?.runtimeId == "runtime.web"
+            || sessions.contains(where: { $0.id == sessionId && $0.instanceId == "web.chatgpt" })
+        guard machine.state == .online else {
+            if isWebHistory { webChatRecoveryNotesBySession[sessionId] = Self.offlineWebTranscriptNote }
+            return
+        }
+        guard let route = routeForSession(sessionId) else {
+            if isWebHistory { webChatRecoveryNotesBySession[sessionId] = Self.missingWebHistoryRouteNote }
+            return
+        }
         await hydrateSessionDescriptorIfNeeded(sessionId: sessionId, route: route, generation: generation)
         do {
             let page = try await transport.loadRecent(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, limit: 50)
@@ -1820,6 +1836,8 @@ final class WorkspaceStore: ObservableObject {
             } else if webChatRecoveryNotesBySession[sessionId] == Self.waitingForWebTranscriptNote
                 || webChatRecoveryNotesBySession[sessionId] == Self.emptyBusyWebTranscriptNote
                 || webChatRecoveryNotesBySession[sessionId] == Self.readingEmptyBusyWebTranscriptNote
+                || webChatRecoveryNotesBySession[sessionId] == Self.offlineWebTranscriptNote
+                || webChatRecoveryNotesBySession[sessionId] == Self.missingWebHistoryRouteNote
                 || webChatRecoveryNotesBySession[sessionId] == Self.missingIdleWebReplyNote {
                 webChatRecoveryNotesBySession.removeValue(forKey: sessionId)
             }
@@ -1876,6 +1894,9 @@ final class WorkspaceStore: ObservableObject {
                 return
             }
             errors[sessionId] = error.localizedDescription
+            if route.runtimeId == "runtime.web" {
+                webChatRecoveryNotesBySession[sessionId] = "历史正文同步失败：\(error.localizedDescription)。本地缓存已保留。"
+            }
         }
     }
 
@@ -4594,7 +4615,19 @@ final class WorkspaceStore: ObservableObject {
             await requestMetadataRefresh()
         case "COMMAND_RESULT", "COMMAND_REJECTED":
             if let raw = event.payload["commandId"]?.stringValue, let commandId = UUID(uuidString: raw) {
-                commandStates[commandId] = event.type == "COMMAND_RESULT" ? .completed : .failed
+                if event.type == "COMMAND_RESULT" {
+                    commandStates[commandId] = .completed
+                } else {
+                    let errorCode = event.payload["errorCode"]?.stringValue ?? ""
+                    let uncertainSend = errorCode == "WEB_SEND_DELIVERY_UNKNOWN" || errorCode == "SEND_DELIVERY_UNKNOWN"
+                    if uncertainSend {
+                        // Dispatch was attempted but provider delivery was not verified.
+                        // Preserve any confirmed completion; never downgrade uncertainty to a retryable failure.
+                        if commandStates[commandId] != .completed { commandStates[commandId] = .unknown }
+                    } else {
+                        commandStates[commandId] = .failed
+                    }
+                }
             }
         default:
             break
