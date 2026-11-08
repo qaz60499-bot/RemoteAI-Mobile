@@ -606,10 +606,11 @@ final class WorkspaceStore: ObservableObject {
                 // A stale root/foreign-tab registration must not become proof
                 // of successful reconnect in the phone UI.
                 if let prior = sessions.first(where: { $0.id == conversation.localConversationId }),
-                   let establishedProject = prior.projectAlias,
                    let establishedAlias = webConversationAlias(from: prior.canonicalUrl),
                    UUID(uuidString: establishedAlias) != nil {
-                    guard sameWebProjectAlias(conversation.projectAlias, establishedProject),
+                    // Both nil Projects are valid for an existing root /c/UUID
+                    // Chat. A foreign Project must still be rejected.
+                    guard sameWebProjectAlias(conversation.projectAlias, prior.projectAlias),
                           let returnedAlias = webConversationAlias(from: conversation.canonicalUrl),
                           returnedAlias.lowercased() == establishedAlias.lowercased() else {
                         errors["web.tabs"] = "当前标签无法证实属于原 Chat 和 Project；未重新绑定或读取其他 Chat。"
@@ -991,8 +992,8 @@ final class WorkspaceStore: ObservableObject {
             if let destination = await enterOpenWebTab(tab),
                case .chat(let verifiedSession) = destination,
                verifiedSession.id == sessionId,
-               let expectedProject = sessions.first(where: { $0.id == sessionId })?.projectAlias,
-               sameWebProjectAlias(verifiedSession.projectAlias, expectedProject) {
+               let expectedSession = sessions.first(where: { $0.id == sessionId }),
+               sameWebProjectAlias(verifiedSession.projectAlias, expectedSession.projectAlias) {
                 // Only an explicit, identity-checked existing-tab enter may
                 // clear a detached marker. A delayed binding event alone cannot
                 // authorize this Chat's older Provider archive.
