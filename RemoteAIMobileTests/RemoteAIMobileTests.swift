@@ -4541,10 +4541,12 @@ final class RemoteAIMobileTests: XCTestCase {
             ],
             createdAt: now
         ), deliverLive: true)
-        for _ in 0..<80 where store.recentSystemNotice?.contains("不会跟着串线") != true {
+        for _ in 0..<80 where store.webChatRecoveryNotesBySession["photo-upload"]?.contains("标签已切换到其他对话") != true {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertTrue(store.recentSystemNotice?.contains("不会跟着串线") == true)
+        XCTAssertTrue(store.webChatRecoveryNotesBySession["photo-upload"]?.contains("标签已切换到其他对话") == true)
+        XCTAssertNil(store.recentSystemNotice, "A Chat-specific binding fault must not appear globally in an unrelated Chat")
+        XCTAssertNil(store.webChatRecoveryNotesBySession["unrelated-session"])
         XCTAssertEqual(store.sessions.first(where: { $0.id == "photo-upload" })?.state, .idle)
 
         await mock.injectEvent(RemoteEvent(
@@ -4562,10 +4564,12 @@ final class RemoteAIMobileTests: XCTestCase {
             ],
             createdAt: now.addingTimeInterval(1)
         ), deliverLive: true)
-        for _ in 0..<80 where store.recentSystemNotice?.contains("已重新绑定") != true {
+        for _ in 0..<80 where store.webChatRecoveryNotesBySession["photo-upload"]?.contains("旧标签断开状态尚未重新核验") != true {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTAssertTrue(store.recentSystemNotice?.contains("已重新绑定") == true)
+        XCTAssertTrue(store.webChatRecoveryNotesBySession["photo-upload"]?.contains("旧标签断开状态尚未重新核验") == true)
+        XCTAssertNil(store.recentSystemNotice, "A stale tab event cannot globally claim that the original Chat has reconnected")
+        XCTAssertNil(store.webChatRecoveryNotesBySession["unrelated-session"])
         await store.suspend()
     }
 
