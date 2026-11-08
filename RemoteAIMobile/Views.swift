@@ -1200,7 +1200,11 @@ struct ChatView: View {
                                 let retryable = commandState == .unknown && UUID(uuidString: message.id) != nil
                                 if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
                                     AssistantStreamRow(stream: stream, message: message, followTail: {
-                                        guard !userBrowsingHistory else { return }
+                                        // Continuous live-stream scrollTo while the composer owns keyboard
+                                        // focus fights UIKit text entry and can monopolize the main run loop.
+                                        // A composing user already controls the viewport; resume normal
+                                        // tail-follow when focus leaves without affecting any stream data.
+                                        guard !userBrowsingHistory, !focused else { return }
                                         proxy.scrollTo("bottom", anchor: .bottom)
                                     }, onSelectText: { text, monospaced in
                                         textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
