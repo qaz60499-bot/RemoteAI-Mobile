@@ -573,6 +573,9 @@ struct Page<T: Codable>: Codable {
     let items: [T]
     let beforeCursor: MessageCursor?
     let hasMore: Bool
+    // Only an authenticated Provider oldest-page proof may set this true.
+    // Nil means a legacy/local/unverified response, never a certified archive end.
+    var serverStartProven: Bool? = nil
 }
 
 struct SequenceDecision: Equatable { let duplicate: Bool; let gap: Bool }
