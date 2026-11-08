@@ -171,7 +171,11 @@ final class RemoteAIMobileUITests: XCTestCase {
         let composer = app.textViews["MessageComposer"]
         let typingBegan = ProcessInfo.processInfo.systemUptime
         composer.tap()
-        composer.typeText("still responsive")
+        // Send keyboard input to the focused app instead of re-resolving the
+        // entire growing SwiftUI transcript through a textView accessibility
+        // snapshot for the typeText target on every slow hosted runner.
+        // Preserve the exact composer value assertion immediately afterward.
+        app.typeText("still responsive")
         XCTAssertEqual(composer.value as? String, "still responsive")
         XCTAssertTrue(progress.exists, "Typing must finish while the stream is still live")
         print("STREAM_UI chars=\(chars) composerInteractionMs=\((ProcessInfo.processInfo.systemUptime - typingBegan) * 1000)")
