@@ -37,11 +37,12 @@ actor CloudflareTransport: Transport {
 
     static func relaySessionConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
-        // Do not inherit a device-wide HTTP/SOCKS proxy for the Relay WebSocket.
-        // A loopback proxy can complete TLS but still tear down upgraded WebSockets,
-        // leaving RemoteAI in an endless reconnect loop. This remains scoped to the
-        // RemoteAI Relay session and does not change other apps or VPN rules.
-        configuration.connectionProxyDictionary = [:]
+        // Isolated Build93 TLS A/B candidate: let the Relay URLSession use the
+        // iOS platform's existing proxy selection rather than forcing DIRECT.
+        // This does not alter Shadowrocket, VPN rules, Relay URL, pairing,
+        // message delivery, or any other application. The known-good build is
+        // retained for data-preserving rollback if the socket fails its tests.
+        configuration.connectionProxyDictionary = nil
         configuration.waitsForConnectivity = false
         return configuration
     }
