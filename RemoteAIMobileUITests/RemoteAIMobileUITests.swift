@@ -189,18 +189,17 @@ final class RemoteAIMobileUITests: XCTestCase {
         // The final is emitted only after every delta is appended by MockTransport.
         let final = app.staticTexts["message-content-stress-final-\(chars)-0"]
         // The UI-only fixture emits 100 characters at the configured chunk interval.
-        // Budget its complete duration plus runner/accessibility slack instead of retaining the
-        // old 40-second timeout that predates the deterministic slow fixture.
+        // On hosted XCTest runners a repeated full staticTexts snapshot against
+        // the still-streaming 30K transcript sometimes blocks accessibility for
+        // over a minute. First await the small, stable button subtree becoming
+        // idle, THEN inspect the final message once. This retains every final
+        // body/marker/draft assertion without polling the growing transcript.
         let expectedFixtureSeconds = (Double(chars) / 100.0) * (Double(fixtureChunkMilliseconds) / 1000.0)
-        XCTAssertTrue(final.waitForExistence(timeout: max(180, expectedFixtureSeconds + 90)),
+        XCTAssertTrue(app.buttons["Send"].waitForExistence(timeout: max(180, expectedFixtureSeconds + 90)),
+                      "Final delivery must clear active generation and restore normal sending")
+        XCTAssertTrue(final.waitForExistence(timeout: 15),
                       "The actual final message must replace the streaming row")
         XCTAssertTrue(final.label.contains(marker), "The rendered final message must have the expected contents")
-        // The draft remains populated: "Send correction" changes to "Send"
-        // only once the chat's authoritative generation state becomes idle.
-        // Check a positive, exact accessibility target rather than repeatedly
-        // searching for a vanished progress label across a huge XCUI tree.
-        XCTAssertTrue(app.buttons["Send"].waitForExistence(timeout: 15),
-                      "Final delivery must clear active generation and restore normal sending")
         XCTAssertEqual(composer.value as? String, "still responsive", "Final must preserve the unsent draft")
     }
 }
