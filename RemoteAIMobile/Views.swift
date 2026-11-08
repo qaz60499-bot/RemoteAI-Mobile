@@ -1199,7 +1199,7 @@ struct ChatView: View {
                                 // Only unknown delivery is replayed with the original command ID.
                                 let retryable = commandState == .unknown && UUID(uuidString: message.id) != nil
                                 if message.toolStatus == "Streaming", let stream = store.assistantStreams[message.sessionId] {
-                                    AssistantStreamRow(stream: stream, message: message, followTail: {
+                                    AssistantStreamRow(stream: stream, message: message, isComposerFocused: focused, followTail: {
                                         // Continuous live-stream scrollTo while the composer owns keyboard
                                         // focus fights UIKit text entry and can monopolize the main run loop.
                                         // A composing user already controls the viewport; resume normal
@@ -2055,12 +2055,14 @@ struct AssistantStreamRow: View, Equatable {
     @ObservedObject var stream: AssistantStream
     @Environment(\.scenePhase) private var scenePhase
     let message: ChatMessage
+    var isComposerFocused: Bool = false
     var followTail: () -> Void = {}
     var onSelectText: ((String, Bool) -> Void)? = nil
     @State private var followTask: Task<Void, Never>?
 
     static func == (lhs: AssistantStreamRow, rhs: AssistantStreamRow) -> Bool {
         lhs.stream === rhs.stream && lhs.message == rhs.message
+            && lhs.isComposerFocused == rhs.isComposerFocused
     }
 
     var body: some View {
@@ -2110,6 +2112,9 @@ struct AssistantStreamRow: View, Equatable {
             followTask = nil
         }
         .onChange(of: stream.visibleBytes) { _ in
+            // Do not schedule a scroll-to-bottom task while the keyboard owns focus.
+            // This avoids a sustained stream forcing scroll layout during text entry.
+            guard !isComposerFocused else { return }
             // Coalesce presentation ticks, without postponing indefinitely while
             // deltas keep arriving. The callback rechecks browsing at execution.
             guard followTask == nil else { return }
