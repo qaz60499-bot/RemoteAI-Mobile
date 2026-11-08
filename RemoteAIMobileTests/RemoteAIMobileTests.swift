@@ -40,10 +40,14 @@ final class RemoteAIMobileTests: XCTestCase {
     func testOlderHistoryProofWireRejectsUnverifiedTerminalAndMalformedMetadata() throws {
         let empty: JSONValue = .array([])
         XCTAssertThrowsError(try OlderHistoryProofCodec.decode(empty, runtimeId: "runtime.web", limit: 40)) { error in
-            guard case TransportError.remote(let code, _) = error else {
-                return XCTFail("Unverified Web terminal must fail with an actionable Provider error")
+            guard let transportError = error as? TransportError else {
+                XCTFail("Unverified Web terminal must fail with an actionable Provider error")
+                return
             }
-            XCTAssertEqual(code, "WEB_SELECTOR_FAILED")
+            switch transportError {
+            case .remote(let code, _): XCTAssertEqual(code, "WEB_SELECTOR_FAILED")
+            default: XCTFail("Expected a retryable Web history source error")
+            }
         }
         let verifiedEmpty: JSONValue = .object([
             "historyProofVersion": .number(1),
