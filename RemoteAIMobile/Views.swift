@@ -1092,6 +1092,7 @@ struct ChatView: View {
     @State private var isAtBottom = true
     @State private var didInitialScrollToBottom = false
     @State private var userBrowsingHistory = false
+    @State private var suppressStreamingTailFollowAfterReturn = false
     @StateObject private var speechInput = SpeechInputController()
     @State private var textSelectionRequest: TextSelectionRequest?
     @FocusState private var focused: Bool
@@ -1204,7 +1205,7 @@ struct ChatView: View {
                                         // focus fights UIKit text entry and can monopolize the main run loop.
                                         // A composing user already controls the viewport; resume normal
                                         // tail-follow when focus leaves without affecting any stream data.
-                                        guard !userBrowsingHistory, !focused else { return }
+                                        guard !userBrowsingHistory, !focused, !suppressStreamingTailFollowAfterReturn else { return }
                                         proxy.scrollTo("bottom", anchor: .bottom)
                                     }, onSelectText: { text, monospaced in
                                         textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
@@ -1263,6 +1264,9 @@ struct ChatView: View {
                         }
                     }
                     .onChange(of: messages.last?.id) { _ in
+                        // A new message starts a fresh follow cycle; a prior manual
+                        // return must not permanently suppress later turns.
+                        suppressStreamingTailFollowAfterReturn = false
                         guard !loadingOlder, !messages.isEmpty else { return }
                         if !didInitialScrollToBottom {
                             DispatchQueue.main.async {
@@ -1277,6 +1281,7 @@ struct ChatView: View {
                         }
                     }
                     .onChange(of: session.id) { _ in
+                        suppressStreamingTailFollowAfterReturn = false
                         didInitialScrollToBottom = false
                         userBrowsingHistory = false
                         isAtBottom = true
@@ -1286,6 +1291,10 @@ struct ChatView: View {
                         Button {
                             userBrowsingHistory = false
                             if store.assistantStreams[session.id] != nil {
+                                // After this one explicit return, never let 250ms tail-follow
+                                // tasks continuously restart ScrollViewReader layout while
+                                // the 30K/50K live row is still growing. The stream stays live.
+                                suppressStreamingTailFollowAfterReturn = true
                                 // A still-growing long stream can keep SwiftUI's animated
                                 // scroll layout busy and block keyboard/accessibility work.
                                 // Make the user's explicit return a single nonanimated jump.
