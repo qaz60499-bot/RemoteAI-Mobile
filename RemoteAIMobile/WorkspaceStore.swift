@@ -176,9 +176,6 @@ final class WorkspaceStore: ObservableObject {
     private var creatingWebProjects = Set<String>()
     private var creatingWebConversations = Set<String>()
     private var reopeningWebConversations = Set<String>()
-    // Only a visible, user-opened archived Web Chat may request one explicit
-    // same-UUID recovery per app lifecycle; passive sync must never open tabs.
-    private var visibleArchivedWebReopenAttempts = Set<String>()
     private var creatingSessions = Set<String>()
     private var stopTasksBySession: [String: Task<Bool, Never>] = [:]
     @Published private(set) var stopRequestsPending = Set<String>()
@@ -645,6 +642,9 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func inspectOpenWebTab(_ tab: OpenWebTab) async {
+        // A former same-tab diagnosis must not be shown as the result of a
+        // new failed or offline inspection. Preserve no false Ready outcome.
+        webTabDiagnosesById.removeValue(forKey: tab.id)
         guard machine.state == .online, !isSuspended else {
             errors["web.tabs"] = "Windows 未连接，无法验证 Chrome 网页是否正常。"
             return
@@ -699,9 +699,11 @@ final class WorkspaceStore: ObservableObject {
             guard let fresh = await refreshVisibleSessionStatus(sessionId, rejectEvidencePoorIdle: true),
                   fresh.state == .idle else { return }
         }
+        // Passive inspection is safe to repeat on a later explicit Chat open:
+        // a one-time reopen latch would permanently block recovery after the
+        // user later restores the exact Provider tab.
         guard !Task.isCancelled, machine.state == .online, !isSuspended,
-              !sessionSendsInFlight.contains(sessionId),
-              visibleArchivedWebReopenAttempts.insert(sessionId).inserted else { return }
+              !sessionSendsInFlight.contains(sessionId) else { return }
 
         let generation = lifecycleGeneration
         await refreshOpenWebTabs()
@@ -716,9 +718,17 @@ final class WorkspaceStore: ObservableObject {
         }
         if providerTabs.count == 1,
            let tab = providerTabs.first,
-           tab.isChat, tab.sessionId == sessionId {
-            await synchronizeVisibleSession(sessionId, force: true)
-            return
+           tab.isChat, tab.sessionId == sessionId,
+           let observed = URL(string: tab.canonicalUrl),
+           observed.scheme == "https", observed.host == "chatgpt.com" {
+            let observedParts = observed.path.split(separator: "/").map(String.init)
+            if observedParts.count == 4, observedParts[0] == "g",
+               observedParts[2] == "c",
+               sameWebProjectAlias(observedParts[1], projectAlias),
+               observedParts[3].lowercased() == providerAlias.lowercased() {
+                await synchronizeVisibleSession(sessionId, force: true)
+                return
+            }
         }
         guard providerTabs.isEmpty else {
             webChatRecoveryNotesBySession[sessionId] =
@@ -954,6 +964,28 @@ final class WorkspaceStore: ObservableObject {
                 webChatRecoveryNotesBySession[sessionId] = "网页身份尚未验证；不会操作其他 Chat。"
             }
             return
+        }
+        // Registry sessionId association is necessary but not sufficient while
+        // Windows A01 still permits stale root/foreign Project tab ownership.
+        // This is a read-only URL consistency fence; BrowserHost must separately
+        // authenticate the live document before any Provider body read.
+        if let known = sessions.first(where: { $0.id == sessionId }),
+           let expectedProject = known.projectAlias,
+           let expectedAlias = webConversationAlias(from: known.canonicalUrl),
+           UUID(uuidString: expectedAlias) != nil {
+            guard let url = URL(string: tab.canonicalUrl),
+                  url.scheme == "https", url.host == "chatgpt.com" else {
+                errors[sessionId] = "本 Chat 当前标签缺少可验证的 Project 网页身份，未执行网页操作。"
+                return
+            }
+            let path = url.path.split(separator: "/").map(String.init)
+            guard path.count == 4, path[0] == "g", path[2] == "c",
+                  sameWebProjectAlias(path[1], expectedProject),
+                  path[3].lowercased() == expectedAlias.lowercased() else {
+                errors[sessionId] = "当前标签的 Project/Chat 路由与本 Chat 不一致；未检查、重新绑定或刷新其他 Chat。"
+                webChatRecoveryNotesBySession[sessionId] = errors[sessionId]
+                return
+            }
         }
         if operation == "rebind" {
             if let destination = await enterOpenWebTab(tab),
