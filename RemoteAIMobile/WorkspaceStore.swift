@@ -2435,6 +2435,7 @@ final class WorkspaceStore: ObservableObject {
             try? await cache.upsertMessages(page.items)
             merge(page.items, into: sessionId)
             if isWebRemoteRead && !page.items.isEmpty
+                && page.serverStartProven != true
                 && page.items.allSatisfy({ previousMessageIDs.contains($0.id) }) {
                 // Neither a replayed cached slice nor a stale server response
                 // advances the oldest durable cursor. Stop passive retries.
@@ -2444,17 +2445,25 @@ final class WorkspaceStore: ObservableObject {
                     "旧历史分页未补入任何新的消息 ID；当前游标无法推进。原有缓存不丢弃，请核验原 Chat 后人工重试。"
                 return
             }
-            if isWebRemoteRead && page.items.isEmpty {
-                // A plain [] has no exposed serverStartProven field in this
-                // protocol. Do not claim the historical Assistant archive is
-                // complete merely because a Windows cache returned zero.
+            if isWebRemoteRead && page.serverStartProven == true {
+                // The wire codec accepts this proof only from a versioned
+                // authenticated Provider reply. A short Windows cache is not
+                // enough to mark the original historical archive complete.
+                webOlderPageNeedsExplicitRetry.remove(sessionId)
+                if webChatRecoveryNotesBySession[sessionId]?.hasPrefix("旧历史") == true {
+                    webChatRecoveryNotesBySession.removeValue(forKey: sessionId)
+                }
+                DiagnosticsLog.shared.record("web_history_provider_start_verified", fields: [
+                    "session": sessionId, "rows": String(page.items.count)
+                ])
+            } else if isWebRemoteRead && page.items.isEmpty {
                 webOlderPageNeedsExplicitRetry.insert(sessionId)
                 webChatRecoveryNotesBySession[sessionId] = "旧历史分页返回空页，但尚无可核实的 Provider 历史起点证明；不能判定原 Assistant 已完整恢复。"
             }
-            // A short nonempty Web page might be only the next local slice:
-            // do not silently disable further authenticated Provider pages.
+            // Short cache pages remain nonterminal in the verified codec.
+            // Only a true Provider start proof may terminate Web pagination.
             hasMoreBySession[sessionId] = !webOlderPageNeedsExplicitRetry.contains(sessionId)
-                && (page.hasMore || (isWebRemoteRead && !page.items.isEmpty))
+                && (page.hasMore || (isWebRemoteRead && page.serverStartProven != true && !page.items.isEmpty))
             if sessions.first(where: { $0.id == sessionId })?.state != .error {
                 errors[sessionId] = nil
             }
