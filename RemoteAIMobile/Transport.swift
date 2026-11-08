@@ -233,6 +233,46 @@ struct StopExecutionReceipt: Equatable {
     var confirmed: Bool { settled && !staleGeneration && (stopped || alreadyIdle) && agentConfirmedIdle }
 }
 
+
+enum OlderHistoryProofCodec {
+    // A short page of locally cached Web messages is not a trustworthy
+    // Provider archive boundary. Keep legacy Windows replies readable, but
+    // never silently mark an unproven Web archive as fully loaded.
+    static func decode(_ raw: JSONValue, runtimeId: String, limit: Int) throws -> Page<ChatMessage> {
+        let safeLimit = max(1, min(limit, 100))
+        if runtimeId == "runtime.web", let envelope = raw.objectValue {
+            guard envelope["historyProofVersion"]?.intValue == 1,
+                  let serverStartProven = envelope["serverStartProven"]?.boolValue,
+                  let hasMore = envelope["hasMore"]?.boolValue,
+                  hasMore != serverStartProven,
+                  let encodedItems = envelope["items"] else {
+                throw TransportError.malformedData
+            }
+            let items = try encodedItems.decode([ServerMessage].self).map { $0.chatMessage }
+            guard items.count <= safeLimit else { throw TransportError.malformedData }
+            if items.isEmpty && !serverStartProven {
+                throw TransportError.remote(
+                    "WEB_SELECTOR_FAILED",
+                    "Older Chat history remains unverified by the Windows Provider source"
+                )
+            }
+            return Page(items: items, beforeCursor: items.first?.cursor, hasMore: hasMore)
+        }
+        let items = try raw.decode([ServerMessage].self).map { $0.chatMessage }
+        guard items.count <= safeLimit else { throw TransportError.malformedData }
+        if runtimeId == "runtime.web" {
+            guard !items.isEmpty else {
+                throw TransportError.remote(
+                    "WEB_SELECTOR_FAILED",
+                    "Windows returned an unverified empty Web history page; original history may be missing"
+                )
+            }
+            return Page(items: items, beforeCursor: items.first?.cursor, hasMore: true)
+        }
+        return Page(items: items, beforeCursor: items.first?.cursor, hasMore: items.count == safeLimit)
+    }
+}
+
 extension Transport {
     // COMMAND completed means the Router returned an envelope; it does not
     // mean the remote renderer or Codex task actually stopped. Keep that proof
@@ -811,10 +851,14 @@ extension Transport {
         let safeLimit = max(1, min(limit, 100))
         try ProtocolSecurity.validateCursor(before)
         let beforeValue = try JSONValue.encode(before)
-        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "loadMessagesBefore", payload: ["before": beforeValue, "limit": .number(Double(safeLimit))])
+        var payload: [String: JSONValue] = ["before": beforeValue, "limit": .number(Double(safeLimit))]
+        if runtimeId == "runtime.web" { payload["historyProofV1"] = .bool(true) }
+        let command = RemoteCommand.make(
+            machineId: machineId, runtimeId: runtimeId, instanceId: instanceId,
+            sessionId: sessionId, action: "loadMessagesBefore", payload: payload
+        )
         let response = try await requireSuccess(execute(command))
-        let items = try response.decode([ServerMessage].self).map(\.chatMessage)
-        return Page(items: items, beforeCursor: items.first?.cursor, hasMore: items.count == safeLimit)
+        return try OlderHistoryProofCodec.decode(response, runtimeId: runtimeId, limit: safeLimit)
     }
 
     func delta(machineId: String, after sequence: Int64, limit: Int = 100) async throws -> DeltaSyncResult {
