@@ -659,10 +659,9 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    // Called only when the person opens this Chat view, never by background
-    // polling, Project catalog refresh, push, or reconnect. A cold archived
-    // Project Chat with no User/Assistant needs an explicitly reopened original
-    // Provider page; loadRecent alone is existing-tab-only and cannot hydrate it.
+    // Opening a Chat may passively read an already-bound exact tab, but must
+    // never create or navigate Chrome tabs just to fill older history. A
+    // user-requested reopen is a separate explicit, guarded operation.
     func recoverArchivedWebHistoryOnVisibleOpen(_ sessionId: String) async {
         guard machine.state == .online, !isSuspended,
               routeForSession(sessionId)?.runtimeId == "runtime.web",
@@ -726,10 +725,12 @@ final class WorkspaceStore: ObservableObject {
                 "原 Chat 网页已存在但身份未核实；没有另开标签或合并历史。"
             return
         }
-        // The user explicitly entered this old Chat. The existing verified
-        // resumeSession path opens only its exact canonical UUID in a background
-        // tab and then checks the unique binding before syncing messages.
-        await reopenClosedWebConversation(sessionId: sessionId)
+        // Viewing a cached conversation does not authorize a new Chrome tab.
+        // Preserve the exact Session/Project history and make the missing
+        // authenticated source visible for a deliberate manual reconnect.
+        webBindingDetachedSessions.insert(sessionId)
+        webChatRecoveryNotesBySession[sessionId] =
+            "原 Chat 没有可验证的打开标签；已加载现有历史缓存。请先在电脑确认原 Project/Chat 后人工重新连接，旧 Assistant 不自动判定为完整。"
     }
 
     func reopenClosedWebConversation(sessionId: String) async {
@@ -3932,10 +3933,13 @@ final class WorkspaceStore: ObservableObject {
             if let existingProject = current.projectAlias,
                !sameWebProjectAlias(existingProject, projectAlias) { return }
             if let existingAlias = webConversationAlias(from: current.canonicalUrl),
-               UUID(uuidString: existingAlias) != nil,
-               let newAlias = conversationAlias,
-               UUID(uuidString: newAlias) != nil,
-               existingAlias.lowercased() != newAlias.lowercased() { return }
+               UUID(uuidString: existingAlias) != nil {
+                // A registered durable Chat must never be demoted by an
+                // alias-less root event or remapped to a different UUID.
+                guard let newAlias = conversationAlias,
+                      UUID(uuidString: newAlias) != nil,
+                      existingAlias.lowercased() == newAlias.lowercased() else { return }
+            }
         }
         // A generic /c/UUID root is not proof of Project membership. Require
         // a matching Project route when the event claims a durable UUID.
