@@ -31,10 +31,11 @@ final class CloudflareTransportPoisonReplayTests: XCTestCase {
         )
     }
 
-    func testRelaySessionDoesNotInheritSystemProxy() {
+    func testRelayTLSABUsesPlatformProxyDefaultsWithoutChangingConnectivityPolicy() {
         let configuration = CloudflareTransport.relaySessionConfiguration()
-        XCTAssertNotNil(configuration.connectionProxyDictionary)
-        XCTAssertTrue(configuration.connectionProxyDictionary?.isEmpty == true)
+        // A/B only: nil defers to iOS's current system proxy selection; the
+        // previously verified IPA remains the explicit no-proxy comparator.
+        XCTAssertNil(configuration.connectionProxyDictionary)
         XCTAssertFalse(configuration.waitsForConnectivity)
     }
 
