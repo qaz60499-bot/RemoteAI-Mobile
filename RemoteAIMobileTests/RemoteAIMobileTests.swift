@@ -15,6 +15,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let legacy = try OlderHistoryProofCodec.decode(wire, runtimeId: "runtime.web", limit: 40)
         XCTAssertEqual(legacy.items.count, 1)
         XCTAssertTrue(legacy.hasMore, "A short legacy cache page must not certify the Provider archive start")
+        XCTAssertNil(legacy.serverStartProven)
 
         let unproven: JSONValue = .object([
             "historyProofVersion": .number(1),
@@ -23,6 +24,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let pending = try OlderHistoryProofCodec.decode(unproven, runtimeId: "runtime.web", limit: 40)
         XCTAssertEqual(pending.items.count, 1)
         XCTAssertTrue(pending.hasMore)
+        XCTAssertEqual(pending.serverStartProven, false)
 
         let proven: JSONValue = .object([
             "historyProofVersion": .number(1),
@@ -31,6 +33,7 @@ final class RemoteAIMobileTests: XCTestCase {
         let complete = try OlderHistoryProofCodec.decode(proven, runtimeId: "runtime.web", limit: 40)
         XCTAssertEqual(complete.items.count, 1)
         XCTAssertFalse(complete.hasMore)
+        XCTAssertEqual(complete.serverStartProven, true)
         XCTAssertEqual(complete.items[0].content, "Older original body")
     }
 
@@ -46,7 +49,9 @@ final class RemoteAIMobileTests: XCTestCase {
             "historyProofVersion": .number(1),
             "items": empty, "hasMore": .bool(false), "serverStartProven": .bool(true)
         ])
-        XCTAssertFalse(try OlderHistoryProofCodec.decode(verifiedEmpty, runtimeId: "runtime.web", limit: 40).hasMore)
+        let terminal = try OlderHistoryProofCodec.decode(verifiedEmpty, runtimeId: "runtime.web", limit: 40)
+        XCTAssertFalse(terminal.hasMore)
+        XCTAssertEqual(terminal.serverStartProven, true)
 
         let unprovenEmpty: JSONValue = .object([
             "historyProofVersion": .number(1),
