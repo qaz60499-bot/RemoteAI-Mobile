@@ -728,6 +728,33 @@ final class WorkspaceStore: ObservableObject {
                sameWebProjectAlias(observedParts[1], projectAlias),
                observedParts[3].lowercased() == providerAlias.lowercased() {
                 await synchronizeVisibleSession(sessionId, force: true)
+                // Visible-open is explicit interest in THIS existing Chat. A
+                // recent Windows cache page is not its older Provider archive.
+                // Attempt at most one authenticated older page without opening,
+                // navigating, reloading, stopping, or sending anything in Chrome.
+                // The Windows adapter independently enforces exact Session,
+                // Project, tab, Provider UUID, and fresh-document proof.
+                guard !Task.isCancelled, generation == lifecycleGeneration,
+                      machine.state == .online, !isSuspended,
+                      !webBindingDetachedSessions.contains(sessionId),
+                      !webOlderPageNeedsExplicitRetry.contains(sessionId),
+                      hasMoreBySession[sessionId] == true,
+                      !olderMessageLoads.contains(sessionId),
+                      !sessionSendsInFlight.contains(sessionId),
+                      let fresh = await refreshVisibleSessionStatus(sessionId, rejectEvidencePoorIdle: true),
+                      fresh.state == .idle else { return }
+                let previouslyKnownMessageIDs = Set(messagesBySession[sessionId, default: []].map(\.id))
+                await loadOlder(sessionId)
+                guard !Task.isCancelled, generation == lifecycleGeneration,
+                      machine.state == .online, !isSuspended else { return }
+                let newHistoryRows = messagesBySession[sessionId, default: []].filter {
+                    !previouslyKnownMessageIDs.contains($0.id)
+                        && ($0.role == .user || $0.role == .assistant)
+                }.count
+                if newHistoryRows > 0 {
+                    webChatRecoveryNotesBySession[sessionId] =
+                        "已从原 Chat 自动补入较早消息 \(newHistoryRows) 条；全历史仍须核实 Provider 起点。"
+                }
                 return
             }
         }
