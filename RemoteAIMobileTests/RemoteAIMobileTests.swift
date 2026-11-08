@@ -4,6 +4,21 @@ import Combine
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
+    func testStreamingRowComposerFocusInvalidatesEquality() {
+        // A reused equatable row must receive fresh focus state; otherwise its
+        // scroll callback can keep following the tail during keyboard entry.
+        let message = ServerMessage(
+            messageId: "focus-row", sessionId: "focus-session",
+            role: "assistant", content: "streaming body",
+            externalId: nil, createdAt: Date()
+        ).chatMessage
+        let stream = AssistantStream(id: "focus-stream", revision: 0, text: "stream")
+        let unfocused = AssistantStreamRow(stream: stream, message: message, isComposerFocused: false)
+        let focused = AssistantStreamRow(stream: stream, message: message, isComposerFocused: true)
+        XCTAssertNotEqual(unfocused, focused, "Focus transition must invalidate stream row")
+        XCTAssertEqual(unfocused, AssistantStreamRow(stream: stream, message: message, isComposerFocused: false))
+    }
+
 
     func testOlderHistoryProofWireDoesNotCertifyShortWebCache() throws {
         let one = ServerMessage(
