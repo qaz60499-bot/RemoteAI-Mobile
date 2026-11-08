@@ -1285,8 +1285,15 @@ struct ChatView: View {
                     if didInitialScrollToBottom, !isAtBottom, !messages.isEmpty {
                         Button {
                             userBrowsingHistory = false
-                            withAnimation(.easeOut(duration: 0.18)) {
+                            if store.assistantStreams[session.id] != nil {
+                                // A still-growing long stream can keep SwiftUI's animated
+                                // scroll layout busy and block keyboard/accessibility work.
+                                // Make the user's explicit return a single nonanimated jump.
                                 proxy.scrollTo("bottom", anchor: .bottom)
+                            } else {
+                                withAnimation(.easeOut(duration: 0.18)) {
+                                    proxy.scrollTo("bottom", anchor: .bottom)
+                                }
                             }
                         } label: {
                             Image(systemName: "arrow.down")
