@@ -285,6 +285,13 @@ final class WorkspaceStore: ObservableObject {
             && message.contains("ChatGPT conversation exposed no readable messages")
     }
 
+    // An older completed Assistant imported into an already-Running Web Chat
+    // is history, not the terminal event of the current generation. Windows
+    // emits this exact source only from its guarded bound-tab history path.
+    static func isRunningWebHistoricalAssistantEvent(runtimeId: String, source: String?) -> Bool {
+        runtimeId == "runtime.web" && source == "chatgpt-web-bound-running-historical-sync"
+    }
+
     static func verifiedRunActivityAt(lastProgressAt: Date?, lastActivityAt: Date?) -> Date? {
         // Never synthesize Date() from a status poll: doing so can make a later
         // terminal status look older than a fictitious new generation event.
@@ -4611,7 +4618,11 @@ final class WorkspaceStore: ObservableObject {
                         return
                     }
                 }
-                if base.role == .assistant {
+                if base.role == .assistant,
+                   !Self.isRunningWebHistoricalAssistantEvent(
+                       runtimeId: event.runtimeId,
+                       source: event.payload["source"]?.stringValue
+                   ) {
                     if event.runtimeId == "runtime.web" { terminalWebRuns.insert(sessionId) }
                     if let stream = assistantStreams[sessionId] {
                         let reconciledAt = StreamPerformance.now
