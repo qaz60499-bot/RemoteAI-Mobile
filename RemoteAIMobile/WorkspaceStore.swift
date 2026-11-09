@@ -292,6 +292,13 @@ final class WorkspaceStore: ObservableObject {
         runtimeId == "runtime.web" && source == "chatgpt-web-bound-running-historical-sync"
     }
 
+    // Delta replay may coalesce historical events while another Web generation
+    // is still live. A previous Assistant imported during that generation must
+    // not overwrite the current busy overlay with a terminal idle state.
+    static func shouldCoalesceAssistantAsTerminal(runtimeId: String, role: String?, source: String?) -> Bool {
+        role == "assistant" && !isRunningWebHistoricalAssistantEvent(runtimeId: runtimeId, source: source)
+    }
+
     static func verifiedRunActivityAt(lastProgressAt: Date?, lastActivityAt: Date?) -> Date? {
         // Never synthesize Date() from a status poll: doing so can make a later
         // terminal status look older than a fictitious new generation event.
@@ -4375,7 +4382,11 @@ final class WorkspaceStore: ObservableObject {
                                 if coalescedSessionPresentation[sessionId]?.active != false {
                                     coalescedSessionPresentation[sessionId] = (true, generationStartedLabel(runtimeId: event.runtimeId), event.createdAt)
                                 }
-                            case "MESSAGE_ADDED" where event.payload["role"]?.stringValue == "assistant":
+                            case "MESSAGE_ADDED" where Self.shouldCoalesceAssistantAsTerminal(
+                                runtimeId: event.runtimeId,
+                                role: event.payload["role"]?.stringValue,
+                                source: event.payload["source"]?.stringValue
+                            ):
                                 coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
                             case "GENERATION_STOPPED" where event.payload["ok"]?.boolValue != false:
                                 coalescedSessionPresentation[sessionId] = (false, nil, event.createdAt)
