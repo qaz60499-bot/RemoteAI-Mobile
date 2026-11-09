@@ -155,6 +155,22 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testRunningWebHistoricalAssistantDoesNotTerminateTheCurrentGeneration() {
+        XCTAssertTrue(WorkspaceStore.isRunningWebHistoricalAssistantEvent(
+            runtimeId: "runtime.web", source: "chatgpt-web-bound-running-historical-sync"
+        ))
+        XCTAssertFalse(WorkspaceStore.isRunningWebHistoricalAssistantEvent(
+            runtimeId: "runtime.web", source: "chatgpt-web-dom-sync"
+        ))
+        XCTAssertFalse(WorkspaceStore.isRunningWebHistoricalAssistantEvent(
+            runtimeId: "runtime.web", source: nil
+        ))
+        XCTAssertFalse(WorkspaceStore.isRunningWebHistoricalAssistantEvent(
+            runtimeId: "runtime.codex", source: "chatgpt-web-bound-running-historical-sync"
+        ))
+    }
+
+    @MainActor
     func testActiveSparseWebHistoryRetryHasStrictBackoffAndStopsWhenHealthy() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let firstRead = now.addingTimeInterval(-16)
