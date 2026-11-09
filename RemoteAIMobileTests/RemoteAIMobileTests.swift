@@ -4,6 +4,61 @@ import Combine
 @testable import RemoteAIMobile
 
 final class RemoteAIMobileTests: XCTestCase {
+    @MainActor
+    func testManualWebResyncRequiresFreshProviderReadAndImportsMissingAssistant() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 2)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await store.loadSession("photo-upload")
+        let foregroundPreference = await mock.lastPreferCacheValue("loadRecentMessages")
+        XCTAssertNil(foregroundPreference, "Ordinary opening keeps the existing cache-first wire behavior")
+        let originalIds = Set(store.messagesBySession["photo-upload", default: []].map(\.id))
+        let sendsBefore = await mock.actionAttemptCount("sendMessage")
+        await mock.appendHistoryMessage(ServerMessage(
+            messageId: "provider-missing-assistant", sessionId: "photo-upload", role: "assistant",
+            content: "Previously absent Provider Assistant body", externalId: "provider-missing-assistant-uuid",
+            createdAt: Date().addingTimeInterval(-15)
+        ))
+
+        await store.recoverWebChat("photo-upload", operation: "resync")
+
+        let manualPreference = await mock.lastPreferCacheValue("loadRecentMessages")
+        let sendsAfter = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(manualPreference, false, "Manual sync must wait for Windows Provider reconciliation")
+        let messages = store.messagesBySession["photo-upload", default: []]
+        XCTAssertTrue(originalIds.isSubset(of: Set(messages.map(\.id))))
+        XCTAssertEqual(messages.filter { $0.id == "provider-missing-assistant" }.count, 1)
+        XCTAssertEqual(messages.first { $0.id == "provider-missing-assistant" }?.text, "Previously absent Provider Assistant body")
+        XCTAssertEqual(sendsAfter, sendsBefore, "History recovery cannot send or resend a message")
+        await store.suspend()
+    }
+
+    @MainActor
+    func testManualWebResyncPreservesProviderReadFailureInsteadOfTryingOlderCache() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let mock = MockTransport(historyCount: 2)
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        await store.loadSession("photo-upload")
+        let originalIds = Set(store.messagesBySession["photo-upload", default: []].map(\.id))
+        let olderBefore = await mock.actionAttemptCount("loadMessagesBefore")
+        let sendsBefore = await mock.actionAttemptCount("sendMessage")
+        await mock.failNextAction("loadRecentMessages")
+
+        await store.recoverWebChat("photo-upload", operation: "resync")
+
+        let manualPreference = await mock.lastPreferCacheValue("loadRecentMessages")
+        let olderAfter = await mock.actionAttemptCount("loadMessagesBefore")
+        let sendsAfter = await mock.actionAttemptCount("sendMessage")
+        XCTAssertEqual(manualPreference, false)
+        XCTAssertEqual(Set(store.messagesBySession["photo-upload", default: []].map(\.id)), originalIds)
+        XCTAssertEqual(olderAfter, olderBefore, "An older-page warning cannot conceal a failed recent Provider read")
+        XCTAssertEqual(sendsAfter, sendsBefore)
+        XCTAssertTrue(store.webChatRecoveryNotesBySession["photo-upload"]?.contains("MOCK_ACTION_FAILURE") == true)
+        await store.suspend()
+    }
+
     func testStreamingRowComposerFocusInvalidatesEquality() {
         // A reused equatable row must receive fresh focus state; otherwise its
         // scroll callback can keep following the tail during keyboard entry.

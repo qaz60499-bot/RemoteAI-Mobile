@@ -840,9 +840,11 @@ extension Transport {
         return (chunk, data)
     }
 
-    func loadRecent(machineId: String, runtimeId: String, instanceId: String, sessionId: String, limit: Int) async throws -> Page<ChatMessage> {
+    func loadRecent(machineId: String, runtimeId: String, instanceId: String, sessionId: String, limit: Int, preferCache: Bool = true) async throws -> Page<ChatMessage> {
         let safeLimit = max(1, min(limit, 100))
-        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "loadRecentMessages", payload: ["limit": .number(Double(safeLimit))])
+        var payload: [String: JSONValue] = ["limit": .number(Double(safeLimit))]
+        if runtimeId == "runtime.web" && !preferCache { payload["preferCache"] = .bool(false) }
+        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "loadRecentMessages", payload: payload)
         let response = try await requireSuccess(execute(command))
         let items = try response.decode([ServerMessage].self).map(\.chatMessage)
         return Page(items: items, beforeCursor: items.first?.cursor, hasMore: items.count == safeLimit)

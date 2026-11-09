@@ -901,9 +901,18 @@ final class WorkspaceStore: ObservableObject {
             // still uses the guarded older-page read below without navigation.
             webOlderPageNeedsExplicitRetry.remove(sessionId)
             let readStartedAt = Date()
-            await loadSession(sessionId)
+            // Manual recovery must await the Provider read rather than a cached reply.
+            await loadSession(sessionId, preferCache: false)
             guard generation == lifecycleGeneration, transport === activeTransport,
                   machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+            // A failed recent read cannot be hidden by an older-page attempt or
+            // by role counts left over from an earlier successful cache read.
+            guard let readAt = visibleSessionHistorySyncAt[sessionId], readAt >= readStartedAt else {
+                if let error = errors[sessionId] {
+                    webChatRecoveryNotesBySession[sessionId] = "重新同步未完成：\(error)"
+                }
+                return
+            }
             let remoteRoles = visibleSessionLastRemoteHistoryRoles[sessionId]
             let fetchedUser = remoteRoles?.user ?? 0
             let fetchedAssistant = remoteRoles?.assistant ?? 0
@@ -1828,7 +1837,7 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func loadSession(_ sessionId: String, remoteRevision: Date? = nil) async {
+    func loadSession(_ sessionId: String, remoteRevision: Date? = nil, preferCache: Bool = true) async {
         guard sessionLoads.insert(sessionId).inserted else { return }
         defer { sessionLoads.remove(sessionId) }
         let generation = lifecycleGeneration
@@ -1908,7 +1917,7 @@ final class WorkspaceStore: ObservableObject {
         }
         await hydrateSessionDescriptorIfNeeded(sessionId: sessionId, route: route, generation: generation)
         do {
-            let page = try await transport.loadRecent(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, limit: 50)
+            let page = try await transport.loadRecent(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, limit: 50, preferCache: preferCache)
             guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
             let authoritativeItems = route.runtimeId == "runtime.web"
                 ? page.items.map(Self.normalizedWebAssistantMessage)
@@ -2014,6 +2023,11 @@ final class WorkspaceStore: ObservableObject {
             }
         } catch {
             guard generation == lifecycleGeneration, !isSuspended else { return }
+            if route.runtimeId == "runtime.web", !preferCache {
+                errors[sessionId] = error.localizedDescription
+                webChatRecoveryNotesBySession[sessionId] = "历史正文同步失败：\(error.localizedDescription)。本地缓存已保留。"
+                return
+            }
             let hasUsableLocalHistory = !messagesBySession[sessionId, default: []].isEmpty
             if Self.isTransientUnreadableWebHistory(error, runtimeId: routeForSession(sessionId)?.runtimeId) {
                 // Keep cached messages and the failed-read revision retryable. The
