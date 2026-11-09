@@ -171,6 +171,27 @@ final class RemoteAIMobileTests: XCTestCase {
     }
 
     @MainActor
+    func testRecoveredHistoricalAssistantDoesNotMarkCoalescedRunningWebChatIdle() {
+        XCTAssertFalse(WorkspaceStore.shouldCoalesceAssistantAsTerminal(
+            runtimeId: "runtime.web", role: "assistant",
+            source: "chatgpt-web-bound-running-historical-sync"
+        ), "An older Assistant backfilled during a Running Web Chat is not its final")
+        XCTAssertTrue(WorkspaceStore.shouldCoalesceAssistantAsTerminal(
+            runtimeId: "runtime.web", role: "assistant", source: "chatgpt-web-dom-sync"
+        ), "Ordinary Web Assistant completion remains terminal")
+        XCTAssertTrue(WorkspaceStore.shouldCoalesceAssistantAsTerminal(
+            runtimeId: "runtime.codex", role: "assistant",
+            source: "chatgpt-web-bound-running-historical-sync"
+        ), "The exception must stay scoped to Web runtime")
+        XCTAssertFalse(WorkspaceStore.shouldCoalesceAssistantAsTerminal(
+            runtimeId: "runtime.web", role: "user", source: "chatgpt-web-dom-sync"
+        ))
+        XCTAssertFalse(WorkspaceStore.shouldCoalesceAssistantAsTerminal(
+            runtimeId: "runtime.web", role: nil, source: nil
+        ))
+    }
+
+    @MainActor
     func testActiveSparseWebHistoryRetryHasStrictBackoffAndStopsWhenHealthy() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let firstRead = now.addingTimeInterval(-16)
