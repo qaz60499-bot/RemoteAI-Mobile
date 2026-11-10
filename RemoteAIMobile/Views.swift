@@ -93,6 +93,7 @@ enum WebAnomalyDisplayStatus: String, CaseIterable {
     case current = "当前异常"
     case uncertain = "待核验"
     case recovered = "已恢复"
+    static let detachedErrorCode = "WEB_BINDING_UNVERIFIED"
 
     static func classify(
         surfaceState: String?, hasIssue: Bool, hasSessionError: Bool = false, bindingDetached: Bool = false,
@@ -180,6 +181,9 @@ struct DiagnosticsView: View {
                                     Spacer()
                                     Text(anomalyStatus(for: session.id)?.rawValue ?? "待核验")
                                         .font(.caption2).foregroundColor(.secondary)
+                                }
+                                if store.isWebBindingDetached(session.id) {
+                                    Text("代码：\(WebAnomalyDisplayStatus.detachedErrorCode) · 待核验").font(.caption)
                                 }
                                 if let issue = store.webProviderIssuesBySession[session.id] {
                                     Text("代码：\(issue.code) · \(issue.chineseStateName)").font(.caption)
