@@ -43,6 +43,8 @@ final class DeltaDisplaySnapshotTests: XCTestCase {
             machineOnline: true, agentOnline: true, browserOnline: true, now: now)
         XCTAssertEqual(closedOriginalTab, .uncertain,
             "A real tabClosed binding event must remain visible in 待核验 even without a Provider issue object")
+        XCTAssertEqual(WebAnomalyDisplayStatus.detachedErrorCode, "WEB_BINDING_UNVERIFIED",
+            "The detached original Chat needs a stable visible reason code")
         let detachedPreviouslyRecovered = WebAnomalyDisplayStatus.classify(
             surfaceState: "online", hasIssue: false, bindingDetached: true,
             observedAt: recent, recoveredAt: recent,
