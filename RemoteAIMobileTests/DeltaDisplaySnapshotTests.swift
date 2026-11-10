@@ -3,6 +3,42 @@ import XCTest
 
 final class DeltaDisplaySnapshotTests: XCTestCase {
     @MainActor
+    func testWebFaultFilteringKeepsStaleAndDisconnectedReportsUnconfirmed() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let recent = now.addingTimeInterval(-30)
+        let stale = now.addingTimeInterval(-180)
+        let current = WebAnomalyDisplayStatus.classify(
+            surfaceState: "degraded", hasIssue: true, observedAt: recent, recoveredAt: nil,
+            machineOnline: true, agentOnline: true, browserOnline: true, now: now)
+        XCTAssertEqual(current, .current)
+
+        let offline = WebAnomalyDisplayStatus.classify(
+            surfaceState: "degraded", hasIssue: true, observedAt: recent, recoveredAt: nil,
+            machineOnline: false, agentOnline: true, browserOnline: true, now: now)
+        XCTAssertEqual(offline, .uncertain, "Disconnected Windows must never present a cached issue as current")
+
+        let old = WebAnomalyDisplayStatus.classify(
+            surfaceState: "degraded", hasIssue: true, observedAt: stale, recoveredAt: nil,
+            machineOnline: true, agentOnline: true, browserOnline: true, now: now)
+        XCTAssertEqual(old, .uncertain, "Old Provider errors require a fresh inspection")
+
+        let recovered = WebAnomalyDisplayStatus.classify(
+            surfaceState: "online", hasIssue: false, observedAt: recent, recoveredAt: recent,
+            machineOnline: true, agentOnline: true, browserOnline: true, now: now)
+        XCTAssertEqual(recovered, .recovered)
+
+        let noSource = WebAnomalyDisplayStatus.classify(
+            surfaceState: nil, hasIssue: false, observedAt: nil, recoveredAt: nil,
+            machineOnline: true, agentOnline: true, browserOnline: true, now: now)
+        XCTAssertNil(noSource, "Unknown-only categories must not invent a fault for an unobserved Chat")
+
+        let browserDown = WebAnomalyDisplayStatus.classify(
+            surfaceState: "degraded", hasIssue: true, observedAt: recent, recoveredAt: nil,
+            machineOnline: true, agentOnline: true, browserOnline: false, now: now)
+        XCTAssertEqual(browserDown, .uncertain)
+    }
+
+    @MainActor
     func testEmptyDeltaSnapshotCannotHideHydratedOriginalWebHistory() {
         let cached = [
             ServerMessage(
