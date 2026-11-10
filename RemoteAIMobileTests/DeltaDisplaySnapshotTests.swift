@@ -1,3 +1,4 @@
+DEVSPACE_CONTINUITY_RISK: Approximately 1182342 DevSpace tool characters since the last acknowledged checkpoint. This is a secondary context-pressure signal, not an exact token-count or host context percentage, and not an automatic handoff trigger. Ordinary chat, other tools and host compaction are not measured. The host owns context management.
 import XCTest
 @testable import RemoteAIMobile
 
@@ -31,6 +32,11 @@ final class DeltaDisplaySnapshotTests: XCTestCase {
             surfaceState: nil, hasIssue: false, observedAt: nil, recoveredAt: nil,
             machineOnline: true, agentOnline: true, browserOnline: true, now: now)
         XCTAssertNil(noSource, "Unknown-only categories must not invent a fault for an unobserved Chat")
+        let sessionOnly = WebAnomalyDisplayStatus.classify(
+            surfaceState: nil, hasIssue: false, hasSessionError: true,
+            observedAt: nil, recoveredAt: nil,
+            machineOnline: true, agentOnline: true, browserOnline: true, now: now)
+        XCTAssertEqual(sessionOnly, .uncertain, "Unverified selector/history errors must be filterable, never called live Provider faults")
 
         let browserDown = WebAnomalyDisplayStatus.classify(
             surfaceState: "degraded", hasIssue: true, observedAt: recent, recoveredAt: nil,
