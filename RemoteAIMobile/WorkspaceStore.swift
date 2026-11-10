@@ -32,6 +32,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var webTabDiagnosesById: [Int: WebTabDiagnosis] = [:]
     @Published var webTabActionNotesById: [Int: String] = [:]
     @Published private(set) var webChatRecoveryNotesBySession: [String: String] = [:]
+    @Published private(set) var webChatBindingFaultAtBySession: [String: Date] = [:]
     @Published var recentWebTabNotices: [String] = []
     private var explicitlyClosedWebTabIDs = Set<Int>()
     @Published var antigravityProjects: [WebProjectDescriptor] = []
@@ -159,6 +160,7 @@ final class WorkspaceStore: ObservableObject {
     private var systemTransportOfflineChannels = Set<String>()
     private var webProviderStatusReceivedAtBySession: [String: Date] = [:]
     private var webBindingDetachedSessions = Set<String>()
+    func isWebBindingDetached(_ sessionId: String) -> Bool { webBindingDetachedSessions.contains(sessionId) }
     private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 2.5
     private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 20
     private static let connectionMonitorIntervalNanoseconds: UInt64 = 500_000_000
@@ -1048,6 +1050,7 @@ final class WorkspaceStore: ObservableObject {
                 // clear a detached marker. A delayed binding event alone cannot
                 // authorize this Chat's older Provider archive.
                 webBindingDetachedSessions.remove(sessionId)
+                webChatBindingFaultAtBySession.removeValue(forKey: sessionId)
                 webChatRecoveryNotesBySession[sessionId] = "已核验原 Chat 的现有标签绑定；当前文档和旧历史来源仍须独立验证，正在同步历史与执行状态。"
                 await synchronizeVisibleSession(sessionId, force: true)
             } else {
@@ -3083,6 +3086,7 @@ final class WorkspaceStore: ObservableObject {
         webProviderRecoveryObservedAtBySession.removeAll()
         webProviderStatusReceivedAtBySession.removeAll()
         webBindingDetachedSessions.removeAll()
+        webChatBindingFaultAtBySession.removeAll()
         webOlderPageNeedsExplicitRetry.removeAll()
         verifiedReopenEmptyWebHistorySessions.removeAll()
         webProjectsSnapshotId = nil
@@ -4890,6 +4894,7 @@ final class WorkspaceStore: ObservableObject {
             let activeTabId = event.payload["activeTabId"]?.intValue
             if activeTabId == nil && ["tabClosed", "conversationContextChanged", "projectContextChanged", "tabReassignedToRegisteredConversation"].contains(reason) {
                 webBindingDetachedSessions.insert(sessionId)
+                webChatBindingFaultAtBySession[sessionId] = event.createdAt
                 // A binding fault belongs to this exact Chat, not a global
                 // notice that could be shown while another Chat is selected.
                 switch reason {
