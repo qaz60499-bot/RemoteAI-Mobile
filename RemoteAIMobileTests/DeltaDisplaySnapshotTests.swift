@@ -1,4 +1,3 @@
-DEVSPACE_CONTINUITY_RISK: Approximately 1182342 DevSpace tool characters since the last acknowledged checkpoint. This is a secondary context-pressure signal, not an exact token-count or host context percentage, and not an automatic handoff trigger. Ordinary chat, other tools and host compaction are not measured. The host owns context management.
 import XCTest
 @testable import RemoteAIMobile
 
