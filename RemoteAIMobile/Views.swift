@@ -95,10 +95,11 @@ enum WebAnomalyDisplayStatus: String, CaseIterable {
     case recovered = "已恢复"
 
     static func classify(
-        surfaceState: String?, hasIssue: Bool, observedAt: Date?, recoveredAt: Date?,
+        surfaceState: String?, hasIssue: Bool, hasSessionError: Bool = false, observedAt: Date?, recoveredAt: Date?,
         machineOnline: Bool, agentOnline: Bool?, browserOnline: Bool?, now: Date
     ) -> WebAnomalyDisplayStatus? {
-        guard hasIssue || recoveredAt != nil || surfaceState == "unknown" else { return nil }
+        guard hasIssue || hasSessionError || recoveredAt != nil || surfaceState == "unknown" else { return nil }
+        if hasSessionError && !hasIssue { return .uncertain }
         guard machineOnline, agentOnline == true, browserOnline == true,
               let observedAt, now.timeIntervalSince(observedAt) >= 0,
               now.timeIntervalSince(observedAt) <= 120 else { return .uncertain }
@@ -124,6 +125,7 @@ struct DiagnosticsView: View {
         WebAnomalyDisplayStatus.classify(
             surfaceState: store.webProviderSurfaceStateBySession[sessionId],
             hasIssue: store.webProviderIssuesBySession[sessionId] != nil,
+            hasSessionError: store.errors[sessionId] != nil,
             observedAt: store.webProviderSurfaceObservedAtBySession[sessionId],
             recoveredAt: store.webProviderRecoveryObservedAtBySession[sessionId],
             machineOnline: store.machine.state == .online,
@@ -177,6 +179,10 @@ struct DiagnosticsView: View {
                                 if let issue = store.webProviderIssuesBySession[session.id] {
                                     Text("代码：\(issue.code) · \(issue.chineseStateName)").font(.caption)
                                     Text(issue.message).font(.caption).lineLimit(3)
+                                }
+                                if let otherError = store.errors[session.id],
+                                   otherError != store.webProviderIssuesBySession[session.id]?.message {
+                                    Text("会话异常：\(otherError)").font(.caption).lineLimit(3)
                                 }
                                 if let at = store.webProviderSurfaceObservedAtBySession[session.id] {
                                     FixedTimestamp(date: at, prefix: "上次网页状态观测")
@@ -1232,6 +1238,7 @@ struct ChatView: View {
         return WebAnomalyDisplayStatus.classify(
             surfaceState: currentWebProviderSurfaceState,
             hasIssue: currentWebProviderIssue != nil,
+            hasSessionError: store.errors[session.id] != nil,
             observedAt: store.webProviderSurfaceObservedAtBySession[session.id],
             recoveredAt: store.webProviderRecoveryObservedAtBySession[session.id],
             machineOnline: store.machine.state == .online,
