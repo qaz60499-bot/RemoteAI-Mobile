@@ -44,6 +44,51 @@ final class DeltaDisplaySnapshotTests: XCTestCase {
     }
 
     @MainActor
+    func testReadyChromeWithInvalidDocumentProofMustRemainUnverifiedOnIPhone() throws {
+        let invalid = """
+        {
+          "tabId": 12,
+          "state": "ready",
+          "generating": false,
+          "composerReady": true,
+          "freshDocumentProofPresent": true,
+          "freshDocumentProofValid": false,
+          "proofValidityFailure": "invalidated",
+          "firstProofInvalidation": {
+            "source": "navigate",
+            "navigationType": "replace",
+            "destinationSameDocument": true,
+            "destinationExactInitialUrl": true,
+            "at": "2026-11-10T13:34:18.615Z"
+          }
+        }
+        """.data(using: .utf8)!
+        let diagnosis = try JSONDecoder().decode(WebTabDiagnosis.self, from: invalid)
+        XCTAssertEqual(diagnosis.state, "ready", "Chrome shell can appear healthy")
+        XCTAssertEqual(diagnosis.freshDocumentProofPresent, true)
+        XCTAssertEqual(diagnosis.freshDocumentProofValid, false)
+        XCTAssertTrue(diagnosis.sourceProofReason?.contains("同文档 replace") == true,
+            "Exact same-URL replace invalidation must show its reason on the phone")
+        XCTAssertEqual(WebAnomalyDisplayStatus.classify(
+            surfaceState: nil, hasIssue: false, hasSessionError: diagnosis.sourceProofReason != nil,
+            observedAt: nil, recoveredAt: nil,
+            machineOnline: true, agentOnline: true, browserOnline: true, now: Date()), .uncertain,
+            "An invalid document proof must be filterable as 待核验, never current Provider outage or recovered")
+
+        let valid = """
+        {"tabId":12,"state":"ready","freshDocumentProofPresent":true,"freshDocumentProofValid":true}
+        """.data(using: .utf8)!
+        XCTAssertNil(try JSONDecoder().decode(WebTabDiagnosis.self, from: valid).sourceProofReason,
+            "A valid source proof must not display a historical invalidation")
+
+        let legacy = """
+        {"tabId":12,"state":"ready"}
+        """.data(using: .utf8)!
+        XCTAssertNotNil(try JSONDecoder().decode(WebTabDiagnosis.self, from: legacy).sourceProofReason,
+            "A legacy Agent that omits proof cannot certify complete Provider history")
+    }
+
+    @MainActor
     func testEmptyDeltaSnapshotCannotHideHydratedOriginalWebHistory() {
         let cached = [
             ServerMessage(
