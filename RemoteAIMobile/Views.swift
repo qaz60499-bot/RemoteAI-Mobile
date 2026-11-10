@@ -88,6 +88,28 @@ private struct DiagnosticExportItem: Identifiable {
     let url: URL
 }
 
+enum WebAnomalyDisplayStatus: String, CaseIterable {
+    case all = "全部"
+    case current = "当前异常"
+    case uncertain = "待核验"
+    case recovered = "已恢复"
+
+    static func classify(
+        surfaceState: String?, hasIssue: Bool, observedAt: Date?, recoveredAt: Date?,
+        machineOnline: Bool, agentOnline: Bool?, browserOnline: Bool?, now: Date
+    ) -> WebAnomalyDisplayStatus? {
+        guard hasIssue || recoveredAt != nil || surfaceState == "unknown" else { return nil }
+        guard machineOnline, agentOnline == true, browserOnline == true,
+              let observedAt, now.timeIntervalSince(observedAt) >= 0,
+              now.timeIntervalSince(observedAt) <= 120 else { return .uncertain }
+        if surfaceState == "degraded" && hasIssue { return .current }
+        if surfaceState == "online", let recoveredAt,
+           now.timeIntervalSince(recoveredAt) >= 0,
+           now.timeIntervalSince(recoveredAt) <= 120 { return .recovered }
+        return .uncertain
+    }
+}
+
 struct DiagnosticsView: View {
     @EnvironmentObject var store: WorkspaceStore
     @Environment(\.dismiss) private var dismiss
@@ -96,6 +118,30 @@ struct DiagnosticsView: View {
     @State private var exporting = false
     @State private var exportItem: DiagnosticExportItem?
     @State private var exportError: String?
+    @State private var webAnomalyFilter: WebAnomalyDisplayStatus = .all
+
+    private func anomalyStatus(for sessionId: String) -> WebAnomalyDisplayStatus? {
+        WebAnomalyDisplayStatus.classify(
+            surfaceState: store.webProviderSurfaceStateBySession[sessionId],
+            hasIssue: store.webProviderIssuesBySession[sessionId] != nil,
+            observedAt: store.webProviderSurfaceObservedAtBySession[sessionId],
+            recoveredAt: store.webProviderRecoveryObservedAtBySession[sessionId],
+            machineOnline: store.machine.state == .online,
+            agentOnline: store.desktopAgentConnected,
+            browserOnline: store.desktopBrowserConnected,
+            now: Date()
+        )
+    }
+
+    private var visibleWebAnomalySessions: [SessionDescriptor] {
+        store.sessions.filter { session in
+            guard session.instanceId == "web.chatgpt", let category = anomalyStatus(for: session.id) else { return false }
+            return webAnomalyFilter == .all || category == webAnomalyFilter
+        }.sorted { $0.orderingDate > $1.orderingDate }
+    }
+
+
+
 
     var body: some View {
         NavigationView {
@@ -109,11 +155,55 @@ struct DiagnosticsView: View {
                 .padding()
                 Divider()
                 ScrollView {
-                    Text(log.text)
-                        .font(.system(.caption2, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .padding()
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("网页运行异常").font(.headline)
+                        Picker("异常筛选", selection: $webAnomalyFilter) {
+                            ForEach(WebAnomalyDisplayStatus.allCases, id: \.self) { category in
+                                Text(category.rawValue).tag(category)
+                            }
+                        }.pickerStyle(.menu)
+                        if visibleWebAnomalySessions.isEmpty {
+                            Text("没有符合筛选条件的已加载网页会话；这不代表未加载的会话或电脑网页没有异常。")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                        ForEach(visibleWebAnomalySessions) { session in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text(session.title).font(.subheadline.weight(.semibold)).lineLimit(2)
+                                    Spacer()
+                                    Text(anomalyStatus(for: session.id)?.rawValue ?? "待核验")
+                                        .font(.caption2).foregroundColor(.secondary)
+                                }
+                                if let issue = store.webProviderIssuesBySession[session.id] {
+                                    Text("代码：\(issue.code) · \(issue.chineseStateName)").font(.caption)
+                                    Text(issue.message).font(.caption).lineLimit(3)
+                                }
+                                if let at = store.webProviderSurfaceObservedAtBySession[session.id] {
+                                    FixedTimestamp(date: at, prefix: "上次网页状态观测")
+                                }
+                                if let note = store.webChatRecoveryNotesBySession[session.id] {
+                                    Text(note).font(.caption2).foregroundColor(.secondary).lineLimit(3)
+                                }
+                                HStack(spacing: 16) {
+                                    Button("检测网页状态") { Task { await store.recoverWebChat(session.id, operation: "inspect") } }
+                                    Button("重新同步消息") { Task { await store.recoverWebChat(session.id, operation: "resync") } }
+                                }.font(.caption).disabled(store.machine.state != .online)
+                                Text("只操作这个 Chat；网页身份不明时会拒绝执行，不自动重发消息。")
+                                    .font(.caption2).foregroundColor(.secondary)
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.secondary.opacity(0.08))
+                            .cornerRadius(8)
+                        }
+                        Divider()
+                        Text("原始诊断日志").font(.headline)
+                        Text(log.text)
+                            .font(.system(.caption2, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .padding()
                 }
             }
             .navigationTitle("诊断日志")
@@ -1137,6 +1227,19 @@ struct ChatView: View {
     private var currentWebProviderSurfaceState: String? {
         runtime.kind == .web ? store.webProviderSurfaceStateBySession[session.id] : nil
     }
+    private var anomalyStatusForCurrentWebChat: WebAnomalyDisplayStatus? {
+        guard runtime.kind == .web else { return nil }
+        return WebAnomalyDisplayStatus.classify(
+            surfaceState: currentWebProviderSurfaceState,
+            hasIssue: currentWebProviderIssue != nil,
+            observedAt: store.webProviderSurfaceObservedAtBySession[session.id],
+            recoveredAt: store.webProviderRecoveryObservedAtBySession[session.id],
+            machineOnline: store.machine.state == .online,
+            agentOnline: store.desktopAgentConnected,
+            browserOnline: store.desktopBrowserConnected,
+            now: Date()
+        )
+    }
     private var generationStatusText: String {
         if store.stopRequestsPending.contains(session.id) {
             return "正在请求停止 · 等待电脑端执行确认…"
@@ -1183,7 +1286,7 @@ struct ChatView: View {
             if let issue = currentWebProviderIssue {
                 WebProviderSurfaceIssueBanner(
                     issue: issue,
-                    surfaceState: currentWebProviderSurfaceState ?? "degraded",
+                    surfaceState: anomalyStatusForCurrentWebChat == .current ? "degraded" : "unknown",
                     surfaceObservedAt: store.webProviderSurfaceObservedAtBySession[session.id],
                     sessionState: currentSessionState
                 )
