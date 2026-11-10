@@ -32,6 +32,16 @@ final class DeltaDisplaySnapshotTests: XCTestCase {
             ChatView.visibleHistoryMessages(canonical: cached, deltaSnapshot: nil).map(\.id),
             ids
         )
+        let runningOnly = ChatMessage(
+            id: "frozen-running", sessionId: "original-web", sequence: nil,
+            role: .tool, kind: .toolEvent, text: "", toolName: "ChatGPT Web",
+            toolStatus: "Running", detail: nil, attachments: nil, createdAt: Date()
+        )
+        XCTAssertEqual(
+            ChatView.visibleHistoryMessages(canonical: cached, deltaSnapshot: [runningOnly]).map(\.id),
+            ids,
+            "A frozen Running-only tool row must not replace cached User/Assistant history"
+        )
         XCTAssertEqual(
             ChatView.visibleHistoryMessages(canonical: cached, deltaSnapshot: [cached[0]]).map(\.id),
             [cached[0].id],
