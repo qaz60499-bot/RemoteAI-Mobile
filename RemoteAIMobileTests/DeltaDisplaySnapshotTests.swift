@@ -44,8 +44,13 @@ final class DeltaDisplaySnapshotTests: XCTestCase {
         )
         XCTAssertEqual(
             ChatView.visibleHistoryMessages(canonical: cached, deltaSnapshot: [cached[0]]).map(\.id),
-            [cached[0].id],
-            "Nonempty delta snapshots should retain their existing coalescing behavior"
+            ids,
+            "A replay snapshot with one cached turn must not hide the remaining durable reply"
+        )
+        XCTAssertEqual(
+            ChatView.visibleHistoryMessages(canonical: cached, deltaSnapshot: cached).map(\.id),
+            ids,
+            "A complete replay snapshot retains normal coalescing behavior"
         )
         XCTAssertTrue(ChatView.visibleHistoryMessages(canonical: [], deltaSnapshot: []).isEmpty)
     }
