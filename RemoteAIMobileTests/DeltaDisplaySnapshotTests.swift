@@ -95,4 +95,36 @@ final class DeltaDisplaySnapshotTests: XCTestCase {
         )
         XCTAssertTrue(ChatView.visibleHistoryMessages(canonical: [], deltaSnapshot: []).isEmpty)
     }
+
+    @MainActor
+    func testDeltaWithSameMessageIdsMustNotHideLongerDurableBodies() {
+        let first = ServerMessage(
+            messageId: "user-stable-id", sessionId: "original-web",
+            role: "user", content: "Complete durable User body",
+            externalId: nil, createdAt: Date().addingTimeInterval(-30)
+        ).chatMessage
+        let reply = ServerMessage(
+            messageId: "assistant-stable-id", sessionId: "original-web",
+            role: "assistant", content: "Complete durable Assistant answer",
+            externalId: nil, createdAt: Date().addingTimeInterval(-20)
+        ).chatMessage
+        var emptyReplay = reply
+        emptyReplay.text = ""
+        XCTAssertEqual(
+            ChatView.visibleHistoryMessages(
+                canonical: [first, reply], deltaSnapshot: [first, emptyReplay]
+            ).map(\.text),
+            [first.text, reply.text],
+            "A delta with matching IDs but blank Assistant text must not erase durable history"
+        )
+        var shorterReplay = reply
+        shorterReplay.text = "Complete"
+        XCTAssertEqual(
+            ChatView.visibleHistoryMessages(
+                canonical: [first, reply], deltaSnapshot: [first, shorterReplay]
+            ).last?.text,
+            reply.text,
+            "A truncated replay with the same UUID cannot replace a previously hydrated reply"
+        )
+    }
 }
