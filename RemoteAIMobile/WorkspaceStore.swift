@@ -2023,9 +2023,13 @@ final class WorkspaceStore: ObservableObject {
             // is explicitly .error lets ChatView continue showing rate-limit / unusual-
             // activity evidence even while periodic reconciliation polls are running.
             if !(route.runtimeId == "runtime.web"
-                    && webOlderPageNeedsExplicitRetry.contains(sessionId)),
+                    && (webOlderPageNeedsExplicitRetry.contains(sessionId)
+                        || webProviderIssuesBySession[sessionId] != nil)),
                sessions.first(where: { $0.id == sessionId })?.state != .error,
                errors[sessionId] != nil {
+                // A cache page is not a fresh Web Provider recovery signal.
+                // Only a scoped, observed online event may clear an actual
+                // same-Chat web fault retained in webProviderIssuesBySession.
                 errors.removeValue(forKey: sessionId)
             }
             // A successful authoritative history read is the recovery watermark for
@@ -5663,7 +5667,11 @@ final class WorkspaceStore: ObservableObject {
         if liveRunStatusBySession[sessionId] != nil { liveRunStatusBySession.removeValue(forKey: sessionId) }
         clearLiveRunActivity(sessionId: sessionId)
         setSessionState(sessionId, .idle)
-        if errors[sessionId] != nil { errors.removeValue(forKey: sessionId) }
+        // The historical Assistant could be older than a newer Provider fault.
+        // Settling this old turn is not proof the webpage recovered.
+        if errors[sessionId] != nil && webProviderIssuesBySession[sessionId] == nil {
+            errors.removeValue(forKey: sessionId)
+        }
 
         await settleRunningToolRows(sessionId: sessionId)
     }
