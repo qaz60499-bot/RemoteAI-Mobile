@@ -95,11 +95,15 @@ enum WebAnomalyDisplayStatus: String, CaseIterable {
     case recovered = "已恢复"
 
     static func classify(
-        surfaceState: String?, hasIssue: Bool, hasSessionError: Bool = false, observedAt: Date?, recoveredAt: Date?,
+        surfaceState: String?, hasIssue: Bool, hasSessionError: Bool = false, bindingDetached: Bool = false,
+        observedAt: Date?, recoveredAt: Date?,
         machineOnline: Bool, agentOnline: Bool?, browserOnline: Bool?, now: Date
     ) -> WebAnomalyDisplayStatus? {
-        guard hasIssue || hasSessionError || recoveredAt != nil || surfaceState == "unknown" else { return nil }
-        if hasSessionError && !hasIssue { return .uncertain }
+        guard hasIssue || hasSessionError || bindingDetached || recoveredAt != nil || surfaceState == "unknown" else { return nil }
+        // A closed or identity-changed original Chat is a real, scoped fault even
+        // when there is no separate Provider error. Never label it recovered
+        // merely because the Relay or the Browser Bridge reports online.
+        if bindingDetached || (hasSessionError && !hasIssue) { return .uncertain }
         guard machineOnline, agentOnline == true, browserOnline == true,
               let observedAt, now.timeIntervalSince(observedAt) >= 0,
               now.timeIntervalSince(observedAt) <= 120 else { return .uncertain }
@@ -126,6 +130,7 @@ struct DiagnosticsView: View {
             surfaceState: store.webProviderSurfaceStateBySession[sessionId],
             hasIssue: store.webProviderIssuesBySession[sessionId] != nil,
             hasSessionError: store.errors[sessionId] != nil,
+            bindingDetached: store.isWebBindingDetached(sessionId),
             observedAt: store.webProviderSurfaceObservedAtBySession[sessionId],
             recoveredAt: store.webProviderRecoveryObservedAtBySession[sessionId],
             machineOnline: store.machine.state == .online,
@@ -186,6 +191,9 @@ struct DiagnosticsView: View {
                                 }
                                 if let at = store.webProviderSurfaceObservedAtBySession[session.id] {
                                     FixedTimestamp(date: at, prefix: "上次网页状态观测")
+                                }
+                                if let detachedAt = store.webChatBindingFaultAtBySession[session.id] {
+                                    FixedTimestamp(date: detachedAt, prefix: "原 Chat 网页绑定异常")
                                 }
                                 if let note = store.webChatRecoveryNotesBySession[session.id] {
                                     Text(note).font(.caption2).foregroundColor(.secondary).lineLimit(3)
