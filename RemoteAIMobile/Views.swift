@@ -1097,9 +1097,21 @@ struct ChatView: View {
     @State private var textSelectionRequest: TextSelectionRequest?
     @FocusState private var focused: Bool
 
+    // A historical delta can capture an empty presentation snapshot before
+    // the visible Chat's persisted User/Assistant turns are hydrated. Never
+    // let that empty snapshot hide real locally cached conversation history.
+    static func visibleHistoryMessages(canonical: [ChatMessage], deltaSnapshot: [ChatMessage]?) -> [ChatMessage] {
+        guard let deltaSnapshot else { return canonical }
+        if deltaSnapshot.isEmpty && canonical.contains(where: { $0.role == .user || $0.role == .assistant }) {
+            return canonical
+        }
+        return deltaSnapshot
+    }
     var messages: [ChatMessage] {
-        store.deltaRecoveryDisplayMessagesBySession?[session.id]
-            ?? store.messagesBySession[session.id, default: []]
+        Self.visibleHistoryMessages(
+            canonical: store.messagesBySession[session.id, default: []],
+            deltaSnapshot: store.deltaRecoveryDisplayMessagesBySession?[session.id]
+        )
     }
     private var supportsModelSelection: Bool { runtime.kind == .codex || runtime.kind == .antigravity }
     private var modelOptions: [CodexModelOption] { instance.modelCatalog?.models ?? [] }
