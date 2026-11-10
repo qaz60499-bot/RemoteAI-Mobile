@@ -1102,7 +1102,9 @@ struct ChatView: View {
     // let that empty snapshot hide real locally cached conversation history.
     static func visibleHistoryMessages(canonical: [ChatMessage], deltaSnapshot: [ChatMessage]?) -> [ChatMessage] {
         guard let deltaSnapshot else { return canonical }
-        if deltaSnapshot.isEmpty && canonical.contains(where: { $0.role == .user || $0.role == .assistant }) {
+        let snapshotHasTurns = deltaSnapshot.contains { $0.role == .user || $0.role == .assistant }
+        let cacheHasTurns = canonical.contains { $0.role == .user || $0.role == .assistant }
+        if !snapshotHasTurns && cacheHasTurns {
             return canonical
         }
         return deltaSnapshot
