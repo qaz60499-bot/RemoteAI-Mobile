@@ -410,8 +410,13 @@ struct InstanceView: View {
                                             .font(.caption2).foregroundColor(.secondary)
                                         Text(webTabStatus(tab))
                                             .font(.caption2).foregroundColor(.secondary)
-                                        Text("执行：\(tab.executionState ?? "Unknown") · Agent 最近记录")
-                                            .font(.caption2).foregroundColor(.secondary)
+                                        if tab.executionState == nil || tab.executionState == "Unknown" {
+                                            Text("执行状态未核验（Unknown）· 不代表对话为空、已结束或已同步")
+                                                .font(.caption2).foregroundColor(.secondary)
+                                        } else {
+                                            Text("执行：\(tab.executionState ?? "Unknown") · Agent 最近记录")
+                                                .font(.caption2).foregroundColor(.secondary)
+                                        }
                                         if let value = tab.lastActivityAt, let date = RemoteAIDate.parse(value) {
                                             FixedTimestamp(date: date, prefix: "最后活动")
                                         }
@@ -1210,6 +1215,21 @@ struct ChatView: View {
                 && !snapshotTurnIDs.contains(message.id)
         }
         if cacheHasMissingTurns { return canonical }
+        // An ID-complete replay may still contain an empty or truncated body.
+        // The durable User/Assistant text is never replaced by this sparse
+        // presentation-only snapshot, even if the message IDs already match.
+        let snapshotByID = deltaSnapshot.reduce(into: [String: ChatMessage]()) { result, message in
+            result[message.id] = message
+        }
+        let snapshotHasDegradedBodies = canonical.contains { message in
+            guard message.role == .user || message.role == .assistant,
+                  let snapshot = snapshotByID[message.id] else { return false }
+            let durableText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let snapshotText = snapshot.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !durableText.isEmpty && (snapshotText.isEmpty
+                || (snapshotText.count < durableText.count && !snapshotText.contains(durableText)))
+        }
+        if snapshotHasDegradedBodies { return canonical }
         return deltaSnapshot
     }
     var messages: [ChatMessage] {
@@ -1325,6 +1345,31 @@ struct ChatView: View {
                         LazyVStack(spacing: 12) {
                             Color.clear.frame(height: 1).id("top").onAppear { guard didInitialScrollToBottom, userBrowsingHistory, !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
                             if loadingOlder { ProgressView().padding(.vertical, 6) }
+                            if runtime.kind == .web && messages.isEmpty {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Label("历史正文尚未就绪", systemImage: "clock.arrow.circlepath")
+                                        .font(.subheadline.weight(.semibold))
+                                    Text("此 Chat 当前没有可显示的已缓存消息，或还未完成来源核验。这不代表原网页对话为空，也不会删除历史。")
+                                        .font(.caption).foregroundColor(.secondary)
+                                    HStack(spacing: 12) {
+                                        Button("检测网页状态") {
+                                            Task { await store.recoverWebChat(session.id, operation: "inspect") }
+                                        }
+                                        Button("重新同步消息") {
+                                            Task { await store.recoverWebChat(session.id, operation: "resync") }
+                                        }
+                                    }
+                                    .font(.caption)
+                                    .disabled(store.machine.state != .online)
+                                    Text("只检查当前 Chat；网页身份不明时会拒绝操作，不自动重发未知结果的消息。")
+                                        .font(.caption2).foregroundColor(.secondary)
+                                }
+                                .padding(12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.secondary.opacity(0.08))
+                                .cornerRadius(8)
+                                .accessibilityIdentifier("web-history-not-ready")
+                            }
                             ForEach(messages) { message in
                                 let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
                                 // Definite failures restore the composer and use a new operation.
