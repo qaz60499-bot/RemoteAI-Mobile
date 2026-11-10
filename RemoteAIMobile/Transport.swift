@@ -192,6 +192,14 @@ struct EnteredOpenWebTab: Decodable {
     let project: WebProjectDescriptor?
 }
 
+struct WebDocumentProofInvalidation: Decodable {
+    let source: String?
+    let navigationType: String?
+    let destinationSameDocument: Bool?
+    let destinationExactInitialUrl: Bool?
+    let at: String?
+}
+
 struct WebTabDiagnosis: Decodable {
     let tabId: Int
     let state: String
@@ -203,6 +211,27 @@ struct WebTabDiagnosis: Decodable {
     let draftPresent: Bool?
     let pendingUploads: Bool?
     let busy: Bool?
+    let freshDocumentProofPresent: Bool?
+    let freshDocumentProofValid: Bool?
+    let proofValidityFailure: String?
+    let firstProofInvalidation: WebDocumentProofInvalidation?
+
+    // A readable Chrome page (ready) is not proof that its Provider history
+    // was authenticated. Keep this distinct from a live Provider outage.
+    var sourceProofReason: String? {
+        guard freshDocumentProofValid == true else {
+            if firstProofInvalidation?.navigationType == "replace"
+                && firstProofInvalidation?.destinationSameDocument == true
+                && firstProofInvalidation?.destinationExactInitialUrl == true {
+                return "相同 URL 的同文档 replace 导航使来源证明失效"
+            }
+            if let proofValidityFailure, !proofValidityFailure.isEmpty {
+                return "文档来源证明校验失败（\(proofValidityFailure)）"
+            }
+            return "当前 Chrome 网页未提供有效的历史来源证明"
+        }
+        return nil
+    }
 }
 
 struct OpenWebTab: Decodable, Identifiable {
