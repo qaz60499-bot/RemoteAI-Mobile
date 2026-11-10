@@ -1946,6 +1946,12 @@ final class WorkspaceStore: ObservableObject {
             }
             try? await cache.upsertMessages(authoritativeItems)
             merge(authoritativeItems, into: sessionId)
+            // A user-requested Provider resync has now reconciled actual history.
+            // Discard any older coalesced delta display for this exact Chat,
+            // otherwise a stale 3U1A snapshot can hide the newly fetched reply.
+            if route.runtimeId == "runtime.web", !preferCache, !authoritativeItems.isEmpty {
+                releaseRecoveryDisplaySnapshot(for: sessionId)
+            }
             if route.runtimeId == "runtime.web" {
                 // A genuine nonempty remote page supersedes any previously
                 // armed idle-empty recovery window for this exact session.
