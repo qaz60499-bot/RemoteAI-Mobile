@@ -1232,6 +1232,19 @@ struct ChatView: View {
         if snapshotHasDegradedBodies { return canonical }
         return deltaSnapshot
     }
+    // Tool status rows such as ChatGPT Web Running are not historical User/Assistant
+    // body text. An empty-session warning must remain visible beside those rows,
+    // including after a sparse delta replay, without suppressing a real stream.
+    static func hasDisplayableWebTranscriptBody(_ messages: [ChatMessage], hasActiveAssistantStream: Bool = false) -> Bool {
+        messages.contains { message in
+            guard message.role == .user || message.role == .assistant else { return false }
+            if message.role == .assistant && message.toolStatus == "Streaming" && hasActiveAssistantStream {
+                return true
+            }
+            return !message.displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !message.resolvedAttachments.isEmpty
+        }
+    }
     var messages: [ChatMessage] {
         Self.visibleHistoryMessages(
             canonical: store.messagesBySession[session.id, default: []],
@@ -1345,7 +1358,9 @@ struct ChatView: View {
                         LazyVStack(spacing: 12) {
                             Color.clear.frame(height: 1).id("top").onAppear { guard didInitialScrollToBottom, userBrowsingHistory, !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
                             if loadingOlder { ProgressView().padding(.vertical, 6) }
-                            if runtime.kind == .web && messages.isEmpty {
+                            if runtime.kind == .web && !Self.hasDisplayableWebTranscriptBody(
+                                messages, hasActiveAssistantStream: store.assistantStreams[session.id] != nil
+                            ) {
                                 VStack(alignment: .leading, spacing: 10) {
                                     Label("历史正文尚未就绪", systemImage: "clock.arrow.circlepath")
                                         .font(.subheadline.weight(.semibold))
