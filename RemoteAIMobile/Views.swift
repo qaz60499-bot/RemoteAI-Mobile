@@ -1102,11 +1102,18 @@ struct ChatView: View {
     // let that empty snapshot hide real locally cached conversation history.
     static func visibleHistoryMessages(canonical: [ChatMessage], deltaSnapshot: [ChatMessage]?) -> [ChatMessage] {
         guard let deltaSnapshot else { return canonical }
-        let snapshotHasTurns = deltaSnapshot.contains { $0.role == .user || $0.role == .assistant }
-        let cacheHasTurns = canonical.contains { $0.role == .user || $0.role == .assistant }
-        if !snapshotHasTurns && cacheHasTurns {
-            return canonical
+        // A partly hydrated replay snapshot can already contain one real turn
+        // while omitting older persisted User/Assistant turns.  Preserve all
+        // durable transcript rows instead of allowing this partial snapshot
+        // to hide the rest until unrelated delta pages finish.
+        let snapshotTurnIDs = Set(deltaSnapshot.compactMap { message -> String? in
+            (message.role == .user || message.role == .assistant) ? message.id : nil
+        })
+        let cacheHasMissingTurns = canonical.contains { message in
+            (message.role == .user || message.role == .assistant)
+                && !snapshotTurnIDs.contains(message.id)
         }
+        if cacheHasMissingTurns { return canonical }
         return deltaSnapshot
     }
     var messages: [ChatMessage] {
