@@ -37,6 +37,25 @@ final class DeltaDisplaySnapshotTests: XCTestCase {
             machineOnline: true, agentOnline: true, browserOnline: true, now: now)
         XCTAssertEqual(sessionOnly, .uncertain, "Unverified selector/history errors must be filterable, never called live Provider faults")
 
+        let closedOriginalTab = WebAnomalyDisplayStatus.classify(
+            surfaceState: nil, hasIssue: false, bindingDetached: true,
+            observedAt: nil, recoveredAt: nil,
+            machineOnline: true, agentOnline: true, browserOnline: true, now: now)
+        XCTAssertEqual(closedOriginalTab, .uncertain,
+            "A real tabClosed binding event must remain visible in 待核验 even without a Provider issue object")
+        let detachedPreviouslyRecovered = WebAnomalyDisplayStatus.classify(
+            surfaceState: "online", hasIssue: false, bindingDetached: true,
+            observedAt: recent, recoveredAt: recent,
+            machineOnline: true, agentOnline: true, browserOnline: true, now: now)
+        XCTAssertEqual(detachedPreviouslyRecovered, .uncertain,
+            "Stale source recovery cannot override a newly detached original Chat")
+        let detachedWhileProviderDegraded = WebAnomalyDisplayStatus.classify(
+            surfaceState: "degraded", hasIssue: true, bindingDetached: true,
+            observedAt: recent, recoveredAt: nil,
+            machineOnline: true, agentOnline: true, browserOnline: true, now: now)
+        XCTAssertEqual(detachedWhileProviderDegraded, .uncertain,
+            "Without the exact bound document, a Provider report must not be labeled a current verified fault")
+
         let browserDown = WebAnomalyDisplayStatus.classify(
             surfaceState: "degraded", hasIssue: true, observedAt: recent, recoveredAt: nil,
             machineOnline: true, agentOnline: true, browserOnline: false, now: now)
