@@ -1064,8 +1064,21 @@ final class WorkspaceStore: ObservableObject {
                 // without treating Unknown as Idle or dropping earlier messages.
                 let issueCode = diagnosis.issueCode.map { " [\($0)]" } ?? ""
                 let issueText = diagnosis.issueMessage.map { " · \($0)" } ?? ""
-                webChatRecoveryNotesBySession[sessionId] =
-                    "网页状态：\(diagnosis.state)\(issueCode)\(issueText)"
+                if let proofReason = diagnosis.sourceProofReason {
+                    // A ready-looking BrowserHost document may be unable to
+                    // authenticate original Provider text (e.g. same-document
+                    // replace on Build88). Never tell the phone "ready" alone.
+                    // This is an unverified source, not a fabricated live error.
+                    errors[sessionId] = "WEB_DOCUMENT_PROOF_UNVERIFIED: \(proofReason)"
+                    webChatRecoveryNotesBySession[sessionId] =
+                        "网页外观状态：\(diagnosis.state)\(issueCode)\(issueText)；历史来源待核验：\(proofReason)。网页能显示并不代表原 Assistant 正文已同步。"
+                } else {
+                    if errors[sessionId]?.hasPrefix("WEB_DOCUMENT_PROOF_UNVERIFIED:") == true {
+                        errors.removeValue(forKey: sessionId)
+                    }
+                    webChatRecoveryNotesBySession[sessionId] =
+                        "网页状态：\(diagnosis.state)\(issueCode)\(issueText)；当前文档来源证明已验证，完整历史起点仍需独立核验。"
+                }
             } else {
                 errors[sessionId] = errors["web.tabs"] ?? "当前网页状态无法验证。"
                 webChatRecoveryNotesBySession[sessionId] = "本 Chat 网页诊断未完成，不能证明状态正常。"
