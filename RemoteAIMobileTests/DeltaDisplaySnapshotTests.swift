@@ -97,6 +97,43 @@ final class DeltaDisplaySnapshotTests: XCTestCase {
     }
 
     @MainActor
+    func testRunningOnlyAndEmptyAssistantMustNotSuppressWebHistoryRecovery() {
+        let runningOnly = ChatMessage(
+            id: "tool-running-only", sessionId: "web-no-source", sequence: nil,
+            role: .tool, kind: .toolEvent, text: "",
+            toolName: "ChatGPT Web", toolStatus: "Running",
+            detail: nil, attachments: nil, createdAt: Date()
+        )
+        XCTAssertFalse(ChatView.hasDisplayableWebTranscriptBody([runningOnly]),
+            "A Running tool row alone must not hide the history-not-ready and recovery controls")
+        XCTAssertFalse(ChatView.hasDisplayableWebTranscriptBody([]),
+            "No cached rows must still display history-not-ready")
+
+        let blankReply = ServerMessage(
+            messageId: "assistant-empty", sessionId: "web-no-source",
+            role: "assistant", content: "", externalId: nil, createdAt: Date()
+        ).chatMessage
+        XCTAssertFalse(ChatView.hasDisplayableWebTranscriptBody([runningOnly, blankReply]),
+            "A blank Assistant envelope must not count as original transcript body")
+
+        let durable = ServerMessage(
+            messageId: "assistant-present", sessionId: "web-no-source",
+            role: "assistant", content: "Original durable reply", externalId: nil, createdAt: Date()
+        ).chatMessage
+        XCTAssertTrue(ChatView.hasDisplayableWebTranscriptBody([runningOnly, durable]),
+            "Real User/Assistant body should keep the ordinary chat layout")
+
+        var activeAssistant = blankReply
+        activeAssistant.toolStatus = "Streaming"
+        XCTAssertTrue(ChatView.hasDisplayableWebTranscriptBody([activeAssistant],
+            hasActiveAssistantStream: true),
+            "An existing live Assistant stream must not be overlaid by history-not-ready")
+        XCTAssertFalse(ChatView.hasDisplayableWebTranscriptBody([activeAssistant],
+            hasActiveAssistantStream: false),
+            "A stale Streaming marker without an active stream is not a verified body")
+    }
+
+    @MainActor
     func testDeltaWithSameMessageIdsMustNotHideLongerDurableBodies() {
         let first = ServerMessage(
             messageId: "user-stable-id", sessionId: "original-web",
