@@ -170,6 +170,16 @@ final class WorkspaceStore: ObservableObject {
         let sessionId: String
         let observedAt: Date
         let note: String
+        // Event-authenticated scope allows cold-start restore even if the session
+        // catalog has not yet been hydrated. Legacy cached faults omit this field.
+        let instanceId: String?
+        init(machineId: String, sessionId: String, observedAt: Date, note: String, instanceId: String? = nil) {
+            self.machineId = machineId
+            self.sessionId = sessionId
+            self.observedAt = observedAt
+            self.note = note
+            self.instanceId = instanceId
+        }
     }
     static func webBindingFaultKey(_ sessionId: String) -> String {
         "web.binding.fault.\(sessionId)"
@@ -177,7 +187,12 @@ final class WorkspaceStore: ObservableObject {
     func restorePersistedWebBindingFaults() async {
         guard let saved = try? await cache.values(StoredWebBindingFault.self, keyPrefix: "web.binding.fault.") else { return }
         for fault in saved where fault.machineId == machine.id {
-            guard sessions.contains(where: { $0.id == fault.sessionId && $0.instanceId == "web.chatgpt" }),
+            let catalogInstance = sessions.first(where: { $0.id == fault.sessionId })?.instanceId
+            // Fail closed if a known Session or the saved event belongs to another
+            // runtime; a scoped exact-Web event can outlive a missing catalog row.
+            guard fault.instanceId == nil || fault.instanceId == "web.chatgpt",
+                  catalogInstance == nil || catalogInstance == "web.chatgpt",
+                  catalogInstance == "web.chatgpt" || fault.instanceId == "web.chatgpt",
                   !fault.note.isEmpty, fault.note.count <= 500 else { continue }
             webBindingDetachedSessions.insert(fault.sessionId)
             webChatBindingFaultAtBySession[fault.sessionId] = fault.observedAt
@@ -4183,6 +4198,7 @@ final class WorkspaceStore: ObservableObject {
             try ProtocolSecurity.validate(event, expectedMachineId: machine.id)
         } catch {
             errors["sync"] = error.localizedDescription
+DEVSPACE_CONTINUITY_RISK: Approximately 1266800 DevSpace tool characters since the last acknowledged checkpoint. This is a secondary context-pressure signal, not an exact token-count or host context percentage, and not an automatic handoff trigger. Ordinary chat, other tools and host compaction are not measured. The host owns context management.
             return
         }
         let decision = tracker.decision(for: event.sequence)
@@ -4938,7 +4954,8 @@ final class WorkspaceStore: ObservableObject {
                 }
                 if let note = webChatRecoveryNotesBySession[sessionId] {
                     try? await cache.put(StoredWebBindingFault(machineId: machine.id, sessionId: sessionId,
-                        observedAt: event.createdAt, note: note), key: Self.webBindingFaultKey(sessionId))
+                        observedAt: event.createdAt, note: note, instanceId: event.instanceId),
+                        key: Self.webBindingFaultKey(sessionId))
                 }
             } else if activeTabId != nil, webBindingDetachedSessions.contains(sessionId) {
                 // Events can arrive after this tab was reassigned or navigated;
