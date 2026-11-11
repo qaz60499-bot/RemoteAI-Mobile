@@ -765,11 +765,11 @@ final class WorkspaceStore: ObservableObject {
         let generation = lifecycleGeneration
         await refreshOpenWebTabs()
         guard !Task.isCancelled, generation == lifecycleGeneration,
-              machine.state == .online, !isSuspended,
-              !openWebTabsInventoryUnverified else { return }
-        // Never create a duplicate tab if that Provider UUID is already open,
-        // even when the old A01 Project/session binding is wrong or missing.
-        let providerTabs = openWebTabs.filter {
+              machine.state == .online, !isSuspended else { return }
+        // A failed tab inventory is not authority to navigate any page, but
+        // it must not prevent a separate authenticated no-tab Provider GET.
+        // The Windows endpoint still verifies the durable user UUID/body.
+        let providerTabs = openWebTabsInventoryUnverified ? [] : openWebTabs.filter {
             webConversationAlias(from: $0.canonicalUrl)?.lowercased()
                 == providerAlias.lowercased()
         }
@@ -858,6 +858,20 @@ final class WorkspaceStore: ObservableObject {
         // This is a strict source read, never a cached 3U1A success.
         webBindingDetachedSessions.insert(sessionId)
         let beforeMessageIDs = Set(messagesBySession[sessionId, default: []].map(\.id))
+        // A parallel initial/cache history request must finish before this
+        // strict one; otherwise sessionLoads silently coalesces it into the
+        // weaker cache request and the automatic recovery never runs.
+        for _ in 0..<8 {
+            if !sessionLoads.contains(sessionId) { break }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled, generation == lifecycleGeneration,
+                  machine.state == .online, !isSuspended else { return }
+        }
+        guard !sessionLoads.contains(sessionId) else {
+            webChatRecoveryNotesBySession[sessionId] =
+                "本 Chat 正在读取缓存，后台认证历史读取尚未开始；保留现有正文等待自动同步。"
+            return
+        }
         let readStartedAt = Date()
         await loadSession(sessionId, preferCache: false)
         guard !Task.isCancelled, generation == lifecycleGeneration,
@@ -867,9 +881,30 @@ final class WorkspaceStore: ObservableObject {
         }.count
         if let verifiedAt = visibleSessionHistorySyncAt[sessionId],
            verifiedAt >= readStartedAt {
-            webChatRecoveryNotesBySession[sessionId] = newRows > 0
-                ? "无需打开 Chrome 标签：已从认证的原 Chat 来源补入 \(newRows) 条正文；网页操作仍需独立验证，历史起点须由 Provider 证明。"
-                : "无需固定打开 Chrome 标签：已认证核对原 Chat 历史，暂无新增；网页绑定状态仍待核验。"
+            // Only this exact authenticated strict read may request a single
+            // versioned older-page proof while the original tab remains shut.
+            // The Windows adapter independently proves oldest Provider page.
+            webOlderPageNeedsExplicitRetry.remove(sessionId)
+            hasMoreBySession[sessionId] = !messagesBySession[sessionId, default: []].isEmpty
+            if hasMoreBySession[sessionId] == true,
+               sessions.first(where: { $0.id == sessionId })?.state == .idle,
+               !olderMessageLoads.contains(sessionId),
+               !sessionSendsInFlight.contains(sessionId) {
+                await loadOlder(sessionId, authenticatedDetachedRead: true)
+                guard !Task.isCancelled, generation == lifecycleGeneration,
+                      machine.state == .online, !isSuspended else { return }
+            }
+            if hasMoreBySession[sessionId] == false
+                && !webOlderPageNeedsExplicitRetry.contains(sessionId) {
+                webChatRecoveryNotesBySession[sessionId] =
+                    "已认证核验原 Chat 全历史起点，补入 \(newRows) 条正文；网页标签状态仍独立待核验。"
+            } else if webOlderPageNeedsExplicitRetry.contains(sessionId) {
+                // Keep the precise failed oldest-page reason set by loadOlder.
+            } else {
+                webChatRecoveryNotesBySession[sessionId] = newRows > 0
+                    ? "无需打开 Chrome 标签：已从认证的原 Chat 来源补入 \(newRows) 条正文；最早历史页仍待核验。"
+                    : "已认证核对原 Chat 正文，暂无新增；最早历史页仍待核验。"
+            }
         } else if webChatRecoveryNotesBySession[sessionId] == nil {
             webChatRecoveryNotesBySession[sessionId] =
                 "原 Chat 当前没有打开标签，认证后台历史来源尚未连通；旧正文已保留，下次打开将继续核验。"
@@ -1037,9 +1072,26 @@ final class WorkspaceStore: ObservableObject {
                 let added = messagesBySession[sessionId, default: []].filter {
                     !priorIds.contains($0.id) && ($0.role == .user || $0.role == .assistant)
                 }.count
-                webChatRecoveryNotesBySession[sessionId] = added > 0
-                    ? "原网页标签虽已关闭，但本次严格 Provider 同步补入 \(added) 条正文。User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条；网页恢复操作与历史起点仍需独立验证。"
-                    : "原网页标签已关闭，本次严格来源读取未新增正文（User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条）；缓存保留，后续可自动重试。"
+                if !messagesBySession[sessionId, default: []].isEmpty,
+                   sessions.first(where: { $0.id == sessionId })?.state == .idle,
+                   !olderMessageLoads.contains(sessionId),
+                   !sessionSendsInFlight.contains(sessionId) {
+                    hasMoreBySession[sessionId] = true
+                    // Only after the strict read above succeeded; still no
+                    // Chrome tab actions. A failed Provider archive response
+                    // cannot certify completion or erase the cached transcript.
+                    await loadOlder(sessionId, authenticatedDetachedRead: true)
+                    guard generation == lifecycleGeneration, transport === activeTransport,
+                          machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+                }
+                if hasMoreBySession[sessionId] == false
+                    && !webOlderPageNeedsExplicitRetry.contains(sessionId) {
+                    webChatRecoveryNotesBySession[sessionId] =
+                        "原 Chat 无需固定标签：已认证核对最早历史页，补入 \(added) 条；User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条。网页异常状态另行核验。"
+                } else if !webOlderPageNeedsExplicitRetry.contains(sessionId) {
+                    webChatRecoveryNotesBySession[sessionId] =
+                        "原 Chat 后台正文同步补入 \(added) 条；User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条；最早页仍待核验。"
+                }
                 return
             }
             var verifiedOlderNewRows = 0
@@ -2533,7 +2585,7 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func loadOlder(_ sessionId: String) async {
+    func loadOlder(_ sessionId: String, authenticatedDetachedRead: Bool = false) async {
         guard olderMessageLoads.insert(sessionId).inserted else { return }
         defer { olderMessageLoads.remove(sessionId) }
         let generation = lifecycleGeneration
@@ -2542,7 +2594,8 @@ final class WorkspaceStore: ObservableObject {
         let isWebRemoteRead = machine.state == .online
             && routeForSession(sessionId)?.runtimeId == "runtime.web"
         if isWebRemoteRead && (webOlderPageNeedsExplicitRetry.contains(sessionId)
-                             || webBindingDetachedSessions.contains(sessionId)) {
+                             || (webBindingDetachedSessions.contains(sessionId)
+                                 && !authenticatedDetachedRead)) {
             // A detached Chat or a failed Provider page cannot be retried by
             // passive top-scroll; only the explicit resync path may re-arm it.
             hasMoreBySession[sessionId] = false
