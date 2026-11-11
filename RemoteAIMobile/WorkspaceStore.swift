@@ -160,6 +160,8 @@ final class WorkspaceStore: ObservableObject {
     private var systemTransportOfflineChannels = Set<String>()
     private var webProviderStatusReceivedAtBySession: [String: Date] = [:]
     private var webBindingDetachedSessions = Set<String>()
+    // Single-flight passive recovery for an exact Chat when its tab reappears.
+    private var passiveOriginalHistoryRecoverySessions = Set<String>()
     func isWebBindingDetached(_ sessionId: String) -> Bool { webBindingDetachedSessions.contains(sessionId) }
 
     // Reuse the existing protected SQLite cache; no new local storage or source fetch.
@@ -781,16 +783,49 @@ final class WorkspaceStore: ObservableObject {
                observedParts[2] == "c",
                sameWebProjectAlias(observedParts[1], projectAlias),
                observedParts[3].lowercased() == providerAlias.lowercased() {
-                await synchronizeVisibleSession(sessionId, force: true)
-                // Visible-open is explicit interest in THIS existing Chat. A
-                // recent Windows cache page is not its older Provider archive.
-                // Attempt at most one authenticated older page without opening,
-                // navigating, reloading, stopping, or sending anything in Chrome.
-                // The Windows adapter independently enforces exact Session,
-                // Project, tab, Provider UUID, and fresh-document proof.
+                // A reappearing original Chat is verified without any user
+                // tap, tab allocation, navigation, Stop or message send.
+                // Only a successful strict Provider read, NOT a cache page or
+                // WEB_PAGE_REGISTERED metadata, can discharge a tabClosed fault.
+                let originalFaultAt = webChatBindingFaultAtBySession[sessionId]
+                let strictReadStartedAt = Date()
+                await loadSession(sessionId, preferCache: false)
                 guard !Task.isCancelled, generation == lifecycleGeneration,
                       machine.state == .online, !isSuspended,
-                      !webBindingDetachedSessions.contains(sessionId),
+                      let readAt = visibleSessionHistorySyncAt[sessionId],
+                      readAt >= strictReadStartedAt,
+                      webChatBindingFaultAtBySession[sessionId] == originalFaultAt else {
+                    webChatRecoveryNotesBySession[sessionId] =
+                        "原 Chat 新标签已发现，但 Provider 来源核验尚未通过；缓存保留，等待下次自动同步。"
+                    return
+                }
+                // An existing tab can move to another Chat during the awaited
+                // read. Check the exact tab/session/UUID again before clearing
+                // a detached marker or reading older pages.
+                await refreshOpenWebTabs()
+                guard !Task.isCancelled, generation == lifecycleGeneration,
+                      machine.state == .online, !isSuspended,
+                      !openWebTabsInventoryUnverified,
+                      openWebTabs.filter({ $0.sessionId == sessionId && $0.isChat
+                          && $0.tabId == tab.tabId
+                          && webConversationAlias(from: $0.canonicalUrl)?.lowercased()
+                              == providerAlias.lowercased() }).count == 1,
+                      webChatBindingFaultAtBySession[sessionId] == originalFaultAt else { return }
+                if webBindingDetachedSessions.contains(sessionId) {
+                    webBindingDetachedSessions.remove(sessionId)
+                    webChatBindingFaultAtBySession.removeValue(forKey: sessionId)
+                    try? await cache.remove(key: Self.webBindingFaultKey(sessionId))
+                }
+                webOlderPageNeedsExplicitRetry.remove(sessionId)
+                if !messagesBySession[sessionId, default: []].isEmpty {
+                    hasMoreBySession[sessionId] = true
+                }
+                webChatRecoveryNotesBySession[sessionId] =
+                    "已自动核验原 Chat 并同步正文；历史起点仍待 Provider 分页证明。"
+                // At most one certified older-page read after the exact
+                // source has independently passed strict Provider validation.
+                guard !Task.isCancelled, generation == lifecycleGeneration,
+                      machine.state == .online, !isSuspended,
                       !webOlderPageNeedsExplicitRetry.contains(sessionId),
                       hasMoreBySession[sessionId] == true,
                       !olderMessageLoads.contains(sessionId),
@@ -4971,9 +5006,20 @@ final class WorkspaceStore: ObservableObject {
             await applyWebPageRegistrationEvent(event, sessionId: sessionId, suppressPresentation: suppressTransientPresentation)
             if event.payload["activeTabId"]?.intValue != nil,
                webBindingDetachedSessions.contains(sessionId) {
-                // Registration updates scoped metadata, but does not attest
-                // that the current Chrome document still belongs to this Chat.
-                webChatRecoveryNotesBySession[sessionId] = "本 Chat 收到新标签注册；此前断开状态仍待独立核验，请手动检查并重新连接。旧 Assistant 不自动判定为已恢复。"
+                // Registration is only a trigger: the exact source remains
+                // untrusted until an independent strict Provider read succeeds.
+                webChatRecoveryNotesBySession[sessionId] =
+                    "检测到原 Chat 重新出现，正在后台核验 Provider 身份；旧消息保留。"
+                if !suppressTransientPresentation,
+                   machine.state == .online, !isSuspended,
+                   passiveOriginalHistoryRecoverySessions.insert(sessionId).inserted {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        defer { self.passiveOriginalHistoryRecoverySessions.remove(sessionId) }
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                        await self.recoverArchivedWebHistoryOnVisibleOpen(sessionId)
+                    }
+                }
             }
             await requestMetadataRefresh()
         case "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "WEB_PAGE_UNREGISTERED":
