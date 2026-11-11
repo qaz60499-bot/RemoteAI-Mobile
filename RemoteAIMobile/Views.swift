@@ -1522,15 +1522,44 @@ struct ChatView: View {
                         }
                     }
                     .onChange(of: store.assistantStreams[session.id] != nil) { streamActive in
-                        // Re-resolve the final message ID after its streamed predecessor
-                        // has been removed. Do not reposition manually browsed history or
-                        // an active keyboard; retain live append and terminal semantics.
+                        // The canonical final swaps a very tall live streaming row for
+                        // a collapsed durable row. LazyVStack can keep geometry from the
+                        // old row for one more layout pass, so an immediate scrollTo alone
+                        // may leave the user stranded in old history.
+                        #if DEBUG
+                        if ProcessInfo.processInfo.environment["REMOTEAI_UI_STRESS_DIRECT"] == "1" {
+                            DiagnosticsLog.shared.record("ui_stream_terminal_anchor_gate", fields: [
+                                "streamActive": String(streamActive),
+                                "didInitialScroll": String(didInitialScrollToBottom),
+                                "browsingHistory": String(userBrowsingHistory),
+                                "composerFocused": String(focused),
+                                "loadingOlder": String(loadingOlder),
+                                "latestIsFinal": String(messages.last?.id.hasPrefix("stress-final-") == true),
+                            ])
+                        }
+                        #endif
                         guard !streamActive, didInitialScrollToBottom,
                               !userBrowsingHistory, !focused, !loadingOlder else { return }
                         DispatchQueue.main.async {
                             guard !userBrowsingHistory, !focused, !loadingOlder,
                                   let latestID = messages.last?.id else { return }
                             proxy.scrollTo(latestID, anchor: .bottom)
+                        }
+                        // One bounded post-layout correction, not a repeating scroll
+                        // timer. A new manual history drag or keyboard focus cancels it.
+                        // Re-read the canonical last ID after final row reconciliation.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(400)) {
+                            guard !userBrowsingHistory, !focused, !loadingOlder,
+                                  let latestID = messages.last?.id else { return }
+                            proxy.scrollTo(latestID, anchor: .bottom)
+                            #if DEBUG
+                            if ProcessInfo.processInfo.environment["REMOTEAI_UI_STRESS_DIRECT"] == "1" {
+                                DiagnosticsLog.shared.record("ui_stream_terminal_anchor_postlayout", fields: [
+                                    "latestIsFinal": String(latestID.hasPrefix("stress-final-")),
+                                    "browsingHistory": String(userBrowsingHistory),
+                                ])
+                            }
+                            #endif
                         }
                     }
                     .onChange(of: session.id) { _ in
