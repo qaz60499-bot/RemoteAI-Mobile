@@ -158,6 +158,7 @@ final class RemoteAIMobileUITests: XCTestCase {
         // Keep every assertion; lengthen only this deterministic test-only stream.
         let fixtureChunkMilliseconds = chars <= 30_000 ? 250 : 150
         app.launchEnvironment["REMOTEAI_UI_STRESS_CHUNK_MS"] = String(fixtureChunkMilliseconds)
+        let streamFixtureLaunchBegan = ProcessInfo.processInfo.systemUptime
         app.launch()
         let progress = app.staticTexts["assistant-stream-progress"]
         XCTAssertTrue(progress.waitForExistence(timeout: 10))
@@ -192,15 +193,24 @@ final class RemoteAIMobileUITests: XCTestCase {
         // accessibility snapshot for 30 seconds under a long transcript.
         // The final is emitted only after every delta is appended by MockTransport.
         let final = app.staticTexts["message-content-stress-final-\(chars)-0"]
-        // The UI-only fixture emits 100 characters at the configured chunk interval.
-        // On hosted XCTest runners a repeated full staticTexts snapshot against
-        // the still-streaming 30K transcript sometimes blocks accessibility for
-        // over a minute. First await the small, stable button subtree becoming
-        // idle, THEN inspect the final message once. This retains every final
-        // body/marker/draft assertion without polling the growing transcript.
+        // The UI-only fixture emits 100 characters at a deterministic interval.
+        // XCTest auto-waits up to 60 seconds for quiescence after a scroll tap.
+        // A second element query before the fixture ends re-enters that wait while
+        // SwiftUI is correctly publishing live deltas, causing an AX snapshot
+        // timeout rather than reporting whether the final answer was rendered.
+        // Let this test-only fixture finish without polling accessibility; then
+        // keep every final message/body/draft assertion, plus terminal Stop state.
+        // The native streaming-cadence test independently checks live responsiveness.
         let expectedFixtureSeconds = (Double(chars) / 100.0) * (Double(fixtureChunkMilliseconds) / 1000.0)
+        let streamFixtureSettleSeconds = expectedFixtureSeconds + 25
+        let remainingUntilSettle = streamFixtureSettleSeconds - (ProcessInfo.processInfo.systemUptime - streamFixtureLaunchBegan)
+        if remainingUntilSettle > 0 {
+            Thread.sleep(forTimeInterval: remainingUntilSettle)
+        }
         XCTAssertTrue(app.buttons["Send"].waitForExistence(timeout: max(180, expectedFixtureSeconds + 90)),
                       "Final delivery must clear active generation and restore normal sending")
+        XCTAssertTrue(app.buttons["Send"].isEnabled, "Final delivery must restore an enabled composer action")
+        XCTAssertFalse(app.buttons["Stop"].exists, "Final delivery must clear active generation")
         XCTAssertTrue(final.waitForExistence(timeout: 15),
                       "The actual final message must replace the streaming row")
         XCTAssertTrue(final.label.contains(marker), "The rendered final message must have the expected contents")
