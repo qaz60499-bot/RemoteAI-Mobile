@@ -1284,6 +1284,7 @@ struct ChatView: View {
             surfaceState: currentWebProviderSurfaceState,
             hasIssue: currentWebProviderIssue != nil,
             hasSessionError: store.errors[session.id] != nil,
+            bindingDetached: store.isWebBindingDetached(session.id),
             observedAt: store.webProviderSurfaceObservedAtBySession[session.id],
             recoveredAt: store.webProviderRecoveryObservedAtBySession[session.id],
             machineOnline: store.machine.state == .online,
@@ -1348,8 +1349,20 @@ struct ChatView: View {
                     sessionState: currentSessionState
                 )
             } else if runtime.kind == .web,
+                      !store.isWebBindingDetached(session.id),
                       let recoveredAt = store.webProviderRecoveryObservedAtBySession[session.id] {
                 WebProviderSurfaceRecoveryBanner(observedAt: recoveredAt, sessionState: currentSessionState)
+            }
+            if runtime.kind == .web, store.isWebBindingDetached(session.id) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("代码：\(WebAnomalyDisplayStatus.detachedErrorCode) · 待核验")
+                        .font(.caption.weight(.semibold))
+                    if let detachedAt = store.webChatBindingFaultAtBySession[session.id] {
+                        FixedTimestamp(date: detachedAt, prefix: "原 Chat 网页绑定异常")
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
             }
             if runtime.kind == .web, let recovery = store.webChatRecoveryNotesBySession[session.id] {
                 Text(recovery)
