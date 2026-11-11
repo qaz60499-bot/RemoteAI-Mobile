@@ -142,7 +142,25 @@ struct DiagnosticsView: View {
     }
 
     private var visibleWebAnomalySessions: [SessionDescriptor] {
-        store.sessions.filter { session in
+        // A real, same-machine WEB_BINDING_CHANGED(tabClosed) can be persisted
+        // before the lazy listSessions catalog has hydrated this original Chat.
+        // Diagnostics must not silently hide that exact fault. These rows are
+        // display-only; they never register a Chat, authorize Provider reads,
+        // adopt a Chrome tab, or mark the old Assistant history complete.
+        let loadedSessionIds = Set(store.sessions.map(\.id))
+        let detachedWithoutCatalog: [SessionDescriptor] = store.webChatBindingFaultAtBySession.compactMap { entry in
+            let sessionId = entry.key
+            guard sessionId.hasPrefix("webconv-"),
+                  !loadedSessionIds.contains(sessionId),
+                  store.isWebBindingDetached(sessionId) else { return nil }
+            let existingProjectRow = store.projectConversationsByAlias.values
+                .flatMap { $0 }
+                .first { $0.localConversationId == sessionId }
+            return SessionDescriptor(id: sessionId, instanceId: "web.chatgpt",
+                title: existingProjectRow?.displayTitle ?? "ChatGPT Conversation（网页绑定待核验）",
+                state: .idle, updatedAt: entry.value)
+        }
+        return (store.sessions + detachedWithoutCatalog).filter { session in
             guard session.instanceId == "web.chatgpt", let category = anomalyStatus(for: session.id) else { return false }
             return webAnomalyFilter == .all || category == webAnomalyFilter
         }.sorted { $0.orderingDate > $1.orderingDate }
