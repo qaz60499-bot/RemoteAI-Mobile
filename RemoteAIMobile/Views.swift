@@ -1491,42 +1491,46 @@ struct ChatView: View {
                             }
                     )
                     .onAppear {
-                        guard !didInitialScrollToBottom, !messages.isEmpty else { return }
+                        guard !didInitialScrollToBottom, let latestID = messages.last?.id else { return }
                         DispatchQueue.main.async {
-                            proxy.scrollTo("bottom", anchor: .bottom)
+                            // A row ID is a stable LazyVStack scroll target. The one-point
+                            // bottom sentinel can be recycled before the last message
+                            // has finished laying out on a long virtualized transcript.
+                            proxy.scrollTo(latestID, anchor: .bottom)
                             didInitialScrollToBottom = true
                         }
                     }
-                    .onChange(of: messages.last?.id) { _ in
-                        // A new message starts a fresh follow cycle; a prior manual
-                        // return must not permanently suppress later turns.
+                    .onChange(of: messages.last?.id) { latestID in
+                        // A canonical final replaces the transient streaming row with a
+                        // different durable ID. Anchor the actual last row rather than
+                        // the recycled one-point bottom sentinel.
                         suppressStreamingTailFollowAfterReturn = false
-                        guard !loadingOlder, !messages.isEmpty else { return }
+                        guard !loadingOlder, let latestID else { return }
                         if !didInitialScrollToBottom {
                             DispatchQueue.main.async {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                                proxy.scrollTo(latestID, anchor: .bottom)
                                 didInitialScrollToBottom = true
                             }
                         } else if !userBrowsingHistory {
                             userBrowsingHistory = false
-                            withAnimation(.easeOut(duration: 0.18)) {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                            // A nonanimated scroll avoids fighting the final row's
+                            // LazyVStack height change and full text collapse.
+                            DispatchQueue.main.async {
+                                guard !userBrowsingHistory, !loadingOlder else { return }
+                                proxy.scrollTo(latestID, anchor: .bottom)
                             }
                         }
                     }
                     .onChange(of: store.assistantStreams[session.id] != nil) { streamActive in
-                        // The final assistant event removes the streaming row and inserts a
-                        // collapsed durable message. LazyVStack can retain the old scroll
-                        // geometry after a user's explicit "return to latest" while 30K+
-                        // streaming content is still growing. Re-anchor once, after the
-                        // terminal layout pass, rather than polling/scrolling on every delta.
-                        // Never steal the scroll position during manual history browsing
-                        // or while the composer has keyboard focus.
+                        // Re-resolve the final message ID after its streamed predecessor
+                        // has been removed. Do not reposition manually browsed history or
+                        // an active keyboard; retain live append and terminal semantics.
                         guard !streamActive, didInitialScrollToBottom,
                               !userBrowsingHistory, !focused, !loadingOlder else { return }
                         DispatchQueue.main.async {
-                            guard !userBrowsingHistory, !focused, !loadingOlder else { return }
-                            proxy.scrollTo("bottom", anchor: .bottom)
+                            guard !userBrowsingHistory, !focused, !loadingOlder,
+                                  let latestID = messages.last?.id else { return }
+                            proxy.scrollTo(latestID, anchor: .bottom)
                         }
                     }
                     .onChange(of: session.id) { _ in
@@ -1547,10 +1551,12 @@ struct ChatView: View {
                                 // A still-growing long stream can keep SwiftUI's animated
                                 // scroll layout busy and block keyboard/accessibility work.
                                 // Make the user's explicit return a single nonanimated jump.
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                                if let latestID = messages.last?.id {
+                                    proxy.scrollTo(latestID, anchor: .bottom)
+                                }
                             } else {
-                                withAnimation(.easeOut(duration: 0.18)) {
-                                    proxy.scrollTo("bottom", anchor: .bottom)
+                                if let latestID = messages.last?.id {
+                                    proxy.scrollTo(latestID, anchor: .bottom)
                                 }
                             }
                         } label: {
