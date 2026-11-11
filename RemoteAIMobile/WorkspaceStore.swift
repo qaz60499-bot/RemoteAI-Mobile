@@ -852,12 +852,28 @@ final class WorkspaceStore: ObservableObject {
                 "原 Chat 网页已存在但身份未核实；没有另开标签或合并历史。"
             return
         }
-        // Viewing a cached conversation does not authorize a new Chrome tab.
-        // Preserve the exact Session/Project history and make the missing
-        // authenticated source visible for a deliberate manual reconnect.
+        // No matching Chrome tab is ordinary usage, not a request to open one.
+        // The Windows extension can independently verify the exact durable
+        // Provider UUID and user-body anchor in a read-only background GET.
+        // This is a strict source read, never a cached 3U1A success.
         webBindingDetachedSessions.insert(sessionId)
-        webChatRecoveryNotesBySession[sessionId] =
-            "原 Chat 没有可验证的打开标签；已加载现有历史缓存。请先在电脑确认原 Project/Chat 后人工重新连接，旧 Assistant 不自动判定为完整。"
+        let beforeMessageIDs = Set(messagesBySession[sessionId, default: []].map(\.id))
+        let readStartedAt = Date()
+        await loadSession(sessionId, preferCache: false)
+        guard !Task.isCancelled, generation == lifecycleGeneration,
+              machine.state == .online, !isSuspended else { return }
+        let newRows = messagesBySession[sessionId, default: []].filter {
+            !beforeMessageIDs.contains($0.id) && ($0.role == .user || $0.role == .assistant)
+        }.count
+        if let verifiedAt = visibleSessionHistorySyncAt[sessionId],
+           verifiedAt >= readStartedAt {
+            webChatRecoveryNotesBySession[sessionId] = newRows > 0
+                ? "无需打开 Chrome 标签：已从认证的原 Chat 来源补入 \(newRows) 条正文；网页操作仍需独立验证，历史起点须由 Provider 证明。"
+                : "无需固定打开 Chrome 标签：已认证核对原 Chat 历史，暂无新增；网页绑定状态仍待核验。"
+        } else if webChatRecoveryNotesBySession[sessionId] == nil {
+            webChatRecoveryNotesBySession[sessionId] =
+                "原 Chat 当前没有打开标签，认证后台历史来源尚未连通；旧正文已保留，下次打开将继续核验。"
+        }
     }
 
     func reopenClosedWebConversation(sessionId: String) async {
@@ -989,8 +1005,11 @@ final class WorkspaceStore: ObservableObject {
             // current-document/Project guard has a chance to recover. This
             // still uses the guarded older-page read below without navigation.
             webOlderPageNeedsExplicitRetry.remove(sessionId)
+            let priorIds = Set(messagesBySession[sessionId, default: []].map(\.id))
             let readStartedAt = Date()
-            // Manual recovery must await the Provider read rather than a cached reply.
+            // A strict exact-Chat Provider read is allowed even when its
+            // Chrome tab has closed. The source must authenticate the cached
+            // User UUID/body and reconcile without creating any browser tab.
             await loadSession(sessionId, preferCache: false)
             guard generation == lifecycleGeneration, transport === activeTransport,
                   machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
@@ -1015,8 +1034,12 @@ final class WorkspaceStore: ObservableObject {
             // UUID before reading Provider content; this never opens Chrome,
             // sends a message, stops a generation or retries a delivery.
             if webBindingDetachedSessions.contains(sessionId) {
-                webChatRecoveryNotesBySession[sessionId] =
-                    "原 Chat 当前没有可信的绑定标签；本次仅核对到电脑缓存 User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条。旧 Assistant 历史未补齐，请先人工核验原网页身份。"
+                let added = messagesBySession[sessionId, default: []].filter {
+                    !priorIds.contains($0.id) && ($0.role == .user || $0.role == .assistant)
+                }.count
+                webChatRecoveryNotesBySession[sessionId] = added > 0
+                    ? "原网页标签虽已关闭，但本次严格 Provider 同步补入 \(added) 条正文。User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条；网页恢复操作与历史起点仍需独立验证。"
+                    : "原网页标签已关闭，本次严格来源读取未新增正文（User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条）；缓存保留，后续可自动重试。"
                 return
             }
             var verifiedOlderNewRows = 0
