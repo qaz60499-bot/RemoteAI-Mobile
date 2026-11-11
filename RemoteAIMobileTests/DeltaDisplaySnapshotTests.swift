@@ -3,6 +3,40 @@ import XCTest
 
 final class DeltaDisplaySnapshotTests: XCTestCase {
     @MainActor
+    func testDetachedChatFaultRestoresFromProtectedCacheAfterColdStartWithoutCrossChatLeak() async throws {
+        let cache = try SQLiteStore.inMemory()
+        let observed = Date(timeIntervalSince1970: 1_799_000_000)
+        let original = SessionDescriptor(id: "original-chat", instanceId: "web.chatgpt",
+            title: "Original Chat", state: .idle, updatedAt: observed)
+        let different = SessionDescriptor(id: "other-chat", instanceId: "web.chatgpt",
+            title: "Other Chat", state: .idle, updatedAt: observed)
+        let nonWeb = SessionDescriptor(id: "non-web", instanceId: "codex.instance",
+            title: "Other Runtime", state: .idle, updatedAt: observed)
+        let note = "本 Chat 的电脑端 ChatGPT 标签页已关闭；原历史缓存保留，需人工核验。"
+        try await cache.put(WorkspaceStore.StoredWebBindingFault(machineId: "my-pc",
+            sessionId: original.id, observedAt: observed, note: note),
+            key: WorkspaceStore.webBindingFaultKey(original.id))
+        try await cache.put(WorkspaceStore.StoredWebBindingFault(machineId: "different-machine",
+            sessionId: different.id, observedAt: observed, note: "Foreign machine"),
+            key: WorkspaceStore.webBindingFaultKey(different.id))
+        try await cache.put(WorkspaceStore.StoredWebBindingFault(machineId: "my-pc",
+            sessionId: nonWeb.id, observedAt: observed, note: "Not Web"),
+            key: WorkspaceStore.webBindingFaultKey(nonWeb.id))
+        for _ in 0..<2 {
+            // A new WorkspaceStore models an app restart with a persisted event cursor:
+            // it must not need the old WEB_BINDING_CHANGED event to be redelivered.
+            let rebooted = WorkspaceStore(transport: MockTransport(historyCount: 0), cache: cache)
+            rebooted.sessions = [original, different, nonWeb]
+            await rebooted.restorePersistedWebBindingFaults()
+            XCTAssertTrue(rebooted.isWebBindingDetached(original.id))
+            XCTAssertEqual(rebooted.webChatBindingFaultAtBySession[original.id], observed)
+            XCTAssertEqual(rebooted.webChatRecoveryNotesBySession[original.id], note)
+            XCTAssertFalse(rebooted.isWebBindingDetached(different.id), "Never show other machine's fault")
+            XCTAssertFalse(rebooted.isWebBindingDetached(nonWeb.id), "Only real web Chat scope")
+        }
+    }
+
+    @MainActor
     func testWebFaultFilteringKeepsStaleAndDisconnectedReportsUnconfirmed() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let recent = now.addingTimeInterval(-30)
