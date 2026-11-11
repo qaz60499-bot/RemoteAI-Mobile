@@ -161,6 +161,29 @@ final class WorkspaceStore: ObservableObject {
     private var webProviderStatusReceivedAtBySession: [String: Date] = [:]
     private var webBindingDetachedSessions = Set<String>()
     func isWebBindingDetached(_ sessionId: String) -> Bool { webBindingDetachedSessions.contains(sessionId) }
+
+    // Reuse the existing protected SQLite cache; no new local storage or source fetch.
+    // The event sequence cursor survives cold starts, so a detached Chat must also
+    // survive until an explicitly verified exact-session rebind clears its marker.
+    struct StoredWebBindingFault: Codable, Equatable {
+        let machineId: String
+        let sessionId: String
+        let observedAt: Date
+        let note: String
+    }
+    static func webBindingFaultKey(_ sessionId: String) -> String {
+        "web.binding.fault.\(sessionId)"
+    }
+    func restorePersistedWebBindingFaults() async {
+        guard let saved = try? await cache.values(StoredWebBindingFault.self, keyPrefix: "web.binding.fault.") else { return }
+        for fault in saved where fault.machineId == machine.id {
+            guard sessions.contains(where: { $0.id == fault.sessionId && $0.instanceId == "web.chatgpt" }),
+                  !fault.note.isEmpty, fault.note.count <= 500 else { continue }
+            webBindingDetachedSessions.insert(fault.sessionId)
+            webChatBindingFaultAtBySession[fault.sessionId] = fault.observedAt
+            webChatRecoveryNotesBySession[fault.sessionId] = fault.note
+        }
+    }
     private static let activeVisibleSessionSyncMinimumInterval: TimeInterval = 2.5
     private static let idleVisibleSessionSyncMinimumInterval: TimeInterval = 20
     private static let connectionMonitorIntervalNanoseconds: UInt64 = 500_000_000
@@ -1051,6 +1074,7 @@ final class WorkspaceStore: ObservableObject {
                 // authorize this Chat's older Provider archive.
                 webBindingDetachedSessions.remove(sessionId)
                 webChatBindingFaultAtBySession.removeValue(forKey: sessionId)
+                try? await cache.remove(key: Self.webBindingFaultKey(sessionId))
                 webChatRecoveryNotesBySession[sessionId] = "已核验原 Chat 的现有标签绑定；当前文档和旧历史来源仍须独立验证，正在同步历史与执行状态。"
                 await synchronizeVisibleSession(sessionId, force: true)
             } else {
@@ -3500,6 +3524,7 @@ final class WorkspaceStore: ObservableObject {
         if let value: [RuntimeDescriptor] = try? await cache.get([RuntimeDescriptor].self, key: "runtimes") { runtimes = value }
         if let value: [InstanceDescriptor] = try? await cache.get([InstanceDescriptor].self, key: "instances") { instances = value }
         if let value: [SessionDescriptor] = try? await cache.get([SessionDescriptor].self, key: "sessions") { sessions = value }
+        await restorePersistedWebBindingFaults()
         if webProjects.isEmpty,
            let value: [WebProjectDescriptor] = try? await cache.get([WebProjectDescriptor].self, key: "web.projects") {
             webProjects = value
@@ -4577,6 +4602,10 @@ final class WorkspaceStore: ObservableObject {
         switch event.type {
         case "SESSION_DELETED":
             sessions.removeAll { $0.id == sessionId }
+            webBindingDetachedSessions.remove(sessionId)
+            webChatBindingFaultAtBySession.removeValue(forKey: sessionId)
+            webChatRecoveryNotesBySession.removeValue(forKey: sessionId)
+            try? await cache.remove(key: Self.webBindingFaultKey(sessionId))
             messagesBySession.removeValue(forKey: sessionId)
             liveRunStatusBySession.removeValue(forKey: sessionId)
             await persistMetadata()
@@ -4906,6 +4935,10 @@ final class WorkspaceStore: ObservableObject {
                     webChatRecoveryNotesBySession[sessionId] = "本 Chat 的电脑端标签已切换到其他 Project；保留原 Session/Project 及历史，禁止跨 Project 读取。"
                 default:
                     webChatRecoveryNotesBySession[sessionId] = "本 Chat 的电脑端标签绑定发生变化；当前网页身份待核验，旧 Assistant 历史未证明完整。"
+                }
+                if let note = webChatRecoveryNotesBySession[sessionId] {
+                    try? await cache.put(StoredWebBindingFault(machineId: machine.id, sessionId: sessionId,
+                        observedAt: event.createdAt, note: note), key: Self.webBindingFaultKey(sessionId))
                 }
             } else if activeTabId != nil, webBindingDetachedSessions.contains(sessionId) {
                 // Events can arrive after this tab was reassigned or navigated;
