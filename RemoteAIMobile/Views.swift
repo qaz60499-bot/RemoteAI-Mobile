@@ -1514,6 +1514,21 @@ struct ChatView: View {
                             }
                         }
                     }
+                    .onChange(of: store.assistantStreams[session.id] != nil) { streamActive in
+                        // The final assistant event removes the streaming row and inserts a
+                        // collapsed durable message. LazyVStack can retain the old scroll
+                        // geometry after a user's explicit "return to latest" while 30K+
+                        // streaming content is still growing. Re-anchor once, after the
+                        // terminal layout pass, rather than polling/scrolling on every delta.
+                        // Never steal the scroll position during manual history browsing
+                        // or while the composer has keyboard focus.
+                        guard !streamActive, didInitialScrollToBottom,
+                              !userBrowsingHistory, !focused, !loadingOlder else { return }
+                        DispatchQueue.main.async {
+                            guard !userBrowsingHistory, !focused, !loadingOlder else { return }
+                            proxy.scrollTo("bottom", anchor: .bottom)
+                        }
+                    }
                     .onChange(of: session.id) { _ in
                         suppressStreamingTailFollowAfterReturn = false
                         didInitialScrollToBottom = false
