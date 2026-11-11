@@ -4198,6 +4198,7 @@ final class WorkspaceStore: ObservableObject {
             try ProtocolSecurity.validate(event, expectedMachineId: machine.id)
         } catch {
             errors["sync"] = error.localizedDescription
+            return
         }
         let decision = tracker.decision(for: event.sequence)
         if decision.duplicate { return }
