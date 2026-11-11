@@ -4198,8 +4198,6 @@ final class WorkspaceStore: ObservableObject {
             try ProtocolSecurity.validate(event, expectedMachineId: machine.id)
         } catch {
             errors["sync"] = error.localizedDescription
-DEVSPACE_CONTINUITY_RISK: Approximately 1266800 DevSpace tool characters since the last acknowledged checkpoint. This is a secondary context-pressure signal, not an exact token-count or host context percentage, and not an automatic handoff trigger. Ordinary chat, other tools and host compaction are not measured. The host owns context management.
-            return
         }
         let decision = tracker.decision(for: event.sequence)
         if decision.duplicate { return }
