@@ -22,6 +22,33 @@ final class DeltaDisplaySnapshotTests: XCTestCase {
         try await cache.put(WorkspaceStore.StoredWebBindingFault(machineId: "my-pc",
             sessionId: nonWeb.id, observedAt: observed, note: "Not Web"),
             key: WorkspaceStore.webBindingFaultKey(nonWeb.id))
+        // The old implementation silently discarded the fault when the cache
+        // contained the sequence cursor but the Session catalog had not yet loaded.
+        // A same-machine/same-Web event must remain visible without requiring
+        // an already-hydrated Session row, while other instances and machines fail closed.
+        try await cache.put(WorkspaceStore.StoredWebBindingFault(machineId: "my-pc",
+            sessionId: original.id, observedAt: observed, note: note, instanceId: "web.chatgpt"),
+            key: WorkspaceStore.webBindingFaultKey(original.id))
+        try await cache.put(WorkspaceStore.StoredWebBindingFault(machineId: "different-machine",
+            sessionId: different.id, observedAt: observed, note: "Foreign machine", instanceId: "web.chatgpt"),
+            key: WorkspaceStore.webBindingFaultKey(different.id))
+        try await cache.put(WorkspaceStore.StoredWebBindingFault(machineId: "my-pc",
+            sessionId: nonWeb.id, observedAt: observed, note: "Not Web", instanceId: "codex.instance"),
+            key: WorkspaceStore.webBindingFaultKey(nonWeb.id))
+        let catalogNotYetHydrated = WorkspaceStore(transport: MockTransport(historyCount: 0), cache: cache)
+        XCTAssertTrue(catalogNotYetHydrated.sessions.isEmpty)
+        await catalogNotYetHydrated.restorePersistedWebBindingFaults()
+        XCTAssertTrue(catalogNotYetHydrated.isWebBindingDetached(original.id),
+            "Authenticated exact-Web binding faults must survive startup before Session metadata arrives")
+        XCTAssertFalse(catalogNotYetHydrated.isWebBindingDetached(different.id),
+            "A foreign machine must not leak into this machine even before catalog hydration")
+        XCTAssertFalse(catalogNotYetHydrated.isWebBindingDetached(nonWeb.id),
+            "Non-Web runtime faults must not be restored into the Web anomaly UI")
+        // Legacy records without instanceId must still restore once the exact Web
+        // Session exists in cached metadata; never loosen that old scope gate.
+        try await cache.put(WorkspaceStore.StoredWebBindingFault(machineId: "my-pc",
+            sessionId: original.id, observedAt: observed, note: note),
+            key: WorkspaceStore.webBindingFaultKey(original.id))
         for _ in 0..<2 {
             // A new WorkspaceStore models an app restart with a persisted event cursor:
             // it must not need the old WEB_BINDING_CHANGED event to be redelivered.
