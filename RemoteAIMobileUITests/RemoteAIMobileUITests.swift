@@ -113,11 +113,16 @@ final class RemoteAIMobileUITests: XCTestCase {
         app.staticTexts["Web"].tap()
         XCTAssertTrue(app.staticTexts["Photo SaaS"].waitForExistence(timeout: 3))
         app.staticTexts["Photo SaaS"].tap()
-        XCTAssertTrue(app.staticTexts["上传性能优化"].waitForExistence(timeout: 3))
-        app.staticTexts["上传性能优化"].tap()
+        // The XCTest tap on a child StaticText occasionally lands during the
+        // navigation row's transition and never activates its NavigationLink.
+        // Target the actual accessible row proven by the failing xcresult tree.
+        let cachedChatRow = app.buttons.containing(.staticText, identifier: "上传性能优化").firstMatch
+        XCTAssertTrue(cachedChatRow.waitForExistence(timeout: 5), "The cached chat must expose its navigation row")
+        XCTAssertTrue(cachedChatRow.isHittable, "The cached chat row must be tappable")
+        cachedChatRow.tap()
 
         let composer = app.textViews["MessageComposer"]
-        XCTAssertTrue(composer.waitForExistence(timeout: 5))
+        XCTAssertTrue(composer.waitForExistence(timeout: 5), "The navigation row must open the chat before keyboard checks")
         composer.tap()
         composer.typeText("unsent keyboard draft")
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
