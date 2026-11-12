@@ -1195,6 +1195,69 @@ struct WebProjectView: View {
     }
 }
 
+// iOS 15-compatible fallback for long virtualized transcripts. ScrollViewReader
+// can report an offscreen lazy target without physically moving UIKit's viewport.
+private struct ScrollTailUIKitBridge: UIViewRepresentable {
+    let requestID: Int
+    let enabled: Bool
+
+    final class Coordinator {
+        var lastRequestID = 0
+        var enabled = false
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView(frame: .zero)
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: UIView, context: Context) {
+        let coordinator = context.coordinator
+        coordinator.enabled = enabled
+        guard requestID > 0, requestID != coordinator.lastRequestID else { return }
+        coordinator.lastRequestID = requestID
+        DispatchQueue.main.async { [weak view, weak coordinator] in
+            guard coordinator?.enabled == true, let view else { return }
+            var ancestor = view.superview
+            while let candidate = ancestor {
+                if let scroll = candidate as? UIScrollView {
+                    scroll.layoutIfNeeded()
+                    let before = scroll.contentOffset.y
+                    let inset = scroll.adjustedContentInset
+                    let target = max(-inset.top,
+                                     scroll.contentSize.height - scroll.bounds.height + inset.bottom)
+                    guard scroll.bounds.height > 0, target.isFinite else { return }
+                    scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x, y: target), animated: false)
+                    #if DEBUG
+                    if ProcessInfo.processInfo.environment["REMOTEAI_UI_STRESS_DIRECT"] == "1" {
+                        DiagnosticsLog.shared.record("ui_native_tail_offset", fields: [
+                            "found": "true",
+                            "request": String(requestID),
+                            "before": String(format: "%.1f", before),
+                            "target": String(format: "%.1f", target),
+                            "after": String(format: "%.1f", scroll.contentOffset.y),
+                            "contentHeight": String(format: "%.1f", scroll.contentSize.height),
+                        ])
+                    }
+                    #endif
+                    return
+                }
+                ancestor = candidate.superview
+            }
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["REMOTEAI_UI_STRESS_DIRECT"] == "1" {
+                DiagnosticsLog.shared.record("ui_native_tail_offset", fields: [
+                    "found": "false", "request": String(requestID),
+                ])
+            }
+            #endif
+        }
+    }
+}
+
 struct ChatView: View {
     @EnvironmentObject var store: WorkspaceStore
     @Environment(\.scenePhase) private var scenePhase
@@ -1224,6 +1287,7 @@ struct ChatView: View {
     @State private var didInitialScrollToBottom = false
     @State private var userBrowsingHistory = false
     @State private var suppressStreamingTailFollowAfterReturn = false
+    @State private var tailScrollRequestID = 0
     @StateObject private var speechInput = SpeechInputController()
     @State private var textSelectionRequest: TextSelectionRequest?
     @FocusState private var focused: Bool
@@ -1402,6 +1466,14 @@ struct ChatView: View {
                         // target. Virtualized 30K/50K cells can fail to resolve a distant
                         // offscreen row ID even when the canonical final was committed.
                         VStack(spacing: 0) {
+                            // Always mounted at the top of ScrollView content so
+                            // native scroll can resolve its owning UIScrollView.
+                            ScrollTailUIKitBridge(
+                                requestID: tailScrollRequestID,
+                                enabled: !userBrowsingHistory && !loadingOlder && !focused
+                            )
+                            .frame(height: 1)
+                            .accessibilityHidden(true)
                         LazyVStack(spacing: 12) {
                             Color.clear.frame(height: 1).id("top").onAppear { guard didInitialScrollToBottom, userBrowsingHistory, !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
                             if loadingOlder { ProgressView().padding(.vertical, 6) }
@@ -1501,7 +1573,7 @@ struct ChatView: View {
                         DispatchQueue.main.async {
                             // Use the non-lazy footer so a long virtualized transcript cannot
                             // leave scrollTo targeted at a recycled/offscreen lazy row.
-                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                            tailScrollRequestID &+= 1
                             didInitialScrollToBottom = true
                         }
                     }
@@ -1512,7 +1584,7 @@ struct ChatView: View {
                         guard !loadingOlder, let latestID else { return }
                         if !didInitialScrollToBottom {
                             DispatchQueue.main.async {
-                                proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                                proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                                tailScrollRequestID &+= 1
                                 didInitialScrollToBottom = true
                             }
                         } else if !userBrowsingHistory {
@@ -1521,7 +1593,7 @@ struct ChatView: View {
                             // LazyVStack height change and full text collapse.
                             DispatchQueue.main.async {
                                 guard !userBrowsingHistory, !loadingOlder else { return }
-                                proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                                proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                                tailScrollRequestID &+= 1
                             }
                         }
                     }
@@ -1547,7 +1619,7 @@ struct ChatView: View {
                         DispatchQueue.main.async {
                             guard !userBrowsingHistory, !focused, !loadingOlder,
                                   !messages.isEmpty else { return }
-                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                            tailScrollRequestID &+= 1
                         }
                         // One bounded post-layout correction, not a repeating scroll
                         // timer. A new manual history drag or keyboard focus cancels it.
@@ -1555,7 +1627,7 @@ struct ChatView: View {
                         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(400)) {
                             guard !userBrowsingHistory, !focused, !loadingOlder,
                                   let latestID = messages.last?.id else { return }
-                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                            tailScrollRequestID &+= 1
                             #if DEBUG
                             if ProcessInfo.processInfo.environment["REMOTEAI_UI_STRESS_DIRECT"] == "1" {
                                 DiagnosticsLog.shared.record("ui_stream_terminal_anchor_postlayout", fields: [
@@ -1585,11 +1657,11 @@ struct ChatView: View {
                                 // scroll layout busy and block keyboard/accessibility work.
                                 // Make the user's explicit return a single nonanimated jump.
                                 if !messages.isEmpty {
-                                    proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                                    proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                                    tailScrollRequestID &+= 1
                                 }
                             } else {
                                 if !messages.isEmpty {
-                                    proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                                    proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                                    tailScrollRequestID &+= 1
                                 }
                             }
                         } label: {
