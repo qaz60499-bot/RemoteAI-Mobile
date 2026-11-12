@@ -1484,7 +1484,12 @@ struct ChatView: View {
                             )
                             .frame(height: 1)
                             .accessibilityHidden(true)
-                        LazyVStack(spacing: 12) {
+                        // The active 32-message presentation window is deliberately
+                        // mounted eagerly: SwiftUI's LazyVStack may synthesize a content
+                        // height that ends near the first visible historic row after a
+                        // 50K stream changes geometry. That invalidates even the native
+                        // footer scroll target. This does not change persisted history.
+                        VStack(spacing: 12) {
                             Color.clear.frame(height: 1).id("top").onAppear {
                                 guard didInitialScrollToBottom, userBrowsingHistory,
                                       !loadingOlder, let anchor = presentedMessages.first?.id else { return }
