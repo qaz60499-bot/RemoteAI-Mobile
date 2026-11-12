@@ -212,10 +212,10 @@ struct DiagnosticsView: View {
                                     Text("会话异常：\(otherError)").font(.caption).lineLimit(3)
                                 }
                                 if let at = store.webProviderSurfaceObservedAtBySession[session.id] {
-                                    FixedTimestamp(date: at, prefix: "上次网页状态观测")
+                                    FixedTimestamp(date: at, prefix: "上次网页状态观测", utc: true)
                                 }
                                 if let detachedAt = store.webChatBindingFaultAtBySession[session.id] {
-                                    FixedTimestamp(date: detachedAt, prefix: "原 Chat 网页绑定异常")
+                                    FixedTimestamp(date: detachedAt, prefix: "原 Chat 网页绑定异常", utc: true)
                                 }
                                 if let note = store.webChatRecoveryNotesBySession[session.id] {
                                     Text(note).font(.caption2).foregroundColor(.secondary).lineLimit(3)
@@ -806,6 +806,7 @@ struct InstanceView: View {
 struct FixedTimestamp: View {
     let date: Date
     var prefix: String = "最后更新"
+    var utc: Bool = false
     // Web fault and recovery timestamps are audit evidence; show unambiguous
     // UTC year/month/day + seconds and milliseconds instead of phone local time.
     private var utcTimestamp: String {
@@ -815,7 +816,7 @@ struct FixedTimestamp: View {
         return formatter.string(from: date)
     }
     var body: some View {
-        Text("\(prefix)（UTC） \(utcTimestamp)")
+        Text(utc ? "\(prefix)（UTC） \(utcTimestamp)" : "\(prefix) \(date.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()))")
             .font(.caption2)
             .foregroundColor(.secondary)
     }
@@ -1458,7 +1459,7 @@ struct ChatView: View {
                     Text("代码：\(WebAnomalyDisplayStatus.detachedErrorCode) · 待核验")
                         .font(.caption.weight(.semibold))
                     if let detachedAt = store.webChatBindingFaultAtBySession[session.id] {
-                        FixedTimestamp(date: detachedAt, prefix: "原 Chat 网页绑定异常")
+                        FixedTimestamp(date: detachedAt, prefix: "原 Chat 网页绑定异常", utc: true)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -3198,12 +3199,12 @@ struct WebProviderSurfaceIssueBanner: View {
                 .font(.caption2)
                 .foregroundColor(.secondary)
             if let observedAt = issue.at {
-                FixedTimestamp(date: observedAt, prefix: "异常观测时间")
+                FixedTimestamp(date: observedAt, prefix: "异常观测时间", utc: true)
             } else {
                 Text("异常观测时间未知").font(.caption2).foregroundColor(.secondary)
             }
             if surfaceState == "unknown", let surfaceObservedAt {
-                FixedTimestamp(date: surfaceObservedAt, prefix: "网页状态最后核对")
+                FixedTimestamp(date: surfaceObservedAt, prefix: "网页状态最后核对", utc: true)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3223,7 +3224,7 @@ struct WebProviderSurfaceUnknownBanner: View {
             Text("当前会话状态：\(sessionState.chineseStatusName)")
                 .font(.caption)
             if let observedAt {
-                FixedTimestamp(date: observedAt, prefix: "网页状态最后核对")
+                FixedTimestamp(date: observedAt, prefix: "网页状态最后核对", utc: true)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3242,7 +3243,7 @@ struct WebProviderSurfaceRecoveryBanner: View {
                 .font(.caption.weight(.semibold))
             Text("当前会话状态：\(sessionState.chineseStatusName)")
                 .font(.caption)
-            FixedTimestamp(date: observedAt, prefix: "最近确认恢复")
+            FixedTimestamp(date: observedAt, prefix: "最近确认恢复", utc: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)
