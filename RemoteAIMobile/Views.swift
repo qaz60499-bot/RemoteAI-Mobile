@@ -806,8 +806,16 @@ struct InstanceView: View {
 struct FixedTimestamp: View {
     let date: Date
     var prefix: String = "最后更新"
+    // Web fault and recovery timestamps are audit evidence; show unambiguous
+    // UTC year/month/day + seconds and milliseconds instead of phone local time.
+    private var utcTimestamp: String {
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)!
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
     var body: some View {
-        Text("\(prefix) \(date.formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour().minute()))")
+        Text("\(prefix)（UTC） \(utcTimestamp)")
             .font(.caption2)
             .foregroundColor(.secondary)
     }
