@@ -1474,7 +1474,17 @@ struct ChatView: View {
                     .padding(.vertical, 5)
             }
             if let error = store.errors[session.id], error != currentWebProviderIssue?.message {
-                ErrorBanner(text: error) { store.clearError(sessionId: session.id) }
+                VStack(alignment: .leading, spacing: 4) {
+                    ErrorBanner(text: error) { store.clearError(sessionId: session.id) }
+                    if runtime.kind == .web,
+                       let observed = store.webChatRecoveryFailureObservedBySession[session.id],
+                       observed.message == error {
+                        // Phone-side observation time, not fabricated original Windows fault time.
+                        FixedTimestamp(date: observed.observedAt,
+                            prefix: "手机确认此次恢复失败", utc: true)
+                            .padding(.horizontal, 10)
+                    }
+                }
             }
             if let attachmentError { ErrorBanner(text: attachmentError) { self.attachmentError = nil } }
             if let voiceError = speechInput.errorMessage { ErrorBanner(text: voiceError) { speechInput.dismissError() } }

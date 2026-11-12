@@ -8,6 +8,13 @@ private enum GenerationTerminalOutcome: Equatable {
     case failed
 }
 
+// Timestamp when the iPhone confirms a manual recovery result. This is NOT
+// the original Windows/Provider fault timestamp, which has its own channel.
+struct WebChatRecoveryFailureObservation {
+    let message: String
+    let observedAt: Date
+}
+
 enum OpenWebTabDestination {
     case chat(SessionDescriptor)
     case project(WebProjectDescriptor)
@@ -32,6 +39,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var webTabDiagnosesById: [Int: WebTabDiagnosis] = [:]
     @Published var webTabActionNotesById: [Int: String] = [:]
     @Published private(set) var webChatRecoveryNotesBySession: [String: String] = [:]
+    @Published private(set) var webChatRecoveryFailureObservedBySession: [String: WebChatRecoveryFailureObservation] = [:]
     @Published private(set) var webChatBindingFaultAtBySession: [String: Date] = [:]
     @Published var recentWebTabNotices: [String] = []
     private var explicitlyClosedWebTabIDs = Set<Int>()
@@ -936,7 +944,8 @@ final class WorkspaceStore: ObservableObject {
                 openWebTabs.filter { $0.sessionId == sessionId && $0.isChat }
             guard matches.count == 1, let tab = matches.first else {
                 webChatRecoveryNotesBySession[sessionId] = "网页打开请求已返回，但原 Chat 标签身份尚未核实；历史保留，未再次重开。"
-                errors[sessionId] = "无法确认原 Chat 已在 Chrome 打开；请先检查标签，再决定是否再次操作。"
+                recordWebChatRecoveryFailure(sessionId: sessionId,
+                    message: "无法确认原 Chat 已在 Chrome 打开；请先检查标签，再决定是否再次操作。")
                 return
             }
             // A returned inventory binding is not proof that the renderer is ready.
@@ -968,7 +977,8 @@ final class WorkspaceStore: ObservableObject {
             }
         } catch {
             guard generation == lifecycleGeneration, !isSuspended else { return }
-            errors[sessionId] = "重新打开原 Chat 未确认：\(error.localizedDescription)"
+            recordWebChatRecoveryFailure(sessionId: sessionId,
+                message: "重新打开原 Chat 未确认：\(error.localizedDescription)")
             webChatRecoveryNotesBySession[sessionId] = "当前操作未确认，保留历史；不会自动再次打开或发送消息。"
         }
     }
@@ -1022,11 +1032,20 @@ final class WorkspaceStore: ObservableObject {
         )
     }
 
+    // Store the phone-side *observation* time together with the exact failure
+    // text. A later unrelated error must not inherit an earlier UTC timestamp.
+    private func recordWebChatRecoveryFailure(sessionId: String, message: String) {
+        errors[sessionId] = message
+        webChatRecoveryFailureObservedBySession[sessionId] = .init(message: message, observedAt: Date())
+    }
+
     // Chat-level recovery never infers a target from the current Chrome window.
     // A fresh, unique tab/session binding is required before any navigation.
     func recoverWebChat(_ sessionId: String, operation: String) async {
+        webChatRecoveryFailureObservedBySession.removeValue(forKey: sessionId)
         guard machine.state == .online, !isSuspended else {
-            errors[sessionId] = "Windows 未连接，无法完成网页恢复；已保留本地历史。"
+            recordWebChatRecoveryFailure(sessionId: sessionId,
+                message: "Windows 未连接，无法完成网页恢复；已保留本地历史。")
             return
         }
         if operation == "resync" {
@@ -1068,9 +1087,12 @@ final class WorkspaceStore: ObservableObject {
             // A failed recent read cannot be hidden by an older-page attempt or
             // by role counts left over from an earlier successful cache read.
             guard let readAt = visibleSessionHistorySyncAt[sessionId], readAt >= readStartedAt else {
-                if let error = errors[sessionId] {
-                    webChatRecoveryNotesBySession[sessionId] = "重新同步未完成：\(error)"
-                }
+                // Delta recovery may finish without a fresh Provider/history page.
+                // Leaving the earlier '正在读取' notice here would misreport progress.
+                let failure = errors[sessionId]
+                    ?? "本次未收到此 Chat 的新历史读取确认；旧消息已保留，不能判定同步完成。"
+                recordWebChatRecoveryFailure(sessionId: sessionId, message: failure)
+                webChatRecoveryNotesBySession[sessionId] = "重新同步未完成：\(failure)"
                 return
             }
             let remoteRoles = visibleSessionLastRemoteHistoryRoles[sessionId]
@@ -1127,6 +1149,9 @@ final class WorkspaceStore: ObservableObject {
                 }.count
                 if webChatRecoveryNotesBySession[sessionId]?.hasPrefix("旧历史") == true {
                     // Preserve exact failed/empty Provider source diagnosis.
+                    if let error = errors[sessionId] {
+                        recordWebChatRecoveryFailure(sessionId: sessionId, message: error)
+                    }
                     return
                 }
             }
@@ -1152,6 +1177,7 @@ final class WorkspaceStore: ObservableObject {
             } else if webChatRecoveryNotesBySession[sessionId] == Self.waitingForWebTranscriptNote {
                 // Preserve the existing specific unreadable-source diagnosis.
             } else if let error = errors[sessionId] {
+                recordWebChatRecoveryFailure(sessionId: sessionId, message: error)
                 webChatRecoveryNotesBySession[sessionId] = "重新同步未完成：\(error)"
             } else {
                 webChatRecoveryNotesBySession[sessionId] =
@@ -1163,7 +1189,8 @@ final class WorkspaceStore: ObservableObject {
         webChatRecoveryNotesBySession[sessionId] = "正在核验当前 Chat 的 Chrome 标签身份…"
         await refreshOpenWebTabs()
         guard !openWebTabsInventoryUnverified else {
-            errors[sessionId] = "无法验证当前 Chrome 标签身份，未执行网页操作。"
+            recordWebChatRecoveryFailure(sessionId: sessionId,
+                message: "无法验证当前 Chrome 标签身份，未执行网页操作。")
             return
         }
         let candidates = openWebTabs.filter { $0.sessionId == sessionId && $0.isChat }
@@ -1172,9 +1199,11 @@ final class WorkspaceStore: ObservableObject {
                 // A historical Chat need not have an open desktop tab. This is not
                 // evidence of a broken identity or a failed message synchronization.
                 // Do not guess another tab from its title, Project, or Chrome focus.
-                errors[sessionId] = "此 Chat 当前没有已验证的打开标签；历史仍可查看和同步。未操作其他网页，也未自动新建标签。"
+                recordWebChatRecoveryFailure(sessionId: sessionId,
+                    message: "此 Chat 当前没有已验证的打开标签；历史仍可查看和同步。未操作其他网页，也未自动新建标签。")
             } else {
-                errors[sessionId] = "此 Chat 对应多个打开标签，无法安全确定操作目标。未操作任何网页，请先核对电脑端标签。"
+                recordWebChatRecoveryFailure(sessionId: sessionId,
+                    message: "此 Chat 对应多个打开标签，无法安全确定操作目标。未操作任何网页，请先核对电脑端标签。")
             }
             if operation == "inspect", let earlierIssue = webProviderIssuesBySession[sessionId] {
                 webChatRecoveryNotesBySession[sessionId] =
@@ -1194,14 +1223,16 @@ final class WorkspaceStore: ObservableObject {
            UUID(uuidString: expectedAlias) != nil {
             guard let url = URL(string: tab.canonicalUrl),
                   url.scheme == "https", url.host == "chatgpt.com" else {
-                errors[sessionId] = "本 Chat 当前标签缺少可验证的 Project 网页身份，未执行网页操作。"
+                recordWebChatRecoveryFailure(sessionId: sessionId,
+                    message: "本 Chat 当前标签缺少可验证的 Project 网页身份，未执行网页操作。")
                 return
             }
             let path = url.path.split(separator: "/").map(String.init)
             guard path.count == 4, path[0] == "g", path[2] == "c",
                   sameWebProjectAlias(path[1], expectedProject),
                   path[3].lowercased() == expectedAlias.lowercased() else {
-                errors[sessionId] = "当前标签的 Project/Chat 路由与本 Chat 不一致；未检查、重新绑定或刷新其他 Chat。"
+                recordWebChatRecoveryFailure(sessionId: sessionId,
+                    message: "当前标签的 Project/Chat 路由与本 Chat 不一致；未检查、重新绑定或刷新其他 Chat。")
                 webChatRecoveryNotesBySession[sessionId] = errors[sessionId]
                 return
             }
@@ -1221,7 +1252,8 @@ final class WorkspaceStore: ObservableObject {
                 webChatRecoveryNotesBySession[sessionId] = "已核验原 Chat 的现有标签绑定；当前文档和旧历史来源仍须独立验证，正在同步历史与执行状态。"
                 await synchronizeVisibleSession(sessionId, force: true)
             } else {
-                errors[sessionId] = "当前 Chrome 标签无法确认属于这个 Chat，未创建新标签或改变其他会话。"
+                recordWebChatRecoveryFailure(sessionId: sessionId,
+                    message: "当前 Chrome 标签无法确认属于这个 Chat，未创建新标签或改变其他会话。")
             }
             return
         }
@@ -1239,7 +1271,8 @@ final class WorkspaceStore: ObservableObject {
                     // authenticate original Provider text (e.g. same-document
                     // replace on Build88). Never tell the phone "ready" alone.
                     // This is an unverified source, not a fabricated live error.
-                    errors[sessionId] = "WEB_DOCUMENT_PROOF_UNVERIFIED: \(proofReason)"
+                    recordWebChatRecoveryFailure(sessionId: sessionId,
+                        message: "WEB_DOCUMENT_PROOF_UNVERIFIED: \(proofReason)")
                     webChatRecoveryNotesBySession[sessionId] =
                         "网页外观状态：\(diagnosis.state)\(issueCode)\(issueText)；历史来源待核验：\(proofReason)。网页能显示并不代表原 Assistant 正文已同步。"
                 } else {
@@ -1250,13 +1283,15 @@ final class WorkspaceStore: ObservableObject {
                         "网页状态：\(diagnosis.state)\(issueCode)\(issueText)；当前文档来源证明已验证，完整历史起点仍需独立核验。"
                 }
             } else {
-                errors[sessionId] = errors["web.tabs"] ?? "当前网页状态无法验证。"
+                recordWebChatRecoveryFailure(sessionId: sessionId,
+                    message: errors["web.tabs"] ?? "当前网页状态无法验证。")
                 webChatRecoveryNotesBySession[sessionId] = "本 Chat 网页诊断未完成，不能证明状态正常。"
             }
             return
         }
         guard managingWebTabIds.insert(tab.id).inserted else {
-            errors[sessionId] = "当前网页已有操作正在执行；请等该操作返回后再处理。"
+            recordWebChatRecoveryFailure(sessionId: sessionId,
+                message: "当前网页已有操作正在执行；请等该操作返回后再处理。")
             return
         }
         defer { managingWebTabIds.remove(tab.id) }
@@ -1277,7 +1312,8 @@ final class WorkspaceStore: ObservableObject {
                 webChatRecoveryNotesBySession[sessionId] = "刷新后尚未验证原会话绑定；历史已保留，请重新检测。"
             }
         } catch {
-            errors[sessionId] = "当前网页刷新未确认：\(error.localizedDescription)；没有操作其他 Chat。"
+            recordWebChatRecoveryFailure(sessionId: sessionId,
+                message: "当前网页刷新未确认：\(error.localizedDescription)；没有操作其他 Chat。")
             webChatRecoveryNotesBySession[sessionId] = "网页操作未确认；保留本地历史，等待重新检测。"
         }
     }
@@ -3318,7 +3354,10 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func draft(sessionId: String) async -> String { (try? await cache.draft(sessionId: sessionId)) ?? "" }
-    func clearError(sessionId: String) { errors[sessionId] = nil }
+    func clearError(sessionId: String) {
+        errors[sessionId] = nil
+        webChatRecoveryFailureObservedBySession.removeValue(forKey: sessionId)
+    }
 
     private func pendingOperationCommandId(key: String, machineId: String) async -> UUID {
         let cacheKey = "pending.operation.\(machineId).\(key)"
