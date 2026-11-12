@@ -1286,6 +1286,9 @@ struct ChatView: View {
     @State private var isAtBottom = true
     @State private var didInitialScrollToBottom = false
     @State private var userBrowsingHistory = false
+    // Presentation-only sliding window; all canonical/history/cache rows stay intact.
+    // Large transcripts may contain thousands of oversized Markdown previews.
+    @State private var presentedMessageLimit = 32
     @State private var suppressStreamingTailFollowAfterReturn = false
     @State private var tailScrollRequestID = 0
     @StateObject private var speechInput = SpeechInputController()
@@ -1344,6 +1347,13 @@ struct ChatView: View {
             canonical: store.messagesBySession[session.id, default: []],
             deltaSnapshot: store.deltaRecoveryDisplayMessagesBySession?[session.id]
         )
+    }
+    // Render only the latest bounded window; older persisted turns remain
+    // reachable by scrolling to the top and expanding local pages before
+    // requesting any additional Provider history.
+    private var presentedMessages: [ChatMessage] {
+        let canonical = messages
+        return Array(canonical.suffix(max(1, presentedMessageLimit)))
     }
     private var supportsModelSelection: Bool { runtime.kind == .codex || runtime.kind == .antigravity }
     private var modelOptions: [CodexModelOption] { instance.modelCatalog?.models ?? [] }
@@ -1475,7 +1485,30 @@ struct ChatView: View {
                             .frame(height: 1)
                             .accessibilityHidden(true)
                         LazyVStack(spacing: 12) {
-                            Color.clear.frame(height: 1).id("top").onAppear { guard didInitialScrollToBottom, userBrowsingHistory, !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
+                            Color.clear.frame(height: 1).id("top").onAppear {
+                                guard didInitialScrollToBottom, userBrowsingHistory,
+                                      !loadingOlder, let anchor = presentedMessages.first?.id else { return }
+                                let loadedCount = messages.count
+                                if loadedCount > presentedMessageLimit {
+                                    // Show another LOCAL window first. No cache mutation, no
+                                    // extra Provider request and no cross-Chat scope widening.
+                                    loadingOlder = true
+                                    presentedMessageLimit = min(loadedCount, presentedMessageLimit + 32)
+                                    DispatchQueue.main.async {
+                                        proxy.scrollTo(anchor, anchor: .top)
+                                        loadingOlder = false
+                                    }
+                                } else if store.hasMoreBySession[session.id] != false {
+                                    loadingOlder = true
+                                    Task {
+                                        await store.loadOlder(session.id)
+                                        await MainActor.run {
+                                            proxy.scrollTo(anchor, anchor: .top)
+                                            loadingOlder = false
+                                        }
+                                    }
+                                }
+                            }
                             if loadingOlder { ProgressView().padding(.vertical, 6) }
                             if runtime.kind == .web && !Self.hasDisplayableWebTranscriptBody(
                                 messages, hasActiveAssistantStream: store.assistantStreams[session.id] != nil
@@ -1504,7 +1537,7 @@ struct ChatView: View {
                                 .cornerRadius(8)
                                 .accessibilityIdentifier("web-history-not-ready")
                             }
-                            ForEach(messages) { message in
+                            ForEach(presentedMessages) { message in
                                 let commandState = UUID(uuidString: message.id).flatMap { store.commandStates[$0] }
                                 // Definite failures restore the composer and use a new operation.
                                 // Only unknown delivery is replayed with the original command ID.
@@ -1647,6 +1680,7 @@ struct ChatView: View {
                         suppressStreamingTailFollowAfterReturn = false
                         didInitialScrollToBottom = false
                         userBrowsingHistory = false
+                        presentedMessageLimit = 32
                         isAtBottom = true
                     }
 
@@ -2673,6 +2707,11 @@ struct MessageRow: View, Equatable {
                                         .accessibilityIdentifier("message-content-\(message.id)-\(segment.id)")
                                 } else {
                                     Text(segment.text)
+                                        // A 2K-character preview can still occupy 3,000+ pt
+                                        // when it contains hundreds of Markdown line breaks.
+                                        // Keep a compact preview; "查看全文" exposes the
+                                        // complete canonical body without truncating storage.
+                                        .lineLimit(renderContent.isLarge ? 12 : nil)
                                         .accessibilityIdentifier("message-content-\(message.id)-\(segment.id)")
                                 }
                             }
