@@ -1039,6 +1039,14 @@ final class WorkspaceStore: ObservableObject {
         webChatRecoveryFailureObservedBySession[sessionId] = .init(message: message, observedAt: Date())
     }
 
+    // End a stale manual-read spinner only if the original pending notice remains.
+    // Never overwrite a newer same-Chat source diagnosis.
+    private static let pendingWebChatResyncNote = "正在重新读取此 Chat 的最近历史，不会刷新或停止电脑网页。"
+    private func finishInterruptedWebChatResyncIfPending(_ sessionId: String) {
+        guard webChatRecoveryNotesBySession[sessionId] == Self.pendingWebChatResyncNote else { return }
+        webChatRecoveryNotesBySession[sessionId] = "连接状态发生变化，本次历史同步未完成；原消息已保留。"
+    }
+
     // Chat-level recovery never infers a target from the current Chrome window.
     // A fresh, unique tab/session binding is required before any navigation.
     func recoverWebChat(_ sessionId: String, operation: String) async {
@@ -1055,18 +1063,21 @@ final class WorkspaceStore: ObservableObject {
             let generation = lifecycleGeneration
             let activeTransport = transport
             let activeMachineId = machine.id
-            webChatRecoveryNotesBySession[sessionId] = "正在重新读取此 Chat 的最近历史，不会刷新或停止电脑网页。"
+            webChatRecoveryNotesBySession[sessionId] = Self.pendingWebChatResyncNote
             await recoverDelta()
             guard generation == lifecycleGeneration, transport === activeTransport,
                   machine.id == activeMachineId, machine.state == .online, !isSuspended else {
-                webChatRecoveryNotesBySession[sessionId] = "连接状态发生变化，本次历史同步未完成；原消息已保留。"
+                finishInterruptedWebChatResyncIfPending(sessionId)
                 return
             }
             for _ in 0..<8 {
                 if !sessionLoads.contains(sessionId) { break }
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 guard generation == lifecycleGeneration, transport === activeTransport,
-                      machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+                      machine.id == activeMachineId, machine.state == .online, !isSuspended else {
+                    finishInterruptedWebChatResyncIfPending(sessionId)
+                    return
+                }
             }
             guard !sessionLoads.contains(sessionId) else {
                 webChatRecoveryNotesBySession[sessionId] = "本 Chat 已有历史读取任务正在执行；尚未确认同步完成。"
@@ -1083,7 +1094,10 @@ final class WorkspaceStore: ObservableObject {
             // User UUID/body and reconcile without creating any browser tab.
             await loadSession(sessionId, preferCache: false)
             guard generation == lifecycleGeneration, transport === activeTransport,
-                  machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+                  machine.id == activeMachineId, machine.state == .online, !isSuspended else {
+                finishInterruptedWebChatResyncIfPending(sessionId)
+                return
+            }
             // A failed recent read cannot be hidden by an older-page attempt or
             // by role counts left over from an earlier successful cache read.
             guard let readAt = visibleSessionHistorySyncAt[sessionId], readAt >= readStartedAt else {
@@ -1118,7 +1132,10 @@ final class WorkspaceStore: ObservableObject {
                     // cannot certify completion or erase the cached transcript.
                     await loadOlder(sessionId, authenticatedDetachedRead: true)
                     guard generation == lifecycleGeneration, transport === activeTransport,
-                          machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+                          machine.id == activeMachineId, machine.state == .online, !isSuspended else {
+                        finishInterruptedWebChatResyncIfPending(sessionId)
+                        return
+                    }
                 }
                 let counts = Self.detachedWebResyncCounts(
                     sessionId: sessionId, priorIDs: priorIds,
@@ -1143,7 +1160,10 @@ final class WorkspaceStore: ObservableObject {
                 let earlierIds = Set(messagesBySession[sessionId, default: []].map(\.id))
                 await loadOlder(sessionId)
                 guard generation == lifecycleGeneration, transport === activeTransport,
-                      machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
+                      machine.id == activeMachineId, machine.state == .online, !isSuspended else {
+                    finishInterruptedWebChatResyncIfPending(sessionId)
+                    return
+                }
                 verifiedOlderNewRows = messagesBySession[sessionId, default: []].filter {
                     !earlierIds.contains($0.id) && ($0.role == .user || $0.role == .assistant)
                 }.count
