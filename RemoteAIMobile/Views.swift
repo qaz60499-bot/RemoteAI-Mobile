@@ -1398,6 +1398,10 @@ struct ChatView: View {
             ScrollViewReader { proxy in
                 ZStack(alignment: .bottomTrailing) {
                     ScrollView {
+                        // The non-lazy content footer is always a mounted ScrollViewReader
+                        // target. Virtualized 30K/50K cells can fail to resolve a distant
+                        // offscreen row ID even when the canonical final was committed.
+                        VStack(spacing: 0) {
                         LazyVStack(spacing: 12) {
                             Color.clear.frame(height: 1).id("top").onAppear { guard didInitialScrollToBottom, userBrowsingHistory, !loadingOlder, store.hasMoreBySession[session.id] != false, let anchor = messages.first?.id else { return }; loadingOlder = true; Task { await store.loadOlder(session.id); await MainActor.run { proxy.scrollTo(anchor, anchor: .top); loadingOlder = false } } }
                             if loadingOlder { ProgressView().padding(.vertical, 6) }
@@ -1440,7 +1444,7 @@ struct ChatView: View {
                                         // A composing user already controls the viewport; resume normal
                                         // tail-follow when focus leaves without affecting any stream data.
                                         guard !userBrowsingHistory, !focused, !suppressStreamingTailFollowAfterReturn else { return }
-                                        proxy.scrollTo("bottom", anchor: .bottom)
+                                        proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
                                     }, onSelectText: { text, monospaced in
                                         textSelectionRequest = TextSelectionRequest(text: text, monospaced: monospaced)
                                     }).id(message.id)
@@ -1469,6 +1473,8 @@ struct ChatView: View {
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
+                        Color.clear.frame(height: 1).id("stable-scroll-tail")
+                        }
                     }
                     .background(Color(.systemGroupedBackground))
                     .simultaneousGesture(
@@ -1493,22 +1499,20 @@ struct ChatView: View {
                     .onAppear {
                         guard !didInitialScrollToBottom, let latestID = messages.last?.id else { return }
                         DispatchQueue.main.async {
-                            // A row ID is a stable LazyVStack scroll target. The one-point
-                            // bottom sentinel can be recycled before the last message
-                            // has finished laying out on a long virtualized transcript.
-                            proxy.scrollTo(latestID, anchor: .bottom)
+                            // Use the non-lazy footer so a long virtualized transcript cannot
+                            // leave scrollTo targeted at a recycled/offscreen lazy row.
+                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
                             didInitialScrollToBottom = true
                         }
                     }
                     .onChange(of: messages.last?.id) { latestID in
                         // A canonical final replaces the transient streaming row with a
-                        // different durable ID. Anchor the actual last row rather than
-                        // the recycled one-point bottom sentinel.
+                        // different durable ID. Anchor the mounted content footer.
                         suppressStreamingTailFollowAfterReturn = false
                         guard !loadingOlder, let latestID else { return }
                         if !didInitialScrollToBottom {
                             DispatchQueue.main.async {
-                                proxy.scrollTo(latestID, anchor: .bottom)
+                                proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
                                 didInitialScrollToBottom = true
                             }
                         } else if !userBrowsingHistory {
@@ -1517,7 +1521,7 @@ struct ChatView: View {
                             // LazyVStack height change and full text collapse.
                             DispatchQueue.main.async {
                                 guard !userBrowsingHistory, !loadingOlder else { return }
-                                proxy.scrollTo(latestID, anchor: .bottom)
+                                proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
                             }
                         }
                     }
@@ -1542,16 +1546,16 @@ struct ChatView: View {
                               !userBrowsingHistory, !focused, !loadingOlder else { return }
                         DispatchQueue.main.async {
                             guard !userBrowsingHistory, !focused, !loadingOlder,
-                                  let latestID = messages.last?.id else { return }
-                            proxy.scrollTo(latestID, anchor: .bottom)
+                                  !messages.isEmpty else { return }
+                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
                         }
                         // One bounded post-layout correction, not a repeating scroll
                         // timer. A new manual history drag or keyboard focus cancels it.
-                        // Re-read the canonical last ID after final row reconciliation.
+                        // Re-anchor the mounted footer after final row reconciliation.
                         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(400)) {
                             guard !userBrowsingHistory, !focused, !loadingOlder,
                                   let latestID = messages.last?.id else { return }
-                            proxy.scrollTo(latestID, anchor: .bottom)
+                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
                             #if DEBUG
                             if ProcessInfo.processInfo.environment["REMOTEAI_UI_STRESS_DIRECT"] == "1" {
                                 DiagnosticsLog.shared.record("ui_stream_terminal_anchor_postlayout", fields: [
@@ -1580,12 +1584,12 @@ struct ChatView: View {
                                 // A still-growing long stream can keep SwiftUI's animated
                                 // scroll layout busy and block keyboard/accessibility work.
                                 // Make the user's explicit return a single nonanimated jump.
-                                if let latestID = messages.last?.id {
-                                    proxy.scrollTo(latestID, anchor: .bottom)
+                                if !messages.isEmpty {
+                                    proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
                                 }
                             } else {
-                                if let latestID = messages.last?.id {
-                                    proxy.scrollTo(latestID, anchor: .bottom)
+                                if !messages.isEmpty {
+                                    proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
                                 }
                             }
                         } label: {
