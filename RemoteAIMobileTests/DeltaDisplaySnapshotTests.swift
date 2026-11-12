@@ -171,6 +171,46 @@ final class DeltaDisplaySnapshotTests: XCTestCase {
     }
 
     @MainActor
+    func testDetachedResyncCountsIncludeAssistantOnlyAfterVerifiedOlderImport() {
+        let sessionID = "original-web-chat"
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func turn(_ id: String, role: String, session: String) -> ChatMessage {
+            ServerMessage(
+                messageId: id, sessionId: session, role: role,
+                content: "body-" + id, externalId: nil, createdAt: now
+            ).chatMessage
+        }
+        let u1 = turn("u1", role: "user", session: sessionID)
+        let u2 = turn("u2", role: "user", session: sessionID)
+        let middleAssistant = turn("middle-a", role: "assistant", session: sessionID)
+        let u3 = turn("u3", role: "user", session: sessionID)
+        let finalAssistant = turn("last-a", role: "assistant", session: sessionID)
+        let prior = [u1, u2, u3, finalAssistant]
+        let priorIDs = Set(prior.map(\.id))
+        let before = WorkspaceStore.detachedWebResyncCounts(
+            sessionId: sessionID, priorIDs: priorIDs, rows: prior
+        )
+        XCTAssertEqual(before.added, 0)
+        XCTAssertEqual(before.user, 3)
+        XCTAssertEqual(before.assistant, 1, "The cached 3U1A cannot claim 3U2A before pagination")
+
+        let otherChat = turn("foreign-a", role: "assistant", session: "other-chat")
+        let after = [u1, u2, middleAssistant, u3, finalAssistant, otherChat]
+        let recovered = WorkspaceStore.detachedWebResyncCounts(
+            sessionId: sessionID, priorIDs: priorIDs, rows: after
+        )
+        XCTAssertEqual(recovered.added, 1, "Only the genuine middle Assistant was newly imported")
+        XCTAssertEqual(recovered.user, 3)
+        XCTAssertEqual(recovered.assistant, 2, "The old final Assistant is never duplicated")
+
+        let repeated = WorkspaceStore.detachedWebResyncCounts(
+            sessionId: sessionID, priorIDs: Set(after.map(\.id)), rows: after
+        )
+        XCTAssertEqual(repeated.added, 0, "A second summary cannot claim a duplicate import")
+        XCTAssertEqual(repeated.assistant, 2)
+    }
+
+    @MainActor
     func testEmptyDeltaSnapshotCannotHideHydratedOriginalWebHistory() {
         let cached = [
             ServerMessage(

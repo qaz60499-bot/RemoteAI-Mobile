@@ -1005,6 +1005,23 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    // Report the actual post-pagination canonical transcript, never stale
+    // counts captured before the authenticated detached older-page read.
+    // Restrict the summary to the exact requested Chat even if a caller
+    // accidentally supplies a mixed replay collection.
+    static func detachedWebResyncCounts(
+        sessionId: String, priorIDs: Set<String>, rows: [ChatMessage]
+    ) -> (added: Int, user: Int, assistant: Int) {
+        let turns = rows.filter {
+            $0.sessionId == sessionId && ($0.role == .user || $0.role == .assistant)
+        }
+        return (
+            added: turns.filter { !priorIDs.contains($0.id) }.count,
+            user: turns.filter { $0.role == .user }.count,
+            assistant: turns.filter { $0.role == .assistant }.count
+        )
+    }
+
     // Chat-level recovery never infers a target from the current Chrome window.
     // A fresh, unique tab/session binding is required before any navigation.
     func recoverWebChat(_ sessionId: String, operation: String) async {
@@ -1069,9 +1086,6 @@ final class WorkspaceStore: ObservableObject {
             // UUID before reading Provider content; this never opens Chrome,
             // sends a message, stops a generation or retries a delivery.
             if webBindingDetachedSessions.contains(sessionId) {
-                let added = messagesBySession[sessionId, default: []].filter {
-                    !priorIds.contains($0.id) && ($0.role == .user || $0.role == .assistant)
-                }.count
                 if !messagesBySession[sessionId, default: []].isEmpty,
                    sessions.first(where: { $0.id == sessionId })?.state == .idle,
                    !olderMessageLoads.contains(sessionId),
@@ -1084,13 +1098,17 @@ final class WorkspaceStore: ObservableObject {
                     guard generation == lifecycleGeneration, transport === activeTransport,
                           machine.id == activeMachineId, machine.state == .online, !isSuspended else { return }
                 }
+                let counts = Self.detachedWebResyncCounts(
+                    sessionId: sessionId, priorIDs: priorIds,
+                    rows: messagesBySession[sessionId, default: []]
+                )
                 if hasMoreBySession[sessionId] == false
                     && !webOlderPageNeedsExplicitRetry.contains(sessionId) {
                     webChatRecoveryNotesBySession[sessionId] =
-                        "原 Chat 无需固定标签：已认证核对最早历史页，补入 \(added) 条；User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条。网页异常状态另行核验。"
+                        "原 Chat 无需固定标签：已认证核对最早历史页，本次补入 \(counts.added) 条；当前缓存 User \(counts.user) 条、Assistant \(counts.assistant) 条。网页异常状态另行核验。"
                 } else if !webOlderPageNeedsExplicitRetry.contains(sessionId) {
                     webChatRecoveryNotesBySession[sessionId] =
-                        "原 Chat 后台正文同步补入 \(added) 条；User \(fetchedUser) 条、Assistant \(fetchedAssistant) 条；最早页仍待核验。"
+                        "原 Chat 后台正文同步本次补入 \(counts.added) 条；当前缓存 User \(counts.user) 条、Assistant \(counts.assistant) 条；最早页仍待核验。"
                 }
                 return
             }
