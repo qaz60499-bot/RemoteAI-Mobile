@@ -1573,7 +1573,8 @@ struct ChatView: View {
                         DispatchQueue.main.async {
                             // Use the non-lazy footer so a long virtualized transcript cannot
                             // leave scrollTo targeted at a recycled/offscreen lazy row.
-                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                            tailScrollRequestID &+= 1
+                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                            tailScrollRequestID &+= 1
                             didInitialScrollToBottom = true
                         }
                     }
@@ -1584,7 +1585,8 @@ struct ChatView: View {
                         guard !loadingOlder, let latestID else { return }
                         if !didInitialScrollToBottom {
                             DispatchQueue.main.async {
-                                proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                                tailScrollRequestID &+= 1
+                                proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                                tailScrollRequestID &+= 1
                                 didInitialScrollToBottom = true
                             }
                         } else if !userBrowsingHistory {
@@ -1593,7 +1595,8 @@ struct ChatView: View {
                             // LazyVStack height change and full text collapse.
                             DispatchQueue.main.async {
                                 guard !userBrowsingHistory, !loadingOlder else { return }
-                                proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                                tailScrollRequestID &+= 1
+                                proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                                tailScrollRequestID &+= 1
                             }
                         }
                     }
@@ -1619,7 +1622,8 @@ struct ChatView: View {
                         DispatchQueue.main.async {
                             guard !userBrowsingHistory, !focused, !loadingOlder,
                                   !messages.isEmpty else { return }
-                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                            tailScrollRequestID &+= 1
+                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                            tailScrollRequestID &+= 1
                         }
                         // One bounded post-layout correction, not a repeating scroll
                         // timer. A new manual history drag or keyboard focus cancels it.
@@ -1627,7 +1631,8 @@ struct ChatView: View {
                         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(400)) {
                             guard !userBrowsingHistory, !focused, !loadingOlder,
                                   let latestID = messages.last?.id else { return }
-                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                            tailScrollRequestID &+= 1
+                            proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                            tailScrollRequestID &+= 1
                             #if DEBUG
                             if ProcessInfo.processInfo.environment["REMOTEAI_UI_STRESS_DIRECT"] == "1" {
                                 DiagnosticsLog.shared.record("ui_stream_terminal_anchor_postlayout", fields: [
@@ -1657,11 +1662,13 @@ struct ChatView: View {
                                 // scroll layout busy and block keyboard/accessibility work.
                                 // Make the user's explicit return a single nonanimated jump.
                                 if !messages.isEmpty {
-                                    proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                                    tailScrollRequestID &+= 1
+                                    proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                                    tailScrollRequestID &+= 1
                                 }
                             } else {
                                 if !messages.isEmpty {
-                                    proxy.scrollTo("stable-scroll-tail", anchor: .bottom)\n                                    tailScrollRequestID &+= 1
+                                    proxy.scrollTo("stable-scroll-tail", anchor: .bottom)
+                                    tailScrollRequestID &+= 1
                                 }
                             }
                         } label: {
