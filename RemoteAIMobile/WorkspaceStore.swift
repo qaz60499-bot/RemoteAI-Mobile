@@ -97,6 +97,8 @@ final class WorkspaceStore: ObservableObject {
 
     static let connectingStateMaxDuration: TimeInterval = 45
 
+    @Published var cliStatus: [String: [String: JSONValue]] = [:]
+    @Published var cliReceipts: [String: String] = [:]
     var transport: Transport
     let cache: SQLiteStore
     private var tracker = SequenceTracker()
@@ -3183,7 +3185,8 @@ final class WorkspaceStore: ObservableObject {
         model: String = "",
         reasoningEffort: String = "",
         projectAlias: String? = nil,
-        codexProjectPath: String? = nil
+        codexProjectPath: String? = nil,
+        upstreamId: String? = nil
     ) async -> Bool {
         guard creatingSessions.insert(instance.id).inserted else { return false }
         defer { creatingSessions.remove(instance.id) }
@@ -3192,7 +3195,8 @@ final class WorkspaceStore: ObservableObject {
         var payload: [String: JSONValue] = [
             "title": .string(effectiveTitle)
         ]
-        if (runtime.kind == .codex || runtime.kind == .antigravity), !model.isEmpty {
+        if let upstreamId { payload["upstreamId"] = .string(upstreamId) }
+        if (runtime.kind == .codex || runtime.kind == .cloudcode || runtime.kind == .antigravity), !model.isEmpty {
             payload["model"] = .string(model)
         }
         if runtime.kind == .antigravity, let projectAlias, !projectAlias.isEmpty {
@@ -3569,6 +3573,37 @@ final class WorkspaceStore: ObservableObject {
         } else {
             connectionPhase = .relayError
             errors["connection"] = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    func cliAction(runtime: RuntimeDescriptor, instance: InstanceDescriptor, sessionId: String, action: String, payload: [String: JSONValue] = [:]) async -> Bool {
+        guard machine.state == .online else { return false }
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let machineId = machine.id
+        let key = "cli.\(sessionId).\(action).\(payload["requestId"]?.stringValue ?? "").\(payload["decision"]?.stringValue ?? "")"
+        let isRead = action == "getSessionStatus"
+        let commandId: UUID
+        if isRead { commandId = UUID() }
+        else { commandId = await pendingOperationCommandId(key: key, machineId: machineId) }
+        do {
+            let response = try await activeTransport.execute(.make(machineId: machineId, runtimeId: runtime.id, instanceId: instance.id, sessionId: sessionId, action: action, payload: payload, commandId: commandId))
+            guard generation == lifecycleGeneration, activeTransport === transport else { return false }
+            guard response.ok else { throw TransportError.remote(response.error?.code ?? "CLI_ERROR", response.error?.message ?? "Command failed") }
+            if isRead, let object = response.result?.objectValue { cliStatus[sessionId] = object }
+            if !isRead {
+                await finishPendingOperation(key: key, machineId: machineId, expectedCommandId: commandId)
+                cliReceipts[sessionId] = "Windows acknowledged; awaiting CLI status"
+            }
+            errors[sessionId] = nil
+            return true
+        } catch {
+            guard generation == lifecycleGeneration else { return false }
+            if !isRead && !isUnknownDelivery(error) { await finishPendingOperation(key: key, machineId: machineId) }
+            if !isRead { cliReceipts[sessionId] = "Receipt unknown; retry keeps the same command ID" }
+            errors[sessionId] = error.localizedDescription
+            return false
         }
     }
 
@@ -4734,6 +4769,16 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func applyEvent(_ event: RemoteEvent, suppressTransientPresentation: Bool = false) async {
+        if event.type == "CLI_STATUS", let id = event.sessionId {
+            var merged = cliStatus[id] ?? sessions.first(where: { $0.id == id })?.cliMetadata ?? [:]
+            merged.merge(event.payload) { _, new in new }
+            cliStatus[id] = merged
+            return
+        }
+        if event.type == "CLI_ERROR", let id = event.sessionId {
+            cliStatus[id, default: [:]]["providerError"] = event.payload["providerError"]
+            return
+        }
         if event.type == "TRANSPORT_STATUS" {
             // Historical delta recovery can contain many old Relay/Browser status
             // transitions. Replaying them into live transport state makes the phone

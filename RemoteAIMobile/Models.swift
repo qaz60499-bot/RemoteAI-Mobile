@@ -3,10 +3,11 @@ import Foundation
 enum RuntimeKind: String, Codable, CaseIterable, Identifiable {
     case web = "Web"
     case codex = "Codex"
+    case cloudcode = "CloudCode"
     case antigravity = "Antigravity"
 
     var id: String { rawValue }
-    var displayName: String { rawValue }
+    var displayName: String { self == .cloudcode ? "Claude Code" : rawValue }
 }
 
 enum MachineConnectionState: String, Codable { case online = "Online", offline = "Offline", connecting = "Connecting" }
@@ -125,6 +126,7 @@ struct SessionDescriptor: Codable, Identifiable, Hashable {
     var workingDirectory: String? = nil
     var threadId: String? = nil
     var modelId: String? = nil
+    var cliMetadata: [String: JSONValue]? = nil
 
     var orderingDate: Date { max(updatedAt, lastActivityAt ?? updatedAt) }
 
@@ -776,7 +778,8 @@ extension ServerSession {
             backgroundTaskStatusReceivedAt: backgroundTaskStatus == nil ? nil : Date(),
             workingDirectory: metadata["cwd"]?.stringValue,
             threadId: externalId,
-            modelId: metadata["model"]?.stringValue
+            modelId: metadata["model"]?.stringValue,
+            cliMetadata: metadata["cliMobile"]?.boolValue == true ? metadata : nil
         )
     }
 }

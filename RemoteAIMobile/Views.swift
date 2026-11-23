@@ -53,9 +53,16 @@ struct RootView: View {
                         }
                     }
                 }
+                Section("Windows CLI") {
+                    ForEach(store.runtimes.filter { $0.kind == .cloudcode || $0.kind == .codex }) { runtime in
+                        NavigationLink(destination: CLIRuntimeView(runtime: runtime)) {
+                            Label("\(runtime.kind.displayName) CLI", systemImage: "terminal")
+                        }
+                    }
+                }
                 Section("Runtimes") {
                     ForEach(store.runtimes) { runtime in
-                        NavigationLink(destination: RuntimeView(runtime: runtime)) {
+                        NavigationLink(destination: runtimeDestination(runtime)) {
                             Label(runtime.name, systemImage: runtimeIcon(runtime.kind)).padding(.vertical, 5)
                         }
                     }
@@ -80,7 +87,11 @@ struct RootView: View {
             .sheet(isPresented: $showingDiagnostics) { DiagnosticsView().environmentObject(store) }
         }.navigationViewStyle(.stack)
     }
-    private func runtimeIcon(_ kind: RuntimeKind) -> String { switch kind { case .web: return "globe"; case .codex: return "terminal"; case .antigravity: return "sparkles" } }
+    @ViewBuilder private func runtimeDestination(_ runtime: RuntimeDescriptor) -> some View {
+        if runtime.kind == .cloudcode { CLIRuntimeView(runtime: runtime) }
+        else { RuntimeView(runtime: runtime) }
+    }
+    private func runtimeIcon(_ kind: RuntimeKind) -> String { switch kind { case .web: return "globe"; case .codex, .cloudcode: return "terminal"; case .antigravity: return "sparkles" } }
 }
 
 private struct DiagnosticExportItem: Identifiable {

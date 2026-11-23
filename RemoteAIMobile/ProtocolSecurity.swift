@@ -11,6 +11,7 @@ enum ProtocolSecurity {
     ]
 
     static let eventTypes: Set<String> = [
+        "CLI_STATUS", "CLI_ERROR",
         "COMMAND_RESULT", "COMMAND_REJECTED", "SYSTEM_STATUS", "RUNTIME_STATUS",
         "INSTANCE_UPDATED", "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "SESSION_DELETED",
         "MESSAGE_ADDED", "MESSAGE_UPDATED", "MESSAGE_REMOVED", "GENERATION_STARTED", "GENERATION_STOPPED",
@@ -21,6 +22,7 @@ enum ProtocolSecurity {
     ]
 
     static let commandActions: Set<String> = [
+        "configureSession", "respondApproval",
         "getStatus", "getDiagnostics", "listRuntimes", "listInstances", "listSessions",
         "createSession", "resumeSession", "stopSession", "getSessionStatus",
         "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore", "readMessageAttachmentChunk",
