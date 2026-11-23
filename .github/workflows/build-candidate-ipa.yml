@@ -8,7 +8,7 @@ on:
       gate:
         description: Validation scope
         type: choice
-        options: [candidate, streaming, sync]
+        options: [candidate, streaming, sync, cli]
         default: candidate
 
 permissions:
@@ -159,7 +159,7 @@ jobs:
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/protocol-security.log | tail -1
 
       - name: Unit tests
-        if: inputs.gate != 'streaming'
+        if: inputs.gate != 'streaming' && inputs.gate != 'cli'
         shell: bash
         run: |
           set -euo pipefail
@@ -175,6 +175,12 @@ jobs:
           grep -E 'PROJECT_ORDER_STRESS_TOTAL=25000' build/tests.log
           grep -E 'PROJECT_REFRESH_STRESS_TOTAL=2500' build/tests.log
           grep -E 'Executed [0-9]+ tests?, with 0 failures' build/tests.log | tail -1
+
+      - name: CLI unit regression tests
+        if: inputs.gate == 'cli'
+        run: |
+          set -euo pipefail
+          xcodebuild test -project RemoteAIMobile.xcodeproj -scheme RemoteAIMobile -configuration Debug -destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}' -only-testing:RemoteAIMobileTests/CLIMobileTests -only-testing:RemoteAIMobileTests/AssistantStreamTests | tee build/cli-unit.log
 
       - name: Streaming unit tests
         if: inputs.gate == 'streaming'
@@ -193,7 +199,7 @@ jobs:
               --only testLongStreamingTailStaysLiveWhileComposerAndHistoryRemainUsable \
               --only testLongStreaming50kTailStaysLiveWhileComposerAndHistoryRemainUsable \
               | tee build/ui-tests.log
-          elif [[ '${{ inputs.gate }}' == 'sync' ]]; then
+          elif [[ '${{ inputs.gate }}' == 'sync' || '${{ inputs.gate }}' == 'cli' ]]; then
             # Targeted regression gate for metadata/Project/Chat sync candidates.
             # The full candidate gate (including both long-stream stress cases)
             # remains unchanged and is independently required for final acceptance.
@@ -211,7 +217,7 @@ jobs:
           grep -E 'CANDIDATE_UI_TESTS_PASS=[1-9][0-9]*' build/ui-tests.log
 
       - name: Streaming cadence and process samples without accessibility polling
-        if: inputs.gate != 'streaming'
+        if: inputs.gate != 'streaming' && inputs.gate != 'cli'
         run: |
           set -euo pipefail
           python3 scripts/sample_streaming_performance.py --udid '${{ steps.simulator.outputs.udid }}' | tee build/stream-performance.log
