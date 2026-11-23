@@ -442,7 +442,6 @@ final class WorkspaceStore: ObservableObject {
         await normalizeCachedTransientState()
         if !(transport is MockTransport) {
             await removeLegacyMockFixtures()
-            await removeCloudCodeFromMobileCache()
         }
         isPaired = PairingKeyStore.isPaired(machineId: machine.id)
         if !isPaired && !(transport is MockTransport) {
@@ -3792,24 +3791,6 @@ final class WorkspaceStore: ObservableObject {
             changed = true
         }
         if changed { try? await cache.put(sessions, key: "sessions") }
-    }
-
-    private func removeCloudCodeFromMobileCache() async {
-        let cloudInstanceIds = Set(instances.filter { $0.runtimeId == "runtime.cloudcode" }.map(\.id))
-        let cloudSessionIds = Set(sessions.filter { cloudInstanceIds.contains($0.instanceId) }.map(\.id))
-        let changed = runtimes.contains { $0.id == "runtime.cloudcode" }
-            || !cloudInstanceIds.isEmpty
-            || !cloudSessionIds.isEmpty
-        guard changed else { return }
-
-        runtimes.removeAll { $0.id == "runtime.cloudcode" }
-        instances.removeAll { $0.runtimeId == "runtime.cloudcode" }
-        sessions.removeAll { cloudInstanceIds.contains($0.instanceId) }
-        for sessionId in cloudSessionIds {
-            messagesBySession.removeValue(forKey: sessionId)
-            hasMoreBySession.removeValue(forKey: sessionId)
-        }
-        await persistMetadata()
     }
 
     private func removeLegacyMockFixtures() async {

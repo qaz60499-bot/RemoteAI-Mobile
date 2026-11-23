@@ -123,7 +123,8 @@ final class PairingTests: XCTestCase {
             case "listRuntimes":
                 result = try JSONValue.encode([
                     ServerRuntime(runtimeId: "runtime.web", kind: RuntimeKind.web.rawValue, label: "Web", capabilities: [], status: "READY", updatedAt: now),
-                    ServerRuntime(runtimeId: "runtime.codex", kind: RuntimeKind.codex.rawValue, label: "Codex", capabilities: [], status: "READY", updatedAt: now)
+                    ServerRuntime(runtimeId: "runtime.codex", kind: RuntimeKind.codex.rawValue, label: "Codex", capabilities: [], status: "READY", updatedAt: now),
+                    ServerRuntime(runtimeId: "runtime.cloudcode", kind: RuntimeKind.cloudcode.rawValue, label: "Claude Code", capabilities: [], status: "READY", updatedAt: now)
                 ])
             case "listInstances":
                 let runtimeId = command.runtimeId
@@ -809,22 +810,52 @@ final class PairingTests: XCTestCase {
         await store.suspend()
     }
 
-    func testSuccessfulPairingLoadsRuntimeCatalogAndDefersInstanceDiscovery() async throws {
+    func testSuccessfulPairingLoadsClaudeRuntimeAndPreservesCachedClaudeHistory() async throws {
         let machineId = "machine-load-runtimes-\(UUID().uuidString)"
         defer { PairingKeyStore.deletePairing(machineId: machineId) }
         try PairingKeyStore.savePairing(machineId: machineId, sharedKey: Data(repeating: 0x33, count: 32))
         let cache = try SQLiteStore.inMemory()
+        let now = Date()
+        let claudeRuntime = RuntimeDescriptor(id: "runtime.cloudcode", machineId: machineId, kind: .cloudcode, name: "Claude Code", status: "READY")
+        let claudeInstance = InstanceDescriptor(id: "claude-instance", runtimeId: claudeRuntime.id, name: "Claude Code", subtitle: nil, status: "READY")
+        let claudeSession = SessionDescriptor(id: "claude-session", instanceId: claudeInstance.id, title: "Existing Claude chat", state: .idle, updatedAt: now)
+        let claudeMessage = ChatMessage(
+            id: "cached-claude-reply",
+            sessionId: claudeSession.id,
+            sequence: 1,
+            role: .assistant,
+            kind: .text,
+            text: "Existing Claude history",
+            toolName: nil,
+            toolStatus: nil,
+            detail: nil,
+            createdAt: now
+        )
+        try await cache.put([claudeRuntime], key: "runtimes")
+        try await cache.put([claudeInstance], key: "instances")
+        try await cache.put([claudeSession], key: "sessions")
+        try await cache.upsertMessages([claudeMessage])
         let transport = RuntimeLoadingTransport()
         let store = WorkspaceStore(transport: transport, cache: cache)
         store.machine = MachineMetadata(id: machineId, name: "My PC", state: .connecting)
+        store.messagesBySession[claudeSession.id] = [claudeMessage]
         var stages: [PairingStage] = []
 
         await store.start { stages.append($0) }
 
         XCTAssertEqual(store.machine.state, .online)
-        XCTAssertEqual(Set(store.runtimes.map(\.id)), Set(["runtime.web", "runtime.codex"]))
-        XCTAssertFalse(store.runtimes.contains(where: { $0.id == "runtime.cloudcode" }))
-        XCTAssertTrue(store.instances.isEmpty, "Pairing/reconnect should not eagerly scan every runtime instance")
+        XCTAssertEqual(Set(store.runtimes.map(\.id)), Set(["runtime.web", "runtime.codex", "runtime.cloudcode"]))
+        XCTAssertEqual(store.instances.map(\.id), [claudeInstance.id])
+        XCTAssertEqual(store.sessions.map(\.id), [claudeSession.id])
+        XCTAssertEqual(store.messagesBySession[claudeSession.id]?.map(\.id), [claudeMessage.id])
+        let cachedInstancesValue: [InstanceDescriptor]? = try await cache.get([InstanceDescriptor].self, key: "instances")
+        let cachedSessionsValue: [SessionDescriptor]? = try await cache.get([SessionDescriptor].self, key: "sessions")
+        let cachedInstances = try XCTUnwrap(cachedInstancesValue)
+        let cachedSessions = try XCTUnwrap(cachedSessionsValue)
+        XCTAssertEqual(cachedInstances.map(\.id), [claudeInstance.id])
+        XCTAssertEqual(cachedSessions.map(\.id), [claudeSession.id])
+        let cachedMessageCount = try await cache.messageCount(sessionId: claudeSession.id)
+        XCTAssertEqual(cachedMessageCount, 1)
         XCTAssertEqual(stages, [.connectingRemoteAI, .loadingRuntimes])
         await store.suspend()
     }

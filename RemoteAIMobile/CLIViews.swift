@@ -58,6 +58,9 @@ struct CLIRuntimeView: View {
             }
             ForEach(instances) { instance in
                 Section(instance.name) {
+                    if let error = store.errors["instance.\(instance.id)"] {
+                        Text(error).font(.caption).foregroundColor(.red)
+                    }
                     ForEach(CodexDirectoryGroup.make(store.sessions.filter { $0.instanceId == instance.id })) { group in
                         DisclosureGroup(group.path) {
                             ForEach(group.sessions.filter { search.isEmpty || $0.title.localizedCaseInsensitiveContains(search) || group.path.localizedCaseInsensitiveContains(search) }) { session in
@@ -192,6 +195,16 @@ struct CLIConversationView: View {
             if controllable {
                 HStack(alignment: .bottom) {
                     TextEditor(text: $text).frame(minHeight: 44, maxHeight: 100)
+                        .overlay(alignment: .topLeading) {
+                            if text.isEmpty {
+                                Text("发送到当前会话")
+                                    .foregroundColor(.secondary)
+                                    .padding(.leading, 5)
+                                    .padding(.top, 8)
+                                    .allowsHitTesting(false)
+                                    .accessibilityHidden(true)
+                            }
+                        }
                         .accessibilityLabel("发送到当前会话")
                     Button("发送") {
                         busy = true

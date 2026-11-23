@@ -365,7 +365,6 @@ extension Transport {
         let response = try await requireSuccess(execute(command))
         let rows = try response.decode([ServerRuntime].self)
         return rows
-            .filter { $0.runtimeId != "runtime.cloudcode" }
             .compactMap { $0.descriptor(machineId: machineId) }
     }
 
