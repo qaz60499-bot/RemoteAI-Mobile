@@ -191,7 +191,8 @@ struct CLIConversationView: View {
             if let error = store.errors[session.id] { Text(error).font(.caption).foregroundColor(.red).padding(6) }
             if controllable {
                 HStack(alignment: .bottom) {
-                    TextField("发送到当前会话", text: $text, axis: .vertical).lineLimit(1...6).textFieldStyle(.roundedBorder)
+                    TextEditor(text: $text).frame(minHeight: 44, maxHeight: 100)
+                        .accessibilityLabel("发送到当前会话")
                     Button("发送") {
                         busy = true
                         Task {
