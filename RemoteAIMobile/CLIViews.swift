@@ -40,6 +40,7 @@ enum CLIStateLabel {
         case "stopped": return "已停止"
         case "process_exited": return "CLI 进程已退出"
         case "recovery_pending": return "等待新指令验证恢复"
+        case "delivery_unknown": return "发送回执未知，禁止重复提交"
         case "waiting_approval": return "等待审批"
         case "waiting_user": return "等待指令"
         case "idle": return "空闲"
@@ -379,6 +380,7 @@ struct CLIUpstreamManagementView: View {
 private extension CLIUpstream {
     var sourceLabel: String {
         switch source {
+        case .some("nativecloud"): return "Cloud Code 原有路由与会话授权"
         case .some("remoteai"): return "RemoteAI 自定义配置"
         case .some("discovered"): return "Windows 导入配置"
         default: return "Windows 现有配置"

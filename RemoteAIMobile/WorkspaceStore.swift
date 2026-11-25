@@ -3428,7 +3428,7 @@ final class WorkspaceStore: ObservableObject {
         guard let transportError = error as? TransportError else { return false }
         if transportError == .disconnected || transportError == .timeout { return true }
         if case .remote(let code, _) = transportError {
-            return code == "WEB_SEND_DELIVERY_UNKNOWN" || code == "CREATE_SESSION_RESULT_UNVERIFIED"
+            return code == "WEB_SEND_DELIVERY_UNKNOWN" || code == "CREATE_SESSION_RESULT_UNVERIFIED" || code == "CLI_SEND_DELIVERY_UNKNOWN"
         }
         return false
     }
