@@ -2,6 +2,48 @@ import XCTest
 @testable import RemoteAIMobile
 
 final class CLIMobileTests: XCTestCase {
+    @MainActor
+    func testSparseCLICacheDoesNotSkipMiddleHistoryOrSameTimestampRows() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let cache = try SQLiteStore.inMemory()
+        let date = Date(timeIntervalSince1970: 1_790_000_000)
+        let rows = (0..<135).map { i in
+            ServerMessage(messageId: String(format: "cli-msg-%04d", i), sessionId: "codex6-a",
+                          role: i.isMultiple(of: 2) ? "user" : "assistant", content: "row \(i)",
+                          externalId: nil, createdAt: date)
+        }
+        for row in rows { await mock.appendHistoryMessage(row) }
+        // Reproduces the physical phone: oldest live events plus a recent page.
+        try await cache.upsertMessages([rows[0].chatMessage, rows[17].chatMessage])
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        await store.start()
+        let runtime = try XCTUnwrap(store.runtimes.first { $0.id == "runtime.codex" })
+        await store.refreshRuntime(runtime)
+        let instance = try XCTUnwrap(store.instances.first { $0.id == "codex.6" })
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        await store.loadSession("codex6-a")
+        for _ in 0..<3 { await store.loadOlder("codex6-a") }
+        let actual = store.messagesBySession["codex6-a", default: []]
+        XCTAssertEqual(actual.map(\.id), rows.map(\.messageId))
+        XCTAssertEqual(Set(actual.map(\.id)).count, 135)
+        XCTAssertEqual(store.hasMoreBySession["codex6-a"], false)
+        await store.loadSession("codex6-a")
+        XCTAssertEqual(store.messagesBySession["codex6-a"]?.count, 135)
+        await store.suspend()
+    }
+
+    func testHistoricalCLIToolKeepsCanonicalIdentityTimeAndDetails() {
+        let at = Date(timeIntervalSince1970: 1_790_000_000)
+        let content = #"{"type":"function_call_output","call_id":"call-1","output":"done"}"#
+        let message = ServerMessage(messageId: "cli-tool-123", sessionId: "observed",
+                                    role: "tool", content: content, externalId: nil, createdAt: at).chatMessage
+        XCTAssertEqual(message.id, "cli-tool-123")
+        XCTAssertEqual(message.createdAt, at)
+        XCTAssertEqual(message.kind, .toolEvent)
+        XCTAssertEqual(message.detail, content)
+        XCTAssertEqual(message.toolStatus, "Recorded")
+    }
+
     func testClaudeRuntimeAndDistinctStates() throws {
         XCTAssertEqual(RuntimeKind(rawValue: "CloudCode")?.displayName, "Claude Code")
         XCTAssertEqual(CLIStateLabel.text("running"), "执行中")

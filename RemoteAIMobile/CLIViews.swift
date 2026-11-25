@@ -634,6 +634,7 @@ struct CLIConversationView: View {
     @State private var showNativeRecovery = false
     @State private var showNextCall = false
     @State private var userAnswer = ""
+    @State private var followsLatest = true
     private var snapshot: [String: JSONValue] { store.cliStatus[session.id] ?? session.cliMetadata ?? [:] }
     private var managedRuntime: Bool {
         (instance.id == "cloudcode.remoteai" && instance.runtimeId == runtime.id && runtime.kind == .cloudcode)
@@ -642,7 +643,16 @@ struct CLIConversationView: View {
     private var controllable: Bool { managedRuntime && snapshot["controlMode"]?.stringValue == "managed" }
     private var active: Bool { ["initializing", "running", "calling_tool", "waiting_approval", "waiting_user"].contains(snapshot["cliState"]?.stringValue ?? "") }
     private var approvals: [CLIApproval] { (try? snapshot["pendingApprovals"]?.decode([CLIApproval].self)) ?? [] }
-    private var messages: [ChatMessage] { (store.messagesBySession[session.id] ?? []).filter { search.isEmpty || $0.text.localizedCaseInsensitiveContains(search) } }
+    private var messages: [ChatMessage] {
+        let rows = store.messagesBySession[session.id] ?? []
+        let canonicalTools = Set(rows.filter { $0.id.hasPrefix("cli-tool-") }.map { "tool-\(session.id)-\($0.id)" })
+        return rows.filter { !canonicalTools.contains($0.id) && (search.isEmpty || $0.text.localizedCaseInsensitiveContains(search) || $0.detail?.localizedCaseInsensitiveContains(search) == true) }.map { row in
+            if row.role == .tool, row.id.hasPrefix("cli-tool-"), row.kind != .toolEvent {
+                return ServerMessage(messageId: row.id, sessionId: row.sessionId, role: "tool", content: row.text, externalId: nil, createdAt: row.createdAt).chatMessage
+            }
+            return row
+        }
+    }
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 5) {
@@ -695,15 +705,18 @@ struct CLIConversationView: View {
                     }
                 }
             }.frame(maxWidth: .infinity, alignment: .leading).padding()
+            ScrollViewReader { proxy in
             List {
-                Button("加载更早记录") { Task { await store.loadOlder(session.id) } }
+                if store.hasMoreBySession[session.id] != false {
+                    Button("加载更早记录") { followsLatest = false; Task { await store.loadOlder(session.id) } }
+                }
                 ForEach(messages) { message in
                     VStack(alignment: .leading, spacing: 6) {
                         Text("\(message.role.rawValue) · \(message.createdAt.formatted(.iso8601))").font(.caption2).foregroundColor(.secondary)
                         if message.kind == .toolEvent {
                             DisclosureGroup(message.toolName ?? "工具调用") { Text(message.toolCardCopyText).font(.system(.caption, design: .monospaced)).textSelection(.enabled) }
                         } else { Text(message.text).textSelection(.enabled) }
-                    }.contextMenu { Button("复制") { UIPasteboard.general.string = message.kind == .toolEvent ? message.toolCardCopyText : message.text } }
+                    }.id(message.id).contextMenu { Button("复制") { UIPasteboard.general.string = message.kind == .toolEvent ? message.toolCardCopyText : message.text } }
                 }
                 if controllable {
                     ForEach(approvals) { item in
@@ -732,6 +745,22 @@ struct CLIConversationView: View {
                     }
                 }
             }.listStyle(.plain)
+                .simultaneousGesture(DragGesture().onChanged { _ in followsLatest = false })
+                .onAppear {
+                    if followsLatest, let id = messages.last?.id { proxy.scrollTo(id, anchor: .bottom) }
+                }
+                .onChange(of: messages.last?.id) { id in
+                    if followsLatest, search.isEmpty, let id { proxy.scrollTo(id, anchor: .bottom) }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if !followsLatest && search.isEmpty {
+                        Button("最新输出") {
+                            followsLatest = true
+                            if let id = messages.last?.id { proxy.scrollTo(id, anchor: .bottom) }
+                        }.buttonStyle(.bordered).padding(8)
+                    }
+                }
+            }
             if let receipt = store.cliReceipts[session.id] { Text(receipt).font(.caption).padding(6) }
             if let error = store.errors[session.id] { Text(error).font(.caption).foregroundColor(.red).padding(6) }
             if controllable {

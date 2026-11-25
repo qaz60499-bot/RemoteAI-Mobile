@@ -787,7 +787,15 @@ extension ServerSession {
 extension ServerMessage {
     var chatMessage: ChatMessage {
         let mappedRole = MessageRole(rawValue: role.lowercased()) ?? .system
-        var message = ChatMessage(id: messageId, sessionId: sessionId, sequence: nil, role: mappedRole, kind: .text, text: content, toolName: nil, toolStatus: nil, detail: nil, attachments: attachments, createdAt: createdAt)
+        let isCLITool = mappedRole == .tool && messageId.hasPrefix("cli-tool-")
+        var message = ChatMessage(id: messageId, sessionId: sessionId, sequence: nil, role: mappedRole, kind: isCLITool ? .toolEvent : .text, text: content, toolName: nil, toolStatus: nil, detail: nil, attachments: attachments, createdAt: createdAt)
+        if isCLITool {
+            let tool = (try? JSONSerialization.jsonObject(with: Data(content.utf8))) as? [String: Any]
+            message.toolName = tool?["name"] as? String ?? tool?["type"] as? String ?? "工具记录"
+            message.detail = content
+            // A historical invocation alone does not prove completion or activity.
+            message.toolStatus = "Recorded"
+        }
         message.providerMessageId = externalId
         return message
     }

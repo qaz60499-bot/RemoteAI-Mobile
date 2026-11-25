@@ -75,6 +75,8 @@ final class WorkspaceStore: ObservableObject {
     @Published var webProviderSurfaceObservedAtBySession: [String: Date] = [:]
     @Published var webProviderRecoveryObservedAtBySession: [String: Date] = [:]
     @Published var hasMoreBySession: [String: Bool] = [:]
+    // Live/cached CLI rows can be sparse. Only a server page advances pagination.
+    private var cliHistoryBefore: [String: MessageCursor] = [:]
     // A short Windows cache page cannot certify the Provider archive beginning.
     // After one empty/failed older-page attempt, require explicit user recheck
     // instead of repeatedly querying the same unverified source on scroll.
@@ -480,6 +482,7 @@ final class WorkspaceStore: ObservableObject {
             hasLoadedWebProjects = false
             attachmentTransferBySession.removeAll()
             hasMoreBySession.removeAll()
+            cliHistoryBefore.removeAll()
             webOlderPageNeedsExplicitRetry.removeAll()
             machine.state = .offline
             connectionPhase = .pairingExpired
@@ -2185,6 +2188,9 @@ final class WorkspaceStore: ObservableObject {
             let authoritativeItems = route.runtimeId == "runtime.web"
                 ? page.items.map(Self.normalizedWebAssistantMessage)
                 : page.items
+            if route.runtimeId == "runtime.codex" || route.runtimeId == "runtime.cloudcode" {
+                cliHistoryBefore[sessionId] = page.beforeCursor
+            }
             await reconcilePendingUnknownCommands(with: authoritativeItems, sessionId: sessionId)
             for remoteUser in authoritativeItems where remoteUser.role == .user {
                 await reconcileOptimisticUserEcho(remoteUser, sessionId: sessionId)
@@ -2693,7 +2699,7 @@ final class WorkspaceStore: ObservableObject {
         // Provider USER UUID, not an optimistic bubble, tool status, synthetic
         // Assistant prefix or historical local ID. The Windows adapter still
         // independently checks the matching durable message ID + timestamp.
-        let first: ChatMessage
+        let before: MessageCursor
         if isWebRemoteRead {
             guard let providerUserAnchor = messagesBySession[sessionId]?.first(where: { message in
                 message.sessionId == sessionId
@@ -2706,18 +2712,21 @@ final class WorkspaceStore: ObservableObject {
                     "旧历史读取缺少本 Chat 的可信 Provider User UUID 游标；不会用工具状态或本地消息冒充来源。请人工核验原 Chat 后重试。"
                 return
             }
-            first = providerUserAnchor
+            before = providerUserAnchor.cursor
         } else {
-            first = firstVisible
+            before = cliHistoryBefore[sessionId] ?? firstVisible.cursor
         }
         do {
             let previousMessageIDs = Set(messagesBySession[sessionId, default: []].map(\.id))
             let page: Page<ChatMessage>
             if machine.state == .online, let route = routeForSession(sessionId) {
-                page = try await transport.loadBefore(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, before: first.cursor, limit: 40)
+                page = try await transport.loadBefore(machineId: machine.id, runtimeId: route.runtimeId, instanceId: route.instanceId, sessionId: sessionId, before: before, limit: 40)
                 guard generation == lifecycleGeneration, machine.state == .online, !isSuspended else { return }
+                if route.runtimeId == "runtime.codex" || route.runtimeId == "runtime.cloudcode" {
+                    cliHistoryBefore[sessionId] = page.beforeCursor
+                }
             } else {
-                let local = try await cache.messagesBefore(sessionId: sessionId, before: first.cursor, limit: 40)
+                let local = try await cache.messagesBefore(sessionId: sessionId, before: firstVisible.cursor, limit: 40)
                 page = Page(items: local, beforeCursor: local.first?.cursor, hasMore: local.count == 40)
             }
             try? await cache.upsertMessages(page.items)
@@ -3336,6 +3345,7 @@ final class WorkspaceStore: ObservableObject {
         hasLoadedWebProjects = false
         attachmentTransferBySession.removeAll()
         hasMoreBySession.removeAll()
+        cliHistoryBefore.removeAll()
         commandStates.removeAll()
         errors.removeAll()
         tracker = SequenceTracker()
@@ -3934,6 +3944,7 @@ final class WorkspaceStore: ObservableObject {
         for sessionId in fixtureSessionIds {
             messagesBySession.removeValue(forKey: sessionId)
             hasMoreBySession.removeValue(forKey: sessionId)
+            cliHistoryBefore.removeValue(forKey: sessionId)
         }
         await persistMetadata()
         try? await cache.put(webProjects, key: "web.projects")
@@ -4951,6 +4962,7 @@ final class WorkspaceStore: ObservableObject {
 
         switch event.type {
         case "SESSION_DELETED":
+            cliHistoryBefore.removeValue(forKey: sessionId)
             sessions.removeAll { $0.id == sessionId }
             webBindingDetachedSessions.remove(sessionId)
             webChatBindingFaultAtBySession.removeValue(forKey: sessionId)
