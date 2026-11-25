@@ -67,8 +67,12 @@ struct CLIRuntimeView: View {
                 ForEach(instances.filter(\.isManagedCLI)) { instance in
                     VStack(alignment: .leading, spacing: 8) {
                         Button { activeSheet = .create(instance) } label: { Label("新建 \(runtime.kind.displayName) 会话", systemImage: "plus.circle") }
+                            .buttonStyle(.borderless)
+                            .accessibilityIdentifier("cli-create-session")
                             .disabled(store.machine.state != .online)
                         Button { activeSheet = .manage(instance) } label: { Label("管理模型 API 中转站", systemImage: "server.rack") }
+                            .buttonStyle(.borderless)
+                            .accessibilityIdentifier("cli-manage-upstreams")
                             .disabled(store.machine.state != .online)
                     }
                 }

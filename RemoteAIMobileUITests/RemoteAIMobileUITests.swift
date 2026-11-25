@@ -22,6 +22,28 @@ final class RemoteAIMobileUITests: XCTestCase {
         XCTAssertGreaterThan(app.staticTexts["My PC"].frame.minY, 50)
     }
 
+    func testCLICreateAndUpstreamButtonsOpenDistinctSheets() throws {
+        let app = makeMockApp()
+        app.launchEnvironment["REMOTEAI_UI_CLI"] = "1"
+        app.launch()
+        let runtime = app.staticTexts["Codex CLI"]
+        XCTAssertTrue(runtime.waitForExistence(timeout: 5))
+        runtime.tap()
+        let create = app.buttons["cli-create-session"]
+        XCTAssertTrue(create.waitForExistence(timeout: 5))
+        // Tap the physical label area to catch List row button co-activation.
+        create.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        XCTAssertTrue(app.navigationBars["新建 CLI 会话"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.textFields["会话名称"].exists)
+        XCTAssertTrue(app.textFields["项目完整路径"].exists)
+        app.buttons["取消"].tap()
+        let manage = app.buttons["cli-manage-upstreams"]
+        XCTAssertTrue(manage.waitForExistence(timeout: 3))
+        manage.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        XCTAssertTrue(app.navigationBars["模型 API 中转站"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.textFields["会话名称"].exists)
+    }
+
     func testOpenWebChatByTappingStatusAreaOfExistingChromeTab() throws {
         let app = makeMockApp()
         app.launch()

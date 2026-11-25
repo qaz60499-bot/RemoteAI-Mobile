@@ -48,7 +48,7 @@ actor MockTransport: Transport {
     private let runtimes: [ServerRuntime]
     private let instances: [ServerInstance]
 
-    init(scenario: MockScenario = .normal, historyCount: Int = 1200, stressChars: Int = 0, stressChunkDelayMilliseconds: Int = 50) {
+    init(scenario: MockScenario = .normal, historyCount: Int = 1200, stressChars: Int = 0, stressChunkDelayMilliseconds: Int = 50, cliMobile: Bool = false) {
         self.scenario = scenario
         let eventPipe = AsyncStream<RemoteEvent>.makeStream()
         self.continuation = eventPipe.continuation
@@ -73,7 +73,9 @@ actor MockTransport: Transport {
             ServerInstance(instanceId: "excel", runtimeId: "runtime.web", label: "Excel SaaS", kind: "cached-project", config: [:], status: "ready", updatedAt: now)
         ] + (1...11).map {
             ServerInstance(instanceId: "codex.\($0)", runtimeId: "runtime.codex", label: "Codex\($0)", kind: "codex-cli", config: [:], status: "ready", updatedAt: now)
-        }
+        } + (cliMobile ? [
+            ServerInstance(instanceId: "codex.remoteai", runtimeId: "runtime.codex", label: "Codex · RemoteAI", kind: "remoteai-managed-cli", config: ["cliMobile": .bool(true), "projectPath": .string("D:\\CLI-Test")], status: "ready", updatedAt: now)
+        ] : [])
         webProjects = [
             WebProjectDescriptor(projectAlias: "g-p-remoteai", projectId: nil, displayName: "RemoteAI", canonicalUrl: "https://chatgpt.com/g/g-p-remoteai/project", lastSeenAt: now, lastOpenedAt: now),
             WebProjectDescriptor(projectAlias: "g-p-photo", projectId: nil, displayName: "Photo SaaS", canonicalUrl: "https://chatgpt.com/g/g-p-photo/project", lastSeenAt: now.addingTimeInterval(-3600), lastOpenedAt: nil)
