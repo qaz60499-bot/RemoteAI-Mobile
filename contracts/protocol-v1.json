@@ -10,7 +10,7 @@
     "action": {
       "type": "string",
       "enum": [
-        "configureSession", "respondApproval", "getStatus", "getDiagnostics", "listRuntimes", "listInstances", "listSessions",
+        "configureSession", "respondApproval", "listCLIUpstreams", "saveCLIUpstream", "deleteCLIUpstream", "recoverCLISession", "getStatus", "getDiagnostics", "getCommandOutcome", "listRuntimes", "listInstances", "listSessions",
         "createSession", "resumeSession", "stopSession", "getSessionStatus",
         "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore", "readMessageAttachmentChunk",
         "getChangesAfterCursor",

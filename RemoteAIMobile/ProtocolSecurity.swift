@@ -26,6 +26,7 @@ enum ProtocolSecurity {
         "getStatus", "getDiagnostics", "listRuntimes", "listInstances", "listSessions",
         "createSession", "resumeSession", "stopSession", "getSessionStatus",
         "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore", "readMessageAttachmentChunk",
+        "listCLIUpstreams", "saveCLIUpstream", "deleteCLIUpstream", "recoverCLISession", "getCommandOutcome",
         "getChangesAfterCursor",
         "registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation",
         "listProjects", "listProjectConversations", "openProject", "createProject", "deleteSession",

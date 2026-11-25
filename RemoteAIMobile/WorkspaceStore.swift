@@ -20,6 +20,14 @@ enum OpenWebTabDestination {
     case project(WebProjectDescriptor)
 }
 
+struct CLIUpstreamActionOutcome {
+    let result: JSONValue?
+    let errorMessage: String?
+    let deliveryUnknown: Bool
+
+    var succeeded: Bool { errorMessage == nil }
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     @Published var machine = MachineMetadata(id: "my-pc", name: "My PC", state: .connecting)
@@ -3185,7 +3193,8 @@ final class WorkspaceStore: ObservableObject {
         reasoningEffort: String = "",
         projectAlias: String? = nil,
         codexProjectPath: String? = nil,
-        upstreamId: String? = nil
+        upstreamId: String? = nil,
+        cliPermissionMode: String? = nil
     ) async -> Bool {
         guard creatingSessions.insert(instance.id).inserted else { return false }
         defer { creatingSessions.remove(instance.id) }
@@ -3195,6 +3204,10 @@ final class WorkspaceStore: ObservableObject {
             "title": .string(effectiveTitle)
         ]
         if let upstreamId { payload["upstreamId"] = .string(upstreamId) }
+        if instance.isManagedCLI {
+            if let cliPermissionMode { payload["permissionMode"] = .string(cliPermissionMode) }
+            if let codexProjectPath, !codexProjectPath.isEmpty { payload["projectPath"] = .string(codexProjectPath) }
+        }
         if (runtime.kind == .codex || runtime.kind == .cloudcode || runtime.kind == .antigravity), !model.isEmpty {
             payload["model"] = .string(model)
         }
@@ -3593,16 +3606,123 @@ final class WorkspaceStore: ObservableObject {
             if isRead, let object = response.result?.objectValue { cliStatus[sessionId] = object }
             if !isRead {
                 await finishPendingOperation(key: key, machineId: machineId, expectedCommandId: commandId)
-                cliReceipts[sessionId] = "Windows acknowledged; awaiting CLI status"
+                if action == "recoverCLISession" {
+                    let result = response.result?.objectValue ?? [:]
+                    if result["prepared"]?.boolValue == true {
+                        cliReceipts[sessionId] = "恢复会话已准备，历史保留。请返回会话列表打开恢复会话，再明确发送新指令；尚未确认任务恢复。"
+                    } else if result["connectionReset"]?.boolValue == true && result["processExitConfirmed"]?.boolValue == true {
+                        cliReceipts[sessionId] = "旧受控进程退出已确认；历史与错误保留。请明确发送新指令验证恢复。"
+                    } else {
+                        cliReceipts[sessionId] = "Windows 已返回；恢复结果尚未确认，请刷新状态。"
+                    }
+                } else { cliReceipts[sessionId] = "Windows acknowledged; awaiting CLI status" }
             }
             errors[sessionId] = nil
             return true
         } catch {
             guard generation == lifecycleGeneration else { return false }
             if !isRead && !isUnknownDelivery(error) { await finishPendingOperation(key: key, machineId: machineId) }
-            if !isRead { cliReceipts[sessionId] = "Receipt unknown; retry keeps the same command ID" }
+            if !isRead { cliReceipts[sessionId] = isUnknownDelivery(error) ? "回执未知；重试使用同一命令标识，不自动重发任务。" : "Windows 已明确拒绝本次操作；请查看错误原因。" }
             errors[sessionId] = error.localizedDescription
             return false
+        }
+    }
+
+    @discardableResult
+    func cliUpstreamAction(
+        runtime: RuntimeDescriptor,
+        instance: InstanceDescriptor,
+        action: String,
+        payload: [String: JSONValue] = [:],
+        operationId: UUID? = nil
+    ) async -> CLIUpstreamActionOutcome {
+        let errorKey = "cliManagement.\(instance.id)"
+        let allowedActions: Set<String> = ["listCLIUpstreams", "saveCLIUpstream", "deleteCLIUpstream"]
+        guard allowedActions.contains(action), instance.isManagedCLI else {
+            let message = "此 Windows CLI 实例不支持中转站管理。"
+            errors[errorKey] = message
+            return CLIUpstreamActionOutcome(result: nil, errorMessage: message, deliveryUnknown: false)
+        }
+        let matchingRuntime = (instance.id == "cloudcode.remoteai" && runtime.kind == .cloudcode)
+            || (instance.id == "codex.remoteai" && runtime.kind == .codex)
+        guard matchingRuntime else {
+            let message = "CLI 实例与运行时不匹配。"
+            errors[errorKey] = message
+            return CLIUpstreamActionOutcome(result: nil, errorMessage: message, deliveryUnknown: false)
+        }
+        let isRead = action == "listCLIUpstreams"
+        guard isRead || operationId != nil else {
+            let message = "操作标识缺失，未发送请求。"
+            errors[errorKey] = message
+            return CLIUpstreamActionOutcome(result: nil, errorMessage: message, deliveryUnknown: false)
+        }
+        guard machine.state == .online else {
+            let message = "Windows Agent 当前离线；未发送操作。"
+            errors[errorKey] = message
+            return CLIUpstreamActionOutcome(result: nil, errorMessage: message, deliveryUnknown: false)
+        }
+
+        let generation = lifecycleGeneration
+        let activeTransport = transport
+        let machineId = machine.id
+        // Only the stable, random operation identifier is stored as a pending
+        // key. The station URL and credential remain in the encrypted request.
+        let operationKey = operationId.map {
+            "cli-upstream.\(instance.id).\(action).\($0.uuidString.lowercased())"
+        }
+        let commandId: UUID
+        if let operationKey {
+            commandId = await pendingOperationCommandId(key: operationKey, machineId: machineId)
+        } else {
+            commandId = UUID()
+        }
+
+        do {
+            let response = try await activeTransport.execute(.make(
+                machineId: machineId,
+                runtimeId: runtime.id,
+                instanceId: instance.id,
+                sessionId: nil,
+                action: action,
+                payload: payload,
+                commandId: commandId
+            ))
+            guard generation == lifecycleGeneration, activeTransport === transport else {
+                let message = "连接状态已变化，操作结果未知。请使用相同内容重试。"
+                errors[errorKey] = message
+                return CLIUpstreamActionOutcome(result: nil, errorMessage: message, deliveryUnknown: true)
+            }
+            guard response.ok else {
+                throw TransportError.remote(response.error?.code ?? "CLI_ERROR", response.error?.message ?? "Command failed")
+            }
+            if let operationKey {
+                await finishPendingOperation(key: operationKey, machineId: machineId, expectedCommandId: commandId)
+            }
+            errors[errorKey] = nil
+            // The public result refreshes the sheet, and the runtime refresh
+            // updates the instance metadata used by the session creation flow.
+            await refreshRuntime(runtime)
+            return CLIUpstreamActionOutcome(result: response.result, errorMessage: nil, deliveryUnknown: false)
+        } catch {
+            guard generation == lifecycleGeneration else {
+                let message = "连接状态已变化，操作结果未知。请使用相同内容重试。"
+                errors[errorKey] = message
+                return CLIUpstreamActionOutcome(result: nil, errorMessage: message, deliveryUnknown: true)
+            }
+            let unknown = isUnknownDelivery(error)
+            if !isRead, !unknown, let operationKey {
+                await finishPendingOperation(key: operationKey, machineId: machineId)
+            }
+            let message: String
+            if let transportError = error as? TransportError, case .remote(let code, _) = transportError {
+                message = "Windows Agent 返回错误（\(code)）。"
+            } else if unknown {
+                message = "连接中断，操作结果未知。请使用相同内容重试。"
+            } else {
+                message = "操作未完成，请检查连接和输入后重试。"
+            }
+            errors[errorKey] = message
+            return CLIUpstreamActionOutcome(result: nil, errorMessage: message, deliveryUnknown: unknown)
         }
     }
 
