@@ -88,6 +88,9 @@ struct CLIRuntimeView: View {
                                 NavigationLink(destination: CLIConversationView(runtime: runtime, instance: instance, session: session)) {
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(session.title)
+                                        if let pid = session.cliMetadata?["pid"]?.intValue {
+                                            Text("PID \(pid) · \(session.threadId.map { String($0.prefix(8)) } ?? "原生身份待确认")").font(.caption2).foregroundColor(.secondary)
+                                        }
                                         Text("\(session.cliMetadata?["controlMode"]?.stringValue == "managed" ? "可控制" : "只读") · \(CLIStateLabel.text(session.cliMetadata?["cliState"]?.stringValue))")
                                             .font(.caption).foregroundColor(.secondary)
                                         if let model = session.modelId { Text(model).font(.caption2) }
@@ -643,6 +646,7 @@ struct CLIConversationView: View {
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 5) {
+                Text(snapshot["sessionTitle"]?.stringValue ?? session.title).font(.headline).lineLimit(2).textSelection(.enabled)
                 Text("\(controllable ? "可控制" : "只读") · \(CLIStateLabel.text(snapshot["cliState"]?.stringValue))").font(.headline)
                 Text(session.workingDirectory ?? "工作目录未知").font(.caption).textSelection(.enabled)
                 Text("模型：\(snapshot["effectiveModel"]?.stringValue ?? snapshot["model"]?.stringValue ?? "待确认") · \(snapshot["upstreamHost"]?.stringValue ?? "Windows CLI 配置")").font(.caption2)
@@ -657,7 +661,10 @@ struct CLIConversationView: View {
                 }
                 DisclosureGroup("进程详细信息", isExpanded: $showProcessDetails) {
                     VStack(alignment: .leading, spacing: 6) {
+                        processRow("会话标题", key: "sessionTitle", fallback: session.title)
+                        processRow("原生 Session ID", key: "nativeSessionId", fallback: session.threadId)
                         processRow("PID", key: "pid")
+                        if snapshot["controllerPid"] != nil { processRow("控制入口 PID", key: "controllerPid") }
                         processRow("进程启动时间", key: "processStartedAt")
                         processRow("可执行文件", key: "executable")
                         processRow("父进程 PID", key: "parentPid")
