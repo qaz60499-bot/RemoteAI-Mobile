@@ -171,6 +171,70 @@ final class CLIMobileTests: XCTestCase {
         XCTAssertFalse(upstream.canEdit)
         XCTAssertTrue(upstream.canRemove)
     }
+
+    func testThreeDimensionCLIStatesAndNaturalLanguageGrouping() {
+        XCTAssertEqual(CLIStateLabel.connectionText("Connected"), "已连接")
+        XCTAssertEqual(CLIStateLabel.connectionText("Reconnecting"), "重连中")
+        XCTAssertEqual(CLIStateLabel.taskText("waiting_user"), "等待用户输入")
+        XCTAssertEqual(CLIStateLabel.syncText("Delivery Unknown"), "发送回执未知")
+        let sync = CLIStateLabel.syncDimension(cliState: "running", stale: true, machineOnline: false, automaticRetry: false, synchronizing: false)
+        XCTAssertEqual(sync.code, "Stale")
+        XCTAssertTrue(sync.isWarning)
+
+        let now = Date(timeIntervalSince1970: 1_790_000_000)
+        let user = ChatMessage(id: "u1", sessionId: "s1", sequence: 1, role: .user, kind: .text, text: "请修复中文进度", createdAt: now)
+        let tool1 = ServerMessage(messageId: "cli-tool-1", sessionId: "s1", role: "tool", content: #"{"name":"Bash","command":"ls"}"#, externalId: nil, createdAt: now).chatMessage
+        let tool2 = ServerMessage(messageId: "cli-tool-2", sessionId: "s1", role: "tool", content: #"{"type":"function_call_output","output":"ok"}"#, externalId: nil, createdAt: now).chatMessage
+        let assistant = ChatMessage(id: "a1", sessionId: "s1", sequence: 2, role: .assistant, kind: .text, text: "\u{001B}[32m已完成验证\u{001B}[0m", createdAt: now)
+
+        let collapsed = CLIConversationFormatter.groupMessages([user, tool1, tool1, tool2, assistant], search: "", showTechnicalLogs: false)
+        XCTAssertEqual(collapsed.count, 3)
+        if case .toolGroup(_, let items) = collapsed[1] {
+            XCTAssertEqual(items.count, 2)
+        } else {
+            XCTFail("Expected collapsed tool group")
+        }
+        XCTAssertEqual(CLIConversationFormatter.cleanNaturalText(assistant.text), "已完成验证")
+    }
+
+    @MainActor
+    func testCLIErrorHistoryRetainedAcrossReloadAndRedactsSecrets() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: mock, cache: cache)
+        let errJSON = JSONValue.object([
+            "code": .string("HTTP_429"),
+            "message": .string("Rate limit reached Authorization: Bearer sk-verysecret123456"),
+            "source": .string("model-api"),
+            "retryAfterSeconds": .number(30),
+            "at": .string("2026-11-26T00:00:00Z")
+        ])
+        let statusEvent = RemoteEvent(
+            protocolVersion: 1,
+            eventId: UUID(),
+            sequence: 1,
+            machineId: "my-pc",
+            runtimeId: "runtime.codex",
+            instanceId: "codex.remoteai",
+            sessionId: "s-err",
+            type: "CLI_STATUS",
+            payload: ["cliState": .string("rate_limited"), "errorHistory": .array([errJSON])],
+            createdAt: Date()
+        )
+        let encoder = JSONEncoder.remoteAI
+        let data = try encoder.encode(statusEvent)
+        let decoded = try JSONDecoder.remoteAI.decode(RemoteEvent.self, from: data)
+        XCTAssertEqual(decoded.type, "CLI_STATUS")
+
+        let record = CLIErrorRecord.fromJSON(errJSON.objectValue!, fallbackSessionId: "s-err")
+        XCTAssertEqual(record.code, "HTTP_429")
+        XCTAssertEqual(record.sourceDisplayName, "模型 API")
+        XCTAssertEqual(record.retryAfterSeconds, 30)
+        XCTAssertFalse(record.message.contains("sk-verysecret123456"))
+        try await cache.put([record], key: "cli.errors.s-err")
+        await store.loadSession("s-err")
+        XCTAssertEqual(store.cliErrorHistoryBySession["s-err"]?.count, 1)
+    }
 }
 
 private actor BoundedCLIHistoryTransport: Transport {

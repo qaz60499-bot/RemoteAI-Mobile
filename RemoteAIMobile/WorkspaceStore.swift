@@ -109,6 +109,8 @@ final class WorkspaceStore: ObservableObject {
 
     @Published var cliStatus: [String: [String: JSONValue]] = [:]
     @Published var cliReceipts: [String: String] = [:]
+    @Published var cliErrorHistoryBySession: [String: [CLIErrorRecord]] = [:]
+    @Published var globalTransportErrors: [CLIErrorRecord] = []
     var transport: Transport
     let cache: SQLiteStore
     private var tracker = SequenceTracker()
@@ -2117,6 +2119,18 @@ final class WorkspaceStore: ObservableObject {
             if commandStates[command.commandId] == nil { commandStates[command.commandId] = .unknown }
         }
 
+        if cliStatus[sessionId] == nil,
+           let savedStatus = try? await cache.get([String: JSONValue].self, key: "cli.status.\(sessionId)") {
+            cliStatus[sessionId] = savedStatus
+        }
+        if cliErrorHistoryBySession[sessionId] == nil,
+           let savedErrors = try? await cache.get([CLIErrorRecord].self, key: "cli.errors.\(sessionId)") {
+            cliErrorHistoryBySession[sessionId] = savedErrors
+        }
+        if globalTransportErrors.isEmpty,
+           let savedGlobal = try? await cache.get([CLIErrorRecord].self, key: "cli.global.errors") {
+            globalTransportErrors = savedGlobal
+        }
         if messagesBySession[sessionId] == nil {
             var local = (try? await cache.recentMessages(sessionId: sessionId, limit: 50)) ?? []
             var normalizedCachedAssistantMessages: [ChatMessage] = []
@@ -3055,6 +3069,7 @@ final class WorkspaceStore: ObservableObject {
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
             if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
             errors[sessionId] = error.localizedDescription
+            await recordCLIError(from: error, sessionId: sessionId, action: "sendMessage", unknownDelivery: isUnknownDelivery(error))
             DiagnosticsLog.shared.record("send_failed", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString]), level: "ERROR")
             return false
         } catch {
@@ -3065,6 +3080,7 @@ final class WorkspaceStore: ObservableObject {
             await removeOptimisticCommandMessage(commandId: commandId, sessionId: sessionId)
             if !trimmed.isEmpty { try? await cache.saveDraft(trimmed, sessionId: sessionId) }
             errors[sessionId] = error.localizedDescription
+            await recordCLIError(from: error, sessionId: sessionId, action: "sendMessage", unknownDelivery: isUnknownDelivery(error))
             DiagnosticsLog.shared.record("send_failed", fields: Self.diagnosticFields(for: error, adding: ["runtime": runtimeId, "instance": instanceId, "session": sessionId, "commandId": commandId.uuidString]), level: "ERROR")
             return false
         }
@@ -3614,7 +3630,9 @@ final class WorkspaceStore: ObservableObject {
             let response = try await activeTransport.execute(.make(machineId: machineId, runtimeId: runtime.id, instanceId: instance.id, sessionId: sessionId, action: action, payload: payload, commandId: commandId))
             guard generation == lifecycleGeneration, activeTransport === transport else { return false }
             guard response.ok else { throw TransportError.remote(response.error?.code ?? "CLI_ERROR", response.error?.message ?? "Command failed") }
-            if isRead, let object = response.result?.objectValue { cliStatus[sessionId] = object }
+            if isRead, let object = response.result?.objectValue {
+                await syncCLIStatusMetadata(object, for: sessionId)
+            }
             if !isRead {
                 await finishPendingOperation(key: key, machineId: machineId, expectedCommandId: commandId)
                 if action == "recoverCLISession" {
@@ -3632,10 +3650,129 @@ final class WorkspaceStore: ObservableObject {
             return true
         } catch {
             guard generation == lifecycleGeneration else { return false }
-            if !isRead && !isUnknownDelivery(error) { await finishPendingOperation(key: key, machineId: machineId) }
-            if !isRead { cliReceipts[sessionId] = isUnknownDelivery(error) ? "回执未知；重试使用同一命令标识，不自动重发任务。" : "Windows 已明确拒绝本次操作；请查看错误原因。" }
+            let unknown = isUnknownDelivery(error)
+            if !isRead && !unknown { await finishPendingOperation(key: key, machineId: machineId) }
+            if !isRead { cliReceipts[sessionId] = unknown ? "回执未知；重试使用同一命令标识，不自动重发任务。" : "Windows 已明确拒绝本次操作；请查看错误原因。" }
             errors[sessionId] = error.localizedDescription
+            await recordCLIError(from: error, sessionId: sessionId, action: action, unknownDelivery: unknown)
             return false
+        }
+    }
+
+    private func recordCLIError(from error: Error, sessionId: String?, action: String, unknownDelivery: Bool = false) async {
+        let meta = sessionId.flatMap { sid in cliStatus[sid] ?? sessions.first(where: { $0.id == sid })?.cliMetadata }
+        let model = meta?["effectiveModel"]?.stringValue ?? meta?["model"]?.stringValue
+        let host = meta?["upstreamHost"]?.stringValue
+        let label = meta?["upstreamLabel"]?.stringValue
+        var code = unknownDelivery ? "CLI_SEND_DELIVERY_UNKNOWN" : "CLI_ACTION_FAILED"
+        var source = "windows-agent"
+        var needsManual = unknownDelivery
+        if let transportError = error as? TransportError {
+            switch transportError {
+            case .offline, .disconnected:
+                code = "NETWORK_DISCONNECTED"; source = "phone-network"
+            case .timeout:
+                code = "REQUEST_TIMEOUT"; source = "phone-network"
+            case .remote(let remoteCode, _):
+                code = remoteCode
+                if remoteCode.hasPrefix("HTTP_") || remoteCode == "PROVIDER_RATE_LIMITED" || remoteCode == "PROVIDER_UNAVAILABLE" {
+                    source = "model-api"
+                    needsManual = remoteCode == "HTTP_401" || remoteCode == "HTTP_403"
+                }
+            default:
+                break
+            }
+        }
+        let record = CLIErrorRecord.make(
+            code: code,
+            message: "\(action): \(error.localizedDescription)",
+            sessionId: sessionId,
+            model: model,
+            upstreamHost: host,
+            upstreamLabel: label,
+            source: source,
+            needsManualAction: needsManual
+        )
+        await appendCLIErrorRecord(record, for: sessionId)
+    }
+
+    private func appendCLIErrorRecord(_ record: CLIErrorRecord, for sessionId: String?) async {
+        if let sessionId {
+            var rows = cliErrorHistoryBySession[sessionId] ?? []
+            if let idx = rows.firstIndex(where: { $0.id == record.id }) {
+                rows[idx] = record
+            } else {
+                rows.append(record)
+            }
+            rows = Array(rows.suffix(100))
+            cliErrorHistoryBySession[sessionId] = rows
+            try? await cache.put(rows, key: "cli.errors.\(sessionId)")
+        } else {
+            var rows = globalTransportErrors
+            if let idx = rows.firstIndex(where: { $0.id == record.id }) {
+                rows[idx] = record
+            } else {
+                rows.append(record)
+            }
+            rows = Array(rows.suffix(50))
+            globalTransportErrors = rows
+            try? await cache.put(rows, key: "cli.global.errors")
+        }
+    }
+
+    private func markCLIErrorSourceRecovered(_ source: String) async {
+        let nowStr = Date().formatted(.iso8601)
+        var changed = false
+        for idx in globalTransportErrors.indices where globalTransportErrors[idx].source == source && !globalTransportErrors[idx].recovered {
+            globalTransportErrors[idx].recovered = true
+            globalTransportErrors[idx].retrying = false
+            globalTransportErrors[idx].recoveredAt = nowStr
+            changed = true
+        }
+        if changed {
+            try? await cache.put(globalTransportErrors, key: "cli.global.errors")
+        }
+    }
+
+    private func syncCLIStatusMetadata(_ payload: [String: JSONValue], for sessionId: String) async {
+        var merged = cliStatus[sessionId] ?? sessions.first(where: { $0.id == sessionId })?.cliMetadata ?? [:]
+        merged.merge(payload) { _, new in new }
+        cliStatus[sessionId] = merged
+        if let index = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[index].cliMetadata = merged
+            if let model = merged["effectiveModel"]?.stringValue ?? merged["model"]?.stringValue {
+                sessions[index].modelId = model
+            }
+            if let stateStr = merged["cliState"]?.stringValue {
+                let mapped: SessionState
+                switch stateStr {
+                case "running", "calling_tool", "initializing": mapped = .busy
+                case "waiting_approval", "waiting_user": mapped = .waiting
+                case "failed", "rate_limited": mapped = .error
+                case "unknown": mapped = .unknown
+                default: mapped = .idle
+                }
+                sessions[index].state = mapped
+            }
+        }
+        try? await cache.put(merged, key: "cli.status.\(sessionId)")
+        if let historyArray = merged["errorHistory"]?.arrayValue {
+            let fallbackModel = merged["effectiveModel"]?.stringValue ?? merged["model"]?.stringValue
+            let fallbackHost = merged["upstreamHost"]?.stringValue
+            let fallbackLabel = merged["upstreamLabel"]?.stringValue
+            var existing = cliErrorHistoryBySession[sessionId] ?? []
+            for item in historyArray {
+                guard let obj = item.objectValue else { continue }
+                let parsed = CLIErrorRecord.fromJSON(obj, fallbackSessionId: sessionId, fallbackModel: fallbackModel, fallbackHost: fallbackHost, fallbackLabel: fallbackLabel)
+                if let idx = existing.firstIndex(where: { $0.id == parsed.id }) {
+                    existing[idx] = parsed
+                } else {
+                    existing.append(parsed)
+                }
+            }
+            let capped = Array(existing.suffix(100))
+            cliErrorHistoryBySession[sessionId] = capped
+            try? await cache.put(capped, key: "cli.errors.\(sessionId)")
         }
     }
 
@@ -4883,13 +5020,22 @@ final class WorkspaceStore: ObservableObject {
 
     private func applyEvent(_ event: RemoteEvent, suppressTransientPresentation: Bool = false) async {
         if event.type == "CLI_STATUS", let id = event.sessionId {
-            var merged = cliStatus[id] ?? sessions.first(where: { $0.id == id })?.cliMetadata ?? [:]
-            merged.merge(event.payload) { _, new in new }
-            cliStatus[id] = merged
+            await syncCLIStatusMetadata(event.payload, for: id)
             return
         }
         if event.type == "CLI_ERROR", let id = event.sessionId {
             cliStatus[id, default: [:]]["providerError"] = event.payload["providerError"]
+            if let obj = event.payload["providerError"]?.objectValue {
+                let meta = cliStatus[id] ?? sessions.first(where: { $0.id == id })?.cliMetadata
+                let record = CLIErrorRecord.fromJSON(
+                    obj,
+                    fallbackSessionId: id,
+                    fallbackModel: meta?["effectiveModel"]?.stringValue ?? meta?["model"]?.stringValue,
+                    fallbackHost: meta?["upstreamHost"]?.stringValue,
+                    fallbackLabel: meta?["upstreamLabel"]?.stringValue
+                )
+                await appendCLIErrorRecord(record, for: id)
+            }
             return
         }
         if event.type == "TRANSPORT_STATUS" {
@@ -5477,6 +5623,7 @@ final class WorkspaceStore: ObservableObject {
             desktopRelayConnected = event.state == .online
             if event.state == .online {
                 let recovered = systemTransportOfflineChannels.remove("device-relay") != nil
+                Task { await self.markCLIErrorSourceRecovered("relay") }
                 if recovered && !wasOnline && !deferringTransientConnectionPresentation {
                     recentSystemNotice = "手机到 Cloudflare Relay 的连接已恢复；正在核对 Windows Agent 和当前会话。"
                 }
@@ -5484,6 +5631,20 @@ final class WorkspaceStore: ObservableObject {
             }
             if event.state == .connecting { return }
             systemTransportOfflineChannels.insert("device-relay")
+            if event.state == .offline {
+                let relayMsg = event.detail ?? "WebSocket 1006 / Cloudflare Relay 连接中断，正在自动重连。"
+                let is1006 = relayMsg.contains("1006") || (connectionPhase == .reconnecting)
+                let record = CLIErrorRecord.make(
+                    code: is1006 ? "WS_1006" : "RELAY_DISCONNECTED",
+                    message: relayMsg,
+                    at: event.at,
+                    sessionId: nil,
+                    source: "relay",
+                    retrying: true,
+                    needsManualAction: false
+                )
+                Task { await self.appendCLIErrorRecord(record, for: nil) }
+            }
             if machine.state == .online && event.state == .offline {
                 deferTransientConnectionPresentation(graceNanoseconds: Self.relayPresentationGraceNanoseconds)
             }
@@ -5503,6 +5664,7 @@ final class WorkspaceStore: ObservableObject {
             case .online:
                 desktopAgentConnected = true
                 let recovered = systemTransportOfflineChannels.remove("windows-agent") != nil
+                Task { await self.markCLIErrorSourceRecovered("windows-agent") }
                 if machine.state != .online {
                     machine.state = .connecting
                     connectionPhase = .authenticating
@@ -5545,6 +5707,16 @@ final class WorkspaceStore: ObservableObject {
                 connectionPhase = .windowsOffline
                 errors["connection"] = "Windows Agent 离线 — 手机仍连接 Cloudflare Relay，将在电脑恢复后自动补同步。"
                 recentSystemNotice = "Windows Agent 已确认离线；Cloudflare Relay 连接仍会保持，电脑恢复后会自动继续。"
+                let agentRecord = CLIErrorRecord.make(
+                    code: "AGENT_OFFLINE",
+                    message: event.detail ?? "Windows Agent 当前离线，等待恢复后自动同步历史与状态。",
+                    at: event.at,
+                    sessionId: nil,
+                    source: "windows-agent",
+                    retrying: false,
+                    needsManualAction: false
+                )
+                Task { await self.appendCLIErrorRecord(agentRecord, for: nil) }
             }
         }
     }

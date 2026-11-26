@@ -791,12 +791,160 @@ extension ServerMessage {
         var message = ChatMessage(id: messageId, sessionId: sessionId, sequence: nil, role: mappedRole, kind: isCLITool ? .toolEvent : .text, text: content, toolName: nil, toolStatus: nil, detail: nil, attachments: attachments, createdAt: createdAt)
         if isCLITool {
             let tool = (try? JSONSerialization.jsonObject(with: Data(content.utf8))) as? [String: Any]
-            message.toolName = tool?["name"] as? String ?? tool?["type"] as? String ?? "工具记录"
+            let rawName = tool?["name"] as? String ?? tool?["type"] as? String ?? "工具记录"
+            message.toolName = Self.localizedCLIToolTitle(rawName)
             message.detail = content
+            let isError = (tool?["is_error"] as? Bool) == true
             // A historical invocation alone does not prove completion or activity.
-            message.toolStatus = "Recorded"
+            message.toolStatus = isError ? "Failed" : "Recorded"
         }
         message.providerMessageId = externalId
         return message
+    }
+
+    static func localizedCLIToolTitle(_ raw: String) -> String {
+        switch raw.lowercased() {
+        case "bash", "exec_command", "shell_command", "commandexecution", "command_execution":
+            return "命令行执行"
+        case "read", "read_file", "view_file":
+            return "读取文件"
+        case "edit", "write", "apply_patch", "filechange":
+            return "修改文件"
+        case "grep", "glob", "find_by_name", "grep_search":
+            return "检索代码"
+        case "tool_result", "function_call_output", "custom_tool_call_output":
+            return "工具输出"
+        case "function_call", "custom_tool_call":
+            return "工具调用"
+        default:
+            return raw
+        }
+    }
+}
+
+struct CLIErrorRecord: Codable, Identifiable, Hashable {
+    let id: String
+    let code: String
+    let message: String
+    let at: Date?
+    let atString: String
+    let sessionId: String?
+    let model: String?
+    let upstreamHost: String?
+    let upstreamLabel: String?
+    let source: String
+    let retryAfterSeconds: Int?
+    var retrying: Bool
+    var recovered: Bool
+    var recoveredAt: String?
+    let needsManualAction: Bool
+
+    var sourceDisplayName: String {
+        switch source {
+        case "model-api": return "模型 API"
+        case "cli": return "CLI 本身"
+        case "windows-agent": return "Windows Agent"
+        case "relay": return "Relay"
+        case "phone-network": return "手机网络"
+        default: return source
+        }
+    }
+
+    static func redactSensitiveText(_ raw: String) -> String {
+        var text = raw
+        let patterns = [
+            (#"(?i)(?:sk-[A-Za-z0-9._-]{8,}|Bearer\s+[A-Za-z0-9._-]{8,})"#, "[redacted]"),
+            (#"(?i)local-[A-Za-z0-9._-]+-session-[A-Za-z0-9_-]+-slot-\d+"#, "[redacted-session-lease]"),
+            (#"(?i)((?:api[_-]?key|auth[_-]?token|authorization|cookie)\s*[=:]\s*)[^\s,}"';]+"#, "$1[redacted]")
+        ]
+        for (pattern, replacement) in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern) {
+                let range = NSRange(location: 0, length: (text as NSString).length)
+                text = regex.stringByReplacingMatches(in: text, range: range, withTemplate: replacement)
+            }
+        }
+        return text
+    }
+
+    static func make(
+        code: String,
+        message: String,
+        at: Date? = Date(),
+        atString: String? = nil,
+        sessionId: String?,
+        model: String? = nil,
+        upstreamHost: String? = nil,
+        upstreamLabel: String? = nil,
+        source: String,
+        retryAfterSeconds: Int? = nil,
+        retrying: Bool = false,
+        recovered: Bool = false,
+        recoveredAt: String? = nil,
+        needsManualAction: Bool = false
+    ) -> CLIErrorRecord {
+        let cleaned = redactSensitiveText(message)
+        let timestamp = atString ?? (at ?? Date()).formatted(.iso8601)
+        let id = "\(sessionId ?? "global")|\(code)|\(timestamp)|\(cleaned.prefix(80))"
+        return CLIErrorRecord(
+            id: id,
+            code: code,
+            message: cleaned,
+            at: at ?? RemoteAIDate.parse(timestamp),
+            atString: timestamp,
+            sessionId: sessionId,
+            model: model,
+            upstreamHost: upstreamHost,
+            upstreamLabel: upstreamLabel,
+            source: source,
+            retryAfterSeconds: retryAfterSeconds,
+            retrying: retrying,
+            recovered: recovered,
+            recoveredAt: recoveredAt,
+            needsManualAction: needsManualAction
+        )
+    }
+
+    static func fromJSON(_ object: [String: JSONValue], fallbackSessionId: String?, fallbackModel: String? = nil, fallbackHost: String? = nil, fallbackLabel: String? = nil) -> CLIErrorRecord {
+        let code = object["code"]?.stringValue ?? "PROVIDER_ERROR"
+        let msg = object["message"]?.stringValue ?? "未知错误"
+        let atStr = object["at"]?.stringValue ?? Date().formatted(.iso8601)
+        let parsedDate = RemoteAIDate.parse(atStr)
+        let source = object["source"]?.stringValue ?? (code.hasPrefix("HTTP_") ? "model-api" : (code.hasPrefix("AGENT_") ? "windows-agent" : "cli"))
+        let retrySec = object["retryAfterSeconds"]?.intValue.map { Int($0) }
+        return make(
+            code: code,
+            message: msg,
+            at: parsedDate,
+            atString: atStr,
+            sessionId: object["sessionId"]?.stringValue ?? fallbackSessionId,
+            model: object["model"]?.stringValue ?? fallbackModel,
+            upstreamHost: object["upstreamHost"]?.stringValue ?? fallbackHost,
+            upstreamLabel: object["upstreamLabel"]?.stringValue ?? fallbackLabel,
+            source: source,
+            retryAfterSeconds: retrySec,
+            retrying: object["retrying"]?.boolValue == true,
+            recovered: object["recovered"]?.boolValue == true,
+            recoveredAt: object["recoveredAt"]?.stringValue,
+            needsManualAction: object["needsManualAction"]?.boolValue == true
+        )
+    }
+}
+
+extension String {
+    func strippingANSIControlSequences() -> String {
+        guard contains("\u{001B}") || contains("\u{009B}") else { return self }
+        let patterns = [
+            #"\u{001B}\[[0-9;?]*[ -/]*[@-~]"#,
+            #"\u{001B}\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\)"#,
+            #"\u{009B}[0-9;?]*[ -/]*[@-~]"#
+        ]
+        var result = self
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern) {
+                let range = NSRange(location: 0, length: (result as NSString).length)
+                result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "")
+            }
+        }
+        return result
     }
 }

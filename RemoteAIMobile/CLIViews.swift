@@ -51,6 +51,171 @@ enum CLIStateLabel {
         default: return "状态未知"
         }
     }
+
+    static func taskText(_ state: String?) -> String {
+        switch state {
+        case "initializing": return "正在初始化"
+        case "running": return "执行中"
+        case "calling_tool": return "正在调用工具"
+        case "waiting_approval": return "等待审批"
+        case "waiting_user": return "等待用户输入"
+        case "idle": return "空闲"
+        case "completed": return "已完成"
+        case "stopped": return "已停止"
+        case "process_exited": return "CLI 进程已退出"
+        case "failed": return "执行失败"
+        case "rate_limited": return "暂停（请求限流）"
+        case "disconnected": return "连接中断（待核对）"
+        case "recovery_pending": return "等待恢复确认"
+        case "delivery_unknown": return "等待回执确认"
+        default: return "状态未知"
+        }
+    }
+
+    static func connectionText(_ state: String) -> String {
+        switch state {
+        case "Connecting": return "正在连接"
+        case "Connected": return "已连接"
+        case "Reconnecting": return "重连中"
+        case "Disconnected": return "已断开"
+        case "Offline": return "离线"
+        default: return state
+        }
+    }
+
+    static func syncText(_ state: String) -> String {
+        switch state {
+        case "Synchronizing": return "同步中"
+        case "Rate Limited": return "请求限流"
+        case "Retrying": return "重试中"
+        case "Recovery Pending": return "等待恢复确认"
+        case "Delivery Unknown": return "发送回执未知"
+        case "Stale": return "状态已过期"
+        case "Synced": return "已同步"
+        default: return state
+        }
+    }
+
+    static func connectionDimension(
+        machineState: MachineConnectionState,
+        phase: ConnectionDiagnosticPhase,
+        agentConnected: Bool?,
+        relayConnected: Bool?
+    ) -> (code: String, label: String, detail: String, isOnline: Bool) {
+        let code: String
+        switch (machineState, phase) {
+        case (.online, .online), (.online, .loadingRuntimes):
+            code = "Connected"
+        case (_, .reconnecting), (_, .windowsReconnecting):
+            code = "Reconnecting"
+        case (.connecting, _):
+            code = "Connecting"
+        case (_, .relayError), (_, .timedOut):
+            code = "Disconnected"
+        case (.offline, _):
+            code = "Offline"
+        default:
+            code = "Connected"
+        }
+        let pcStatus = agentConnected == true ? "电脑 Agent 在线" : (agentConnected == false ? "电脑 Agent 离线" : "电脑 Agent 待核对")
+        let relayStatus = relayConnected == true ? "Relay 在线" : (relayConnected == false ? "Relay 断开" : "Relay 待核对")
+        return (code, connectionText(code), "\(pcStatus) · \(relayStatus)", code == "Connected")
+    }
+
+    static func syncDimension(
+        cliState: String?,
+        stale: Bool,
+        machineOnline: Bool,
+        automaticRetry: Bool,
+        synchronizing: Bool
+    ) -> (code: String, label: String, isWarning: Bool) {
+        let code: String
+        if cliState == "delivery_unknown" { code = "Delivery Unknown" }
+        else if cliState == "rate_limited" { code = "Rate Limited" }
+        else if cliState == "recovery_pending" { code = "Recovery Pending" }
+        else if automaticRetry { code = "Retrying" }
+        else if stale || !machineOnline { code = "Stale" }
+        else if synchronizing { code = "Synchronizing" }
+        else { code = "Synced" }
+        let warn = ["Delivery Unknown", "Rate Limited", "Recovery Pending", "Retrying", "Stale"].contains(code)
+        return (code, syncText(code), warn)
+    }
+}
+
+enum CLIConversationFormatter {
+    enum DisplayEntry: Identifiable, Equatable {
+        case message(ChatMessage)
+        case toolGroup(id: String, items: [ChatMessage])
+
+        var id: String {
+            switch self {
+            case .message(let m): return "msg-\(m.id)"
+            case .toolGroup(let id, _): return id
+            }
+        }
+    }
+
+    static func groupMessages(_ rows: [ChatMessage], search: String, showTechnicalLogs: Bool) -> [DisplayEntry] {
+        var dedupedTools = Set<String>()
+        let filtered = rows.filter { row in
+            if row.kind == .toolEvent {
+                let toolKey = "\(row.id)|\(row.toolName ?? "")|\(row.toolStatus ?? "")|\(row.detail ?? "")"
+                if !dedupedTools.insert(toolKey).inserted { return false }
+            }
+            if search.isEmpty { return true }
+            return row.text.localizedCaseInsensitiveContains(search)
+                || row.detail?.localizedCaseInsensitiveContains(search) == true
+                || row.toolName?.localizedCaseInsensitiveContains(search) == true
+        }
+        var entries: [DisplayEntry] = []
+        var toolBuffer: [ChatMessage] = []
+        func flushTools() {
+            guard !toolBuffer.isEmpty else { return }
+            if showTechnicalLogs {
+                for item in toolBuffer { entries.append(.message(item)) }
+            } else {
+                let groupId = "tool-group-\(toolBuffer.first!.id)-\(toolBuffer.count)"
+                entries.append(.toolGroup(id: groupId, items: toolBuffer))
+            }
+            toolBuffer.removeAll(keepingCapacity: true)
+        }
+        for row in filtered {
+            if row.kind == .toolEvent {
+                toolBuffer.append(row)
+            } else {
+                flushTools()
+                entries.append(.message(row))
+            }
+        }
+        flushTools()
+        return entries
+    }
+
+    static func roleDisplayName(_ role: MessageRole, runtimeKind: RuntimeKind) -> String {
+        switch role {
+        case .user: return "你"
+        case .assistant: return runtimeKind.displayName
+        case .system: return "系统"
+        case .tool: return "技术日志"
+        }
+    }
+
+    static func readableTime(_ date: Date?) -> String {
+        guard let date else { return "未知" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "MM-dd HH:mm:ss"
+        return formatter.string(from: date)
+    }
+
+    static func readableISOTime(_ raw: String?) -> String? {
+        guard let raw, let parsed = RemoteAIDate.parse(raw) else { return raw }
+        return readableTime(parsed)
+    }
+
+    static func cleanNaturalText(_ raw: String) -> String {
+        CLIErrorRecord.redactSensitiveText(raw.strippingANSIControlSequences())
+    }
 }
 
 struct CLIRuntimeView: View {
@@ -59,11 +224,26 @@ struct CLIRuntimeView: View {
     @State private var search = ""
     @State private var activeSheet: CLIRuntimeSheet?
     private var instances: [InstanceDescriptor] { store.instances.filter { $0.runtimeId == runtime.id && $0.config["cliMobile"]?.boolValue == true } }
+    private var connectionSummary: (code: String, label: String, detail: String, isOnline: Bool) {
+        CLIStateLabel.connectionDimension(
+            machineState: store.machine.state,
+            phase: store.connectionPhase,
+            agentConnected: store.desktopAgentConnected,
+            relayConnected: store.desktopRelayConnected
+        )
+    }
     var body: some View {
         List {
             Section {
-                Text("桌面会话先按原身份观察；旧进程退出后可恢复同一会话。RemoteAI 托管会话支持指令、审批和停止。")
-                    .font(.footnote).foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("连接：\(connectionSummary.label)（\(connectionSummary.code)）")
+                        .font(.subheadline).fontWeight(.semibold)
+                        .foregroundColor(connectionSummary.isOnline ? .green : .orange)
+                    Text(connectionSummary.detail)
+                        .font(.caption).foregroundColor(.secondary)
+                    Text("桌面会话先按原身份观察；旧进程退出后可恢复同一会话。RemoteAI 托管会话支持指令、审批和停止。")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
                 ForEach(instances.filter(\.isManagedCLI)) { instance in
                     VStack(alignment: .leading, spacing: 8) {
                         Button { activeSheet = .create(instance) } label: { Label("新建 \(runtime.kind.displayName) 会话", systemImage: "plus.circle") }
@@ -86,15 +266,7 @@ struct CLIRuntimeView: View {
                         DisclosureGroup(group.path) {
                             ForEach(group.sessions.filter { search.isEmpty || $0.title.localizedCaseInsensitiveContains(search) || group.path.localizedCaseInsensitiveContains(search) }) { session in
                                 NavigationLink(destination: CLIConversationView(runtime: runtime, instance: instance, session: session)) {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(session.title)
-                                        if let pid = session.cliMetadata?["pid"]?.intValue {
-                                            Text("PID \(pid) · \(session.threadId.map { String($0.prefix(8)) } ?? "原生身份待确认")").font(.caption2).foregroundColor(.secondary)
-                                        }
-                                        Text("\(session.cliMetadata?["controlMode"]?.stringValue == "managed" ? "可控制" : "只读") · \(CLIStateLabel.text(session.cliMetadata?["cliState"]?.stringValue))")
-                                            .font(.caption).foregroundColor(.secondary)
-                                        if let model = session.modelId { Text(model).font(.caption2) }
-                                    }.padding(.vertical, 4)
+                                    CLISessionRowView(session: session, store: store)
                                 }
                             }
                         }
@@ -121,6 +293,61 @@ struct CLIRuntimeView: View {
     private func refresh() async {
         await store.refreshRuntime(runtime)
         for instance in instances { await store.refreshSessions(runtime: runtime, instance: instance) }
+    }
+}
+
+struct CLISessionRowView: View {
+    let session: SessionDescriptor
+    @ObservedObject var store: WorkspaceStore
+
+    private var meta: [String: JSONValue] { store.cliStatus[session.id] ?? session.cliMetadata ?? [:] }
+    private var cliState: String? { meta["cliState"]?.stringValue }
+    private var stale: Bool { meta["stale"]?.boolValue == true || store.machine.state != .online }
+    private var syncInfo: (code: String, label: String, isWarning: Bool) {
+        CLIStateLabel.syncDimension(
+            cliState: cliState,
+            stale: stale,
+            machineOnline: store.machine.state == .online,
+            automaticRetry: meta["automaticProviderRetry"]?.boolValue == true,
+            synchronizing: false
+        )
+    }
+    private var unrecoveredErrorCount: Int {
+        (store.cliErrorHistoryBySession[session.id] ?? []).filter { !$0.recovered }.count
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(session.title).lineLimit(2)
+                Spacer()
+                if unrecoveredErrorCount > 0 {
+                    Text("异常 \(unrecoveredErrorCount)")
+                        .font(.caption2).padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.red.opacity(0.15)).foregroundColor(.red).cornerRadius(6)
+                }
+            }
+            if let pid = meta["pid"]?.intValue {
+                Text("PID \(pid) · \(session.threadId.map { String($0.prefix(8)) } ?? "原生身份待确认")")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+            Text("\(meta["controlMode"]?.stringValue == "managed" ? "可控制" : "只读") · 任务：\(CLIStateLabel.taskText(cliState)) · 同步：\(syncInfo.label)")
+                .font(.caption)
+                .foregroundColor(syncInfo.isWarning ? .orange : .secondary)
+            if let stage = meta["progressStage"]?.stringValue, !stage.isEmpty {
+                Text("阶段：\(stage)").font(.caption2).foregroundColor(.secondary)
+            }
+            let modelText = meta["effectiveModel"]?.stringValue ?? meta["model"]?.stringValue ?? session.modelId
+            let hostText = meta["upstreamLabel"]?.stringValue ?? meta["upstreamHost"]?.stringValue
+            if modelText != nil || hostText != nil {
+                Text([modelText, hostText].compactMap { $0 }.joined(separator: " · "))
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+            if let timeText = CLIConversationFormatter.readableISOTime(meta["lastProgressAt"]?.stringValue ?? meta["lastObservedAt"]?.stringValue) {
+                Text(stale ? "最后更新：\(timeText)（状态可能过期）" : "最新输出：\(timeText)")
+                    .font(.caption2).foregroundColor(stale ? .orange : .secondary)
+            }
+        }.padding(.vertical, 4)
     }
 }
 
@@ -633,6 +860,9 @@ struct CLIConversationView: View {
     @State private var showProcessDetails = false
     @State private var showNativeRecovery = false
     @State private var showNextCall = false
+    @State private var showTechnicalLogs = false
+    @State private var showErrorSheet = false
+    @State private var expandedToolGroups = Set<String>()
     @State private var userAnswer = ""
     @State private var followsLatest = true
     private var snapshot: [String: JSONValue] { store.cliStatus[session.id] ?? session.cliMetadata ?? [:] }
@@ -641,33 +871,122 @@ struct CLIConversationView: View {
             || (instance.id == "codex.remoteai" && instance.runtimeId == runtime.id && runtime.kind == .codex)
     }
     private var controllable: Bool { managedRuntime && snapshot["controlMode"]?.stringValue == "managed" }
-    private var active: Bool { ["initializing", "running", "calling_tool", "waiting_approval", "waiting_user"].contains(snapshot["cliState"]?.stringValue ?? "") }
+    private var cliState: String? { snapshot["cliState"]?.stringValue }
+    private var active: Bool { ["initializing", "running", "calling_tool", "waiting_approval", "waiting_user"].contains(cliState ?? "") }
     private var approvals: [CLIApproval] { (try? snapshot["pendingApprovals"]?.decode([CLIApproval].self)) ?? [] }
-    private var messages: [ChatMessage] {
+    private var isStale: Bool { snapshot["stale"]?.boolValue == true || store.machine.state != .online }
+    private var connectionInfo: (code: String, label: String, detail: String, isOnline: Bool) {
+        CLIStateLabel.connectionDimension(
+            machineState: store.machine.state,
+            phase: store.connectionPhase,
+            agentConnected: store.desktopAgentConnected,
+            relayConnected: store.desktopRelayConnected
+        )
+    }
+    private var syncInfo: (code: String, label: String, isWarning: Bool) {
+        CLIStateLabel.syncDimension(
+            cliState: cliState,
+            stale: isStale,
+            machineOnline: store.machine.state == .online,
+            automaticRetry: snapshot["automaticProviderRetry"]?.boolValue == true,
+            synchronizing: false
+        )
+    }
+    private var combinedErrors: [CLIErrorRecord] {
+        var rows = store.cliErrorHistoryBySession[session.id] ?? []
+        if let rawHistory = snapshot["errorHistory"]?.arrayValue {
+            let fallbackModel = snapshot["effectiveModel"]?.stringValue ?? snapshot["model"]?.stringValue
+            let fallbackHost = snapshot["upstreamHost"]?.stringValue
+            let fallbackLabel = snapshot["upstreamLabel"]?.stringValue
+            for item in rawHistory {
+                guard let obj = item.objectValue else { continue }
+                let rec = CLIErrorRecord.fromJSON(obj, fallbackSessionId: session.id, fallbackModel: fallbackModel, fallbackHost: fallbackHost, fallbackLabel: fallbackLabel)
+                if !rows.contains(where: { $0.id == rec.id }) { rows.append(rec) }
+            }
+        }
+        if let errObj = snapshot["providerError"]?.objectValue {
+            let rec = CLIErrorRecord.fromJSON(
+                errObj,
+                fallbackSessionId: session.id,
+                fallbackModel: snapshot["effectiveModel"]?.stringValue ?? snapshot["model"]?.stringValue,
+                fallbackHost: snapshot["upstreamHost"]?.stringValue,
+                fallbackLabel: snapshot["upstreamLabel"]?.stringValue
+            )
+            if !rows.contains(where: { $0.id == rec.id }) { rows.append(rec) }
+        }
+        for globalErr in store.globalTransportErrors {
+            if !rows.contains(where: { $0.id == globalErr.id }) { rows.append(globalErr) }
+        }
+        return rows.sorted { ($0.at ?? .distantPast) > ($1.at ?? .distantPast) }
+    }
+    private var activeErrors: [CLIErrorRecord] { combinedErrors.filter { !$0.recovered } }
+    private var rawMessages: [ChatMessage] {
         let rows = store.messagesBySession[session.id] ?? []
         let canonicalTools = Set(rows.filter { $0.id.hasPrefix("cli-tool-") }.map { "tool-\(session.id)-\($0.id)" })
-        return rows.filter { !canonicalTools.contains($0.id) && (search.isEmpty || $0.text.localizedCaseInsensitiveContains(search) || $0.detail?.localizedCaseInsensitiveContains(search) == true) }.map { row in
+        return rows.filter { !canonicalTools.contains($0.id) }.map { row in
             if row.role == .tool, row.id.hasPrefix("cli-tool-"), row.kind != .toolEvent {
                 return ServerMessage(messageId: row.id, sessionId: row.sessionId, role: "tool", content: row.text, externalId: nil, createdAt: row.createdAt).chatMessage
             }
             return row
         }
     }
+    private var displayEntries: [CLIConversationFormatter.DisplayEntry] {
+        CLIConversationFormatter.groupMessages(rawMessages, search: search, showTechnicalLogs: showTechnicalLogs)
+    }
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 5) {
-                Text(snapshot["sessionTitle"]?.stringValue ?? session.title).font(.headline).lineLimit(2).textSelection(.enabled)
-                Text("\(controllable ? "可控制" : "只读") · \(CLIStateLabel.text(snapshot["cliState"]?.stringValue))").font(.headline)
-                Text(session.workingDirectory ?? "工作目录未知").font(.caption).textSelection(.enabled)
-                Text("模型：\(snapshot["effectiveModel"]?.stringValue ?? snapshot["model"]?.stringValue ?? "待确认") · \(snapshot["upstreamHost"]?.stringValue ?? "Windows CLI 配置")").font(.caption2)
-                if let at = snapshot["lastObservedAt"]?.stringValue { Text("Windows 观测 UTC：\(at)").font(.caption2).foregroundColor(.secondary) }
-                if snapshot["stale"]?.boolValue == true || store.machine.state != .online { Text("观测已过期，等待重新连接；保留已有输出。").font(.caption).foregroundColor(.orange) }
+                HStack(alignment: .top) {
+                    Text(snapshot["sessionTitle"]?.stringValue ?? session.title).font(.headline).lineLimit(2).textSelection(.enabled)
+                    Spacer(minLength: 8)
+                    Text(controllable ? "可控制" : "只读")
+                        .font(.caption2).padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(controllable ? Color.blue.opacity(0.15) : Color.secondary.opacity(0.15))
+                        .foregroundColor(controllable ? .blue : .secondary)
+                        .cornerRadius(6)
+                }
+                Text("连接：\(connectionInfo.label)（\(connectionInfo.detail)）")
+                    .font(.caption).foregroundColor(connectionInfo.isOnline ? .green : .orange)
+                HStack(spacing: 6) {
+                    Text("任务：\(CLIStateLabel.taskText(cliState))")
+                        .font(.subheadline).fontWeight(.semibold)
+                    if let stage = snapshot["progressStage"]?.stringValue, !stage.isEmpty {
+                        Text("· \(stage)").font(.caption).foregroundColor(.secondary)
+                    }
+                }
+                Text("同步：\(syncInfo.label)（\(syncInfo.code)）")
+                    .font(.caption).foregroundColor(syncInfo.isWarning ? .orange : .secondary)
+                if let progressTime = CLIConversationFormatter.readableISOTime(snapshot["lastProgressAt"]?.stringValue) {
+                    Text("最新输出时间：\(progressTime)").font(.caption2).foregroundColor(.secondary)
+                }
+                if let observedTime = CLIConversationFormatter.readableISOTime(snapshot["lastObservedAt"]?.stringValue) {
+                    Text(isStale ? "状态已过期 · 最后更新：\(observedTime)" : "最近观测：\(observedTime)")
+                        .font(.caption2).foregroundColor(isStale ? .orange : .secondary)
+                }
+                Text(session.workingDirectory ?? "工作目录未知").font(.caption).foregroundColor(.secondary).textSelection(.enabled)
+                Text("模型：\(snapshot["effectiveModel"]?.stringValue ?? snapshot["model"]?.stringValue ?? "待确认") · \(snapshot["upstreamLabel"]?.stringValue ?? snapshot["upstreamHost"]?.stringValue ?? "Windows CLI 配置")").font(.caption2)
+                if isStale {
+                    Text(snapshot["staleReason"]?.stringValue ?? "观测已过期，等待重新连接；保留已有输出与错误历史。").font(.caption).foregroundColor(.orange)
+                }
                 if !controllable { Text(snapshot["controlReason"]?.stringValue ?? "现有进程未开放安全控制接口。").font(.caption).foregroundColor(.secondary) }
                 if let reason = snapshot["unknownReason"]?.stringValue { Text(reason).font(.caption).foregroundColor(.orange) }
                 if !controllable {
                     Button(snapshot["interruptedManaged"]?.boolValue == true ? "验证旧进程退出并恢复连接" : "旧进程退出后恢复此会话") {
                         if snapshot["interruptedManaged"]?.boolValue == true { confirmRecovery = true } else { showNativeRecovery = true }
                     }.disabled(store.machine.state != .online || recoveryBusy)
+                }
+                HStack {
+                    Toggle("展开技术日志", isOn: $showTechnicalLogs).font(.caption)
+                    Spacer()
+                    if !combinedErrors.isEmpty {
+                        Button("错误记录（\(combinedErrors.count)）") { showErrorSheet = true }
+                            .font(.caption)
+                            .foregroundColor(activeErrors.isEmpty ? .secondary : .red)
+                    }
+                }
+                if let latestActive = activeErrors.first {
+                    CLIErrorCard(error: latestActive, compact: true)
+                        .onTapGesture { showErrorSheet = true }
                 }
                 DisclosureGroup("进程详细信息", isExpanded: $showProcessDetails) {
                     VStack(alignment: .leading, spacing: 6) {
@@ -689,34 +1008,55 @@ struct CLIConversationView: View {
                             .font(.caption2).foregroundColor(.secondary)
                     }.font(.caption)
                 }
-                if let error = snapshot["providerError"]?.objectValue {
-                    DisclosureGroup("错误 \(error["code"]?.stringValue ?? "")") { Text(error["message"]?.stringValue ?? "").textSelection(.enabled); Text(error["at"]?.stringValue ?? "").font(.caption2) }.foregroundColor(.red)
-                }
-                if let history = snapshot["errorHistory"]?.arrayValue, !history.isEmpty {
-                    DisclosureGroup("错误历史（\(history.count)）") {
-                        ForEach(Array(history.enumerated()), id: \.offset) { _, item in
-                            if let error = item.objectValue {
-                                VStack(alignment: .leading) {
-                                    Text("\(error["code"]?.stringValue ?? "") · \(error["at"]?.stringValue ?? "")").font(.caption2)
-                                    Text(error["message"]?.stringValue ?? "").font(.caption).textSelection(.enabled)
-                                }
-                            }
-                        }
-                    }
-                }
-            }.frame(maxWidth: .infinity, alignment: .leading).padding()
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal).padding(.vertical, 8)
             ScrollViewReader { proxy in
             List {
                 if store.hasMoreBySession[session.id] != false {
                     Button("加载更早记录") { followsLatest = false; Task { await store.loadOlder(session.id) } }
                 }
-                ForEach(messages) { message in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("\(message.role.rawValue) · \(message.createdAt.formatted(.iso8601))").font(.caption2).foregroundColor(.secondary)
-                        if message.kind == .toolEvent {
-                            DisclosureGroup(message.toolName ?? "工具调用") { Text(message.toolCardCopyText).font(.system(.caption, design: .monospaced)).textSelection(.enabled) }
-                        } else { Text(message.text).textSelection(.enabled) }
-                    }.id(message.id).contextMenu { Button("复制") { UIPasteboard.general.string = message.kind == .toolEvent ? message.toolCardCopyText : message.text } }
+                ForEach(displayEntries) { entry in
+                    switch entry {
+                    case .toolGroup(let groupId, let items):
+                        DisclosureGroup(
+                            isExpanded: Binding(
+                                get: { expandedToolGroups.contains(groupId) },
+                                set: { if $0 { expandedToolGroups.insert(groupId) } else { expandedToolGroups.remove(groupId) } }
+                            )
+                        ) {
+                            ForEach(items) { toolItem in
+                                DisclosureGroup("\(toolItem.toolName ?? "工具记录") · \(CLIConversationFormatter.readableTime(toolItem.createdAt))") {
+                                    Text(CLIConversationFormatter.cleanNaturalText(toolItem.toolCardCopyText))
+                                        .font(.system(.caption, design: .monospaced))
+                                        .textSelection(.enabled)
+                                }
+                            }
+                        } label: {
+                            let summaryNames = Array(Set(items.compactMap(\.toolName))).prefix(3).joined(separator: "、")
+                            Text("技术日志（\(items.count) 条：\(summaryNames.isEmpty ? "工具执行" : summaryNames)）")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                        .id(entry.id)
+                    case .message(let message):
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("\(CLIConversationFormatter.roleDisplayName(message.role, runtimeKind: runtime.kind)) · \(CLIConversationFormatter.readableTime(message.createdAt))")
+                                .font(.caption2).foregroundColor(.secondary)
+                            if message.kind == .toolEvent {
+                                DisclosureGroup("\(message.toolName ?? "工具记录") · \(message.toolStatus ?? "Recorded")") {
+                                    Text(CLIConversationFormatter.cleanNaturalText(message.toolCardCopyText))
+                                        .font(.system(.caption, design: .monospaced))
+                                        .textSelection(.enabled)
+                                }
+                            } else {
+                                Text(CLIConversationFormatter.cleanNaturalText(message.text)).textSelection(.enabled)
+                            }
+                        }.id(entry.id).contextMenu {
+                            Button("复制") {
+                                UIPasteboard.general.string = message.kind == .toolEvent
+                                    ? CLIConversationFormatter.cleanNaturalText(message.toolCardCopyText)
+                                    : CLIConversationFormatter.cleanNaturalText(message.text)
+                            }
+                        }
+                    }
                 }
                 if controllable {
                     ForEach(approvals) { item in
@@ -747,22 +1087,22 @@ struct CLIConversationView: View {
             }.listStyle(.plain)
                 .simultaneousGesture(DragGesture().onChanged { _ in followsLatest = false })
                 .onAppear {
-                    if followsLatest, let id = messages.last?.id { proxy.scrollTo(id, anchor: .bottom) }
+                    if followsLatest, let id = displayEntries.last?.id { proxy.scrollTo(id, anchor: .bottom) }
                 }
-                .onChange(of: messages.last?.id) { id in
+                .onChange(of: displayEntries.last?.id) { id in
                     if followsLatest, search.isEmpty, let id { proxy.scrollTo(id, anchor: .bottom) }
                 }
                 .overlay(alignment: .bottomTrailing) {
                     if !followsLatest && search.isEmpty {
                         Button("最新输出") {
                             followsLatest = true
-                            if let id = messages.last?.id { proxy.scrollTo(id, anchor: .bottom) }
+                            if let id = displayEntries.last?.id { proxy.scrollTo(id, anchor: .bottom) }
                         }.buttonStyle(.bordered).padding(8)
                     }
                 }
             }
             if let receipt = store.cliReceipts[session.id] { Text(receipt).font(.caption).padding(6) }
-            if let error = store.errors[session.id] { Text(error).font(.caption).foregroundColor(.red).padding(6) }
+            if let error = store.errors[session.id] { Text(CLIErrorRecord.redactSensitiveText(error)).font(.caption).foregroundColor(.red).padding(6) }
             if controllable {
                 HStack(alignment: .bottom) {
                     TextEditor(text: $text).frame(minHeight: 44, maxHeight: 100)
@@ -818,10 +1158,19 @@ struct CLIConversationView: View {
             CLINativeRecoveryView(runtime: runtime, instance: instance, session: session).environmentObject(store)
         }
         .sheet(isPresented: $showNextCall) { CLINextCallView(runtime: runtime, instance: instance, session: session).environmentObject(store) }
+        .sheet(isPresented: $showErrorSheet) { CLIErrorHistorySheet(sessionTitle: snapshot["sessionTitle"]?.stringValue ?? session.title, errors: combinedErrors) }
         .alert("允许当前会话执行这次工具调用？", isPresented: Binding(get: { approval != nil }, set: { if !$0 { approval = nil } })) {
             Button("取消", role: .cancel) { approval = nil }
             Button("允许一次") { if let item = approval { Task { await respond(item, decision: "allow") } }; approval = nil }
         } message: { Text(approval?.summary ?? "") }
+        .onChange(of: store.machine.state) { newState in
+            if newState == .online {
+                Task {
+                    await refresh()
+                    await store.loadSession(session.id, preferCache: false)
+                }
+            }
+        }
         .task {
             await store.loadSession(session.id)
             while !Task.isCancelled {
@@ -853,5 +1202,84 @@ struct CLIConversationView: View {
     private func respond(_ item: CLIApproval, decision: String) async {
         _ = await store.cliAction(runtime: runtime, instance: instance, sessionId: session.id, action: "respondApproval", payload: ["requestId": .string(item.requestId), "decision": .string(decision)])
         await refresh()
+    }
+}
+
+struct CLIErrorCard: View {
+    let error: CLIErrorRecord
+    var compact: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(error.code).font(.caption).fontWeight(.semibold).foregroundColor(error.recovered ? .secondary : .red)
+                Text("来源：\(error.sourceDisplayName)")
+                    .font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.14)).cornerRadius(4)
+                Spacer()
+                if error.recovered {
+                    Text("已恢复").font(.caption2).foregroundColor(.green)
+                } else if error.retrying {
+                    Text("正在重试").font(.caption2).foregroundColor(.orange)
+                } else if error.needsManualAction {
+                    Text("需人工处理").font(.caption2).foregroundColor(.red)
+                }
+            }
+            Text(error.message)
+                .font(.caption)
+                .lineLimit(compact ? 2 : nil)
+                .textSelection(.enabled)
+            HStack(spacing: 8) {
+                if let time = CLIConversationFormatter.readableISOTime(error.atString) {
+                    Text("时间：\(time)")
+                }
+                if let wait = error.retryAfterSeconds {
+                    Text("等待重试：\(wait) 秒")
+                }
+            }
+            .font(.caption2).foregroundColor(.secondary)
+            if !compact {
+                let modelText = [error.model, error.upstreamLabel ?? error.upstreamHost].compactMap { $0 }.joined(separator: " · ")
+                if !modelText.isEmpty {
+                    Text("模型/中转站：\(modelText)").font(.caption2).foregroundColor(.secondary)
+                }
+                if let sid = error.sessionId {
+                    Text("会话：\(sid)").font(.caption2).foregroundColor(.secondary)
+                }
+                if let recoveredAt = error.recoveredAt, let time = CLIConversationFormatter.readableISOTime(recoveredAt) {
+                    Text("恢复时间：\(time)").font(.caption2).foregroundColor(.green)
+                }
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background((error.recovered ? Color.secondary : Color.red).opacity(0.08))
+        .cornerRadius(8)
+    }
+}
+
+struct CLIErrorHistorySheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let sessionTitle: String
+    let errors: [CLIErrorRecord]
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section {
+                    Text("真实错误独立保留，不会因折叠技术日志而隐藏，恢复与重进后仍可查看。").font(.caption).foregroundColor(.secondary)
+                }
+                ForEach(errors) { item in
+                    CLIErrorCard(error: item, compact: false)
+                }
+            }
+            .navigationTitle("错误记录 · \(sessionTitle)")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { dismiss() }
+                }
+            }
+        }
     }
 }
