@@ -872,10 +872,10 @@ extension Transport {
         let safeLimit = max(1, min(limit, 100))
         var payload: [String: JSONValue] = ["limit": .number(Double(safeLimit))]
         if runtimeId == "runtime.web" && !preferCache { payload["preferCache"] = .bool(false) }
-        let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "loadRecentMessages", payload: payload)
-        let response = try await requireSuccess(execute(command))
+        let (response, pageLimit) = try await executeHistoryRead(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "loadRecentMessages", payload: payload, limit: safeLimit)
         let items = try response.decode([ServerMessage].self).map(\.chatMessage)
-        return Page(items: items, beforeCursor: items.first?.cursor, hasMore: items.count == safeLimit)
+        guard items.count <= pageLimit else { throw TransportError.malformedData }
+        return Page(items: items, beforeCursor: items.first?.cursor, hasMore: items.count == pageLimit)
     }
 
     func loadBefore(machineId: String, runtimeId: String, instanceId: String, sessionId: String, before: MessageCursor, limit: Int) async throws -> Page<ChatMessage> {
@@ -884,12 +884,36 @@ extension Transport {
         let beforeValue = try JSONValue.encode(before)
         var payload: [String: JSONValue] = ["before": beforeValue, "limit": .number(Double(safeLimit))]
         if runtimeId == "runtime.web" { payload["historyProofV1"] = .bool(true) }
-        let command = RemoteCommand.make(
-            machineId: machineId, runtimeId: runtimeId, instanceId: instanceId,
-            sessionId: sessionId, action: "loadMessagesBefore", payload: payload
-        )
-        let response = try await requireSuccess(execute(command))
-        return try OlderHistoryProofCodec.decode(response, runtimeId: runtimeId, limit: safeLimit)
+        let (response, pageLimit) = try await executeHistoryRead(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: "loadMessagesBefore", payload: payload, limit: safeLimit)
+        return try OlderHistoryProofCodec.decode(response, runtimeId: runtimeId, limit: pageLimit)
+    }
+
+    private func executeHistoryRead(machineId: String, runtimeId: String, instanceId: String, sessionId: String, action: String, payload: [String: JSONValue], limit: Int) async throws -> (JSONValue, Int) {
+        let cliRead = (runtimeId == "runtime.codex" || runtimeId == "runtime.cloudcode")
+            && (action == "loadRecentMessages" || action == "loadMessagesBefore")
+        var pageLimit = limit
+        while true {
+            try Task.checkCancellation()
+            var request = payload
+            request["limit"] = .number(Double(pageLimit))
+            let command = RemoteCommand.make(machineId: machineId, runtimeId: runtimeId, instanceId: instanceId, sessionId: sessionId, action: action, payload: request)
+            do {
+                return (try await requireSuccess(execute(command)), pageLimit)
+            } catch {
+                // Build93's Agent reports an oversized encrypted response as
+                // INTERNAL_ERROR. A 219 KB tool page exceeds its 256 KiB frame
+                // after base64 encoding. Retry only this read, with the same
+                // cursor and a strictly smaller page; never retry a write or
+                // a timeout/disconnection. At most seven attempts (100 -> 1).
+                guard cliRead, pageLimit > 1, let transportError = error as? TransportError else { throw error }
+                switch transportError {
+                case .frameTooLarge, .remote("INTERNAL_ERROR", _):
+                    pageLimit = max(1, pageLimit / 2)
+                default:
+                    throw error
+                }
+            }
+        }
     }
 
     func delta(machineId: String, after sequence: Int64, limit: Int = 100) async throws -> DeltaSyncResult {

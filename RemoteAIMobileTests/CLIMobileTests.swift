@@ -2,6 +2,58 @@ import XCTest
 @testable import RemoteAIMobile
 
 final class CLIMobileTests: XCTestCase {
+    func testLargeCLIToolPagesCrossRelayLimitWithoutLosingHistory() async throws {
+        let mock = MockTransport(historyCount: 0)
+        let transport = BoundedCLIHistoryTransport(base: mock)
+        try await transport.connect()
+        let at = Date(timeIntervalSince1970: 1_790_000_000)
+        let rows = (0..<55).map { index in
+            ServerMessage(messageId: String(format: "cli-tool-%04d", index), sessionId: "large-cli",
+                          role: "tool", content: String(repeating: "large command output ", count: 550) + "\(index)",
+                          externalId: nil, createdAt: at)
+        }
+        for row in rows { await mock.appendHistoryMessage(row) }
+        var page = try await transport.loadRecent(machineId: "my-pc", runtimeId: "runtime.codex", instanceId: "codex.6", sessionId: "large-cli", limit: 50)
+        var received = page.items
+        var pages = 1
+        while page.hasMore && pages < 12 {
+            let cursor = try XCTUnwrap(page.beforeCursor)
+            page = try await transport.loadBefore(machineId: "my-pc", runtimeId: "runtime.codex", instanceId: "codex.6", sessionId: "large-cli", before: cursor, limit: 40)
+            received = page.items + received
+            pages += 1
+        }
+        XCTAssertFalse(page.hasMore)
+        XCTAssertEqual(received.map(\.id), rows.map(\.messageId))
+        XCTAssertEqual(received.map(\.text), rows.map(\.content))
+        XCTAssertEqual(Set(received.map(\.id)).count, rows.count)
+        let rejected = await transport.rejectedPages
+        XCTAssertGreaterThan(rejected, 0)
+        let writes = await transport.writeCount
+        XCTAssertEqual(writes, 0)
+    }
+
+    func testCLIHistoryReadDoesNotRetryDisconnectionOrWebErrors() async throws {
+        for (runtime, failure) in [("runtime.codex", TransportError.disconnected), ("runtime.codex", .timeout), ("runtime.codex", .malformedData), ("runtime.web", .remote("INTERNAL_ERROR", "Internal error"))] {
+            let transport = BoundedCLIHistoryTransport(base: MockTransport(historyCount: 0), failure: failure)
+            do {
+                _ = try await transport.loadRecent(machineId: "my-pc", runtimeId: runtime, instanceId: "codex.6", sessionId: "large-cli", limit: 50)
+                XCTFail("Expected read failure")
+            } catch { XCTAssertEqual(error as? TransportError, failure) }
+            let attempts = await transport.readAttempts
+            XCTAssertEqual(attempts, 1)
+        }
+    }
+
+    func testSingleOversizedCLIRecordTerminatesBoundedRead() async throws {
+        let transport = BoundedCLIHistoryTransport(base: MockTransport(historyCount: 0), failure: .remote("INTERNAL_ERROR", "Internal error"))
+        do {
+            _ = try await transport.loadRecent(machineId: "my-pc", runtimeId: "runtime.cloudcode", instanceId: "cloudcode.remoteai", sessionId: "large-cli", limit: 100)
+            XCTFail("Expected oversized record failure")
+        } catch { XCTAssertEqual(error as? TransportError, .remote("INTERNAL_ERROR", "Internal error")) }
+        let attempts = await transport.readAttempts
+        XCTAssertEqual(attempts, 7)
+    }
+
     @MainActor
     func testSparseCLICacheDoesNotSkipMiddleHistoryOrSameTimestampRows() async throws {
         let mock = MockTransport(historyCount: 0)
@@ -118,5 +170,39 @@ final class CLIMobileTests: XCTestCase {
         XCTAssertEqual(upstream.availabilityReason, "session-scoped credential cannot be reused")
         XCTAssertFalse(upstream.canEdit)
         XCTAssertTrue(upstream.canRemove)
+    }
+}
+
+private actor BoundedCLIHistoryTransport: Transport {
+    let base: MockTransport
+    let failure: TransportError?
+    private(set) var rejectedPages = 0
+    private(set) var readAttempts = 0
+    private(set) var writeCount = 0
+    init(base: MockTransport, failure: TransportError? = nil) { self.base = base; self.failure = failure }
+    var isConnected: Bool { get async { await base.isConnected } }
+    func connect() async throws { try await base.connect() }
+    func disconnect() async { await base.disconnect() }
+    func eventStream() async -> AsyncStream<RemoteEvent> { await base.eventStream() }
+    func healthStream() async -> AsyncStream<TransportHealthEvent> { await base.healthStream() }
+    func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
+        let historyRead = ["loadRecentMessages", "loadMessagesBefore"].contains(command.action)
+        if historyRead {
+            readAttempts += 1
+            if let failure { throw failure }
+        } else { writeCount += 1 }
+        let response = try await base.execute(command)
+        if historyRead {
+            let payload = JSONValue.object(["kind": .string("commandResponse"), "commandId": .string(command.commandId.uuidString), "response": try JSONValue.encode(response)])
+            let plaintextBytes = try JSONEncoder.remoteAI.encode(payload).count
+            let encryptedFrameBytes = ((plaintextBytes + 2) / 3) * 4 + 1024
+            if encryptedFrameBytes > 256 * 1024 {
+                rejectedPages += 1
+                return CommandResponseEnvelope(ok: false, result: nil,
+                    error: RemoteErrorPayload(code: "INTERNAL_ERROR", message: "Internal error", retryable: false, details: nil),
+                    idempotentReplay: nil)
+            }
+        }
+        return response
     }
 }
