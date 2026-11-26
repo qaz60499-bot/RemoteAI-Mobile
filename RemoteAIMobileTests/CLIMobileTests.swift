@@ -115,6 +115,8 @@ final class CLIMobileTests: XCTestCase {
         XCTAssertTrue(ProtocolSecurity.commandActions.contains("listCLIUpstreams"))
         XCTAssertTrue(ProtocolSecurity.commandActions.contains("saveCLIUpstream"))
         XCTAssertTrue(ProtocolSecurity.commandActions.contains("deleteCLIUpstream"))
+        XCTAssertTrue(ProtocolSecurity.commandActions.contains("testCLIUpstream"))
+        XCTAssertTrue(ProtocolSecurity.commandActions.contains("refreshCLIUpstreamModels"))
         XCTAssertTrue(ProtocolSecurity.commandActions.contains("recoverCLISession"))
         XCTAssertTrue(ProtocolSecurity.commandActions.contains("getCommandOutcome"))
         XCTAssertTrue(ProtocolSecurity.commandActions.contains("registerCurrentPage"))
@@ -170,6 +172,16 @@ final class CLIMobileTests: XCTestCase {
         XCTAssertEqual(upstream.availabilityReason, "session-scoped credential cannot be reused")
         XCTAssertFalse(upstream.canEdit)
         XCTAssertTrue(upstream.canRemove)
+    }
+
+    func testRichUpstreamMetadataDecodesBackwardCompatibly() throws {
+        let data = Data(#"{"id":"upstream-custom-1","label":"Sync","host":"api.example.test","models":["m1","m2"],"defaultModel":"m1","credentialAvailable":true,"health":"verified","healthDetail":"HTTP 200","source":"remoteai","editable":true,"removable":true,"enabled":false,"keySet":true,"keyHint":"sk-1***90","secretRef":"cli-upstream-1","revision":5,"customModels":["m2"],"hiddenModels":[],"canTest":true,"canRefreshModels":true,"canManageModels":true}"#.utf8)
+        let upstream = try JSONDecoder().decode(CLIUpstream.self, from: data)
+        XCTAssertFalse(upstream.isEnabled)
+        XCTAssertEqual(upstream.keyHint, "sk-1***90")
+        XCTAssertEqual(upstream.revision, 5)
+        XCTAssertTrue(upstream.canEditSettings)
+        XCTAssertEqual(upstream.customModels, ["m2"])
     }
 
     func testThreeDimensionCLIStatesAndNaturalLanguageGrouping() {

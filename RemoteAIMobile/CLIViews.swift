@@ -1,6 +1,15 @@
 import SwiftUI
 import UIKit
 
+struct CLIModelDetail: Codable, Identifiable, Hashable {
+    let id: String
+    let displayName: String?
+    let source: String?
+    let isDefault: Bool?
+    let available: Bool?
+    let hidden: Bool?
+}
+
 struct CLIUpstream: Codable, Identifiable, Hashable {
     let id: String
     let label: String
@@ -13,13 +22,37 @@ struct CLIUpstream: Codable, Identifiable, Hashable {
     let editable: Bool?
     let removable: Bool?
     let availabilityReason: String?
+    var cliKind: String? = nil
+    var compatibleProtocols: [String]? = nil
+    var enabled: Bool? = nil
+    var keySet: Bool? = nil
+    var keyHint: String? = nil
+    var secretRef: String? = nil
+    var healthDetail: String? = nil
+    var lastCheckedAt: String? = nil
+    var modelsUpdatedAt: String? = nil
+    var customModels: [String]? = nil
+    var hiddenModels: [String]? = nil
+    var fetchedModels: [String]? = nil
+    var modelDetails: [CLIModelDetail]? = nil
+    var revision: Int? = nil
+    var inUseByActiveSession: Bool? = nil
+    var readOnlyReason: String? = nil
+    var canTest: Bool? = nil
+    var canRefreshModels: Bool? = nil
+    var canManageModels: Bool? = nil
+    var canToggleEnabled: Bool? = nil
 
+    var isEnabled: Bool { enabled ?? true }
     var canEdit: Bool { source == "remoteai" && editable == true }
+    var canEditSettings: Bool { canManageModels == true || canEdit }
     var canRemove: Bool { removable == true && (source == "remoteai" || source == "discovered") }
 }
 
 extension InstanceDescriptor {
     var cliUpstreams: [CLIUpstream] { (try? config["upstreamCatalog"]?.decode([CLIUpstream].self)) ?? [] }
+    var cliRecentDirectories: [String] { (try? config["recentDirectories"]?.decode([String].self)) ?? [] }
+    var cliUpstreamRevision: Int { config["upstreamCatalogRevision"]?.intValue ?? 0 }
     var isManagedCLI: Bool { id == "cloudcode.remoteai" || id == "codex.remoteai" }
 }
 
@@ -262,9 +295,20 @@ struct CLIRuntimeView: View {
                     if let error = store.errors["instance.\(instance.id)"] {
                         Text(error).font(.caption).foregroundColor(.red)
                     }
-                    ForEach(CodexDirectoryGroup.make(store.sessions.filter { $0.instanceId == instance.id })) { group in
+                    let instanceSessions = store.sessions.filter { $0.instanceId == instance.id }
+                    ForEach(CodexDirectoryGroup.make(instanceSessions)) { group in
                         DisclosureGroup(group.path) {
                             ForEach(group.sessions.filter { search.isEmpty || $0.title.localizedCaseInsensitiveContains(search) || group.path.localizedCaseInsensitiveContains(search) }) { session in
+                                NavigationLink(destination: CLIConversationView(runtime: runtime, instance: instance, session: session)) {
+                                    CLISessionRowView(session: session, store: store)
+                                }
+                            }
+                        }
+                    }
+                    let ungrouped = instanceSessions.filter { $0.codexDirectoryKey == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
+                    if !ungrouped.isEmpty {
+                        DisclosureGroup("工作目录未知") {
+                            ForEach(ungrouped) { session in
                                 NavigationLink(destination: CLIConversationView(runtime: runtime, instance: instance, session: session)) {
                                     CLISessionRowView(session: session, store: store)
                                 }
@@ -381,6 +425,19 @@ struct CLICreateView: View {
                 Section("Windows 会话") {
                     TextField("会话名称", text: $title)
                     TextField("项目完整路径", text: $projectPath).autocapitalization(.none).disableAutocorrection(true)
+                    if !instance.cliRecentDirectories.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(instance.cliRecentDirectories, id: \.self) { dir in
+                                    Button(dir.split(separator: "\\").last.map(String.init) ?? dir) {
+                                        projectPath = dir
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .font(.caption)
+                                }
+                            }
+                        }
+                    }
                     Toggle("授权此项目文件修改与测试", isOn: $allowProjectWrites)
                     Text("授权仅作用于所选项目；工具审批仍保留。Windows 会检查项目是否在已授权范围内。").font(.caption)
                 }
@@ -390,13 +447,20 @@ struct CLICreateView: View {
                         ForEach(instance.cliUpstreams.filter(\.credentialAvailable)) { item in Text("\(item.label) · \(item.host)").tag(item.id) }
                     }
                     if let selected {
-                        Text("凭据保留在 Windows · \(selected.health == "unknown" ? "连接尚未验证" : selected.health)").font(.caption)
+                        Text("凭据保留在 Windows（\(selected.keyHint ?? "受保护")） · \(selected.health == "unknown" ? "连接尚未验证" : selected.health)").font(.caption)
+                        if let detail = selected.healthDetail, !detail.isEmpty {
+                            Text(detail).font(.caption2).foregroundColor(.secondary)
+                        }
                         Picker("模型", selection: $model) { ForEach(selected.models, id: \.self) { Text($0).tag($0) } }
                     }
+                    let unavailable = instance.cliUpstreams.filter { !$0.credentialAvailable }
                     if !instance.cliUpstreams.contains(where: \.credentialAvailable) {
-                        Text(instance.cliUpstreams.first(where: { !$0.credentialAvailable })?.availabilityReason
+                        Text(unavailable.first?.availabilityReason
                              ?? "此 Windows 配置没有可复用于新会话的凭据。请在 Windows 添加可复用的模型 API 凭据后重试。")
                             .font(.caption).foregroundColor(.secondary)
+                    } else if !unavailable.isEmpty {
+                        Text("另有 \(unavailable.count) 个已停用或不可用配置，可在“管理模型 API 中转站”中查看原因。")
+                            .font(.caption2).foregroundColor(.secondary)
                     }
                     Text("仅用于此会话的新调用。Cloudflare RemoteAI Relay 负责加密传输，与这里的模型 API 中转站独立。")
                         .font(.footnote).foregroundColor(.secondary)
@@ -429,6 +493,7 @@ struct CLIUpstreamManagementView: View {
     @State private var catalog: [CLIUpstream] = []
     @State private var loading = false
     @State private var deleting = false
+    @State private var actionBusyId: String?
     @State private var errorMessage: String?
     @State private var statusMessage: String?
     @State private var showEditor = false
@@ -438,12 +503,21 @@ struct CLIUpstreamManagementView: View {
     @State private var deleteRetryTarget: CLIUpstream?
     @State private var deleteOperationId: UUID?
 
+    private var currentRevision: Int {
+        store.instances.first(where: { $0.id == instance.id })?.cliUpstreamRevision ?? instance.cliUpstreamRevision
+    }
+
     var body: some View {
         List {
             Section {
-                Text("这些中转站配置仅供此电脑上的 RemoteAI CLI 使用。Windows 保管 API Key；Cloudflare Relay 只负责加密传输，与模型 API 中转站独立。")
+                Text(store.machine.state == .online
+                     ? "Windows 权威配置在线 · 双向实时同步 · 版本 r\(currentRevision)"
+                     : "Windows 当前离线，等待重连；离线期间不可修改 Windows API 配置。")
+                    .font(.caption)
+                    .foregroundColor(store.machine.state == .online ? .green : .orange)
+                Text("手机与电脑共用同一套 Windows 权威配置，API Key 仅由 Windows DPAPI 保管，不回传明文。")
                     .font(.footnote).foregroundColor(.secondary)
-                Text("删除自定义中转站会删除此处的 RemoteAI 配置。隐藏导入中转站只会在此处隐藏，不会更改 Windows 中的来源配置。")
+                Text("删除自定义配置会从 Windows 移除；隐藏外部导入配置仅在 RemoteAI 隐藏，不改动原配置。")
                     .font(.footnote).foregroundColor(.secondary)
             }
             if loading {
@@ -465,35 +539,88 @@ struct CLIUpstreamManagementView: View {
             ForEach(catalog) { item in
                 Section {
                     VStack(alignment: .leading, spacing: 5) {
-                        Text(item.label).font(.headline)
-                        Text(item.host).font(.caption).textSelection(.enabled)
+                        HStack {
+                            Text(item.label).font(.headline)
+                            Spacer()
+                            Text(item.isEnabled ? "已启用" : "已停用")
+                                .font(.caption2).padding(.horizontal, 6).padding(.vertical, 2)
+                                .background((item.isEnabled ? Color.green : Color.orange).opacity(0.15))
+                                .foregroundColor(item.isEnabled ? .green : .orange)
+                                .cornerRadius(6)
+                            if item.inUseByActiveSession == true {
+                                Text("任务使用中")
+                                    .font(.caption2).padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(Color.blue.opacity(0.15)).foregroundColor(.blue).cornerRadius(6)
+                            }
+                        }
+                        HStack(spacing: 6) {
+                            Text(item.host).font(.caption).textSelection(.enabled)
+                            if let protocols = item.compatibleProtocols, !protocols.isEmpty {
+                                Text("· \(protocols.joined(separator: ", "))")
+                                    .font(.caption2).foregroundColor(.secondary)
+                            }
+                        }
                         Text("\(item.sourceLabel) · \(credentialStatus(for: item))")
                             .font(.caption2).foregroundColor(.secondary)
+                        if item.keyHint != nil || item.secretRef != nil {
+                            let hintPart = item.keyHint.map { "Key 掩码：\($0)" }
+                            let refPart = item.secretRef.map { "引用：\(String($0.prefix(24)))" }
+                            Text([hintPart, refPart].compactMap { $0 }.joined(separator: " · "))
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
                         if !item.credentialAvailable, let availabilityReason = item.availabilityReason, !availabilityReason.isEmpty {
-                            Text(availabilityReason).font(.caption2).foregroundColor(.secondary)
+                            Text(availabilityReason).font(.caption2).foregroundColor(.orange)
+                        }
+                        if let readOnlyReason = item.readOnlyReason, !readOnlyReason.isEmpty {
+                            Text(readOnlyReason).font(.caption2).foregroundColor(.secondary)
                         }
                         if !item.models.isEmpty {
-                            Text("模型：\(item.models.joined(separator: ", "))").font(.caption2).foregroundColor(.secondary)
+                            Text("可用模型（\(item.models.count)）：\(item.models.joined(separator: ", "))").font(.caption2).foregroundColor(.secondary)
+                        }
+                        if let custom = item.customModels, !custom.isEmpty {
+                            Text("自定义模型：\(custom.joined(separator: ", "))").font(.caption2).foregroundColor(.secondary)
                         }
                         if let defaultModel = item.defaultModel, !defaultModel.isEmpty {
                             Text("默认模型：\(defaultModel)").font(.caption2).foregroundColor(.secondary)
                         }
-                        if item.health != "unknown" {
-                            Text("连接状态：\(item.health)").font(.caption2).foregroundColor(.secondary)
+                        if let updated = CLIConversationFormatter.readableISOTime(item.modelsUpdatedAt) {
+                            Text("模型目录更新：\(updated)").font(.caption2).foregroundColor(.secondary)
+                        }
+                        if item.health != "unknown" || (item.healthDetail != nil && !item.healthDetail!.isEmpty) {
+                            Text("检测状态：\(item.health)\(item.healthDetail.map { " · \($0)" } ?? "")")
+                                .font(.caption2)
+                                .foregroundColor(item.health == "verified" ? .green : (item.health == "failed" || item.health == "upstream-policy-rejected" ? .red : .secondary))
                         }
                     }
-                    HStack {
-                        if item.canEdit {
-                            Button("编辑") {
-                                editingUpstream = item
-                                showEditor = true
-                            }.disabled(deleting || deleteRetryTarget != nil || store.machine.state != .online)
-                        }
-                        if item.canRemove {
-                            Button(item.source == "discovered" ? "隐藏" : "删除", role: .destructive) {
-                                deleteCandidate = item
-                                confirmDelete = true
-                            }.disabled(deleting || deleteRetryTarget != nil || store.machine.state != .online)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 12) {
+                            if item.canTest != false {
+                                Button(actionBusyId == item.id ? "处理中…" : "测试") {
+                                    Task { await probeUpstream(action: "testCLIUpstream", item: item) }
+                                }.disabled(actionBusyId != nil || deleting || store.machine.state != .online)
+                            }
+                            if item.canRefreshModels == true {
+                                Button("刷新模型") {
+                                    Task { await probeUpstream(action: "refreshCLIUpstreamModels", item: item) }
+                                }.disabled(actionBusyId != nil || deleting || store.machine.state != .online)
+                            }
+                            if item.canToggleEnabled != false {
+                                Button(item.isEnabled ? "停用" : "启用") {
+                                    Task { await toggleEnabled(item) }
+                                }.disabled(actionBusyId != nil || deleting || store.machine.state != .online)
+                            }
+                            if item.canEditSettings {
+                                Button(item.canEdit ? "编辑" : "模型设置") {
+                                    editingUpstream = item
+                                    showEditor = true
+                                }.disabled(actionBusyId != nil || deleting || deleteRetryTarget != nil || store.machine.state != .online)
+                            }
+                            if item.canRemove {
+                                Button(item.source == "discovered" ? "隐藏" : "删除", role: .destructive) {
+                                    deleteCandidate = item
+                                    confirmDelete = true
+                                }.disabled(actionBusyId != nil || deleting || deleteRetryTarget != nil || store.machine.state != .online)
+                            }
                         }
                     }
                 }
@@ -517,8 +644,13 @@ struct CLIUpstreamManagementView: View {
         }
         .refreshable { await loadCatalog() }
         .task { await loadCatalog() }
+        .onChange(of: store.upstreamCatalogRevision) { _ in
+            if let latest = store.instances.first(where: { $0.id == instance.id })?.cliUpstreams, !latest.isEmpty {
+                catalog = latest
+            }
+        }
         .sheet(isPresented: $showEditor, onDismiss: { Task { await loadCatalog() } }) {
-            let savedMessage = editingUpstream == nil ? "已添加自定义中转站。" : "已更新自定义中转站。"
+            let savedMessage = editingUpstream == nil ? "已添加自定义中转站。" : "已更新中转站配置。"
             CLIUpstreamEditorView(runtime: runtime, instance: instance, upstream: editingUpstream) {
                 statusMessage = savedMessage
             }
@@ -536,7 +668,7 @@ struct CLIUpstreamManagementView: View {
         } message: {
             Text(deleteCandidate?.source == "discovered"
                  ? "仅在此电脑的 RemoteAI 配置中隐藏此导入中转站；Windows 的来源配置不会更改。"
-                 : "从此电脑的 RemoteAI 配置中删除此自定义中转站。")
+                 : "从此电脑的 RemoteAI 配置中删除此自定义中转站，并清理不再使用的 DPAPI 凭据。")
         }
     }
 
@@ -547,7 +679,7 @@ struct CLIUpstreamManagementView: View {
     }
 
     private func credentialStatus(for item: CLIUpstream) -> String {
-        if item.credentialAvailable { return "凭据由 Windows 保管" }
+        if item.keySet == true || item.credentialAvailable { return "凭据由 Windows 保管" }
         return item.availabilityReason == nil ? "没有可复用凭据" : "现有凭据不可复用"
     }
 
@@ -573,6 +705,69 @@ struct CLIUpstreamManagementView: View {
     }
 
     @MainActor
+    private func probeUpstream(action: String, item: CLIUpstream) async {
+        actionBusyId = item.id
+        errorMessage = nil
+        statusMessage = nil
+        defer { actionBusyId = nil }
+        let outcome = await store.cliUpstreamAction(
+            runtime: runtime,
+            instance: instance,
+            action: action,
+            payload: ["id": .string(item.id)]
+        )
+        guard outcome.succeeded else {
+            errorMessage = outcome.errorMessage ?? "检测失败。"
+            return
+        }
+        if let rows = outcome.result?.objectValue?["upstreams"], let decoded = try? rows.decode([CLIUpstream].self) {
+            catalog = decoded
+        }
+        if action == "testCLIUpstream" {
+            let ok = outcome.result?.objectValue?["ok"]?.boolValue == true
+            let detail = outcome.result?.objectValue?["detail"]?.stringValue ?? ""
+            statusMessage = ok ? "检测可用：\(detail)" : "检测异常：\(detail)"
+        } else {
+            let refreshed = outcome.result?.objectValue?["refreshed"]?.boolValue == true
+            let count = outcome.result?.objectValue?["modelsCount"]?.intValue ?? 0
+            let msg = outcome.result?.objectValue?["message"]?.stringValue
+            statusMessage = refreshed ? "已同步 \(count) 个模型。" : (msg ?? "模型列表未更新。")
+        }
+    }
+
+    @MainActor
+    private func toggleEnabled(_ item: CLIUpstream) async {
+        actionBusyId = item.id
+        errorMessage = nil
+        statusMessage = nil
+        defer { actionBusyId = nil }
+        var payload: [String: JSONValue] = [
+            "id": .string(item.id),
+            "enabled": .bool(!item.isEnabled),
+        ]
+        if let rev = item.revision {
+            payload["expectedRevision"] = .number(Double(rev))
+        }
+        let outcome = await store.cliUpstreamAction(
+            runtime: runtime,
+            instance: instance,
+            action: "saveCLIUpstream",
+            payload: payload,
+            operationId: UUID()
+        )
+        guard outcome.succeeded else {
+            errorMessage = outcome.errorMessage ?? "切换启用状态失败。"
+            return
+        }
+        if let rows = outcome.result?.objectValue?["upstreams"], let decoded = try? rows.decode([CLIUpstream].self) {
+            catalog = decoded
+        } else {
+            await loadCatalog()
+        }
+        statusMessage = !item.isEnabled ? "已启用 \(item.label)。" : "已停用 \(item.label)（不影响正在运行的任务）。"
+    }
+
+    @MainActor
     private func remove(_ item: CLIUpstream, operationId: UUID) async {
         guard item.canRemove else {
             errorMessage = "此中转站不允许从手机管理。"
@@ -582,11 +777,13 @@ struct CLIUpstreamManagementView: View {
         errorMessage = nil
         statusMessage = nil
         defer { deleting = false }
+        var payload: [String: JSONValue] = ["id": .string(item.id)]
+        if let rev = item.revision { payload["expectedRevision"] = .number(Double(rev)) }
         let outcome = await store.cliUpstreamAction(
             runtime: runtime,
             instance: instance,
             action: "deleteCLIUpstream",
-            payload: ["id": .string(item.id)],
+            payload: payload,
             operationId: operationId
         )
         guard outcome.succeeded else {
@@ -633,11 +830,16 @@ struct CLIUpstreamEditorView: View {
     @State private var baseURL = ""
     @State private var apiKey = ""
     @State private var modelsText: String
+    @State private var customModelsText: String
+    @State private var hiddenModelsText: String
     @State private var defaultModel: String
+    @State private var enabled: Bool
     @State private var busy = false
     @State private var retrySamePayload = false
     @State private var operationId: UUID?
     @State private var errorMessage: String?
+
+    private var isCustomStation: Bool { upstream == nil || upstream?.canEdit == true }
 
     init(runtime: RuntimeDescriptor, instance: InstanceDescriptor, upstream: CLIUpstream?, onSaved: @escaping () -> Void = {}) {
         self.runtime = runtime
@@ -646,31 +848,54 @@ struct CLIUpstreamEditorView: View {
         self.onSaved = onSaved
         _label = State(initialValue: upstream?.label ?? "")
         _modelsText = State(initialValue: upstream?.models.joined(separator: ", ") ?? "")
+        _customModelsText = State(initialValue: upstream?.customModels?.joined(separator: ", ") ?? "")
+        _hiddenModelsText = State(initialValue: upstream?.hiddenModels?.joined(separator: ", ") ?? "")
         _defaultModel = State(initialValue: upstream?.defaultModel ?? upstream?.models.first ?? "")
+        _enabled = State(initialValue: upstream?.enabled ?? true)
     }
 
     var body: some View {
         NavigationView {
             Form {
-                Section("RemoteAI 自定义中转站") {
-                    TextField("名称", text: $label)
-                    TextField("服务端 URL", text: $baseURL)
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    Text(upstream == nil
-                         ? "请输入 API Base URL。Windows 不会把 API Key 或完整 URL 回传到手机。"
-                         : "Windows 不会把完整 URL 回传到手机；编辑时请重新填写 API Base URL。留空 API Key 会保留 Windows 中当前密钥。")
-                        .font(.caption).foregroundColor(.secondary)
-                    SecureField(upstream == nil ? "API Key（必填）" : "API Key（留空以保留现有密钥）", text: $apiKey)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    TextField("模型 ID（以逗号分隔）", text: $modelsText)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    TextField("默认模型", text: $defaultModel)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                if isCustomStation {
+                    Section("RemoteAI 自定义中转站") {
+                        TextField("名称", text: $label)
+                        TextField(upstream == nil ? "服务端 URL" : "服务端 URL（留空保留现有地址）", text: $baseURL)
+                            .keyboardType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Text(upstream == nil
+                             ? "请输入 API Base URL。Windows 不会把 API Key 或完整 URL 回传到手机。"
+                             : "当前主机：\(upstream?.host ?? "")。留空 URL 和 API Key 将保留 Windows 中的当前配置。")
+                            .font(.caption).foregroundColor(.secondary)
+                        SecureField(upstream == nil ? "API Key（必填）" : "API Key（留空以保留现有密钥）", text: $apiKey)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        TextField("模型 ID（以逗号分隔）", text: $modelsText)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        TextField("默认模型", text: $defaultModel)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Toggle("启用此中转站", isOn: $enabled)
+                    }
+                } else if let upstream {
+                    Section("外部配置设置（只读源）") {
+                        Text(upstream.label).font(.headline)
+                        Text(upstream.host).font(.caption).foregroundColor(.secondary)
+                        Text(upstream.readOnlyReason ?? "外部来源配置为只读，无法修改地址或密钥；可在 RemoteAI 内控制启用状态和模型列表。")
+                            .font(.caption).foregroundColor(.orange)
+                        Toggle("允许在 RemoteAI 新建会话中使用", isOn: $enabled)
+                        TextField("自定义补充模型（以逗号分隔）", text: $customModelsText)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        TextField("本地隐藏模型（以逗号分隔，不改上游）", text: $hiddenModelsText)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        TextField("默认模型", text: $defaultModel)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
                 }
                 Section {
                     Text("API Key 仅在本次加密请求中发送给 Windows；手机不保存它，也不会写入操作回执或诊断日志。")
@@ -681,7 +906,7 @@ struct CLIUpstreamEditorView: View {
                 }
             }
             .disabled(busy || retrySamePayload)
-            .navigationTitle(upstream == nil ? "添加中转站" : "编辑中转站")
+            .navigationTitle(upstream == nil ? "添加中转站" : (isCustomStation ? "编辑中转站" : "模型与启用设置"))
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() }.disabled(busy) }
                 ToolbarItem(placement: .confirmationAction) {
@@ -699,35 +924,54 @@ struct CLIUpstreamEditorView: View {
         return retrySamePayload ? "使用相同内容重试" : "保存"
     }
 
-    @MainActor
-    private func save() async {
-        let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let urlIsValid: Bool
-        if let url = URL(string: cleanURL), let scheme = url.scheme?.lowercased() {
-            urlIsValid = (scheme == "https" || scheme == "http") && url.host != nil && url.user == nil && url.password == nil
-        } else {
-            urlIsValid = false
-        }
-        let models = modelsText
-            .split(whereSeparator: { $0 == "," || $0 == "\n" })
+    private func splitModels(_ raw: String) -> [String] {
+        raw.split(whereSeparator: { $0 == "," || $0 == "\n" })
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        let cleanDefaultModel = defaultModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanLabel.isEmpty else { errorMessage = "请输入中转站名称。"; return }
-        guard urlIsValid else { errorMessage = "请输入有效的 HTTP 或 HTTPS 服务端 URL。"; return }
-        guard !models.isEmpty else { errorMessage = "至少填写一个模型 ID。"; return }
-        guard models.contains(cleanDefaultModel) else { errorMessage = "默认模型必须出现在模型列表中。"; return }
-        guard upstream != nil || !apiKey.isEmpty else { errorMessage = "添加自定义中转站时必须填写 API Key。"; return }
+    }
 
-        var payload: [String: JSONValue] = [
-            "label": .string(cleanLabel),
-            "baseURL": .string(cleanURL),
-            "models": .array(models.map { .string($0) }),
-            "defaultModel": .string(cleanDefaultModel),
-        ]
-        if let upstream { payload["id"] = .string(upstream.id) }
-        if !apiKey.isEmpty { payload["apiKey"] = .string(apiKey) }
+    @MainActor
+    private func save() async {
+        var payload: [String: JSONValue] = ["enabled": .bool(enabled)]
+        if let upstream {
+            payload["id"] = .string(upstream.id)
+            if let rev = upstream.revision { payload["expectedRevision"] = .number(Double(rev)) }
+        }
+
+        if isCustomStation {
+            let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            if upstream == nil || !cleanURL.isEmpty {
+                let urlIsValid: Bool
+                if let url = URL(string: cleanURL), let scheme = url.scheme?.lowercased() {
+                    urlIsValid = (scheme == "https" || scheme == "http") && url.host != nil && url.user == nil && url.password == nil
+                } else {
+                    urlIsValid = false
+                }
+                guard urlIsValid else { errorMessage = "请输入有效的 HTTP 或 HTTPS 服务端 URL。"; return }
+                payload["baseURL"] = .string(cleanURL)
+            }
+            let models = splitModels(modelsText)
+            let cleanDefaultModel = defaultModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanLabel.isEmpty else { errorMessage = "请输入中转站名称。"; return }
+            guard !models.isEmpty else { errorMessage = "至少填写一个模型 ID。"; return }
+            guard models.contains(cleanDefaultModel) else { errorMessage = "默认模型必须出现在模型列表中。"; return }
+            guard upstream != nil || !apiKey.isEmpty else { errorMessage = "添加自定义中转站时必须填写 API Key。"; return }
+
+            payload["label"] = .string(cleanLabel)
+            payload["models"] = .array(models.map { .string($0) })
+            payload["defaultModel"] = .string(cleanDefaultModel)
+            if !apiKey.isEmpty { payload["apiKey"] = .string(apiKey) }
+        } else {
+            let customModels = splitModels(customModelsText)
+            let hiddenModels = splitModels(hiddenModelsText)
+            let cleanDefaultModel = defaultModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            payload["customModels"] = .array(customModels.map { .string($0) })
+            payload["hiddenModels"] = .array(hiddenModels.map { .string($0) })
+            if !cleanDefaultModel.isEmpty {
+                payload["defaultModel"] = .string(cleanDefaultModel)
+            }
+        }
 
         let stableOperationId = operationId ?? UUID()
         operationId = stableOperationId

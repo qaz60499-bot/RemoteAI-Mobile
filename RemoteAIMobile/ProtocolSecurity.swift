@@ -26,7 +26,7 @@ enum ProtocolSecurity {
         "getStatus", "getDiagnostics", "listRuntimes", "listInstances", "listSessions",
         "createSession", "resumeSession", "stopSession", "getSessionStatus",
         "sendMessage", "stopGeneration", "loadRecentMessages", "loadMessagesBefore", "readMessageAttachmentChunk",
-        "listCLIUpstreams", "saveCLIUpstream", "deleteCLIUpstream", "recoverCLISession", "getCommandOutcome",
+        "listCLIUpstreams", "saveCLIUpstream", "deleteCLIUpstream", "testCLIUpstream", "refreshCLIUpstreamModels", "recoverCLISession", "getCommandOutcome",
         "getChangesAfterCursor",
         "registerCurrentPage", "unregisterConversation", "openConversation", "focusConversation", "createConversation",
         "listProjects", "listProjectConversations", "openProject", "createProject", "deleteSession",
@@ -52,7 +52,7 @@ enum ProtocolSecurity {
         "INVALID_COMMAND", "UNAUTHORIZED_DEVICE", "UNKNOWN_RUNTIME", "UNKNOWN_INSTANCE", "UNKNOWN_SESSION",
         "CAPABILITY_DENIED", "ALREADY_EXECUTED", "BROWSER_NOT_CONNECTED", "BROWSER_BINDING_MISSING",
         "WEB_SELECTOR_FAILED", "WEB_SEND_NOT_ACCEPTED", "WEB_SEND_DELIVERY_UNKNOWN", "PROVIDER_RATE_LIMITED", "PROVIDER_UNAVAILABLE", "SESSION_UNAVAILABLE", "PAGINATION_CURSOR_INVALID",
-        "TRANSPORT_OFFLINE", "INTERNAL_ERROR"
+        "CONFLICT", "UNSUPPORTED_OPERATION", "TRANSPORT_OFFLINE", "INTERNAL_ERROR"
     ]
     private static let deltaAllowedKeys: Set<String> = ["cursor", "events", "nextCursor", "hasMore"]
     private static let deltaRequiredKeys: Set<String> = ["events", "nextCursor", "hasMore"]

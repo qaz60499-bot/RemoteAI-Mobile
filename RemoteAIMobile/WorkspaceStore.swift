@@ -111,6 +111,7 @@ final class WorkspaceStore: ObservableObject {
     @Published var cliReceipts: [String: String] = [:]
     @Published var cliErrorHistoryBySession: [String: [CLIErrorRecord]] = [:]
     @Published var globalTransportErrors: [CLIErrorRecord] = []
+    @Published var upstreamCatalogRevision: Int = 0
     var transport: Transport
     let cache: SQLiteStore
     private var tracker = SequenceTracker()
@@ -3785,7 +3786,13 @@ final class WorkspaceStore: ObservableObject {
         operationId: UUID? = nil
     ) async -> CLIUpstreamActionOutcome {
         let errorKey = "cliManagement.\(instance.id)"
-        let allowedActions: Set<String> = ["listCLIUpstreams", "saveCLIUpstream", "deleteCLIUpstream"]
+        let allowedActions: Set<String> = [
+            "listCLIUpstreams",
+            "saveCLIUpstream",
+            "deleteCLIUpstream",
+            "testCLIUpstream",
+            "refreshCLIUpstreamModels",
+        ]
         guard allowedActions.contains(action), instance.isManagedCLI else {
             let message = "此 Windows CLI 实例不支持中转站管理。"
             errors[errorKey] = message
@@ -3799,7 +3806,8 @@ final class WorkspaceStore: ObservableObject {
             return CLIUpstreamActionOutcome(result: nil, errorMessage: message, deliveryUnknown: false)
         }
         let isRead = action == "listCLIUpstreams"
-        guard isRead || operationId != nil else {
+        let requiresOperationId = ["saveCLIUpstream", "deleteCLIUpstream"].contains(action)
+        guard !requiresOperationId || operationId != nil else {
             let message = "操作标识缺失，未发送请求。"
             errors[errorKey] = message
             return CLIUpstreamActionOutcome(result: nil, errorMessage: message, deliveryUnknown: false)
@@ -3847,6 +3855,21 @@ final class WorkspaceStore: ObservableObject {
                 await finishPendingOperation(key: operationKey, machineId: machineId, expectedCommandId: commandId)
             }
             errors[errorKey] = nil
+            if let upstreamsValue = response.result?.objectValue?["upstreams"],
+               let idx = instances.firstIndex(where: { $0.id == instance.id }) {
+                var updated = instances[idx]
+                updated.config["upstreamCatalog"] = upstreamsValue
+                instances[idx] = updated
+                await persistMetadata()
+            } else if isRead, let upstreamsValue = response.result,
+                      (try? upstreamsValue.decode([CLIUpstream].self)) != nil,
+                      let idx = instances.firstIndex(where: { $0.id == instance.id }) {
+                var updated = instances[idx]
+                updated.config["upstreamCatalog"] = upstreamsValue
+                instances[idx] = updated
+                await persistMetadata()
+            }
+            upstreamCatalogRevision &+= 1
             // The public result refreshes the sheet, and the runtime refresh
             // updates the instance metadata used by the session creation flow.
             await refreshRuntime(runtime)
@@ -3862,8 +3885,9 @@ final class WorkspaceStore: ObservableObject {
                 await finishPendingOperation(key: operationKey, machineId: machineId)
             }
             let message: String
-            if let transportError = error as? TransportError, case .remote(let code, _) = transportError {
-                message = "Windows Agent 返回错误（\(code)）。"
+            if let transportError = error as? TransportError, case .remote(let code, let remoteMsg) = transportError {
+                let safeMsg = CLIErrorRecord.redactSensitiveText(remoteMsg)
+                message = safeMsg.isEmpty ? "Windows Agent 返回错误（\(code)）。" : "\(safeMsg)（\(code)）"
             } else if unknown {
                 message = "连接中断，操作结果未知。请使用相同内容重试。"
             } else {
@@ -5048,6 +5072,18 @@ final class WorkspaceStore: ObservableObject {
         guard let sessionId = event.sessionId else {
             if ["INSTANCE_UPDATED", "RUNTIME_STATUS", "SESSION_CREATED", "SESSION_UPDATED", "SESSION_RENAMED", "SESSION_STATUS", "WEB_PAGE_REGISTERED", "WEB_PAGE_UNREGISTERED"].contains(event.type) {
                 await requestMetadataRefresh()
+                if event.type == "INSTANCE_UPDATED",
+                   event.runtimeId == "runtime.codex" || event.runtimeId == "runtime.cloudcode" {
+                    let targetRuntime = runtimes.first(where: { $0.id == event.runtimeId })
+                        ?? RuntimeDescriptor(
+                            id: event.runtimeId,
+                            machineId: event.machineId,
+                            kind: event.runtimeId == "runtime.codex" ? .codex : .cloudcode,
+                            name: event.runtimeId == "runtime.codex" ? "Codex" : "Claude Code"
+                        )
+                    await refreshRuntime(targetRuntime)
+                    upstreamCatalogRevision &+= 1
+                }
             }
             return
         }
