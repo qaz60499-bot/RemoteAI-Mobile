@@ -52,7 +52,7 @@ struct CLIUpstream: Codable, Identifiable, Hashable {
 extension InstanceDescriptor {
     var cliUpstreams: [CLIUpstream] { (try? config["upstreamCatalog"]?.decode([CLIUpstream].self)) ?? [] }
     var cliRecentDirectories: [String] { (try? config["recentDirectories"]?.decode([String].self)) ?? [] }
-    var cliUpstreamRevision: Int { config["upstreamCatalogRevision"]?.intValue ?? 0 }
+    var cliUpstreamRevision: Int { config["upstreamCatalogRevision"]?.intValue.map(Int.init) ?? 0 }
     var isManagedCLI: Bool { id == "cloudcode.remoteai" || id == "codex.remoteai" }
 }
 
