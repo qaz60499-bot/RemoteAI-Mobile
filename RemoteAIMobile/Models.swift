@@ -934,9 +934,9 @@ extension String {
     func strippingANSIControlSequences() -> String {
         guard contains("\u{001B}") || contains("\u{009B}") else { return self }
         let patterns = [
-            #"\u{001B}\[[0-9;?]*[ -/]*[@-~]"#,
-            #"\u{001B}\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\)"#,
-            #"\u{009B}[0-9;?]*[ -/]*[@-~]"#
+            "\u{001B}\\[[0-9;?]*[ -/]*[@-~]",
+            "\u{001B}\\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\\\)",
+            "\u{009B}[0-9;?]*[ -/]*[@-~]"
         ]
         var result = self
         for pattern in patterns {
