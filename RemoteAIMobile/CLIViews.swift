@@ -251,11 +251,30 @@ enum CLIConversationFormatter {
     }
 }
 
+enum CLISessionSection: String, CaseIterable {
+    case current = "当前电脑 CLI"
+    case subtask = "原生子任务"
+    case related = "同进程关联会话（当前身份待确认）"
+    case history = "历史与待恢复会话"
+}
+
+enum CLISessionDirectory {
+    static func section(_ meta: [String: JSONValue]) -> CLISessionSection {
+        if meta["sessionScope"]?.stringValue == "history" || meta["processAlive"]?.boolValue == false || meta["cliState"]?.stringValue == "process_exited" { return .history }
+        if meta["nativeRole"]?.stringValue == "subtask" || meta["sessionScope"]?.stringValue == "subtask" { return .subtask }
+        if meta["sessionScope"]?.stringValue == "related" { return .related }
+        if meta["pid"]?.intValue != nil && meta["stale"]?.boolValue != true { return .current }
+        return .history
+    }
+}
+
 struct CLIRuntimeView: View {
     @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.scenePhase) private var scenePhase
     let runtime: RuntimeDescriptor
     @State private var search = ""
     @State private var activeSheet: CLIRuntimeSheet?
+    @State private var visible = false
     private var instances: [InstanceDescriptor] { store.instances.filter { $0.runtimeId == runtime.id && $0.config["cliMobile"]?.boolValue == true } }
     private var connectionSummary: (code: String, label: String, detail: String, isOnline: Bool) {
         CLIStateLabel.connectionDimension(
@@ -290,29 +309,14 @@ struct CLIRuntimeView: View {
                     }
                 }
             }
-            ForEach(instances) { instance in
-                Section(instance.name) {
-                    if let error = store.errors["instance.\(instance.id)"] {
-                        Text(error).font(.caption).foregroundColor(.red)
-                    }
-                    let instanceSessions = store.sessions.filter { $0.instanceId == instance.id }
-                    ForEach(CodexDirectoryGroup.make(instanceSessions)) { group in
-                        DisclosureGroup(group.path) {
-                            ForEach(group.sessions.filter { search.isEmpty || $0.title.localizedCaseInsensitiveContains(search) || group.path.localizedCaseInsensitiveContains(search) }) { session in
-                                NavigationLink(destination: CLIConversationView(runtime: runtime, instance: instance, session: session)) {
-                                    CLISessionRowView(session: session, store: store)
-                                }
-                            }
-                        }
-                    }
-                    let ungrouped = instanceSessions.filter { $0.codexDirectoryKey == nil && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }
-                    if !ungrouped.isEmpty {
-                        DisclosureGroup("工作目录未知") {
-                            ForEach(ungrouped) { session in
-                                NavigationLink(destination: CLIConversationView(runtime: runtime, instance: instance, session: session)) {
-                                    CLISessionRowView(session: session, store: store)
-                                }
-                            }
+            ForEach(CLISessionSection.allCases, id: \.self) { category in
+                let rows = sessions(in: category)
+                if !rows.isEmpty {
+                    Section("\(category.rawValue) · \(rows.count)") {
+                        if category == .current {
+                            sessionLinks(rows)
+                        } else {
+                            DisclosureGroup("查看\(category.rawValue)") { sessionLinks(rows) }
                         }
                     }
                 }
@@ -322,8 +326,14 @@ struct CLIRuntimeView: View {
         .navigationTitle(runtime.kind.displayName)
         .searchable(text: $search, prompt: "搜索会话或工作目录")
         .refreshable { await refresh() }
-        .task(id: store.machine.state == .online) {
-            if store.machine.state == .online { await refresh() }
+        .onAppear { visible = true }
+        .onDisappear { visible = false }
+        .task(id: visible && scenePhase == .active && store.machine.state == .online) {
+            guard visible && scenePhase == .active && store.machine.state == .online else { return }
+            while !Task.isCancelled {
+                await refresh()
+                do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
+            }
         }
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
@@ -339,6 +349,22 @@ struct CLIRuntimeView: View {
     private func refresh() async {
         await store.refreshRuntime(runtime)
         for instance in instances { await store.refreshSessions(runtime: runtime, instance: instance) }
+    }
+    private func sessions(in category: CLISessionSection) -> [SessionDescriptor] {
+        let ids = Set(instances.map(\.id))
+        return store.sessions.filter { session in
+            ids.contains(session.instanceId) && CLISessionDirectory.section(store.cliStatus[session.id] ?? session.cliMetadata ?? [:]) == category
+                && (search.isEmpty || session.title.localizedCaseInsensitiveContains(search) || (session.workingDirectory ?? "").localizedCaseInsensitiveContains(search))
+        }.sorted { $0.orderingDate > $1.orderingDate }
+    }
+    @ViewBuilder private func sessionLinks(_ rows: [SessionDescriptor]) -> some View {
+        ForEach(rows) { session in
+            if let instance = instances.first(where: { $0.id == session.instanceId }) {
+                NavigationLink(destination: CLIConversationView(runtime: runtime, instance: instance, session: session)) {
+                    CLISessionRowView(session: session, store: store)
+                }
+            }
+        }
     }
 }
 
@@ -382,6 +408,16 @@ struct CLISessionRowView: View {
                 .foregroundColor(syncInfo.isWarning ? .orange : .secondary)
             if let stage = meta["progressStage"]?.stringValue, !stage.isEmpty {
                 Text("阶段：\(stage)").font(.caption2).foregroundColor(.secondary)
+            }
+            if let cwd = session.workingDirectory { Text(cwd).font(.caption2).foregroundColor(.secondary).lineLimit(1) }
+            if let instruction = meta["latestUserInstruction"]?.stringValue, !instruction.isEmpty {
+                Text("指令：\(instruction)").font(.caption).lineLimit(2)
+            }
+            if let output = meta["latestAssistantOutput"]?.stringValue, !output.isEmpty {
+                Text(output).font(.caption).foregroundColor(.secondary).lineLimit(3)
+            }
+            if let parent = meta["parentNativeSessionId"]?.stringValue {
+                Text("所属会话：\(parent.prefix(8))").font(.caption2).foregroundColor(.secondary)
             }
             let modelText = meta["effectiveModel"]?.stringValue ?? meta["model"]?.stringValue ?? session.modelId
             let hostText = meta["upstreamLabel"]?.stringValue ?? meta["upstreamHost"]?.stringValue
@@ -1211,6 +1247,9 @@ struct CLIConversationView: View {
                 }
                 Text(session.workingDirectory ?? "工作目录未知").font(.caption).foregroundColor(.secondary).textSelection(.enabled)
                 Text("模型：\(snapshot["effectiveModel"]?.stringValue ?? snapshot["model"]?.stringValue ?? "待确认") · \(snapshot["upstreamLabel"]?.stringValue ?? snapshot["upstreamHost"]?.stringValue ?? "Windows CLI 配置")").font(.caption2)
+                if let configuration = snapshot["configurationLabel"]?.stringValue {
+                    Text("配置：\(configuration) · 额度：未知").font(.caption2).foregroundColor(.secondary)
+                }
                 if isStale {
                     Text(snapshot["staleReason"]?.stringValue ?? "观测已过期，等待重新连接；保留已有输出与错误历史。").font(.caption).foregroundColor(.orange)
                 }

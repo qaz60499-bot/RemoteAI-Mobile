@@ -2,6 +2,15 @@ import XCTest
 @testable import RemoteAIMobile
 
 final class CLIMobileTests: XCTestCase {
+    func testCLIDirectoryKeepsSubtasksAndExitedHistoryOutOfCurrentProcesses() {
+        let current: [String: JSONValue] = ["pid": .number(1776), "stale": .bool(false), "sessionScope": .string("current"), "processAlive": .bool(true)]
+        XCTAssertEqual(CLISessionDirectory.section(current), .current)
+        XCTAssertEqual(CLISessionDirectory.section(current.merging(["sessionScope": .string("subtask"), "nativeRole": .string("subtask")]) { _, new in new }), .subtask)
+        XCTAssertEqual(CLISessionDirectory.section(current.merging(["sessionScope": .string("related")]) { _, new in new }), .related)
+        XCTAssertEqual(CLISessionDirectory.section(current.merging(["cliState": .string("process_exited")]) { _, new in new }), .history)
+        XCTAssertEqual(CLISessionDirectory.section(["controlMode": .string("managed"), "pid": .null]), .history)
+        XCTAssertEqual(CLISessionDirectory.section(current.merging(["stale": .bool(true)]) { _, new in new }), .history)
+    }
     @MainActor
     func testCLIListReplacesStaleProcessCacheAndRejectsOlderStatusReplay() async throws {
         let at = Date(timeIntervalSince1970: 1_790_000_000)

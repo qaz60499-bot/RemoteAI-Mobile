@@ -25,8 +25,15 @@ private extension View {
 
 struct RootView: View {
     @EnvironmentObject var store: WorkspaceStore
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showingPair = false
     @State private var showingDiagnostics = false
+    @State private var visible = false
+    private var currentCLISessions: [SessionDescriptor] {
+        let ids = Set(store.instances.filter { $0.config["cliMobile"]?.boolValue == true }.map(\.id))
+        return store.sessions.filter { ids.contains($0.instanceId) && CLISessionDirectory.section(store.cliStatus[$0.id] ?? $0.cliMetadata ?? [:]) == .current }
+            .sorted { $0.orderingDate > $1.orderingDate }
+    }
     var body: some View {
         NavigationView {
             List {
@@ -53,7 +60,18 @@ struct RootView: View {
                         }
                     }
                 }
-                Section("Windows CLI") {
+                Section("当前电脑 CLI · \(currentCLISessions.count)") {
+                    ForEach(currentCLISessions) { session in
+                        if let instance = store.instances.first(where: { $0.id == session.instanceId }),
+                           let runtime = store.runtimes.first(where: { $0.id == instance.runtimeId }) {
+                            NavigationLink(destination: CLIConversationView(runtime: runtime, instance: instance, session: session)) {
+                                CLISessionRowView(session: session, store: store)
+                            }
+                        }
+                    }
+                    if currentCLISessions.isEmpty { Text("尚未确认正在运行的 CLI。可下拉刷新或查看历史会话。").font(.footnote).foregroundColor(.secondary) }
+                }
+                Section("CLI 历史与管理") {
                     ForEach(store.runtimes.filter { $0.kind == .cloudcode || $0.kind == .codex }) { runtime in
                         NavigationLink(destination: CLIRuntimeView(runtime: runtime)) {
                             Label("\(runtime.kind.displayName) CLI", systemImage: "terminal")
@@ -77,6 +95,16 @@ struct RootView: View {
             .listStyle(.insetGrouped)
             .remoteAITopBreathingRoom()
             .navigationTitle("Remote AI")
+            .refreshable { await refreshCLIDirectory() }
+            .onAppear { visible = true }
+            .onDisappear { visible = false }
+            .task(id: visible && scenePhase == .active && store.machine.state == .online) {
+                guard visible && scenePhase == .active && store.machine.state == .online else { return }
+                while !Task.isCancelled {
+                    await refreshCLIDirectory()
+                    do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
+                }
+            }
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     Button { showingDiagnostics = true } label: { Image(systemName: "doc.text.magnifyingglass") }.accessibilityLabel("Diagnostics Log")
@@ -86,6 +114,16 @@ struct RootView: View {
             .sheet(isPresented: $showingPair) { PairingView().environmentObject(store) }
             .sheet(isPresented: $showingDiagnostics) { DiagnosticsView().environmentObject(store) }
         }.navigationViewStyle(.stack)
+    }
+    private func refreshCLIDirectory() async {
+        for runtime in store.runtimes.filter({ $0.kind == .codex || $0.kind == .cloudcode }) {
+            guard !Task.isCancelled else { return }
+            await store.refreshRuntime(runtime)
+            for instance in store.instances.filter({ $0.runtimeId == runtime.id && $0.config["cliMobile"]?.boolValue == true }) {
+                guard !Task.isCancelled else { return }
+                await store.refreshSessions(runtime: runtime, instance: instance)
+            }
+        }
     }
     @ViewBuilder private func runtimeDestination(_ runtime: RuntimeDescriptor) -> some View {
         if runtime.kind == .cloudcode { CLIRuntimeView(runtime: runtime) }
