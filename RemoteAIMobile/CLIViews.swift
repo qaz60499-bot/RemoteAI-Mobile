@@ -262,7 +262,7 @@ enum CLISessionDirectory {
     static func needsLiveRefresh(_ config: [String: JSONValue], managed: Bool) -> Bool {
         config["cliMobile"]?.boolValue == true && (managed || (config["activeProcessCount"]?.intValue ?? 1) > 0)
     }
-    static func section(_ meta: [String: JSONValue], activeProcessCount: Int? = nil) -> CLISessionSection {
+    static func section(_ meta: [String: JSONValue], activeProcessCount: Int64? = nil) -> CLISessionSection {
         if activeProcessCount == 0 { return .history }
         if meta["sessionScope"]?.stringValue == "history" || meta["processAlive"]?.boolValue == false || meta["cliState"]?.stringValue == "process_exited" { return .history }
         if meta["nativeRole"]?.stringValue == "subtask" || meta["sessionScope"]?.stringValue == "subtask" { return .subtask }
