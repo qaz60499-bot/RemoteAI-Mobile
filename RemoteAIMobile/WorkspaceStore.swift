@@ -2071,6 +2071,11 @@ final class WorkspaceStore: ObservableObject {
             let currentById = Dictionary(uniqueKeysWithValues: currentRows.map { ($0.id, $0) })
             let remoteRows = remote.map { row in
                 var updated = row
+                if let incoming = row.cliMetadata,
+                   let known = cliStatus[row.id],
+                   Self.cliObservationDate(known) > Self.cliObservationDate(incoming) {
+                    updated.cliMetadata = known
+                }
                 if let current = currentById[row.id],
                    let known = current.backgroundTaskStatus,
                    known.observedAt >= (row.backgroundTaskStatus?.observedAt ?? .distantPast) {
@@ -2085,6 +2090,21 @@ final class WorkspaceStore: ObservableObject {
                 merged.append(contentsOf: remoteRows)
                 merged.sort(by: Self.sessionOrdersBefore)
                 sessions = merged
+            }
+
+            // CLI rows render cliStatus before descriptor metadata. Reconcile that
+            // cache too, or a fresh list keeps displaying pre-restart PIDs/control.
+            var changedCLIIDs: [String] = []
+            for row in remoteRows {
+                if let metadata = row.cliMetadata, cliStatus[row.id] != metadata {
+                    cliStatus[row.id] = metadata
+                    changedCLIIDs.append(row.id)
+                }
+            }
+            for id in changedCLIIDs {
+                if let metadata = cliStatus[id] {
+                    try? await cache.put(metadata, key: "cli.status.\(id)")
+                }
             }
 
             // listSessions carries durable Agent-side Project identity and titles.
@@ -3757,7 +3777,19 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    private static func cliObservationDate(_ metadata: [String: JSONValue]) -> Date {
+        ["lastObservedAt", "lastProgressAt"].compactMap {
+            metadata[$0]?.stringValue.flatMap(RemoteAIDate.parse)
+        }.max() ?? .distantPast
+    }
+
     private func syncCLIStatusMetadata(_ payload: [String: JSONValue], for sessionId: String) async {
+        // Durable deltas may replay older CLI_STATUS after a current list/status.
+        // Keep the newer process identity and task state in that case.
+        let incomingDate = Self.cliObservationDate(payload)
+        if incomingDate != .distantPast,
+           let known = cliStatus[sessionId] ?? sessions.first(where: { $0.id == sessionId })?.cliMetadata,
+           Self.cliObservationDate(known) > incomingDate { return }
         // A fresh authenticated status resolves this session's transport error,
         // independently of the provider errors retained below.
         if var errors = cliErrorHistoryBySession[sessionId] {

@@ -322,7 +322,9 @@ struct CLIRuntimeView: View {
         .navigationTitle(runtime.kind.displayName)
         .searchable(text: $search, prompt: "搜索会话或工作目录")
         .refreshable { await refresh() }
-        .task { await refresh() }
+        .task(id: store.machine.state == .online) {
+            if store.machine.state == .online { await refresh() }
+        }
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
             case .create(let instance):

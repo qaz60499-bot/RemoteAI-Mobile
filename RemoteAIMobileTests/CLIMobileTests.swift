@@ -3,6 +3,30 @@ import XCTest
 
 final class CLIMobileTests: XCTestCase {
     @MainActor
+    func testCLIListReplacesStaleProcessCacheAndRejectsOlderStatusReplay() async throws {
+        let at = Date(timeIntervalSince1970: 1_790_000_000)
+        let old: [String: JSONValue] = ["cliMobile": .bool(true), "cliState": .string("running"), "pid": .number(100), "controlMode": .string("read-only"), "lastObservedAt": .string("2026-11-27T10:00:00Z")]
+        let fresh: [String: JSONValue] = ["cliMobile": .bool(true), "cliState": .string("completed"), "pid": .null, "controlMode": .string("managed"), "lastObservedAt": .string("2026-11-27T11:00:00Z")]
+        let transport = CLISnapshotTransport(metadata: fresh, at: at)
+        let cache = try SQLiteStore.inMemory()
+        let store = WorkspaceStore(transport: transport, cache: cache)
+        store.machine.state = .online
+        let runtime = RuntimeDescriptor(id: "runtime.cloudcode", machineId: "my-pc", kind: .cloudcode, name: "Claude")
+        let instance = InstanceDescriptor(id: "cloudcode.remoteai", runtimeId: runtime.id, name: "CLI", subtitle: nil)
+        store.cliStatus["snapshot-session"] = old
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        XCTAssertEqual(store.cliStatus["snapshot-session"], fresh)
+        XCTAssertEqual(store.sessions.first?.cliMetadata, fresh)
+        let saved = try await cache.get([String: JSONValue].self, key: "cli.status.snapshot-session")
+        XCTAssertEqual(saved, fresh)
+        await transport.setMetadata(old)
+        _ = await store.cliAction(runtime: runtime, instance: instance, sessionId: "snapshot-session", action: "getSessionStatus")
+        XCTAssertEqual(store.cliStatus["snapshot-session"], fresh)
+        await store.refreshSessions(runtime: runtime, instance: instance)
+        XCTAssertEqual(store.cliStatus["snapshot-session"], fresh)
+        XCTAssertEqual(store.sessions.first?.cliMetadata, fresh)
+    }
+    @MainActor
     func testCLIErrorSeparatesAgentOfflineFromRelayAndProvider() async throws {
         let cases: [(TransportError, String)] = [(.offline, "windows-agent"), (.disconnected, "relay"), (.remote("HTTP_503", "upstream unavailable"), "model-api")]
         for (error, source) in cases {
@@ -281,6 +305,25 @@ final class CLIMobileTests: XCTestCase {
         try await cache.put([record], key: "cli.errors.s-err")
         await store.loadSession("s-err")
         XCTAssertEqual(store.cliErrorHistoryBySession["s-err"]?.count, 1)
+    }
+}
+
+private actor CLISnapshotTransport: Transport {
+    var metadata: [String: JSONValue]
+    let at: Date
+    init(metadata: [String: JSONValue], at: Date) { self.metadata = metadata; self.at = at }
+    func setMetadata(_ value: [String: JSONValue]) { metadata = value }
+    var isConnected: Bool { true }
+    func connect() async throws {}
+    func disconnect() async {}
+    func eventStream() async -> AsyncStream<RemoteEvent> { AsyncStream { $0.finish() } }
+    func healthStream() async -> AsyncStream<TransportHealthEvent> { AsyncStream { $0.finish() } }
+    func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
+        let result: JSONValue
+        if command.action == "listSessions" {
+            result = try JSONValue.encode([ServerSession(sessionId: "snapshot-session", runtimeId: "runtime.cloudcode", instanceId: "cloudcode.remoteai", externalId: "native-uuid", title: "Existing", canonicalUrl: nil, status: "idle", metadata: metadata, createdAt: at, updatedAt: at, lastVisited: nil)])
+        } else { result = .object(metadata) }
+        return CommandResponseEnvelope(ok: true, result: result, error: nil, idempotentReplay: nil)
     }
 }
 
