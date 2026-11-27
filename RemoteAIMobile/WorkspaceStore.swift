@@ -3663,7 +3663,7 @@ final class WorkspaceStore: ObservableObject {
                     } else {
                         cliReceipts[sessionId] = "Windows 已返回；恢复结果尚未确认，请刷新状态。"
                     }
-                } else { cliReceipts[sessionId] = "Windows acknowledged; awaiting CLI status" }
+                } else { cliReceipts[sessionId] = "Windows 已接收操作；执行进度见上方任务状态。" }
             }
             errors[sessionId] = nil
             return true
