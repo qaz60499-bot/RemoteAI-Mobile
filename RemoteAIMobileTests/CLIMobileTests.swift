@@ -8,6 +8,7 @@ final class CLIMobileTests: XCTestCase {
         XCTAssertTrue(CLISessionDirectory.needsLiveRefresh(["cliMobile": .bool(true), "activeProcessCount": .number(0)], managed: true))
         let current: [String: JSONValue] = ["pid": .number(1776), "stale": .bool(false), "sessionScope": .string("current"), "processAlive": .bool(true)]
         XCTAssertEqual(CLISessionDirectory.section(current), .current)
+        XCTAssertEqual(CLISessionDirectory.section(current, activeProcessCount: 0), .history)
         XCTAssertEqual(CLISessionDirectory.section(current.merging(["sessionScope": .string("subtask"), "nativeRole": .string("subtask")]) { _, new in new }), .subtask)
         XCTAssertEqual(CLISessionDirectory.section(current.merging(["sessionScope": .string("related")]) { _, new in new }), .related)
         XCTAssertEqual(CLISessionDirectory.section(current.merging(["cliState": .string("process_exited")]) { _, new in new }), .history)
