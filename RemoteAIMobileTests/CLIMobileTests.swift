@@ -2,6 +2,41 @@ import XCTest
 @testable import RemoteAIMobile
 
 final class CLIMobileTests: XCTestCase {
+    @MainActor
+    func testCLIErrorSeparatesAgentOfflineFromRelayAndProvider() async throws {
+        let cases: [(TransportError, String)] = [(.offline, "windows-agent"), (.disconnected, "relay"), (.remote("HTTP_503", "upstream unavailable"), "model-api")]
+        for (error, source) in cases {
+            let transport = CLIReceiptTransport(status: "FAILED", queryError: error)
+            let store = WorkspaceStore(transport: transport, cache: try SQLiteStore.inMemory())
+            store.machine.state = .online
+            let runtime = RuntimeDescriptor(id: "runtime.codex", machineId: "my-pc", kind: .codex, name: "Codex")
+            let instance = InstanceDescriptor(id: "codex.remoteai", runtimeId: runtime.id, name: "CLI", subtitle: nil)
+            _ = await store.cliAction(runtime: runtime, instance: instance, sessionId: "s", action: "getSessionStatus")
+            XCTAssertEqual(store.cliErrorHistoryBySession["s"]?.last?.source, source)
+        }
+    }
+    func testCLIReconnectQueriesReceiptBeforeAnySubmission() async throws {
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.codex", instanceId: "codex.remoteai", sessionId: "s", action: "sendMessage", payload: ["text": .string("once")])
+        for status in ["COMPLETED", "RUNNING", "UNKNOWN_DELIVERY", "NOT_FOUND"] {
+            let transport = CLIReceiptTransport(status: status)
+            let state = try await transport.reconcileCLISend(command)
+            let actions = await transport.actions
+            XCTAssertEqual(actions.first, "getCommandOutcome")
+            XCTAssertEqual(actions.filter { $0 == "sendMessage" }.count, status == "NOT_FOUND" ? 1 : 0)
+            XCTAssertEqual(state, ["RUNNING", "UNKNOWN_DELIVERY"].contains(status) ? .unknown : .completed)
+            let submittedID = await transport.submittedID
+            if status == "NOT_FOUND" { XCTAssertEqual(submittedID, command.commandId) }
+        }
+    }
+
+    func testCLIReceiptQueryFailureNeverResends() async throws {
+        let transport = CLIReceiptTransport(status: "FAILED", queryError: .timeout)
+        let command = RemoteCommand.make(machineId: "my-pc", runtimeId: "runtime.codex", instanceId: "codex.remoteai", sessionId: "s", action: "sendMessage")
+        do { _ = try await transport.reconcileCLISend(command); XCTFail("Expected timeout") }
+        catch { XCTAssertEqual(error as? TransportError, .timeout) }
+        let actions = await transport.actions
+        XCTAssertEqual(actions, ["getCommandOutcome"])
+    }
     func testLargeCLIToolPagesCrossRelayLimitWithoutLosingHistory() async throws {
         let mock = MockTransport(historyCount: 0)
         let transport = BoundedCLIHistoryTransport(base: mock)
@@ -246,6 +281,31 @@ final class CLIMobileTests: XCTestCase {
         try await cache.put([record], key: "cli.errors.s-err")
         await store.loadSession("s-err")
         XCTAssertEqual(store.cliErrorHistoryBySession["s-err"]?.count, 1)
+    }
+}
+
+private actor CLIReceiptTransport: Transport {
+    let status: String
+    let queryError: TransportError?
+    private(set) var actions: [String] = []
+    private(set) var submittedID: UUID?
+    init(status: String, queryError: TransportError? = nil) { self.status = status; self.queryError = queryError }
+    var isConnected: Bool { true }
+    func connect() async throws {}
+    func disconnect() async {}
+    func eventStream() async -> AsyncStream<RemoteEvent> { AsyncStream { $0.finish() } }
+    func healthStream() async -> AsyncStream<TransportHealthEvent> { AsyncStream { $0.finish() } }
+    func execute(_ command: RemoteCommand) async throws -> CommandResponseEnvelope {
+        actions.append(command.action)
+        if command.action == "getSessionStatus", let queryError { throw queryError }
+        if command.action == "getCommandOutcome" {
+            if let queryError { throw queryError }
+            return CommandResponseEnvelope(ok: true, result: .object([
+                "status": .string(status), "outcome": .object(["ok": .bool(true)])
+            ]), error: nil, idempotentReplay: nil)
+        }
+        submittedID = command.commandId
+        return CommandResponseEnvelope(ok: true, result: nil, error: nil, idempotentReplay: nil)
     }
 }
 

@@ -335,6 +335,26 @@ extension Transport {
         return .failed
     }
 
+    // Resolve the durable receipt before a CLI send retry. A missing receipt may
+    // be submitted once with its original identity; pending/unknown is read-only.
+    func reconcileCLISend(_ command: RemoteCommand) async throws -> CommandState {
+        let query = RemoteCommand.make(machineId: command.machineId, runtimeId: command.runtimeId,
+            instanceId: command.instanceId, sessionId: command.sessionId, action: "getCommandOutcome",
+            payload: ["targetCommandId": .string(command.commandId.uuidString)])
+        let response = try await execute(query)
+        guard response.ok else {
+            throw TransportError.remote(response.error?.code ?? "CLI_RECEIPT_UNKNOWN", response.error?.message ?? "无法核对发送回执")
+        }
+        guard let result = response.result?.objectValue, let status = result["status"]?.stringValue else { throw TransportError.malformedData }
+        if status == "NOT_FOUND" { return try await send(command) }
+        if ["RUNNING", "UNKNOWN", "UNKNOWN_DELIVERY"].contains(status) { return .unknown }
+        guard ["COMPLETED", "FAILED"].contains(status),
+              let outcome = try result["outcome"]?.decode(CommandResponseEnvelope.self) else { throw TransportError.malformedData }
+        if outcome.ok { return .completed }
+        if let error = outcome.error { throw TransportError.remote(error.code, error.message) }
+        return .failed
+    }
+
     func agentStatusSnapshot(machineId: String) async throws -> AgentStatusSnapshot {
         let command = RemoteCommand.make(machineId: machineId, runtimeId: "runtime.web", instanceId: "agent", action: "getStatus", payload: ["assistantDeltaVersion": .number(1)])
         let response = try await requireSuccess(execute(command))

@@ -2963,8 +2963,12 @@ final class WorkspaceStore: ObservableObject {
                         errors["connection"] = nil
                         await recoverDelta(freshLatestSequence: authenticatedSequence)
                         commandStates[commandId] = .executing
-                        let replayedState = try await activeTransport.send(persisted)
+                        let isCLI = runtimeId == "runtime.codex" || runtimeId == "runtime.cloudcode"
+                        let replayedState: CommandState
+                        if isCLI { replayedState = try await activeTransport.reconcileCLISend(persisted) }
+                        else { replayedState = try await activeTransport.send(persisted) }
                         commandStates[commandId] = replayedState
+                        if replayedState == .unknown { continue }
                         await recoverDelta()
                         try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
                         try? await cache.saveDraft("", sessionId: sessionId)
@@ -3112,9 +3116,16 @@ final class WorkspaceStore: ObservableObject {
             }
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
             commandStates[commandId] = .executing
-            let finalState = try await activeTransport.send(command)
+            let isCLI = runtimeId == "runtime.codex" || runtimeId == "runtime.cloudcode"
+            let finalState: CommandState
+            if isCLI { finalState = try await activeTransport.reconcileCLISend(command) }
+            else { finalState = try await activeTransport.send(command) }
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
             commandStates[commandId] = finalState
+            if finalState == .unknown {
+                errors[message.sessionId] = "原指令的回执仍待确认，已查询 Windows；请同步历史后再核对，没有重复提交。"
+                return
+            }
             try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
             errors[message.sessionId] = nil
             // A replayed command response proves the side effect result, but the replay
@@ -3127,8 +3138,8 @@ final class WorkspaceStore: ObservableObject {
             errors[message.sessionId] = "Windows 已接收或连接刚发生切换，RemoteAI 会继续使用同一个 command ID 查询最终结果，不会重复发送到 ChatGPT。"
         } catch {
             guard generation == lifecycleGeneration, transport === activeTransport, machine.id == activeMachineId, !isSuspended else { return }
-            commandStates[commandId] = .failed
-            try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId))
+            commandStates[commandId] = isUnknownDelivery(error) ? .unknown : .failed
+            if !isUnknownDelivery(error) { try? await cache.remove(key: Self.pendingCommandKey(commandId, machineId: activeMachineId)) }
             errors[message.sessionId] = error.localizedDescription
         }
     }
@@ -3506,8 +3517,11 @@ final class WorkspaceStore: ObservableObject {
         let monitoredTransport = transport
         let generation = lifecycleGeneration
         connectionMonitorTask = Task { [weak self] in
+            var failures = 0
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: Self.connectionMonitorIntervalNanoseconds)
+                let delay = failures == 0 ? Self.connectionMonitorIntervalNanoseconds
+                    : UInt64(min(30.0, pow(2.0, Double(min(failures, 5))))) * 1_000_000_000
+                try? await Task.sleep(nanoseconds: delay)
                 guard !Task.isCancelled,
                       let self,
                       generation == self.lifecycleGeneration,
@@ -3535,6 +3549,7 @@ final class WorkspaceStore: ObservableObject {
                             break
                         }
                         self.machine.state = .online
+                        failures = 0
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
                         self.endTransientConnectionPresentation()
@@ -3550,6 +3565,7 @@ final class WorkspaceStore: ObservableObject {
                               !self.isSuspended,
                               self.transport === monitoredTransport else { break }
                         self.applyConnectionFailure(error)
+                        failures = min(failures + 1, 5)
                         if (error as? TransportError) == .pairingRequired { break }
                     }
                 } else if self.machine.state != .online {
@@ -3565,6 +3581,7 @@ final class WorkspaceStore: ObservableObject {
                               !self.isSuspended,
                               self.transport === monitoredTransport else { break }
                         self.machine.state = .online
+                        failures = 0
                         self.connectionPhase = .online
                         self.errors["connection"] = nil
                         self.endTransientConnectionPresentation()
@@ -3577,6 +3594,7 @@ final class WorkspaceStore: ObservableObject {
                               !self.isSuspended,
                               self.transport === monitoredTransport else { break }
                         self.applyConnectionFailure(error)
+                        failures = min(failures + 1, 5)
                         if (error as? TransportError) == .pairingRequired { break }
                     }
                 } else if self.machine.state == .online && Date().timeIntervalSince(self.lastOnlineHeadProbe) >= 15 {
@@ -3670,15 +3688,19 @@ final class WorkspaceStore: ObservableObject {
         var needsManual = unknownDelivery
         if let transportError = error as? TransportError {
             switch transportError {
-            case .offline, .disconnected:
-                code = "NETWORK_DISCONNECTED"; source = "phone-network"
+            case .offline:
+                code = "WINDOWS_AGENT_OFFLINE"; source = "windows-agent"
+            case .disconnected:
+                code = "RELAY_DISCONNECTED"; source = "relay"
             case .timeout:
-                code = "REQUEST_TIMEOUT"; source = "phone-network"
+                code = "REQUEST_TIMEOUT"; source = "relay"
             case .remote(let remoteCode, _):
                 code = remoteCode
                 if remoteCode.hasPrefix("HTTP_") || remoteCode == "PROVIDER_RATE_LIMITED" || remoteCode == "PROVIDER_UNAVAILABLE" {
                     source = "model-api"
-                    needsManual = remoteCode == "HTTP_401" || remoteCode == "HTTP_403"
+                    needsManual = ["HTTP_401", "HTTP_402", "HTTP_403"].contains(remoteCode)
+                } else if remoteCode.hasPrefix("CLI_") {
+                    source = "cli"
                 }
             default:
                 break
@@ -3736,6 +3758,20 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func syncCLIStatusMetadata(_ payload: [String: JSONValue], for sessionId: String) async {
+        // A fresh authenticated status resolves this session's transport error,
+        // independently of the provider errors retained below.
+        if var errors = cliErrorHistoryBySession[sessionId] {
+            let at = Date().formatted(.iso8601)
+            for index in errors.indices where ["windows-agent", "relay", "phone-network"].contains(errors[index].source)
+                && ["WINDOWS_AGENT_OFFLINE", "RELAY_DISCONNECTED", "NETWORK_DISCONNECTED", "REQUEST_TIMEOUT"].contains(errors[index].code)
+                && !errors[index].recovered {
+                errors[index].recovered = true
+                errors[index].recoveredAt = at
+                errors[index].retrying = false
+            }
+            cliErrorHistoryBySession[sessionId] = errors
+            try? await cache.put(errors, key: "cli.errors.\(sessionId)")
+        }
         var merged = cliStatus[sessionId] ?? sessions.first(where: { $0.id == sessionId })?.cliMetadata ?? [:]
         merged.merge(payload) { _, new in new }
         cliStatus[sessionId] = merged
