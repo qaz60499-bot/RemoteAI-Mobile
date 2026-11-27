@@ -363,10 +363,13 @@ struct CLIRuntimeView: View {
         }
     }
     private func sessions(in category: CLISessionSection) -> [SessionDescriptor] {
-        let ids = Set(instances.map(\.id))
+        let instancesByID = Dictionary(uniqueKeysWithValues: instances.map { ($0.id, $0) })
         return store.sessions.filter { session in
-            ids.contains(session.instanceId) && CLISessionDirectory.section(store.cliStatus[session.id] ?? session.cliMetadata ?? [:], activeProcessCount: instances.first(where: { $0.id == session.instanceId })?.config["activeProcessCount"]?.intValue) == category
-                && (search.isEmpty || session.title.localizedCaseInsensitiveContains(search) || (session.workingDirectory ?? "").localizedCaseInsensitiveContains(search))
+            guard let instance = instancesByID[session.instanceId] else { return false }
+            let metadata = store.cliStatus[session.id] ?? session.cliMetadata ?? [:]
+            let activeCount = instance.config["activeProcessCount"]?.intValue
+            guard CLISessionDirectory.section(metadata, activeProcessCount: activeCount) == category else { return false }
+            return search.isEmpty || session.title.localizedCaseInsensitiveContains(search) || (session.workingDirectory ?? "").localizedCaseInsensitiveContains(search)
         }.sorted { $0.orderingDate > $1.orderingDate }
     }
     @ViewBuilder private func sessionLinks(_ rows: [SessionDescriptor]) -> some View {
