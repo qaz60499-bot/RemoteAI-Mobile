@@ -3,6 +3,9 @@ import XCTest
 
 final class CLIMobileTests: XCTestCase {
     func testCLIDirectoryKeepsSubtasksAndExitedHistoryOutOfCurrentProcesses() {
+        XCTAssertTrue(CLISessionDirectory.needsLiveRefresh(["cliMobile": .bool(true), "activeProcessCount": .number(2)], managed: false))
+        XCTAssertFalse(CLISessionDirectory.needsLiveRefresh(["cliMobile": .bool(true), "activeProcessCount": .number(0)], managed: false))
+        XCTAssertTrue(CLISessionDirectory.needsLiveRefresh(["cliMobile": .bool(true), "activeProcessCount": .number(0)], managed: true))
         let current: [String: JSONValue] = ["pid": .number(1776), "stale": .bool(false), "sessionScope": .string("current"), "processAlive": .bool(true)]
         XCTAssertEqual(CLISessionDirectory.section(current), .current)
         XCTAssertEqual(CLISessionDirectory.section(current.merging(["sessionScope": .string("subtask"), "nativeRole": .string("subtask")]) { _, new in new }), .subtask)

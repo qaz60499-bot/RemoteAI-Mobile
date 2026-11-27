@@ -30,7 +30,7 @@ struct RootView: View {
     @State private var showingDiagnostics = false
     @State private var visible = false
     private var currentCLISessions: [SessionDescriptor] {
-        let ids = Set(store.instances.filter { $0.config["cliMobile"]?.boolValue == true }.map(\.id))
+        let ids = Set(store.instances.filter { CLISessionDirectory.needsLiveRefresh($0.config, managed: $0.isManagedCLI) }.map(\.id))
         return store.sessions.filter { ids.contains($0.instanceId) && CLISessionDirectory.section(store.cliStatus[$0.id] ?? $0.cliMetadata ?? [:]) == .current }
             .sorted { $0.orderingDate > $1.orderingDate }
     }
@@ -119,7 +119,7 @@ struct RootView: View {
         for runtime in store.runtimes.filter({ $0.kind == .codex || $0.kind == .cloudcode }) {
             guard !Task.isCancelled else { return }
             await store.refreshRuntime(runtime)
-            for instance in store.instances.filter({ $0.runtimeId == runtime.id && $0.config["cliMobile"]?.boolValue == true }) {
+            for instance in store.instances.filter({ $0.runtimeId == runtime.id && CLISessionDirectory.needsLiveRefresh($0.config, managed: $0.isManagedCLI) }) {
                 guard !Task.isCancelled else { return }
                 await store.refreshSessions(runtime: runtime, instance: instance)
             }

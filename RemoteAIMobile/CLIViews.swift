@@ -259,6 +259,9 @@ enum CLISessionSection: String, CaseIterable {
 }
 
 enum CLISessionDirectory {
+    static func needsLiveRefresh(_ config: [String: JSONValue], managed: Bool) -> Bool {
+        config["cliMobile"]?.boolValue == true && (managed || (config["activeProcessCount"]?.intValue ?? 1) > 0)
+    }
     static func section(_ meta: [String: JSONValue]) -> CLISessionSection {
         if meta["sessionScope"]?.stringValue == "history" || meta["processAlive"]?.boolValue == false || meta["cliState"]?.stringValue == "process_exited" { return .history }
         if meta["nativeRole"]?.stringValue == "subtask" || meta["sessionScope"]?.stringValue == "subtask" { return .subtask }
@@ -308,6 +311,7 @@ struct CLIRuntimeView: View {
                             .disabled(store.machine.state != .online)
                     }
                 }
+                Button("加载或刷新历史会话") { Task { await refresh(includeHistory: true) } }
             }
             ForEach(CLISessionSection.allCases, id: \.self) { category in
                 let rows = sessions(in: category)
@@ -346,9 +350,16 @@ struct CLIRuntimeView: View {
             }
         }
     }
-    private func refresh() async {
+    private func refresh(includeHistory: Bool = false) async {
         await store.refreshRuntime(runtime)
-        for instance in instances { await store.refreshSessions(runtime: runtime, instance: instance) }
+        let live = instances.filter { CLISessionDirectory.needsLiveRefresh($0.config, managed: $0.isManagedCLI) }
+        for instance in live { await store.refreshSessions(runtime: runtime, instance: instance) }
+        if includeHistory {
+            for instance in instances where !live.contains(where: { $0.id == instance.id }) {
+                guard !Task.isCancelled else { return }
+                await store.refreshSessions(runtime: runtime, instance: instance)
+            }
+        }
     }
     private func sessions(in category: CLISessionSection) -> [SessionDescriptor] {
         let ids = Set(instances.map(\.id))
